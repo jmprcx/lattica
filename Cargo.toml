@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lattica-primitives",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jmprcx/torv3-vanity-gen"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Post-quantum primitives (NIST FIPS standards, pure-Rust RustCrypto-adjacent crates)
+fips203 = "0.4"   # ML-KEM  (FIPS 203) — key encapsulation for note encryption
+fips204 = "0.4"   # ML-DSA  (FIPS 204) — binding / transparent signatures
+
+# Hashing
+sha3 = "0.10"     # Keccak / SHA3 — conservative out-of-circuit hash
+blake3 = "1"
+
+# Symmetric AEAD (quantum-safe at 256-bit keys)
+chacha20poly1305 = "0.10"
+
+# Utilities
+hex = "0.4"
+rand_core = "0.6"
