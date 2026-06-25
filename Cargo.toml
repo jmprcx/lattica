@@ -5,6 +5,8 @@ members = [
     "crates/lattica-tree",
     "crates/lattica-tx",
     "crates/lattica-circuit",
+    "crates/lattica-node",
+    "crates/lattica-wallet",
 ]
 
 [workspace.package]
@@ -37,3 +39,5 @@ rand_core = "0.6"
 lattica-primitives = { path = "crates/lattica-primitives" }
 lattica-tree = { path = "crates/lattica-tree" }
 lattica-tx = { path = "crates/lattica-tx" }
+lattica-circuit = { path = "crates/lattica-circuit" }
+lattica-node = { path = "crates/lattica-node" }

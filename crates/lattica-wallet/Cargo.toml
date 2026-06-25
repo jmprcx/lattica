@@ -1,0 +1,20 @@
+[package]
+name = "lattica-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Wallet CLI for the Lattica shielded protocol: keygen, scan, and an end-to-end transfer demo."
+
+[[bin]]
+name = "lattica-wallet"
+path = "src/main.rs"
+
+[dependencies]
+lattica-primitives.workspace = true
+lattica-tree.workspace = true
+lattica-tx.workspace = true
+lattica-circuit.workspace = true
+lattica-node.workspace = true
+hex.workspace = true
