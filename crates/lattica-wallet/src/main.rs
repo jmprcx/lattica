@@ -3,6 +3,9 @@
 //! `lattica-wallet demo` runs a complete post-quantum shielded transfer end to end against
 //! an in-memory chain and narrates every step.
 
+use std::time::Instant;
+
+use lattica_circuit::{prove_authorization, verify_authorization};
 use lattica_node::{build_transfer, Chain};
 use lattica_primitives::sig::{PK_LEN, SIG_LEN};
 use lattica_tx::{try_decrypt, FullKey};
@@ -17,8 +20,9 @@ fn main() {
     match cmd.as_str() {
         "demo" => demo(),
         "keygen" => keygen(),
+        "bench" => bench(),
         other => {
-            eprintln!("unknown command: {other}\nusage: lattica-wallet [demo|keygen]");
+            eprintln!("unknown command: {other}\nusage: lattica-wallet [demo|keygen|bench]");
             std::process::exit(2);
         }
     }
@@ -31,6 +35,32 @@ fn keygen() {
     println!("  recipient id : {}…", short(&addr.recipient_id()));
     println!("  ML-KEM ek    : {}… ({} bytes)", short(&addr.kem_ek), addr.kem_ek.len());
     println!("  ML-DSA pk    : {}… ({} bytes)", short(&key.sig.pk_bytes()), PK_LEN);
+}
+
+fn bench() {
+    const ITERS: u32 = 10;
+    let secret = [7u8; 32];
+
+    let t = Instant::now();
+    let mut proof = prove_authorization(&secret).expect("prove");
+    for _ in 1..ITERS {
+        proof = prove_authorization(&secret).expect("prove");
+    }
+    let prove_ms = t.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
+
+    let t = Instant::now();
+    for _ in 0..ITERS {
+        assert!(verify_authorization(&proof));
+    }
+    let verify_ms = t.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
+
+    println!("Lattica FRI-STARK authorization proof ({ITERS} iters)");
+    println!("  prove       : {prove_ms:.2} ms");
+    println!("  verify      : {verify_ms:.2} ms");
+    println!("  proof size  : {} bytes", proof.proof.len());
+    println!("  ML-DSA sig  : {SIG_LEN} bytes");
+    println!("  ML-DSA pk   : {PK_LEN} bytes");
+    println!("  ML-KEM ct   : {} bytes", lattica_primitives::kem::CT_LEN);
 }
 
 fn demo() {
