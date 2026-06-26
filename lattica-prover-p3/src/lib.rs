@@ -6,6 +6,7 @@
 //! and the `lattica_spend_verify` **C ABI** the Zig node calls — matching `src/ffi.zig`.
 
 pub mod full_spend_air;
+pub mod joinsplit_air;
 pub mod poseidon2_air;
 pub mod spend_air;
 
