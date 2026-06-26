@@ -302,20 +302,77 @@ pub fn native_permutation(mut state: [BaseElement; STATE_WIDTH]) -> [BaseElement
 
 // --- C ABI (matches src/ffi.zig) --------------------------------------------------------------
 
-/// `lattica_spend_verify` — the production spend verifier the Zig node calls.
+const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
+
+/// Decode a canonical field element (8 bytes LE, must be `< P`).
+fn read_felt(bytes: &[u8]) -> Option<BaseElement> {
+    let v = u64::from_le_bytes(bytes.try_into().ok()?);
+    if v >= GOLDILOCKS_P {
+        return None; // non-canonical encoding
+    }
+    Some(BaseElement::new(v))
+}
+
+/// Decode a 32-byte digest as 4 canonical field elements.
+fn read_digest(bytes: &[u8]) -> Option<[BaseElement; 4]> {
+    let mut d = [BaseElement::ZERO; 4];
+    for i in 0..4 {
+        d[i] = read_felt(&bytes[i * 8..i * 8 + 8])?;
+    }
+    Some(d)
+}
+
+/// `lattica_spend_verify` — the production spend verifier the Zig node calls (matches the C ABI in
+/// `src/ffi.zig`). Returns 0 to accept, non-zero to reject (always fail-closed on any parse error).
 ///
-/// NOTE: the full spend statement (commitment opening + membership + nullifier + balance + range
-/// + tx-binding) is built up incrementally on top of the Rescue-Prime AIR above. Until that is
-/// complete and audited, this returns a non-zero "unimplemented" code so the node fails closed —
-/// it never accepts a spend against a stub verifier.
+/// `public_inputs` is the canonical `SpendPublicInputs` layout from `ffi.zig`:
+/// `anchor(32) ‖ nullifier(32) ‖ out_cm(32) ‖ tx_binding(32) ‖ fee(8)` = 136 bytes. The current
+/// spend statement binds `anchor`(=root), `nullifier`, and `tx_binding`; `out_cm`/`fee` are parsed
+/// for forward-compatibility and consumed once value-balance is integrated.
 #[no_mangle]
 pub extern "C" fn lattica_spend_verify(
-    _proof_ptr: *const u8,
-    _proof_len: usize,
-    _pi_ptr: *const u8,
-    _pi_len: usize,
+    proof_ptr: *const u8,
+    proof_len: usize,
+    pi_ptr: *const u8,
+    pi_len: usize,
 ) -> i32 {
-    -1 // unimplemented; fail closed
+    if proof_ptr.is_null() || pi_ptr.is_null() {
+        return -1;
+    }
+    let pi_bytes = unsafe { core::slice::from_raw_parts(pi_ptr, pi_len) };
+    let proof_bytes = unsafe { core::slice::from_raw_parts(proof_ptr, proof_len) };
+
+    const PI_LEN: usize = 32 * 4 + 8; // anchor, nullifier, out_cm, tx_binding, fee
+    if pi_bytes.len() != PI_LEN {
+        return -1;
+    }
+    let root = match read_digest(&pi_bytes[0..32]) {
+        Some(d) => d,
+        None => return -1,
+    };
+    let nf = match read_digest(&pi_bytes[32..64]) {
+        Some(d) => d,
+        None => return -1,
+    };
+    // pi_bytes[64..96] = out_cm, pi_bytes[128..136] = fee — used once balance is integrated.
+    let tx_binding = match read_digest(&pi_bytes[96..128]) {
+        Some(d) => d,
+        None => return -1,
+    };
+    let proof = match Proof::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+    let pi = spend::PublicInputs { root, nf, tx_binding };
+    match spend::verify_spend(proof, pi) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Serialize a spend proof to bytes (for the prover/wallet side and tests).
+pub fn proof_to_bytes(proof: &Proof) -> Vec<u8> {
+    proof.to_bytes()
 }
 
 // --- tests ------------------------------------------------------------------------------------
@@ -358,8 +415,50 @@ mod tests {
     }
 
     #[test]
-    fn spend_verify_abi_fails_closed() {
-        let pi = [0u8; 136];
-        assert_eq!(lattica_spend_verify(pi.as_ptr(), 4, pi.as_ptr(), pi.len()), -1);
+    fn spend_verify_abi_roundtrip() {
+        use crate::spend::{self, Note, DEPTH, DIGEST};
+
+        let note = Note {
+            recipient: BaseElement::new(0xABCD),
+            value: BaseElement::new(1000),
+            rho: BaseElement::new(0x1111_2222),
+            rcm: BaseElement::new(0x3333_4444),
+            nk: BaseElement::new(0x5555_6666),
+            pos: BaseElement::new(42),
+        };
+        let mut sib = [[BaseElement::ZERO; DIGEST]; DEPTH];
+        let mut bits = [false; DEPTH];
+        for d in 0..DEPTH {
+            for k in 0..DIGEST {
+                sib[d][k] = BaseElement::new((d * 10 + k + 1) as u64);
+            }
+            bits[d] = d % 2 == 1;
+        }
+        let txb = [BaseElement::new(7), BaseElement::new(8), BaseElement::new(9), BaseElement::new(10)];
+        let (proof, pi) = spend::prove_spend(note, sib, bits, txb);
+        let proof_bytes = proof.to_bytes();
+
+        // Encode SpendPublicInputs (src/ffi.zig layout): anchor(root) ‖ nullifier ‖ out_cm ‖ tx_binding ‖ fee.
+        let mut pib = Vec::new();
+        let put = |v: &mut Vec<u8>, d: &[BaseElement; DIGEST]| {
+            for e in d {
+                v.extend_from_slice(&e.as_int().to_le_bytes());
+            }
+        };
+        put(&mut pib, &pi.root);
+        put(&mut pib, &pi.nf);
+        pib.extend_from_slice(&[0u8; 32]); // out_cm (unused until balance)
+        put(&mut pib, &pi.tx_binding);
+        pib.extend_from_slice(&0u64.to_le_bytes()); // fee (unused until balance)
+        assert_eq!(pib.len(), 136);
+
+        // Accepts a valid proof.
+        assert_eq!(lattica_spend_verify(proof_bytes.as_ptr(), proof_bytes.len(), pib.as_ptr(), pib.len()), 0);
+        // Rejects a tampered root.
+        let mut bad = pib.clone();
+        bad[0] ^= 1;
+        assert_ne!(lattica_spend_verify(proof_bytes.as_ptr(), proof_bytes.len(), bad.as_ptr(), bad.len()), 0);
+        // Fail-closed on a malformed public-input length.
+        assert_eq!(lattica_spend_verify(proof_bytes.as_ptr(), proof_bytes.len(), pib.as_ptr(), 10), -1);
     }
 }

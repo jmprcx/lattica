@@ -48,7 +48,10 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
   nullifier-load / row-0 constraints. Validated: `cm`/`nf` equal `Rp64_256::hash_elements`; AIR
   `root`/`nf` equal the native fold/hash; valid-verifies; wrong-root, wrong-nf, tampered-opening,
   and **inconsistent-`rho`** (commitment vs nullifier) all rejected. **C-01/C-02/C-03 core.**
-- `lattica_spend_verify` C ABI present and **fail-closed**. 15/15 Rust tests.
+- `lattica_spend_verify` C ABI is **real** (lib.rs): parses the `SpendPublicInputs` byte layout
+  from `src/ffi.zig` (canonical field-element + length checks), deserializes the Winterfell proof,
+  and calls `verify_spend` — fail-closed on any parse error. Round-trip tested (accept / tampered-
+  root reject / malformed-length fail-closed). 19/19 Rust tests (incl. the range AIR).
 
 ### Remaining within Phase 2
 1. ~~Merkle membership (general position).~~ **Done.**
@@ -64,7 +67,9 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
    `value < 2^BITS`, in-range verifies / out-of-range rejected / handles `value=0`. **Balance**
    `in = out + fee` (+ `mint`/`burn`) with `out_cm` binding and the range tied to the *hidden*
    note/output values: remaining (integration into `spend.rs` via persistent value columns).
-7. Canonical proof serialization; the real `lattica_spend_verify` over `SpendPublicInputs`.
+7. ~~The real `lattica_spend_verify` over `SpendPublicInputs`.~~ **Done** (lib.rs): canonical
+   public-input parsing + Winterfell proof (de)serialization, fail-closed. A `lattica_spend_prove`
+   ABI (wallet side) and linking the static lib into a Zig integration test remain.
 8. Differential test the whole statement vs. the hand-rolled reference; production parameters +
    written soundness budget (Phase 5).
 
