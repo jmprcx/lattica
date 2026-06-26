@@ -68,6 +68,13 @@ testable hand-rolled hash-AIR for avoiding an un-vetted multi-table prover build
   validated Winterfell `lattica-prover` statement; build it incrementally (one hash region →
   membership chain → + nullifier/output → + balance/range/ownership/tx-binding), each
   differential-tested against the Winterfell oracle.
+  - **M4 de-risked:** `GenericPoseidon2LinearLayers::{external,internal}_linear_layer<R:
+    PrimeCharacteristicRing>` is generic over the algebra, and the AIR builder's `AB::Expr`
+    implements `PrimeCharacteristicRing` — so the custom AIR can **call the vetted linear layers
+    directly** on the symbolic state. The hand-written surface is then only: the `x⁷` S-box, adding
+    the vetted round constants, the full/partial round sequencing, and the spend wiring. The vetted
+    constants + linear algebra are reused; correctness of the round structure is pinned by the
+    differential test against native `Poseidon2Goldilocks`.
 - **M5:** native oracle + **differential tests** vs the Winterfell `lattica-prover`; canonical proof
   serialization; the `lattica_spend_verify` / `lattica_spend_prove` C ABI (matches `src/ffi.zig`).
 - **M6:** Phase-4 node cutover — wire the verifier into `node.zig`, switch protocol hashing to
