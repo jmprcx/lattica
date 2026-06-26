@@ -435,6 +435,11 @@ pub const LOG_BLOWUP: usize = 4;
 pub const NUM_QUERIES: usize = 96;
 pub const COMMIT_POW_BITS: usize = 0;
 pub const QUERY_POW_BITS: usize = 16;
+// FRI encoding levers (chosen via the `sweep` binary): they shrink the proof with NO effect on the
+// proven/conjectured security. Arity-16 folding (max_log_arity=4) + a 2^6 Merkle cap cut the proof
+// ~49% (828→421 KB) and verify ~halve, at the same 103-bit proven / 127-bit conjectured level.
+pub const MAX_LOG_ARITY: usize = 4;
+pub const CAP_HEIGHT: usize = 6;
 /// Bit-length of the extension field FRI/challenges operate in (Goldilocks², ⌊log2 p²⌋).
 pub const EXT_FIELD_BITS: usize = 127;
 /// Collision resistance of the Poseidon2 4-Goldilocks Merkle digest (birthday bound).
@@ -454,7 +459,7 @@ fn make_config(seed: u64) -> MyConfig {
     let perm = default_goldilocks_poseidon2_8();
     let hash = MyHash::new(perm.clone());
     let compress = MyCompress::new(perm.clone());
-    let val_mmcs = ValMmcs::new(hash, compress, 0, SmallRng::seed_from_u64(seed));
+    let val_mmcs = ValMmcs::new(hash, compress, CAP_HEIGHT, SmallRng::seed_from_u64(seed));
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let dft = Dft::default();
     let fri_params = production_fri_params(challenge_mmcs);
@@ -467,7 +472,7 @@ fn production_fri_params(mmcs: ChallengeMmcs) -> FriParameters<ChallengeMmcs> {
     FriParameters {
         log_blowup: LOG_BLOWUP,
         log_final_poly_len: 0,
-        max_log_arity: 1,
+        max_log_arity: MAX_LOG_ARITY,
         num_queries: NUM_QUERIES,
         commit_proof_of_work_bits: COMMIT_POW_BITS,
         query_proof_of_work_bits: QUERY_POW_BITS,
@@ -491,9 +496,111 @@ pub struct SecurityReport {
     pub trace_height: usize,
 }
 
+// --- parameter sweep (proof size vs proven bits vs prove/verify time) -------------------------
+
+/// One point in the FRI parameter space.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepPoint {
+    pub log_blowup: usize,
+    pub num_queries: usize,
+    pub query_pow: usize,
+    pub commit_pow: usize,
+    pub max_log_arity: usize,
+    pub cap_height: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SweepResult {
+    pub conjectured_bits: usize, // effective (capped by field / collision)
+    pub proven_bits: usize,
+    pub proof_bytes: usize,
+    pub prove_ms: u128,
+    pub verify_ms: u128,
+}
+
+fn fri_from(point: &SweepPoint, mmcs: ChallengeMmcs) -> FriParameters<ChallengeMmcs> {
+    FriParameters {
+        log_blowup: point.log_blowup,
+        log_final_poly_len: 0,
+        max_log_arity: point.max_log_arity,
+        num_queries: point.num_queries,
+        commit_proof_of_work_bits: point.commit_pow,
+        query_proof_of_work_bits: point.query_pow,
+        mmcs,
+    }
+}
+
+fn config_from(point: &SweepPoint, seed: u64) -> MyConfig {
+    let perm = default_goldilocks_poseidon2_8();
+    let val_mmcs = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm.clone()),
+        point.cap_height,
+        SmallRng::seed_from_u64(seed),
+    );
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    let fri = fri_from(point, challenge_mmcs);
+    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, SmallRng::seed_from_u64(seed));
+    MyConfig::new(pcs, Challenger::new(perm))
+}
+
+fn proven_conjectured(point: &SweepPoint) -> (usize, usize) {
+    let perm = default_goldilocks_poseidon2_8();
+    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), point.cap_height, SmallRng::seed_from_u64(1));
+    let fri = fri_from(point, ChallengeMmcs::new(val_mmcs));
+    let air = FullSpendAir;
+    let layout = AirLayout::from_air::<Goldilocks>(&air);
+    let params = StarkSecurityParams::from_air::<Val, Challenge, FullSpendAir, ChallengeMmcs>(
+        &fri, &air, layout, EXT_FIELD_BITS, COLLISION_RESISTANCE_BITS, 2,
+    );
+    let zk_degree_bits = HEIGHT.trailing_zeros() as usize + 1;
+    let proven = ProvenSecurity::compute(&params, 1usize << zk_degree_bits).security_bits();
+    let conjectured = fri.conjectured_soundness_bits().min(EXT_FIELD_BITS).min(COLLISION_RESISTANCE_BITS);
+    (proven, conjectured)
+}
+
+/// Prove a `DEPTH`-deep spend at `point`'s FRI parameters and measure proof size + prove/verify
+/// time alongside the (proven, conjectured) security. Panics if the config fails to verify (e.g.
+/// `log_blowup` too small for the constraint degree).
+pub fn sweep_one(w: &Witness, point: &SweepPoint) -> SweepResult {
+    let air = FullSpendAir;
+    let pis = public_values(w);
+    let config = config_from(point, 1);
+    let trace = build_trace(w);
+    let t0 = std::time::Instant::now();
+    let proof = prove(&config, &air, trace, &pis);
+    let prove_ms = t0.elapsed().as_millis();
+    let bytes = postcard::to_allocvec(&proof).expect("serialize");
+    let t1 = std::time::Instant::now();
+    let ok = verify(&config, &air, &proof, &pis).is_ok();
+    let verify_ms = t1.elapsed().as_millis();
+    assert!(ok, "sweep point {point:?} failed to verify");
+    let (proven_bits, conjectured_bits) = proven_conjectured(point);
+    SweepResult { conjectured_bits, proven_bits, proof_bytes: bytes.len(), prove_ms, verify_ms }
+}
+
+/// A representative valid spend witness (used by the demo and the parameter sweep).
+pub fn demo_witness() -> Witness {
+    Witness {
+        nk: 12345,
+        value: 1000,
+        rho: Val::from_u64(7),
+        rcm: Val::from_u64(9),
+        pos: Val::from_u64(3),
+        sib: core::array::from_fn(|d| core::array::from_fn(|k| Val::from_u64((d * 4 + k + 50) as u64))),
+        bits: core::array::from_fn(|d| d % 3 == 0),
+        out_recipient: core::array::from_fn(|i| Val::from_u64(77 + i as u64)),
+        out_value: 600,
+        out_rho: Val::from_u64(11),
+        out_rcm: Val::from_u64(13),
+        fee: 400,
+        tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCDEF + i as u64)),
+    }
+}
+
 pub fn security_report() -> SecurityReport {
     let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0, SmallRng::seed_from_u64(1));
+    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, SmallRng::seed_from_u64(1));
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs);
     let fri_params = production_fri_params(challenge_mmcs);
 

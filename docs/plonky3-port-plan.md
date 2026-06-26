@@ -101,7 +101,10 @@ calls, runs at **production parameters**, and carries a **machine-checked soundn
   `ConjecturedSecurity`; the `production_security_budget` test gates proven ≥ 100, conjectured ≥ 128.
 - **Parameter hardening — done**: `DEPTH 4→32` (block count padded 36→64), `recipient` 1→**4-element
   digest** (input & output notes share the commitment layout), value `BITS 32→52` (wraparound-safe).
-  Production proof ~848 KB, prove ~2.2 s, verify ~14 ms (`DEPTH=32`). 22 tests pass.
+- **Proof-size tuning — done** (`cargo run --bin sweep`, table in `docs/soundness-budget.md`): FRI
+  folding arity 1→4 + a 2⁶ Merkle cap cut the proof **828→421 KB (−49%)** at the *same* 103/127-bit
+  security (verify 13→8 ms). Raising the blowup or grinding were shown counter-productive.
+  Production (`DEPTH=32`): proof **~421 KB**, prove ~2.05 s, verify ~8 ms. 22 tests pass.
 
 **Remaining before production:** (1) **M6** node cutover + `lattica_spend_prove`; (2) **Phase-3
 external audit** (incl. a Poseidon2 review). These are integration + audit, not new architecture.

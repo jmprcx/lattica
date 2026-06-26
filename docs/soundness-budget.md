@@ -20,8 +20,13 @@ cross-checked against Ethereum's `soundcalc`).
 | FRI queries | **96** | |
 | Query grinding | **16** bits | PoW before sampling queries |
 | Commit grinding | 0 bits | |
-| `log_final_poly_len` / `max_log_arity` | 0 / 1 | fold to a constant, arity 2 |
+| `log_final_poly_len` / `max_log_arity` | 0 / **4** | fold to a constant, arity 16 (proof-size lever) |
+| Merkle cap height | **6** | 2⁶ cap ⇒ shorter query paths (proof-size lever) |
 | Trace | height **2048** (`DEPTH=32`), width 17 | 62 constraints, max degree 8 |
+
+The `max_log_arity` and `cap_height` values are FRI *encoding* choices — they shrink the proof with
+**no** effect on the security level (see the sweep below). They were chosen by `cargo run --bin
+sweep`.
 
 `max_constraint_degree = 8 ≤ blowup + 1 = 17` (the Plonky3 quotient-fit requirement), with margin.
 
@@ -43,13 +48,38 @@ plateaus near 96 for this rate, so UDR is the binding (and reported) regime.
 
 | | |
 |---|---|
-| Proof size | ~848 KB |
-| Prove | ~2.2 s |
-| Verify | ~14 ms |
+| Proof size | **~421 KB** |
+| Prove | ~2.05 s |
+| Verify | ~8 ms |
 
-Verify (the node-side cost) is ~14 ms; proving (~2 s, wallet-side) is acceptable. Proof size is
-dominated by the 96 FRI query openings; it can be cut by raising `log_blowup` (fewer queries for the
-same security, at a larger prover LDE) if proof size becomes the binding constraint.
+## Proof-size parameter sweep
+
+`cargo run --release --bin sweep` proves a real `DEPTH=32` spend at each FRI configuration and
+measures proof size + timings next to the proven/conjectured bits. Headline rows (proven/conjectured
+are bits; proof in KB):
+
+| config | proven | conj | proof KB | prove ms | verify ms |
+|---|---|---|---|---|---|
+| `lb4 q96 ar1 cap0` (initial) | 103 | 127 | 828 | 2143 | 13 |
+| `lb4 q96 ar3 cap0` | 103 | 127 | 539 | 2035 | 9 |
+| `lb4 q96 ar3 cap4` | 103 | 127 | 443 | 2075 | 7 |
+| **`lb4 q96 ar4 cap6`** (production) | **103** | **127** | **421** | 2019 | **7** |
+| `lb4 q64 ar1 cap0` | 96 | 127 | 553 | 2091 | 9 |
+| `lb5 q64 ar1 cap0` | 94 | 127 | 589 | 4373 | 9 |
+| `lb6 q48 ar1 cap0` | 91 | 127 | 469 | 8568 | 8 |
+| `lb4 q64 pow24` | 96 | 127 | 553 | **30710** | 9 |
+
+What the data shows:
+- **FRI folding arity is a (near-)free proof-size lever.** Arity 1→4 + a 2⁶ Merkle cap cut the proof
+  **828 → 421 KB (−49%)** at the *same* 103-bit proven / 127-bit conjectured level, and verify ~halves
+  (13 → 7 ms). Adopted as production. (Pushing further — `ar5 cap6` — regresses; the cap/arity
+  overhead overtakes the path savings.)
+- **Raising the blowup (lower rate) is counter-productive here:** `lb5`/`lb6` cost 2–4× prove time
+  *and* give fewer proven bits at these query counts. `log_blowup=4` is best.
+- **Query grinding is not a useful lever** for the proven bound: `q64 pow24` matches `q64 pow16`
+  (96 bits) but proves 15× slower (~31 s). Proven security is gained by *queries*, not grinding.
+- The proven floor for ≥100 bits is `num_queries = 96`; fewer queries (≤80) sit at the 96-bit LDR
+  plateau. So the production choice is "96 queries at the smallest encoding."
 
 ## Parameter hardening (was demo-sized in M4c)
 
