@@ -99,10 +99,11 @@ counts below are historical, from the iteration that added each piece.)
   `ZK re-randomized: true`, 5/5 tests). Recommendation (`docs/framework-decision.md` "ZK-01 spike
   result"): a ZK-capable framework is needed (Winterfell has none). Options evaluated — **plonky2**
   (ZK, gadgets/small audit surface; *nightly*), **Plonky3** (ZK + **stable** + **proven-security**;
-  AIR-style, our AIR ports), **zkVM** (ZK by construction; heavy, large TCB). **Front-runner:
-  Plonky3** (ZK on stable + proven security). Final framework decision pending (suggest a short
-  Plonky3 ZK prove-spike to confirm parity); then re-express `lattica-prover`, keeping Winterfell as
-  a differential oracle.
+  AIR-style, our AIR ports), **zkVM** (ZK by construction; heavy, large TCB). All three spiked:
+  plonky2 (`plonky2-spike/`, full spend core, ZK ✓) and Plonky3 (`plonky3-spike/`, degree-7 core,
+  ZK on **stable** ✓, `ZK re-randomized: true`). **Recommended: Plonky3** (only option with ZK +
+  stable + proven security). Decision ready; then re-express `lattica-prover` in the chosen
+  framework (Winterfell kept as a differential oracle), do C-04, then the Phase-4 node cutover.
 - **C-03 protocol match:** the in-circuit `Rp64_256` hash must match the protocol's
   `noteCommitment`/`nullifier` (switch `tx.zig`/`primitives.zig` to the field hash); full note
   format; `recipient` → 4-element digest; `DEPTH` → 32; widen `BITS`.

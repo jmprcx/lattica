@@ -135,9 +135,11 @@ To avoid plonky2's **nightly** requirement, also evaluated **Plonky3** (`p3-*` 0
   conjectured** soundness bounds (round-by-round, per 2024/1553) — a direct **C-04** advantage over
   Winterfell/plonky2's conjectured-only. Style is **AIR** (`impl Air` + `prove(&config, air, trace,
   pis)` / `verify`), so the existing `lattica-prover` AIR logic ports relatively directly. Cost:
-  verbose config assembly (the `Val/Perm/Mmcs/Challenge/Pcs/Challenger` type stack) and hand-written
-  AIR (larger audit surface than plonky2 gadgets); newer, faster-moving API. *(Confirmed via build +
-  source/test inspection; a full prove-spike with the ZK PCS was not run here — fast follow-up.)*
+  verbose config assembly (the `Val/Mmcs/Challenge/Pcs/Challenger` type stack) and hand-written
+  AIR (larger audit surface than plonky2 gadgets); newer, faster-moving API. **Spiked**
+  (`plonky3-spike/`): the degree-7 power-map core with the hiding (ZK) FRI PCS, **on the stable
+  toolchain** — prove→verify ACCEPTED, `ZK re-randomized: true`, ~6 ms prove, ~100 KB proof, 3/3
+  tests (valid-verifies, wrong-result-rejected, ZK-randomized).
 - **zkVM (SP1 / RISC0)** — ZK by construction; the spend statement is written as an ordinary Rust
   program (no hand-written constraints → smallest *application* code/audit surface). Stable *host*
   toolchain, but needs a special *guest* toolchain (RISC-V) — **not installable in this sandbox**
@@ -149,23 +151,26 @@ To avoid plonky2's **nightly** requirement, also evaluated **Plonky3** (`p3-*` 0
 
 | | Winterfell | plonky2 | **Plonky3** | zkVM (SP1/RISC0) |
 |---|---|---|---|---|
-| Zero-knowledge | ❌ | ✅ (spiked) | ✅ (framework-tested; not spiked here) | ✅ by construction |
+| Zero-knowledge | ❌ | ✅ (spiked) | ✅ (spiked, stable) | ✅ by construction |
 | Toolchain | **stable** | **nightly** | **stable** | stable host + RISC-V guest |
 | Field | Goldilocks | Goldilocks | Goldilocks (or BabyBear/Koala) | RISC-V VM |
 | In-circuit hash | Rescue-Prime | Poseidon | Poseidon2 | VM-internal |
 | Soundness accounting | conjectured | conjectured | **proven + conjectured** | VM's |
 | Statement style | hand-AIR | **gadgets (small surface)** | hand-AIR (ports from our work) | plain Rust program |
 | App audit surface | high | low | high (but reuses validated AIR) | tiny app / huge VM TCB |
-| Proof size (spiked) | ~73 KB | ~149 KB | STARK-range (not spiked) | large, compressible |
+| Proof size (spiked) | ~73 KB | ~149 KB | ~100 KB (degree-7 core) | large, compressible |
 | Maturity | Polygon Miden | Polygon zkEVM | SP1/Valida; newer | RISC0/SP1 production |
 
 ### Recommendation (updated)
 
-**Plonky3 is the front-runner:** it is the only option giving **ZK + stable toolchain +
-proven-security**, on our field, and our existing AIR work ports to it. **plonky2** is the strong
-alternative when the smallest hand-written audit surface (gadgets) matters more than avoiding
-nightly. A **zkVM** is the right call only if developer velocity / protocol-agility outweighs proof
-size and a large trusted base. Suggested next step: a short **Plonky3 ZK prove-spike** (port the
-spend core, enable `HidingFriPcs`) to confirm end-to-end parity with the plonky2 result before
-committing. This is the user's design decision; C-04 (final FRI/PQ params + soundness budget) is
-owed for whichever framework is chosen.
+**Plonky3 is the recommended choice:** it is the only option giving **ZK + stable toolchain +
+proven-security**, on our field, and the `plonky3-spike/` confirmed ZK prove→verify end-to-end on
+stable (parity with the plonky2 result, without nightly). Our existing `lattica-prover` AIR ports to
+it. **plonky2** remains the alternative when the smallest hand-written audit surface (gadgets)
+matters more than avoiding nightly; a **zkVM** only if developer velocity / protocol-agility
+outweighs proof size and a large trusted base.
+
+**Confirmed (spiked):** all of Winterfell (no ZK), plonky2 (ZK, nightly), and Plonky3 (ZK, stable)
+now have a working prove→verify. The framework decision is ready to make. Remaining for whichever is
+chosen: production circuit = the full spend statement (port from `lattica-prover`); C-04 (final
+FRI/PQ params + a written soundness budget); and then the Phase-4 node cutover.

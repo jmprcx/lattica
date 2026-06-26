@@ -1,0 +1,25 @@
+# ZK-01 spike — Plonky3 with the hiding (zero-knowledge) FRI PCS, on STABLE Rust.
+# Mirrors the original Winterfell Phase-0 spike (degree-7 power-map core) so it is directly
+# comparable, but with zero-knowledge enabled. See docs/framework-decision.md "ZK-01".
+[package]
+name = "lattica-plonky3-spike"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+p3-air = "0.6.1"
+p3-baby-bear = "0.6.1"
+p3-challenger = "0.6.1"
+p3-commit = "0.6.1"
+p3-dft = "0.6.1"
+p3-field = "0.6.1"
+p3-fri = "0.6.1"
+p3-keccak = "0.6.1"
+p3-matrix = "0.6.1"
+p3-merkle-tree = "0.6.1"
+p3-symmetric = "0.6.1"
+p3-uni-stark = "0.6.1"
+rand = "0.10"
+postcard = { version = "1", features = ["alloc"] }
