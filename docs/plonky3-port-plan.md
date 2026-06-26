@@ -35,8 +35,21 @@ constraints (value-balance, range, tx-binding). Options:
   constraints inline (≈ what the Winterfell `lattica-prover` did), plus the wiring. Avoids the
   lookup machinery but re-hand-rolls the soundness-critical hash AIR (larger audit surface).
 
-**Plan: pursue A.** Lower long-term audit surface (vetted hash chip) and the scalable architecture;
-the lookup framework is the next investigation.
+**M3 finding (investigated):** `p3-lookup` 0.6.1 gives the LogUp *gadget* (`LogUpGadget`,
+`LookupBus`, `InteractionBuilder`) — **but Plonky3 0.6.1 ships no multi-table prover**
+(`p3-machine`/`p3-stark`/`p3-multi-stark` do not exist; `p3-uni-stark` is single-table). So option
+**A would require building the multi-table prover *orchestration*** (per-table commits, shared
+lookup challenges, LogUp aux/permutation traces, cross-table linking) — itself large and
+soundness-critical, and *not* vetted. Option **B reuses the vetted single-table `uni-stark` ZK
+prover** (already working in M1/M2); its only hand-written soundness-critical piece is the Poseidon2
+*round constraints*, which are well-understood and **validatable against the native
+`Poseidon2Goldilocks`** (differential test) — a contained, testable surface.
+
+**Revised plan: build the first full statement with B** (single `uni-stark` AIR; vetted Poseidon2
+*constants* + hand-written round constraints, differential-tested vs native; multi-region trace like
+the validated Winterfell `lattica-prover`). Keep **A as the scalable future** if/when a vetted
+multi-table prover is adopted (or the orchestration is built + audited). Net: B trades a contained,
+testable hand-rolled hash-AIR for avoiding an un-vetted multi-table prover build.
 
 ## Incremental milestones
 
@@ -45,10 +58,16 @@ the lookup framework is the next investigation.
   (`HidingFriPcs` + salted `MerkleTreeHidingMmcs`) with a Goldilocks-native `DuplexChallenger` and
   `F_p²` challenges. Still owed: the written C-04 soundness budget (Plonky3 `security.rs` gives
   proven bounds to anchor it).
-- **M3:** wire `p3-lookup` (LogUp) to a multi-table prover; a minimal **two-hash linked** example
-  (commitment → one membership merge) proving the linking via a lookup.
-- **M4:** the **full spend statement** — ownership + commitment + depth-D membership + nullifier +
-  output commitment + value-balance + range + tx-binding (the `lattica-prover` statement, now ZK).
+- **M3 — done (investigation + decision):** no multi-table prover in p3 0.6.1; **chose option B**
+  (single `uni-stark` AIR, vetted Poseidon2 constants + hand-written round constraints) for the
+  first full statement (see the architecture section above).
+- **M4:** the **full spend statement** as a single multi-region `uni-stark` AIR — Poseidon2 rounds
+  (vetted constants, differential-tested vs `Poseidon2Goldilocks`) for the commitment / depth-D
+  membership / nullifier / output / ownership hashes, plus the wiring (link region outputs→inputs),
+  value-balance, range, and tx-binding — under the hiding (ZK) PCS. This is the analogue of the
+  validated Winterfell `lattica-prover` statement; build it incrementally (one hash region →
+  membership chain → + nullifier/output → + balance/range/ownership/tx-binding), each
+  differential-tested against the Winterfell oracle.
 - **M5:** native oracle + **differential tests** vs the Winterfell `lattica-prover`; canonical proof
   serialization; the `lattica_spend_verify` / `lattica_spend_prove` C ABI (matches `src/ffi.zig`).
 - **M6:** Phase-4 node cutover — wire the verifier into `node.zig`, switch protocol hashing to

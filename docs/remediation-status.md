@@ -105,10 +105,12 @@ counts below are historical, from the iteration that added each piece.)
   stable + proven security). **Decided: Plonky3.** Port started (`lattica-prover-p3/`,
   `docs/plonky3-port-plan.md`): **M1 done** — vetted Poseidon2-Goldilocks AIR proves/verifies on
   stable, hash matches the protocol's native `Poseidon2Goldilocks` (addresses C-03 at the hash
-  level). **M2 done** — the foundation now proves/verifies in **zero-knowledge** (hiding FRI PCS +
-  `DuplexChallenger`, `F_p²` challenges) on stable. Remaining: C-04 budget; M3 lookup framework
-  (`p3-lookup`/LogUp exists); M4 full spend statement; M5 differential tests + C ABI; M6 Phase-4
-  node cutover. Winterfell `lattica-prover` kept as the differential oracle.
+  level). **M2 done** — foundation proves/verifies in **zero-knowledge** (hiding FRI PCS +
+  `DuplexChallenger`, `F_p²`) on stable. **M3 done** — investigated the composition architecture:
+  `p3-lookup` (LogUp) exists but p3 ships no multi-table prover, so chose a single-`uni-stark` AIR
+  (vetted Poseidon2 constants + hand-written rounds, differential-tested) over building un-vetted
+  multi-table orchestration. Remaining: M4 full spend statement (the big one); C-04 budget; M5
+  differential tests + C ABI; M6 Phase-4 node cutover. Winterfell `lattica-prover` = the oracle.
 - **C-03 protocol match:** the in-circuit `Rp64_256` hash must match the protocol's
   `noteCommitment`/`nullifier` (switch `tx.zig`/`primitives.zig` to the field hash); full note
   format; `recipient` → 4-element digest; `DEPTH` → 32; widen `BITS`.
