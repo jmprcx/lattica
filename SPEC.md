@@ -157,10 +157,11 @@ formally proven.
   hidden `(value, ρ, nk, path)` it proves `cm=H(value,ρ)`, that `cm` folds up the path to
   `anchor`, `nf=H(nk,ρ)`, and `value=send+fee` — with `ρ` wired equal across regions by an id/σ
   grand-product copy constraint and `cm`→leaf wired by adjacency. `cm` stays hidden. Soundness
-  tests reject a wrong anchor, wrong nf, unbalanced tx, wrong path, and an inconsistent `ρ`.
+  tests reject a wrong anchor, wrong nf, unbalanced tx, wrong path, and an inconsistent `ρ`. The
+  proof is **zero-knowledge** (all committed columns blinded + masked FRI; proofs randomized).
   Remaining is hardening/integration, not new mechanism: the full commitment opening
-  (`recipient`/`rcm`) + owner binding, general path positions, ZK blinding, switching the
-  protocol's commitment/nullifier/Merkle hashing to the field hash, and node integration. See
+  (`recipient`/`rcm`) + owner binding, general path positions, switching the protocol's
+  commitment/nullifier/Merkle hashing to the field hash, and node integration. See
   [`soundness.md §6`](./soundness.md).
 - **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
   and PoC-grade — a formal ZK proof and production parameters are future work.

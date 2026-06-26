@@ -29,8 +29,8 @@ src/
   stark.zig            from-scratch ZK FRI-STARK: multi-column AIR, Merkle, FRI, prover/verifier
   membership.zig       in-circuit ZK Merkle membership proof (R3, partial)
   permutation.zig      grand-product permutation argument (R3 wiring primitive)
-  spend.zig            full four-constraint in-circuit spend proof: commitment + membership
-                       + nullifier + balance, wired (R3 circuit)
+  spend.zig            full four-constraint in-circuit ZK spend proof: commitment + membership
+                       + nullifier + balance, wired + blinded (R3 circuit)
   tree.zig             incremental Merkle commitment tree
   tx.zig               notes, keys, addresses, ML-KEM note encryption
   circuit.zig          spend-authorization proof (façade over stark.zig)
@@ -82,7 +82,7 @@ commitment opening, Merkle membership, nullifier, and balance, wired together �
 node demo still uses the native per-check path; integrating the single proof is pending.
 Remaining documented steps to production (see [`SPEC.md` §8](./SPEC.md)): node-integrate the
 folded spend proof, complete the commitment opening (`recipient`/`rcm`) + general path
-positions + ZK on the spend circuit, swap the SPN's generated constants for a vetted
+positions, swap the SPN's generated constants for a vetted
 standardized instance + wider state, and production-grade STARK parameters (the zero-knowledge
 here is honest-verifier and PoC-grade, not formally proven). None require changing the
 post-quantum primitive choices.

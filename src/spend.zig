@@ -41,13 +41,16 @@ const DEPTH: usize = 6; // Merkle levels (demo; production 32)
 const BLOCK: usize = rescue.ROUNDS + 1; // 16 rows per hash region
 const NUM_BLOCKS: usize = 2 + DEPTH; // commitment + DEPTH membership + nullifier = 8
 const N: usize = NUM_BLOCKS * BLOCK; // 128
-const BLOWUP: usize = 32;
-const LDE_SIZE: usize = N * BLOWUP; // 4096
-const NUM_FOLDS: usize = 8;
+/// ZK: random coefficients masking each committed column. Must exceed the per-column open count
+/// (4 rows/query · NUM_QUERIES = 128).
+const TRACE_BLIND: usize = 160;
+const BLOWUP: usize = 64;
+const LDE_SIZE: usize = N * BLOWUP; // 8192
+const NUM_FOLDS: usize = 9;
 const FINAL_SIZE: usize = LDE_SIZE >> NUM_FOLDS; // 16
-const COMP_DEGREE_BOUND: usize = 1024; // > round-constraint quotient degree (~769)
+const COMP_DEGREE_BOUND: usize = 2048; // > round-constraint quotient degree (~1889 after blinding)
 const FINAL_DEGREE_BOUND: usize = COMP_DEGREE_BOUND >> NUM_FOLDS; // 4
-const NUM_QUERIES: usize = 40;
+const NUM_QUERIES: usize = 32;
 const N_CONSTRAINTS: usize = WIDTH + 1 + 1 + 1 + 2 + 2; // 3 round, 1 carry, 1 cap, 1 balance, 2 outputs, 2 grand-product
 
 // Block index → first/last row.
@@ -209,6 +212,56 @@ fn valuesToLde(allocator: Allocator, values: [N]Felt) ![]Felt {
     var coeffs = values;
     field.intt(&coeffs, field.rootOfUnity(N));
     return coeffsToLde(allocator, &coeffs);
+}
+
+fn osRandom(buf: []u8) void {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
+        std.debug.assert(rc != 0 and rc <= buf.len - off);
+        off += rc;
+    }
+}
+const Rng = struct {
+    inner: std.Random.DefaultCsprng,
+    fn init() Rng {
+        var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        osRandom(&seed);
+        return .{ .inner = std.Random.DefaultCsprng.init(seed) };
+    }
+    fn felt(self: *Rng) Felt {
+        return self.inner.random().int(u64) % field.P;
+    }
+    fn fillFelts(self: *Rng, out: []Felt) void {
+        for (out) |*v| v.* = self.felt();
+    }
+};
+
+/// Interpolate `N` values over H, add the ZK blinding `Z_H·b` (random `b` of degree < TRACE_BLIND),
+/// and evaluate over the LDE coset. Since `Z_H = x^N − 1` vanishes on H, the masked polynomial
+/// equals the values on H (constraints unaffected) but every LDE opening is uniform.
+fn valuesToBlindedLde(allocator: Allocator, values: [N]Felt, rng: *Rng) ![]Felt {
+    var coeffs = values;
+    field.intt(&coeffs, field.rootOfUnity(N));
+    var mc = try allocator.alloc(Felt, N + TRACE_BLIND);
+    defer allocator.free(mc);
+    @memset(mc, 0);
+    @memcpy(mc[0..N], &coeffs);
+    var b: [TRACE_BLIND]Felt = undefined;
+    rng.fillFelts(&b);
+    for (0..TRACE_BLIND) |k| {
+        mc[k] = field.sub(mc[k], b[k]);
+        mc[N + k] = field.add(mc[N + k], b[k]);
+    }
+    return coeffsToLde(allocator, mc);
+}
+
+/// A uniformly random polynomial of degree < COMP_DEGREE_BOUND over the LDE — the FRI mask `g`.
+fn buildRandomPolyLde(allocator: Allocator, rng: *Rng) ![]Felt {
+    const coeffs = try allocator.alloc(Felt, COMP_DEGREE_BOUND);
+    defer allocator.free(coeffs);
+    rng.fillFelts(coeffs);
+    return coeffsToLde(allocator, coeffs);
 }
 fn evalPoly(coeffs: []const Felt, x: Felt) Felt {
     var acc: Felt = 0;
@@ -444,12 +497,12 @@ fn buildRows(value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, siblings: [DEPTH]F
     return rows;
 }
 
-fn buildTraceLde(allocator: Allocator, rows: [N][WIDTH]Felt) ![WIDTH][]Felt {
+fn buildTraceLde(allocator: Allocator, rows: [N][WIDTH]Felt, rng: *Rng) ![WIDTH][]Felt {
     var out: [WIDTH][]Felt = undefined;
     for (0..WIDTH) |i| {
         var col: [N]Felt = undefined;
         for (0..N) |r| col[r] = rows[r][i];
-        out[i] = try valuesToLde(allocator, col);
+        out[i] = try valuesToBlindedLde(allocator, col, rng);
     }
     return out;
 }
@@ -482,10 +535,13 @@ const Query = struct {
     z_an: ValOpen,
     z_b: ValOpen,
     z_bn: ValOpen,
+    g_a: ValOpen,
+    g_b: ValOpen,
 };
 pub const Proof = struct {
     trace_root: Hash,
     z_root: Hash,
+    g_root: Hash,
     fri_roots: [NUM_FOLDS]Hash,
     fri_final: []Felt,
     queries: []Query,
@@ -534,7 +590,8 @@ fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Fe
     };
     const rows = buildRows(value, rho_a, rho_b, nk, siblings);
 
-    const trace_lde = try buildTraceLde(allocator, rows);
+    var rng = Rng.init();
+    const trace_lde = try buildTraceLde(allocator, rows, &rng);
     defer for (trace_lde) |c| allocator.free(c);
     var trace_c: [WIDTH][]const Felt = undefined;
     for (0..WIDTH) |i| trace_c[i] = trace_lde[i];
@@ -553,22 +610,31 @@ fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Fe
     var col1_h: [N]Felt = undefined;
     for (0..N) |r| col1_h[r] = rows[r][1];
     const z_h = grandProduct(col1_h, ctx);
-    const z_lde = try valuesToLde(allocator, z_h);
+    const z_lde = try valuesToBlindedLde(allocator, z_h, &rng);
     defer allocator.free(z_lde);
+    const g_lde = try buildRandomPolyLde(allocator, &rng);
+    defer allocator.free(g_lde);
     var z_tree = try MerkleTree.build(allocator, z_lde);
     defer z_tree.deinit();
+    var g_tree = try MerkleTree.build(allocator, g_lde);
+    defer g_tree.deinit();
     const z_root = z_tree.root();
+    const g_root = g_tree.root();
 
     tr.absorbHash(z_root);
+    tr.absorbHash(g_root);
     for (&ctx.comb) |*c| c.* = tr.challengeFelt();
+    const zeta = tr.challengeFelt();
 
+    // FRI input H = CP + ζ·g (mask the low-degree test for zero-knowledge).
     const h = try allocator.alloc(Felt, LDE_SIZE);
     defer allocator.free(h);
     var x = ldeOffset();
     for (0..LDE_SIZE) |j| {
         const cur = rowAt(trace_c, j);
         const next = rowAt(trace_c, (j + BLOWUP) % LDE_SIZE);
-        h[j] = compositionAt(cur, next, z_lde[j], z_lde[(j + BLOWUP) % LDE_SIZE], x, ctx);
+        const cp = compositionAt(cur, next, z_lde[j], z_lde[(j + BLOWUP) % LDE_SIZE], x, ctx);
+        h[j] = field.add(cp, field.mul(zeta, g_lde[j]));
         x = field.mul(x, ldeGen());
     }
 
@@ -593,10 +659,12 @@ fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Fe
         q.z_an = .{ .val = z_lde[an], .path = try z_tree.open(allocator, an) };
         q.z_b = .{ .val = z_lde[bb], .path = try z_tree.open(allocator, bb) };
         q.z_bn = .{ .val = z_lde[bn], .path = try z_tree.open(allocator, bn) };
+        q.g_a = .{ .val = g_lde[a], .path = try g_tree.open(allocator, a) };
+        q.g_b = .{ .val = g_lde[bb], .path = try g_tree.open(allocator, bb) };
     }
     allocator.free(fri.final_layer);
     fri.deinit();
-    return .{ .trace_root = trace_root, .z_root = z_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
+    return .{ .trace_root = trace_root, .z_root = z_root, .g_root = g_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
 }
 
 pub fn verify(allocator: Allocator, pub_in: PublicInputs, proof: Proof) !bool {
@@ -608,8 +676,10 @@ pub fn verify(allocator: Allocator, pub_in: PublicInputs, proof: Proof) !bool {
     const beta = tr.challengeFelt();
     const gamma = tr.challengeFelt();
     tr.absorbHash(proof.z_root);
+    tr.absorbHash(proof.g_root);
     var ctx = newCtx(pub_in, beta, gamma);
     for (&ctx.comb) |*c| c.* = tr.challengeFelt();
+    const zeta = tr.challengeFelt();
 
     var betas: [NUM_FOLDS]Felt = undefined;
     for (0..NUM_FOLDS) |k| {
@@ -638,11 +708,16 @@ pub fn verify(allocator: Allocator, pub_in: PublicInputs, proof: Proof) !bool {
         if (!verifyLeaf(proof.z_root, LDE_SIZE, an, q.z_an.val, q.z_an.path)) ok = false;
         if (!verifyLeaf(proof.z_root, LDE_SIZE, bb, q.z_b.val, q.z_b.path)) ok = false;
         if (!verifyLeaf(proof.z_root, LDE_SIZE, bn, q.z_bn.val, q.z_bn.path)) ok = false;
+        if (!verifyLeaf(proof.g_root, LDE_SIZE, a, q.g_a.val, q.g_a.path)) ok = false;
+        if (!verifyLeaf(proof.g_root, LDE_SIZE, bb, q.g_b.val, q.g_b.path)) ok = false;
 
+        // ALI: the FRI input H = CP(trace,Z) + ζ·g at both layer-0 query points.
         const x_a = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(a)));
         const x_b = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(bb)));
-        if (compositionAt(q.cur_a.row, q.next_a.row, q.z_a.val, q.z_an.val, x_a, ctx) != q.fri.layers[0].a) ok = false;
-        if (compositionAt(q.cur_b.row, q.next_b.row, q.z_b.val, q.z_bn.val, x_b, ctx) != q.fri.layers[0].b) ok = false;
+        const h_a = field.add(compositionAt(q.cur_a.row, q.next_a.row, q.z_a.val, q.z_an.val, x_a, ctx), field.mul(zeta, q.g_a.val));
+        const h_b = field.add(compositionAt(q.cur_b.row, q.next_b.row, q.z_b.val, q.z_bn.val, x_b, ctx), field.mul(zeta, q.g_b.val));
+        if (h_a != q.fri.layers[0].a) ok = false;
+        if (h_b != q.fri.layers[0].b) ok = false;
 
         for (0..NUM_FOLDS) |k| {
             const size_k = LDE_SIZE >> @intCast(k);
@@ -762,4 +837,18 @@ test "spend: a wrong sibling (not the real path) rejected" {
     wrong[2] = field.add(wrong[2], 1); // prove with a different path ⇒ different root ≠ anchor
     const proof = try prove(al, 1000, 7, 9, 100, wrong);
     try testing.expect(!try verify(al, pub_in, proof));
+}
+
+test "spend: proofs are randomized (zero-knowledge blinding)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const sib = sampleSiblings(8);
+    const pub_in = publicFor(1000, 7, 9, 100, sib);
+    const p1 = try prove(al, 1000, 7, 9, 100, sib);
+    const p2 = try prove(al, 1000, 7, 9, 100, sib);
+    // Fresh blinding each time ⇒ different commitments, but both verify against the same publics.
+    try testing.expect(!std.mem.eql(u8, &p1.trace_root, &p2.trace_root));
+    try testing.expect(try verify(al, pub_in, p1));
+    try testing.expect(try verify(al, pub_in, p2));
 }

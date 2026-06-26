@@ -180,16 +180,19 @@ Progress:
    Soundness tests: wrong anchor, wrong nf, unbalanced, tampered trace, a **wrong sibling/path**,
    and the decisive **inconsistent-`ρ`** case are all rejected; the two-round Fiat-Shamir
    (commit trace → β,γ → commit `Z` → constraint challenges → FRI) runs end-to-end.
-3. **Remaining to complete/harden R3:** widen the commitment to the real opening
-   (`recipient`/`rcm`) and add an owner binding; general (non-leftmost) path positions; ZK
-   blinding + masked FRI (additive, as in `stark.zig`); switch the protocol's commitment/
-   nullifier/Merkle hashing to the field hash; node integration (verify the single proof instead
-   of native checks); and a generic engine to replace the per-module duplication.
+3. ~~ZK on the spend circuit.~~ **Done** — `src/spend.zig` now blinds all four committed columns
+   (the three trace columns and the grand-product `Z`) with `Z_H·b` and runs FRI on `CP + ζ·g`
+   for a committed random `g`, so trace/`Z`/FRI openings are uniform and proofs are randomized
+   (tested). The four-constraint fold is therefore both complete and zero-knowledge.
+4. **Remaining to harden/integrate R3:** widen the commitment to the real opening
+   (`recipient`/`rcm`) + an owner binding; general (non-leftmost) path positions; switch the
+   protocol's commitment/nullifier/Merkle hashing to the field hash; node integration (verify the
+   single proof instead of native checks); and a generic engine to replace the per-module
+   duplication.
 
-The four-constraint fold and its wiring are now demonstrated; what remains is hardening and
-integration, not an unbuilt mechanism. `src/permutation.zig` and `src/spend.zig` are non-ZK and
-standalone (the assembly is
-the point).
+The four-constraint fold, its wiring, and ZK are now all demonstrated; what remains is hardening
+and integration, not an unbuilt mechanism. `src/permutation.zig` is non-ZK and standalone (it
+isolates the grand-product mechanism); `src/spend.zig` is the integrated, zero-knowledge one.
 
 ### Other gaps (carried from the assessment)
 - **64-bit-field soundness bottleneck** → extension-field challenges (`parameters.md §1`).
