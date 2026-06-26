@@ -125,12 +125,17 @@ replacing Halo 2 whose soundness rests on ECDLP.
 
 **Implementation in the Zig reference.** A transparent FRI-STARK prover has no `std.crypto`
 equivalent, so it is implemented from scratch in `src/stark.zig` over the **Goldilocks** field
-(`p = 2^64 - 2^32 + 1`): the execution trace is interpolated (NTT) and Merkle-committed over an
-LDE coset (blowup ×16); a Fiat-Shamir-random combination of the transition and boundary
-constraint quotients forms the composition polynomial; **FRI** folds it to a constant; and
-queries open the composition, the FRI layers, and the trace, with the verifier checking Merkle
-paths, the algebraic composition⇔trace link, and fold consistency. Parameters are PoC-grade
-(32 queries, rate 1/4 → conjectured ~64-bit; tune for production).
+(`p = 2^64 - 2^32 + 1`). The in-circuit relation for constraint (3) is **knowledge of a preimage
+of an arithmetization-friendly hash** (`src/rescue.zig`): a Poseidon-style SPN (S-box `x^7`, MDS
+diffusion, full rounds), arithmetised as a **multi-column AIR** — one trace column per state
+element, one row per round, with the round constants supplied as periodic low-degree columns.
+The trace is interpolated (NTT) and Merkle-committed over an LDE coset; a Fiat-Shamir-random
+combination of the per-element transition quotients and the boundary quotients forms the
+composition polynomial; **FRI** folds it to a constant; and queries open the trace rows, the mask,
+and the FRI layers, with the verifier checking Merkle paths, the algebraic composition⇔trace link,
+and fold consistency. This **closes gap R1** — the relation is a genuine one-way hash, replacing
+the earlier algebraic `x³ + C`. Parameters are PoC-grade (32 queries, rate 1/4, 64-bit field →
+effective conjectured ~50-bit, bounded by the field; see [`parameters.md`](./parameters.md)).
 
 **Zero-knowledge.** The proof is zero-knowledge (honest-verifier, via Fiat-Shamir). Two
 blindings make the openings reveal nothing about the witness: (1) the trace polynomial is masked
@@ -144,15 +149,18 @@ formally proven.
 
 **PoC scope and honest gaps.**
 
-- Constraint (3) is a **real, verifying FRI-STARK** (`src/stark.zig`, exposed via
-  `src/circuit.zig`). Constraints (1), (2), (4) are enforced natively by the node; because they
-  use the same commitment/nullifier/Merkle framing, moving them inside the AIR is additive, not
-  a redesign.
-- **Zero-knowledge.** Implemented (trace blinding + masked FRI; see above). It is
-  honest-verifier and PoC-grade — a formal ZK proof and production parameters are future work.
-- **One-way in-circuit hash.** The authorization relation uses an algebraic transition for
-  clarity; production substitutes a vetted one-way arithmetization-friendly hash
-  (Poseidon2/Rescue, with margins for recent Poseidon cryptanalysis).
+- Constraint (3) is a **real, zero-knowledge FRI-STARK** proving knowledge of a hash preimage
+  (`src/stark.zig` + `src/rescue.zig`, exposed via `src/circuit.zig`). **(R3, open)** Constraints
+  (1) membership, (2) nullifier, (4) balance are still enforced natively by the node; folding
+  them into the same AIR is the remaining in-circuit work (additive — reuses the in-circuit hash;
+  needs Merkle-path rows, a nullifier hash, balance columns, and copy/permutation wiring). See
+  [`soundness.md §6`](./soundness.md).
+- **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
+  and PoC-grade — a formal ZK proof and production parameters are future work.
+- **One-way in-circuit hash (R1).** Closed: the authorization relation is a Poseidon-style SPN
+  hash (`x^7` S-box, MDS, full rounds). The *construction* is standard; the specific MDS and
+  round constants are deterministically generated, not yet a standardized/vetted instance —
+  production must use published constants and the spec's round count.
 
 ## 9. Transaction format, validation, and consensus shell
 

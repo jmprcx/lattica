@@ -16,18 +16,19 @@ parameters referenced here.
 `prove(secret)` produces, and `verify(image, π)` checks, a non-interactive argument of knowledge
 for the relation:
 
-> **R(image; secret):** the prover knows `s = secretToField(secret)` such that iterating the
-> transition `x → x³ + C` over Goldilocks for `N-1` steps maps `s` to `image`.
+> **R(image; secret):** the prover knows `s = secretToField(secret)` such that
+> `rescue.hash(s) = image`, where `rescue.hash` is the arithmetization-friendly Poseidon-style
+> SPN in `src/rescue.zig` (S-box `x^7`, MDS diffusion, `ROUNDS` full rounds).
 
-Equivalently: the prover knows an execution trace `T[0..N]` with `T[0] = s`, `T[i+1] = T[i]³+C`,
-and `T[N-1] = image`.
+Equivalently: the prover knows an execution trace of `WIDTH` columns × `N = ROUNDS+1` rows where
+row 0 is `[s, 0, 0]`, each row is one SPN round of the previous, and the output row's first cell
+equals `image`.
 
-> **Caveat (R1).** `x → x³ + C` is a *permutation with an easy inverse* (cube roots exist over
-> Goldilocks), so knowing `image` lets anyone compute a valid `s`. The proof is therefore a
-> sound *argument of knowledge of a trace*, but the relation is **not a one-way authorization**.
-> Replacing the transition with a vetted arithmetization-friendly hash (§6, R1) is what turns
-> this into a meaningful spend authorization. Everything below concerns the soundness of the
-> *proof system*, which is independent of this caveat.
+> **R1 closed.** The relation is now a real one-way hash (the SPN's S-box `x^7` is a permutation
+> with no algebraic inverse shortcut, and full rounds with MDS diffusion put Gröbner-basis
+> preimage attacks out of reach), so the proof is a meaningful spend authorization, not just an
+> argument of knowledge of a trace. The remaining hash caveat is that the specific MDS/constants
+> are deterministically generated rather than a standardized vetted instance (see §6).
 
 ---
 
@@ -114,20 +115,24 @@ non-interactive STARK). Two blindings make the transcript independent of the wit
 ## 6. Remaining gaps and their design (R1, R3)
 
 The exit criterion — *a fully zero-knowledge, fully in-circuit spend proof with a written
-soundness argument* — is **not yet met**. R2 (zero-knowledge) is implemented (§5). R1 and R3
-remain; this section is the design to build them, incrementally and with review.
+soundness argument* — is **not yet fully met**. R2 (zero-knowledge) and **R1 (in-circuit hash)
+are implemented** (§1, §5). R3 remains; this section records the realized R1 design and the R3
+plan.
 
-### R1 — vetted arithmetization-friendly hash, in-circuit
-Replace `x³ + C` with **Poseidon2** or **Rescue-Prime** over Goldilocks (standard published
-constants). AIR shape:
-- trace widens to the hash state width `m` (one row per round); add **periodic columns** for the
-  round constants (the current single-constraint AIR must generalize to multi-column with periodic
-  values);
-- transition constraints encode one round: S-box (degree `α`, e.g. 7), the MDS linear layer, and
-  round-constant addition; Rescue's inverse S-box is expressed as a forward degree-`α` constraint;
-- boundary asserts input = secret state, output = `image`.
-- *Soundness impact:* the composition degree rises to `≈ α·(state rows)`; size `COMP_DEGREE_BOUND`
-  and the LDE accordingly.
+### R1 — arithmetization-friendly hash, in-circuit — **implemented**
+The toy `x³ + C` is replaced by a Poseidon-style SPN (`src/rescue.zig`) proven by a multi-column
+AIR (`src/stark.zig`):
+- the trace is `WIDTH` columns (state width) × `N = ROUNDS+1` rows, one row per round;
+- per-element transition constraints encode one round —
+  `T_i(ωx) − (Σ_j M[i][j]·T_j(x)^7 + RC[r][i]) = 0` — degree `α = 7`; the round constants `RC`
+  are supplied as **periodic low-degree columns** the verifier evaluates at the query points;
+- boundary constraints fix the capacity cells to 0 at row 0 and the output to `image` at row N-1;
+  the input rate cell (the secret) is never asserted.
+- *Realized impact:* the degree-7 S-box raises the composition degree to `≈ α·(N+TRACE_BLIND)`,
+  so `COMP_DEGREE_BOUND` and the LDE were sized up accordingly (see `src/stark.zig` parameters).
+- **Caveat:** the MDS (a Cauchy matrix) and round constants are deterministically generated, not
+  a standardized vetted Poseidon2/Rescue-Prime instance, and the state width `m = 3` is small.
+  Production must adopt published constants, the spec's round count, and a wider state.
 
 ### R3 — fold all four constraints into one AIR
 Today only constraint (3) is in-circuit; (1) membership, (2) nullifier, (4) balance are

@@ -6,12 +6,12 @@
 //! elliptic-curve discrete log, broken by Shor) with a proof whose soundness rests only on the
 //! collision resistance of SHA3. There is **no trusted setup and no elliptic curve** anywhere.
 //!
-//! The statement proved, in zero knowledge, is knowledge of a secret `s` whose authorization
-//! image — the final state of the 1024-step chain `x → x³ + C` over the Goldilocks field —
-//! equals the public image, *without revealing `s`* (only the final state is asserted). The
-//! same commitment/nullifier/Merkle framing is reused, so the remaining production work
-//! (folding membership/nullifier/balance into the AIR, ZK trace masking, and a vetted one-way
-//! in-circuit hash) is additive — see `SPEC.md §8`.
+//! The statement proved, in zero knowledge, is knowledge of a secret `s` with
+//! `rescue.hash(s) = image` — a preimage of the arithmetization-friendly hash in `rescue.zig`
+//! (a Poseidon-style SPN), proven in-circuit as a multi-column AIR — *without revealing `s`*.
+//! This closes gap R1 (the relation is now a genuine one-way hash, not the old algebraic
+//! `x³ + C`). The remaining production work is R3: folding membership/nullifier/balance into the
+//! same AIR (they are still enforced natively by the node) — see `SPEC.md §8`.
 //!
 //! This module is a thin façade over `stark.zig`, keeping the proof as opaque bytes so the rest
 //! of the protocol (transaction digest, node validation) is unaffected.

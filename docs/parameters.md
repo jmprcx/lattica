@@ -64,17 +64,17 @@ soundness independent of the constraint degree and is the conventional next step
 | Use | Current | Recommended |
 |---|---|---|
 | Out-of-circuit (commitments, nullifiers, Merkle, KDF, transcript) | SHA3-256 | SHA3-256 (keep) |
-| In-circuit (AIR) authorization relation | algebraic `x → x³ + C` (**toy, not one-way**) | **Poseidon2 or Rescue-Prime over Goldilocks**, standardized constants |
+| In-circuit (AIR) authorization relation | **Poseidon-style SPN** (`x^7`, MDS, full rounds), generated constants | **Poseidon2 or Rescue-Prime over Goldilocks**, standardized constants + spec round count |
 | Proof-of-work (consensus, out of scope here) | — | hash with **doubled output width** (Grover margin) |
 
 **Rationale.** SHA3-256 is conservative and standard for the out-of-circuit hashing; under
 Grover its preimage/collision margins remain adequate for the protocol's use (and PoW, when
-added, doubles the width). The in-circuit relation is the **R1 gap**: `x³ + C` is trivially
-invertible and proves nothing about a secret. Production must use a *vetted, arithmetization-
-friendly* hash — **Poseidon2** (with margins for the recent Poseidon cryptanalysis) or
-**Rescue-Prime** — with the **published standard round constants and MDS matrix**, not
-self-generated ones. The choice should be made jointly with the AIR design in `soundness.md §6`,
-since the hash's round structure determines the circuit's column count and constraint degree.
+added, doubles the width). The in-circuit relation **(R1) is now a real arithmetization-friendly
+hash** — a Poseidon-style SPN (`x^7` S-box, Cauchy MDS, full rounds) in `src/rescue.zig`, proven
+by a multi-column AIR — replacing the trivially-invertible `x³ + C`. What remains for production
+is to swap the deterministically-generated MDS/constants for a **vetted, standardized**
+Poseidon2/Rescue-Prime instance (published constants, spec round count, margins for the recent
+Poseidon cryptanalysis) and to widen the state from the PoC's `m = 3`.
 
 ---
 
@@ -99,6 +99,6 @@ post-quantum margin over the PoC's level-2 choice at a modest size increase. ML-
 
 1. **Extension-field challenges** (≥128-bit) — closes the dominant `1/|F|` soundness term. *(highest priority)*
 2. **FRI:** rate ≤ 1/8, ≥ 64 queries, 20–32 grinding bits → > 120-bit soundness.
-3. **In-circuit hash:** replace `x³ + C` with Poseidon2/Rescue-Prime, standard constants (R1).
+3. **In-circuit hash (R1):** done — Poseidon-style SPN in-circuit. Remaining: swap to standardized/vetted constants and a wider state.
 4. **ML-DSA-65** for binding signatures.
 5. (Architectural, see `soundness.md`) **DEEP-FRI** and **fold all four constraints into the AIR** (R3).

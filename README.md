@@ -25,7 +25,8 @@ build.zig              Zig build: the wallet executable + the `test` step
 src/
   primitives.zig       ML-KEM, ML-DSA, SHA3 commitments/nullifiers/PRF/KDF, AEAD
   field.zig            Goldilocks field (p = 2^64-2^32+1), roots of unity, NTT
-  stark.zig            from-scratch FRI-STARK: Merkle, transcript, FRI, prover/verifier
+  rescue.zig           arithmetization-friendly hash (Poseidon-style SPN, x^7 + MDS)
+  stark.zig            from-scratch ZK FRI-STARK: multi-column AIR, Merkle, FRI, prover/verifier
   tree.zig             incremental Merkle commitment tree
   tx.zig               notes, keys, addresses, ML-KEM note encryption
   circuit.zig          spend-authorization proof (façade over stark.zig)
@@ -64,17 +65,16 @@ Two deliberate differences from the original Rust PoC:
   spec calls for.
 - **The FRI-STARK spend-authorization proof is implemented from scratch in Zig** (`stark.zig`),
   since no `std.crypto` equivalent exists. It is a genuine **zero-knowledge**, transparent,
-  hash-based STARK over the Goldilocks field — Merkle-committed trace LDE, a Fiat-Shamir random
-  constraint composition, FRI low-degree testing, and query openings binding the composition to
-  the trace. No trusted setup, no elliptic curve; soundness rests on SHA3. **Zero-knowledge** is
-  achieved by blinding the trace polynomial with `Z_H(x)·b(x)` (random `b`), so every opened
-  trace value is uniform, and by running FRI on `CP + ζ·g` for a committed random polynomial
-  `g`, so the FRI-layer openings reveal nothing about the witness. Proofs are randomized
-  (different each time, all verifying). A 1-in/1-out transfer carries a ~265 KB proof
-  (prove ~170 ms, verify ~5 ms, release).
+  hash-based STARK over the Goldilocks field, and it now proves **knowledge of a preimage of an
+  arithmetization-friendly hash** (`rescue.zig`, a Poseidon-style SPN) via a multi-column AIR —
+  closing the old "toy `x³ + C`" gap (R1). **Zero-knowledge** is achieved by blinding each trace
+  column with `Z_H(x)·b(x)` (random `b`), so every opened trace row is uniform, and by running
+  FRI on `CP + ζ·g` for a committed random polynomial `g`, so the FRI-layer openings reveal
+  nothing about the witness. Proofs are randomized (different each time, all verifying). A
+  1-in/1-out transfer carries a ~230 KB proof (prove ~50 ms, verify ~3 ms, release).
 
-Remaining documented steps to production (see [`SPEC.md` §8](./SPEC.md)): a vetted one-way
-in-circuit hash in place of the algebraic `x → x³ + C` relation, folding
-membership/nullifier/balance into the AIR, and production-grade STARK parameters (the
-zero-knowledge here is honest-verifier and PoC-grade, not formally proven). None require
+Remaining documented steps to production (see [`SPEC.md` §8](./SPEC.md)): fold
+membership/nullifier/balance into the AIR (R3; still node-enforced), swap the SPN's generated
+constants for a vetted standardized instance + wider state, and production-grade STARK
+parameters (the zero-knowledge here is honest-verifier and PoC-grade, not formally proven). None require
 changing the post-quantum primitive choices.

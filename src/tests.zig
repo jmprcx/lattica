@@ -4,6 +4,7 @@
 test {
     _ = @import("primitives.zig");
     _ = @import("field.zig");
+    _ = @import("rescue.zig");
     _ = @import("stark.zig");
     _ = @import("tree.zig");
     _ = @import("tx.zig");

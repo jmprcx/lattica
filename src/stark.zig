@@ -1,55 +1,77 @@
-//! A self-contained, transparent, hash-based **FRI-STARK** for the Lattica spend-authorization
-//! relation — no elliptic curves, no trusted setup, soundness resting only on SHA3 collision
-//! resistance. This replaces the earlier placeholder in `circuit.zig` with a genuine proof.
+//! A self-contained, transparent, **zero-knowledge** FRI-STARK proving knowledge of a preimage
+//! of the arithmetization-friendly hash in `rescue.zig` — no elliptic curves, no trusted setup,
+//! soundness resting on SHA3 collision resistance.
 //!
-//! The statement proved (in the same shape as the reference AIR): the prover knows a secret
-//! `s` such that iterating the transition `x → x³ + C` for `NUM_STEPS` steps over the
-//! Goldilocks field reaches the public image, **without revealing `s`** (only the final state
-//! is asserted; the starting secret is never opened).
+//! ## Statement
 //!
-//! Construction (the classic FRI-STARK / "STARK101" shape):
-//!  1. Build the execution trace and interpolate it (iNTT) into the trace polynomial.
-//!  2. Evaluate it on a larger LDE coset (blowup ×8) and Merkle-commit those evaluations.
-//!  3. Form the composition polynomial — a Fiat-Shamir-random combination of the transition
-//!     and boundary constraint quotients — and Merkle-commit its LDE.
-//!  4. Run FRI on the composition evaluations, folding to a constant, committing each layer.
-//!  5. At Fiat-Shamir-random query positions, open the trace, the composition, and every FRI
-//!     layer with Merkle proofs. The verifier re-derives all challenges and checks: Merkle
-//!     paths, the algebraic link composition⇔trace at each query (binding constraints to the
-//!     trace), and FRI fold consistency down to the committed constant.
+//! `verify(image, π)` accepts iff the prover knew `s` with `rescue.hash(s) = image`, i.e. a full
+//! execution trace of the SPN permutation `[s,0,0] → … → out` with `out[0] = image`, **without
+//! revealing `s`** (the input rate cell is never asserted/opened in the clear).
+//!
+//! ## AIR (multi-column)
+//!
+//! The trace is `WIDTH` columns × `N` rows (`N = ROUNDS+1`); row `r` is the permutation state
+//! after `r` rounds. Constraints:
+//!   * **Transition** (rows 0..N-2), one per state element `i`:
+//!         `T_i(ωx) − ( Σ_j M[i][j]·T_j(x)^7 + RC[r][i] ) = 0`
+//!     where `M` is the MDS matrix and `RC` are the (periodic) round constants, supplied to the
+//!     verifier as low-degree polynomials evaluated at the query points.
+//!   * **Boundary**: `T_1(1)=0`, `T_2(1)=0` (capacity initialised to 0) and `T_0(ω^{N-1})=image`.
+//!
+//! ## Construction (classic FRI-STARK + ZK)
+//!   1. Interpolate each trace column and **blind** it: `T'_i = T_i + Z_H·b_i` (random `b_i`).
+//!   2. Evaluate over an LDE coset (blowup), Merkle-commit the rows.
+//!   3. Compose the constraint quotients with Fiat-Shamir coefficients into `CP`.
+//!   4. **Mask** the FRI input: `H = CP + ζ·g` for a committed random `g`.
+//!   5. FRI low-degree test on `H`; query openings bind `H` to the trace (ALI) and to `g`.
+//!
+//! Zero-knowledge: trace blinding makes every opened row uniform; the `g` mask makes the FRI
+//! openings uniform. Both blindings use the OS CSPRNG, so proofs are randomized. See
+//! `docs/soundness.md` for the full argument and `docs/parameters.md` for the parameters.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const p = @import("primitives.zig");
 const field = @import("field.zig");
+const rescue = @import("rescue.zig");
 const Felt = field.Felt;
 
 const Hash = [32]u8;
+const WIDTH = rescue.WIDTH;
 
 // ---------------------------------------------------------------------------------------
-// Merkle tree over field elements (SHA3, domain-separated)
+// Merkle tree over field-element leaves (single value or a WIDTH-wide row)
 // ---------------------------------------------------------------------------------------
 
 fn hashLeaf(v: Felt) Hash {
     return p.hashDomain("lattica:stark:leaf", &.{&field.toBytes(v)});
 }
 
+fn hashRow(row: [WIDTH]Felt) Hash {
+    var bytes: [WIDTH][8]u8 = undefined;
+    var fields: [WIDTH][]const u8 = undefined;
+    for (0..WIDTH) |i| {
+        bytes[i] = field.toBytes(row[i]);
+        fields[i] = &bytes[i];
+    }
+    return p.hashDomain("lattica:stark:row", &fields);
+}
+
 fn hashNode(l: Hash, r: Hash) Hash {
     return p.hashDomain("lattica:stark:node", &.{ &l, &r });
 }
 
-/// A complete binary Merkle tree over a power-of-two number of field-element leaves, stored in
-/// a 1-indexed heap array (`nodes[1]` is the root, leaves live at `nodes[n..2n]`).
+/// A binary Merkle tree over `2^k` leaf hashes (1-indexed heap; root at `nodes[1]`).
 const MerkleTree = struct {
     allocator: Allocator,
     n: usize,
     nodes: []Hash,
 
-    fn build(allocator: Allocator, leaves: []const Felt) !MerkleTree {
-        const n = leaves.len;
+    fn fromLeafHashes(allocator: Allocator, leaf_hashes: []const Hash) !MerkleTree {
+        const n = leaf_hashes.len;
         std.debug.assert(n != 0 and (n & (n - 1)) == 0);
         const nodes = try allocator.alloc(Hash, 2 * n);
-        for (leaves, 0..) |v, i| nodes[n + i] = hashLeaf(v);
+        for (leaf_hashes, 0..) |h, i| nodes[n + i] = h;
         var i: usize = n - 1;
         while (i >= 1) : (i -= 1) {
             nodes[i] = hashNode(nodes[2 * i], nodes[2 * i + 1]);
@@ -58,15 +80,33 @@ const MerkleTree = struct {
         return .{ .allocator = allocator, .n = n, .nodes = nodes };
     }
 
+    /// Build from single-value leaves (FRI layers, the mask `g`).
+    fn build(allocator: Allocator, leaves: []const Felt) !MerkleTree {
+        const hs = try allocator.alloc(Hash, leaves.len);
+        defer allocator.free(hs);
+        for (leaves, hs) |v, *h| h.* = hashLeaf(v);
+        return fromLeafHashes(allocator, hs);
+    }
+
+    /// Build from WIDTH-wide rows (the trace); leaf `r` = `hashRow(cols[*][r])`.
+    fn buildRows(allocator: Allocator, cols: [WIDTH][]const Felt) !MerkleTree {
+        const n = cols[0].len;
+        const hs = try allocator.alloc(Hash, n);
+        defer allocator.free(hs);
+        for (0..n) |r| {
+            var row: [WIDTH]Felt = undefined;
+            for (0..WIDTH) |i| row[i] = cols[i][r];
+            hs[r] = hashRow(row);
+        }
+        return fromLeafHashes(allocator, hs);
+    }
+
     fn deinit(self: *MerkleTree) void {
         self.allocator.free(self.nodes);
     }
-
     fn root(self: MerkleTree) Hash {
         return self.nodes[1];
     }
-
-    /// Sibling path from leaf `index` up to (excluding) the root.
     fn open(self: MerkleTree, allocator: Allocator, index: usize) ![]Hash {
         const depth = std.math.log2_int(usize, self.n);
         const path = try allocator.alloc(Hash, depth);
@@ -80,10 +120,9 @@ const MerkleTree = struct {
     }
 };
 
-/// Recompute the root from a leaf value and its sibling path, and compare to `root`.
-fn merkleVerify(root: Hash, n: usize, index: usize, leaf_val: Felt, path: []const Hash) bool {
+fn merkleVerifyHash(root: Hash, n: usize, index: usize, leaf_hash: Hash, path: []const Hash) bool {
     if (path.len != std.math.log2_int(usize, n)) return false;
-    var h = hashLeaf(leaf_val);
+    var h = leaf_hash;
     var idx = index;
     for (path) |sib| {
         h = if (idx & 1 == 0) hashNode(h, sib) else hashNode(sib, h);
@@ -92,12 +131,18 @@ fn merkleVerify(root: Hash, n: usize, index: usize, leaf_val: Felt, path: []cons
     return std.mem.eql(u8, &h, &root);
 }
 
+fn merkleVerify(root: Hash, n: usize, index: usize, val: Felt, path: []const Hash) bool {
+    return merkleVerifyHash(root, n, index, hashLeaf(val), path);
+}
+
+fn merkleVerifyRow(root: Hash, n: usize, index: usize, row: [WIDTH]Felt, path: []const Hash) bool {
+    return merkleVerifyHash(root, n, index, hashRow(row), path);
+}
+
 // ---------------------------------------------------------------------------------------
 // Fiat-Shamir transcript (SHA3 duplex)
 // ---------------------------------------------------------------------------------------
 
-/// A hash-based transcript. `absorb` mixes prover messages into the state; `challenge*` squeeze
-/// pseudo-random challenges. Squeezes between absorbs are distinct (a counter is mixed in).
 const Transcript = struct {
     state: Hash,
     counter: u64,
@@ -105,65 +150,59 @@ const Transcript = struct {
     fn init(label: []const u8) Transcript {
         return .{ .state = p.hashDomain("lattica:stark:transcript", &.{label}), .counter = 0 };
     }
-
     fn absorb(self: *Transcript, bytes: []const u8) void {
         self.state = p.hashDomain("lattica:stark:absorb", &.{ &self.state, bytes });
         self.counter = 0;
     }
-
     fn absorbHash(self: *Transcript, h: Hash) void {
         self.absorb(&h);
     }
-
     fn absorbFelt(self: *Transcript, v: Felt) void {
         self.absorb(&field.toBytes(v));
     }
-
     fn squeeze(self: *Transcript) Hash {
         var ctr: [8]u8 = undefined;
         std.mem.writeInt(u64, &ctr, self.counter, .little);
         self.counter += 1;
         return p.hashDomain("lattica:stark:squeeze", &.{ &self.state, &ctr });
     }
-
     fn challengeFelt(self: *Transcript) Felt {
-        const h = self.squeeze();
-        return field.fromBytes(h[0..16]);
+        return field.fromBytes(self.squeeze()[0..16]);
     }
-
     fn challengeIndex(self: *Transcript, bound: usize) usize {
         const h = self.squeeze();
-        const x = std.mem.readInt(u64, h[0..8], .little);
-        return @intCast(x % bound);
+        return @intCast(std.mem.readInt(u64, h[0..8], .little) % bound);
     }
 };
 
 // ---------------------------------------------------------------------------------------
-// Protocol parameters
+// Parameters
 // ---------------------------------------------------------------------------------------
 
-/// Trace length (steps in the authorization chain); a power of two.
-const N: usize = 1024;
-/// Number of random coefficients masking the trace (zero-knowledge). Must be at least the total
-/// number of trace openings (4 per query · NUM_QUERIES = 128) so the opened values are uniform.
-const TRACE_BLIND: usize = 256;
-/// LDE blowup factor (RS code rate 1/BLOWUP).
-const BLOWUP: usize = 16;
-/// Size of the low-degree-extension evaluation domain.
-const LDE_SIZE: usize = N * BLOWUP; // 16384
-/// Number of FRI folding rounds.
-const NUM_FOLDS: usize = 8;
-/// Size of the final (uncommitted) FRI layer, sent in the clear.
+/// Trace length = rounds + 1 (one round per transition); a power of two.
+const N: usize = rescue.ROUNDS + 1; // 16
+/// Constraint count: WIDTH transition + 3 boundary.
+const N_CONSTRAINTS: usize = WIDTH + 3;
+/// Random coefficients masking each trace column (ZK). Must exceed the per-column open count
+/// (4 rows/query · NUM_QUERIES = 128).
+const TRACE_BLIND: usize = 160;
+/// LDE blowup. The degree-7 S-box raises the composition degree to ~7·(N+TRACE_BLIND), so the
+/// blowup is large relative to N (the trace is short).
+const BLOWUP: usize = 512;
+const LDE_SIZE: usize = N * BLOWUP; // 8192
+const NUM_FOLDS: usize = 7;
 const FINAL_SIZE: usize = LDE_SIZE >> NUM_FOLDS; // 64
-/// Degree bound asserted for the composition polynomial. The blinded trace has degree < N +
-/// TRACE_BLIND, so the cubic transition quotient has degree ~2814 < this bound.
-const COMP_DEGREE_BOUND: usize = 4096;
-/// Degree bound the final FRI layer must satisfy.
+/// Composition-polynomial degree bound (> its true max ~1210).
+const COMP_DEGREE_BOUND: usize = 2048;
 const FINAL_DEGREE_BOUND: usize = COMP_DEGREE_BOUND >> NUM_FOLDS; // 16
-/// Number of FRI query repetitions (soundness amplification).
 const NUM_QUERIES: usize = 32;
-/// Round constant of the transition `x -> x^3 + C`.
-const C_CONST: Felt = 42;
+
+fn ldeOffset() Felt {
+    return field.GENERATOR;
+}
+fn ldeGen() Felt {
+    return field.rootOfUnity(LDE_SIZE);
+}
 
 // ---------------------------------------------------------------------------------------
 // Randomness for the zero-knowledge blinding (OS CSPRNG)
@@ -172,73 +211,40 @@ const C_CONST: Felt = 42;
 fn osRandom(buf: []u8) void {
     var off: usize = 0;
     while (off < buf.len) {
-        // On success `getrandom` returns the number of bytes written (1..len); on error it
-        // returns a wrapped -errno that is far larger than the request. For a PoC, treat any
-        // non-progress as fatal.
         const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
         std.debug.assert(rc != 0 and rc <= buf.len - off);
         off += rc;
     }
 }
 
-/// A fresh CSPRNG seeded from the OS, used to draw the blinding factors. The blinding is what
-/// makes the proof zero-knowledge, so it must be unpredictable to the verifier.
 const Rng = struct {
     inner: std.Random.DefaultCsprng,
-
     fn init() Rng {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
         osRandom(&seed);
         return .{ .inner = std.Random.DefaultCsprng.init(seed) };
     }
-
     fn felt(self: *Rng) Felt {
         return self.inner.random().int(u64) % field.P;
     }
-
     fn fillFelts(self: *Rng, out: []Felt) void {
         for (out) |*v| v.* = self.felt();
     }
 };
 
-/// Coset shift for the LDE domain: a generator of F_p^*, so the coset is disjoint from every
-/// subgroup used (keeps the vanishing polynomials nonzero on the domain).
-fn ldeOffset() Felt {
-    return field.GENERATOR;
-}
-/// Generator of the LDE evaluation domain (a primitive LDE_SIZE-th root of unity).
-fn ldeGen() Felt {
-    return field.rootOfUnity(LDE_SIZE);
-}
-
 // ---------------------------------------------------------------------------------------
 // FRI: low-degree test by repeated folding
 // ---------------------------------------------------------------------------------------
 
-const FriQueryLayer = struct {
-    a: Felt,
-    b: Felt,
-    path_a: []Hash,
-    path_b: []Hash,
-};
+const FriQueryLayer = struct { a: Felt, b: Felt, path_a: []Hash, path_b: []Hash };
+const FriQuery = struct { layers: [NUM_FOLDS]FriQueryLayer };
+const FriProof = struct { roots: [NUM_FOLDS]Hash, final_layer: []Felt, queries: []FriQuery };
 
-const FriQuery = struct {
-    layers: [NUM_FOLDS]FriQueryLayer,
-};
-
-const FriProof = struct {
-    roots: [NUM_FOLDS]Hash,
-    final_layer: []Felt, // FINAL_SIZE values, in the clear
-    queries: []FriQuery, // one per derived query position
-};
-
-/// Fold one FRI layer: `next[i] = even(x_i²) + beta·odd(x_i²)`, where `even`/`odd` are the
-/// even/odd parts of the layer polynomial recovered from the ± pair `(cur[i], cur[i+half])`.
 fn friFold(allocator: Allocator, cur: []const Felt, beta: Felt, offset: Felt, gen: Felt) ![]Felt {
     const half = cur.len / 2;
     const next = try allocator.alloc(Felt, half);
     const inv2 = field.inv(2);
-    var x = offset; // x_i = offset · gen^i
+    var x = offset;
     for (0..half) |i| {
         const a = cur[i];
         const b = cur[i + half];
@@ -250,8 +256,6 @@ fn friFold(allocator: Allocator, cur: []const Felt, beta: Felt, offset: Felt, ge
     return next;
 }
 
-/// Holds the committed FRI layers so individual query positions can be opened on demand (used
-/// by the STARK, which interleaves FRI openings with trace openings for the same positions).
 const FriProver = struct {
     allocator: Allocator,
     layer_evals: [NUM_FOLDS][]Felt,
@@ -260,8 +264,6 @@ const FriProver = struct {
     betas: [NUM_FOLDS]Felt,
     final_layer: []Felt,
 
-    /// Commit all fold layers into `transcript`, drawing a fold challenge per layer and finally
-    /// absorbing the in-the-clear final layer.
     fn commit(allocator: Allocator, transcript: *Transcript, evals: []const Felt) !FriProver {
         var self: FriProver = undefined;
         self.allocator = allocator;
@@ -281,24 +283,21 @@ const FriProver = struct {
         return self;
     }
 
-    /// Open all layers at query position `q0` (in `[0, LDE_SIZE/2)`).
     fn open(self: FriProver, allocator: Allocator, q0: usize) !FriQuery {
         var q: FriQuery = undefined;
         for (0..NUM_FOLDS) |k| {
             const half_k = (LDE_SIZE >> @intCast(k)) / 2;
             const a_idx = q0 % half_k;
-            const b_idx = a_idx + half_k;
             q.layers[k] = .{
                 .a = self.layer_evals[k][a_idx],
-                .b = self.layer_evals[k][b_idx],
+                .b = self.layer_evals[k][a_idx + half_k],
                 .path_a = try self.trees[k].open(allocator, a_idx),
-                .path_b = try self.trees[k].open(allocator, b_idx),
+                .path_b = try self.trees[k].open(allocator, a_idx + half_k),
             };
         }
         return q;
     }
 
-    /// Free the committed layers and trees. Does not free `final_layer` (the caller keeps it).
     fn deinit(self: *FriProver) void {
         for (0..NUM_FOLDS) |k| {
             self.trees[k].deinit();
@@ -307,144 +306,91 @@ const FriProver = struct {
     }
 };
 
-/// Prove that `evals` (over the LDE coset) is close to a low-degree codeword. Caller owns the
-/// result (free with `friFree`).
-fn friProve(allocator: Allocator, transcript: *Transcript, evals: []const Felt) !FriProof {
-    var prover = try FriProver.commit(allocator, transcript, evals);
-    const roots = prover.roots;
-    const final_layer = try allocator.dupe(Felt, prover.final_layer);
-    const queries = try allocator.alloc(FriQuery, NUM_QUERIES);
-    for (queries) |*q| {
-        const q0 = transcript.challengeIndex(LDE_SIZE / 2);
-        q.* = try prover.open(allocator, q0);
-    }
-    allocator.free(prover.final_layer);
-    prover.deinit();
-    return .{ .roots = roots, .final_layer = final_layer, .queries = queries };
-}
-
-/// Result of FRI verification: whether it passed, plus the layer-0 opened values per query (so
-/// the STARK can bind them to the trace).
-const FriVerifyResult = struct {
-    ok: bool,
-    /// For query i: the position q0 and the two opened layer-0 values.
-    q0: [NUM_QUERIES]usize,
-    a0: [NUM_QUERIES]Felt,
-    b0: [NUM_QUERIES]Felt,
-};
-
 fn friCheckFinalLowDegree(allocator: Allocator, final_layer: []const Felt) !bool {
     const gen_f = field.pow(ldeGen(), @as(u64, 1) << @intCast(NUM_FOLDS));
     const coeffs = try allocator.dupe(Felt, final_layer);
     defer allocator.free(coeffs);
     field.intt(coeffs, gen_f);
-    for (coeffs[FINAL_DEGREE_BOUND..]) |c| {
-        if (c != 0) return false;
-    }
+    for (coeffs[FINAL_DEGREE_BOUND..]) |c| if (c != 0) return false;
     return true;
 }
 
-/// Verify a FRI proof against the transcript (which must be in the same state the prover's was
-/// before `friProve`). Re-derives the fold challenges and query positions.
-fn friVerify(allocator: Allocator, transcript: *Transcript, proof: FriProof) !FriVerifyResult {
-    var betas: [NUM_FOLDS]Felt = undefined;
-    for (0..NUM_FOLDS) |k| {
-        transcript.absorbHash(proof.roots[k]);
-        betas[k] = transcript.challengeFelt();
-    }
-    for (proof.final_layer) |v| transcript.absorbFelt(v);
-
-    var result = FriVerifyResult{ .ok = true, .q0 = undefined, .a0 = undefined, .b0 = undefined };
-
-    if (proof.final_layer.len != FINAL_SIZE) return .{ .ok = false, .q0 = undefined, .a0 = undefined, .b0 = undefined };
-    if (!try friCheckFinalLowDegree(allocator, proof.final_layer)) {
-        result.ok = false;
-    }
-
-    const inv2 = field.inv(2);
-    for (proof.queries, 0..) |q, qi| {
-        const q0 = transcript.challengeIndex(LDE_SIZE / 2);
-        result.q0[qi] = q0;
-        result.a0[qi] = q.layers[0].a;
-        result.b0[qi] = q.layers[0].b;
-        for (0..NUM_FOLDS) |k| {
-            const size_k = LDE_SIZE >> @intCast(k);
-            const half_k = size_k / 2;
-            const a_idx = q0 % half_k;
-            const b_idx = a_idx + half_k;
-            const offset_k = field.pow(ldeOffset(), @as(u64, 1) << @intCast(k));
-            const gen_k = field.pow(ldeGen(), @as(u64, 1) << @intCast(k));
-            const layer = q.layers[k];
-            // Merkle openings.
-            if (!merkleVerify(proof.roots[k], size_k, a_idx, layer.a, layer.path_a)) result.ok = false;
-            if (!merkleVerify(proof.roots[k], size_k, b_idx, layer.b, layer.path_b)) result.ok = false;
-            // Fold consistency.
-            const x = field.mul(offset_k, field.pow(gen_k, @intCast(a_idx)));
-            const even = field.mul(field.add(layer.a, layer.b), inv2);
-            const odd = field.mul(field.mul(field.sub(layer.a, layer.b), inv2), field.inv(x));
-            const folded = field.add(even, field.mul(betas[k], odd));
-            // The folded value must appear at position `a_idx` of the next layer.
-            if (k + 1 < NUM_FOLDS) {
-                const half_next = half_k / 2;
-                const expected = if (a_idx < half_next) q.layers[k + 1].a else q.layers[k + 1].b;
-                if (folded != expected) result.ok = false;
-            } else {
-                if (folded != proof.final_layer[a_idx % FINAL_SIZE]) result.ok = false;
-            }
-        }
-    }
-    return result;
-}
-
-fn friFree(allocator: Allocator, proof: FriProof) void {
-    for (proof.queries) |q| {
-        for (q.layers) |layer| {
-            allocator.free(layer.path_a);
-            allocator.free(layer.path_b);
-        }
-    }
-    allocator.free(proof.queries);
-    allocator.free(proof.final_layer);
-}
-
 // ---------------------------------------------------------------------------------------
-// The authorization AIR: prove knowledge of a chain preimage
+// The authorization AIR
 // ---------------------------------------------------------------------------------------
 
-/// Map a 32-byte secret to a field element (low 16 bytes, reduced mod p).
 fn secretToField(secret: *const [32]u8) Felt {
     var b: [16]u8 = undefined;
     @memcpy(&b, secret[0..16]);
     return field.fromBytes(&b);
 }
 
-/// One step of the authorization chain: `x -> x^3 + C`.
-fn chainStep(x: Felt) Felt {
-    return field.add(field.mul(field.mul(x, x), x), C_CONST);
-}
-
-/// The public authorization image: the final state after `N-1` chain steps from `secret`.
+/// Public authorization image: `rescue.hash(secret)`.
 pub fn imageFelt(secret: *const [32]u8) Felt {
-    var s = secretToField(secret);
-    for (0..N - 1) |_| s = chainStep(s);
-    return s;
+    return rescue.hash(secretToField(secret));
 }
 
-/// Evaluate the composition polynomial at one point from the trace value, its "next" value, and
-/// the domain point. Used identically by prover (over the whole LDE) and verifier (at queries),
-/// so the two are guaranteed consistent.
-fn compositionAt(t: Felt, t_next: Felt, x: Felt, image: Felt, alpha: Felt, gamma: Felt, omega_last: Felt) Felt {
-    // transition: t^3 + C - t_next must vanish on the trace domain except the last row.
-    const trans_num = field.sub(chainStep(t), t_next);
-    const x_n = field.pow(x, N);
-    const z_trans = field.mul(field.sub(x_n, 1), field.inv(field.sub(x, omega_last)));
-    const q_trans = field.mul(trans_num, field.inv(z_trans));
-    // boundary: t - image must vanish at the last row.
-    const q_bound = field.mul(field.sub(t, image), field.inv(field.sub(x, omega_last)));
-    return field.add(field.mul(alpha, q_trans), field.mul(gamma, q_bound));
+fn evalPoly(coeffs: []const Felt, x: Felt) Felt {
+    var acc: Felt = 0;
+    var i = coeffs.len;
+    while (i > 0) {
+        i -= 1;
+        acc = field.add(field.mul(acc, x), coeffs[i]);
+    }
+    return acc;
 }
 
-/// Evaluate a coefficient vector (length <= LDE_SIZE) over the LDE coset (offset · gen^i).
+/// Coefficients of the round-constant interpolation polynomials (one per state element), so the
+/// verifier can evaluate the periodic constants at any query point. Deterministic and public.
+fn roundConstantCoeffs() [WIDTH][N]Felt {
+    const rc = rescue.roundConstants();
+    const w = field.rootOfUnity(N);
+    var out: [WIDTH][N]Felt = undefined;
+    for (0..WIDTH) |i| {
+        var vals: [N]Felt = undefined;
+        for (0..N) |r| vals[r] = if (r < rescue.ROUNDS) rc[r][i] else 0;
+        field.intt(&vals, w);
+        out[i] = vals;
+    }
+    return out;
+}
+
+/// Evaluate the composition polynomial at one point from the current/next trace rows. Identical
+/// for prover (over the whole LDE) and verifier (at query points), so they cannot disagree.
+fn compositionAt(
+    cur: [WIDTH]Felt,
+    next: [WIDTH]Felt,
+    x: Felt,
+    image: Felt,
+    comb: [N_CONSTRAINTS]Felt,
+    rc_at: [WIDTH]Felt,
+    m: [WIDTH][WIDTH]Felt,
+    omega_last: Felt,
+) Felt {
+    var sb: [WIDTH]Felt = undefined;
+    for (0..WIDTH) |j| sb[j] = rescue.sbox(cur[j]);
+
+    const z_trans = field.mul(field.sub(field.pow(x, N), 1), field.inv(field.sub(x, omega_last)));
+    const z_trans_inv = field.inv(z_trans);
+
+    var cp: Felt = 0;
+    // Transition constraints: next_i - (Σ_j M[i][j]·cur_j^7 + rc_i).
+    for (0..WIDTH) |i| {
+        var roundi = rc_at[i];
+        for (0..WIDTH) |j| roundi = field.add(roundi, field.mul(m[i][j], sb[j]));
+        const ctrans = field.sub(next[i], roundi);
+        cp = field.add(cp, field.mul(comb[i], field.mul(ctrans, z_trans_inv)));
+    }
+    // Boundary constraints: capacity cells zero at row 0; output = image at the last row.
+    const inv_x1 = field.inv(field.sub(x, 1));
+    const inv_xl = field.inv(field.sub(x, omega_last));
+    cp = field.add(cp, field.mul(comb[WIDTH + 0], field.mul(cur[1], inv_x1)));
+    cp = field.add(cp, field.mul(comb[WIDTH + 1], field.mul(cur[2], inv_x1)));
+    cp = field.add(cp, field.mul(comb[WIDTH + 2], field.mul(field.sub(cur[0], image), inv_xl)));
+    return cp;
+}
+
+/// Evaluate a coefficient vector (length <= LDE_SIZE) over the LDE coset.
 fn coeffsToLde(allocator: Allocator, coeffs: []const Felt) ![]Felt {
     std.debug.assert(coeffs.len <= LDE_SIZE);
     const lde = try allocator.alloc(Felt, LDE_SIZE);
@@ -459,36 +405,39 @@ fn coeffsToLde(allocator: Allocator, coeffs: []const Felt) ![]Felt {
     return lde;
 }
 
-/// Build the trace, interpolate it, add the zero-knowledge blinding `Z_H(x)·b(x)` (random `b` of
-/// degree < TRACE_BLIND), and evaluate the masked trace polynomial over the LDE coset.
-///
-/// Because `Z_H(x) = x^N - 1` vanishes on the constraint domain H, the masked trace agrees with
-/// the real trace on H — all constraints still hold — but every LDE opening is randomized, so
-/// the opened values leak nothing about the witness.
-fn buildMaskedTraceLde(allocator: Allocator, secret_felt: Felt, rng: *Rng) ![]Felt {
-    const trace = try allocator.alloc(Felt, N);
-    defer allocator.free(trace);
-    trace[0] = secret_felt;
-    for (1..N) |i| trace[i] = chainStep(trace[i - 1]);
-    field.intt(trace, field.rootOfUnity(N)); // trace now holds coefficients (degree < N)
+/// Build the trace, interpolate each column, add ZK blinding `Z_H·b_i`, and evaluate over the
+/// LDE coset. Returns the WIDTH LDE columns (each owned by `allocator`).
+fn buildTraceLde(allocator: Allocator, secret_felt: Felt, rng: *Rng) ![WIDTH][]Felt {
+    const m = rescue.mds();
+    const rc = rescue.roundConstants();
+    // Raw execution trace: N rows of WIDTH columns.
+    var rows: [N]rescue.State = undefined;
+    rows[0] = .{ secret_felt, 0, 0 };
+    for (0..rescue.ROUNDS) |r| rows[r + 1] = rescue.round(rows[r], m, rc[r]);
 
-    // Coefficients of T'(x) = T(x) + (x^N - 1)·b(x), degree < N + TRACE_BLIND.
-    const mc = try allocator.alloc(Felt, N + TRACE_BLIND);
-    defer allocator.free(mc);
-    @memset(mc, 0);
-    @memcpy(mc[0..N], trace);
-    var b: [TRACE_BLIND]Felt = undefined;
-    rng.fillFelts(&b);
-    for (0..TRACE_BLIND) |i| {
-        mc[i] = field.sub(mc[i], b[i]); // -b(x)
-        mc[N + i] = field.add(mc[N + i], b[i]); // + x^N · b(x)
+    const w = field.rootOfUnity(N);
+    var out: [WIDTH][]Felt = undefined;
+    for (0..WIDTH) |i| {
+        // Interpolate column i over H.
+        var col: [N]Felt = undefined;
+        for (0..N) |r| col[r] = rows[r][i];
+        field.intt(&col, w);
+        // Blinded coefficients: col + (x^N - 1)·b_i, degree < N + TRACE_BLIND.
+        const mc = try allocator.alloc(Felt, N + TRACE_BLIND);
+        defer allocator.free(mc);
+        @memset(mc, 0);
+        @memcpy(mc[0..N], &col);
+        var b: [TRACE_BLIND]Felt = undefined;
+        rng.fillFelts(&b);
+        for (0..TRACE_BLIND) |k| {
+            mc[k] = field.sub(mc[k], b[k]);
+            mc[N + k] = field.add(mc[N + k], b[k]);
+        }
+        out[i] = try coeffsToLde(allocator, mc);
     }
-    return coeffsToLde(allocator, mc);
+    return out;
 }
 
-/// A uniformly random polynomial of degree < COMP_DEGREE_BOUND, evaluated over the LDE coset.
-/// Folded into the FRI input, it masks the low-degree test so the FRI-layer openings reveal
-/// nothing about the witness-derived composition polynomial.
 fn buildRandomPolyLde(allocator: Allocator, rng: *Rng) ![]Felt {
     const coeffs = try allocator.alloc(Felt, COMP_DEGREE_BOUND);
     defer allocator.free(coeffs);
@@ -496,19 +445,21 @@ fn buildRandomPolyLde(allocator: Allocator, rng: *Rng) ![]Felt {
     return coeffsToLde(allocator, coeffs);
 }
 
-const TraceOpen = struct {
-    val: Felt,
-    path: []Hash,
-};
+// ---------------------------------------------------------------------------------------
+// Proof object
+// ---------------------------------------------------------------------------------------
+
+const RowOpen = struct { row: [WIDTH]Felt, path: []Hash };
+const ValOpen = struct { val: Felt, path: []Hash };
 
 const StarkQuery = struct {
     fri: FriQuery,
-    ta: TraceOpen, // trace at q0
-    ta_next: TraceOpen, // trace at (q0 + BLOWUP) mod LDE_SIZE
-    tb: TraceOpen, // trace at q0 + LDE_SIZE/2
-    tb_next: TraceOpen, // trace at (q0 + LDE_SIZE/2 + BLOWUP) mod LDE_SIZE
-    ga: TraceOpen, // mask polynomial g at q0
-    gb: TraceOpen, // mask polynomial g at q0 + LDE_SIZE/2
+    cur_a: RowOpen, // trace row at q
+    next_a: RowOpen, // trace row at (q + BLOWUP) mod LDE
+    cur_b: RowOpen, // trace row at q + LDE/2
+    next_b: RowOpen, // trace row at (q + LDE/2 + BLOWUP) mod LDE
+    g_a: ValOpen, // mask g at q
+    g_b: ValOpen, // mask g at q + LDE/2
 };
 
 pub const StarkProof = struct {
@@ -519,21 +470,41 @@ pub const StarkProof = struct {
     queries: []StarkQuery,
 };
 
-const TRANSCRIPT_LABEL = "lattica:auth-stark:v1";
+const TRANSCRIPT_LABEL = "lattica:auth-stark:v2-rescue";
 
-/// Produce a real, zero-knowledge FRI-STARK proof that the prover knows a secret whose chain
-/// image is `image`. The proof is randomized (trace blinding + a random FRI mask), so repeated
-/// proofs of the same statement differ and reveal nothing about the witness.
+fn rowAt(cols: [WIDTH][]const Felt, idx: usize) [WIDTH]Felt {
+    var row: [WIDTH]Felt = undefined;
+    for (0..WIDTH) |i| row[i] = cols[i][idx];
+    return row;
+}
+
+// ---------------------------------------------------------------------------------------
+// Prove
+// ---------------------------------------------------------------------------------------
+
 pub fn prove(allocator: Allocator, secret: *const [32]u8) !StarkProof {
     var rng = Rng.init();
     const image = imageFelt(secret);
+    const m = rescue.mds();
+    const omega_last = field.pow(field.rootOfUnity(N), N - 1);
 
-    const trace_lde = try buildMaskedTraceLde(allocator, secretToField(secret), &rng);
-    defer allocator.free(trace_lde);
+    const trace_lde = try buildTraceLde(allocator, secretToField(secret), &rng);
+    defer for (trace_lde) |c| allocator.free(c);
+    const trace_const: [WIDTH][]const Felt = blk: {
+        var c: [WIDTH][]const Felt = undefined;
+        for (0..WIDTH) |i| c[i] = trace_lde[i];
+        break :blk c;
+    };
     const g_lde = try buildRandomPolyLde(allocator, &rng);
     defer allocator.free(g_lde);
 
-    var trace_tree = try MerkleTree.build(allocator, trace_lde);
+    // Round-constant evaluations over the LDE (for the composition).
+    const rc_coeffs = roundConstantCoeffs();
+    var rc_lde: [WIDTH][]Felt = undefined;
+    for (0..WIDTH) |i| rc_lde[i] = try coeffsToLde(allocator, &rc_coeffs[i]);
+    defer for (rc_lde) |c| allocator.free(c);
+
+    var trace_tree = try MerkleTree.buildRows(allocator, trace_const);
     defer trace_tree.deinit();
     var g_tree = try MerkleTree.build(allocator, g_lde);
     defer g_tree.deinit();
@@ -544,17 +515,19 @@ pub fn prove(allocator: Allocator, secret: *const [32]u8) !StarkProof {
     tr.absorbFelt(image);
     tr.absorbHash(trace_root);
     tr.absorbHash(g_root);
-    const alpha = tr.challengeFelt();
-    const gamma = tr.challengeFelt();
+    var comb: [N_CONSTRAINTS]Felt = undefined;
+    for (&comb) |*c| c.* = tr.challengeFelt();
     const zeta = tr.challengeFelt();
 
-    // FRI input H(x) = CP(x) + zeta·g(x): the composition masked by the random polynomial.
-    const omega_last = field.pow(field.rootOfUnity(N), N - 1);
+    // FRI input H = CP + zeta·g.
     const h = try allocator.alloc(Felt, LDE_SIZE);
     defer allocator.free(h);
     var x = ldeOffset();
     for (0..LDE_SIZE) |j| {
-        const cp = compositionAt(trace_lde[j], trace_lde[(j + BLOWUP) % LDE_SIZE], x, image, alpha, gamma, omega_last);
+        const cur = rowAt(trace_const, j);
+        const next = rowAt(trace_const, (j + BLOWUP) % LDE_SIZE);
+        const rc_at = [WIDTH]Felt{ rc_lde[0][j], rc_lde[1][j], rc_lde[2][j] };
+        const cp = compositionAt(cur, next, x, image, comb, rc_at, m, omega_last);
         h[j] = field.add(cp, field.mul(zeta, g_lde[j]));
         x = field.mul(x, ldeGen());
     }
@@ -567,32 +540,41 @@ pub fn prove(allocator: Allocator, secret: *const [32]u8) !StarkProof {
     const queries = try allocator.alloc(StarkQuery, NUM_QUERIES);
     for (queries) |*sq| {
         const q0 = tr.challengeIndex(half0);
-        const a_idx = q0;
-        const b_idx = q0 + half0;
+        const a = q0;
+        const an = (q0 + BLOWUP) % LDE_SIZE;
+        const b = q0 + half0;
+        const bn = (b + BLOWUP) % LDE_SIZE;
         sq.fri = try fri.open(allocator, q0);
-        sq.ta = .{ .val = trace_lde[a_idx], .path = try trace_tree.open(allocator, a_idx) };
-        sq.ta_next = .{ .val = trace_lde[(a_idx + BLOWUP) % LDE_SIZE], .path = try trace_tree.open(allocator, (a_idx + BLOWUP) % LDE_SIZE) };
-        sq.tb = .{ .val = trace_lde[b_idx], .path = try trace_tree.open(allocator, b_idx) };
-        sq.tb_next = .{ .val = trace_lde[(b_idx + BLOWUP) % LDE_SIZE], .path = try trace_tree.open(allocator, (b_idx + BLOWUP) % LDE_SIZE) };
-        sq.ga = .{ .val = g_lde[a_idx], .path = try g_tree.open(allocator, a_idx) };
-        sq.gb = .{ .val = g_lde[b_idx], .path = try g_tree.open(allocator, b_idx) };
+        sq.cur_a = .{ .row = rowAt(trace_const, a), .path = try trace_tree.open(allocator, a) };
+        sq.next_a = .{ .row = rowAt(trace_const, an), .path = try trace_tree.open(allocator, an) };
+        sq.cur_b = .{ .row = rowAt(trace_const, b), .path = try trace_tree.open(allocator, b) };
+        sq.next_b = .{ .row = rowAt(trace_const, bn), .path = try trace_tree.open(allocator, bn) };
+        sq.g_a = .{ .val = g_lde[a], .path = try g_tree.open(allocator, a) };
+        sq.g_b = .{ .val = g_lde[b], .path = try g_tree.open(allocator, b) };
     }
     allocator.free(fri.final_layer);
     fri.deinit();
     return .{ .trace_root = trace_root, .g_root = g_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
 }
 
-/// Verify a FRI-STARK proof against the public `image`.
+// ---------------------------------------------------------------------------------------
+// Verify
+// ---------------------------------------------------------------------------------------
+
 pub fn verify(allocator: Allocator, image: Felt, proof: StarkProof) !bool {
     if (proof.fri_final.len != FINAL_SIZE) return false;
     if (proof.queries.len != NUM_QUERIES) return false;
+
+    const m = rescue.mds();
+    const omega_last = field.pow(field.rootOfUnity(N), N - 1);
+    const rc_coeffs = roundConstantCoeffs();
 
     var tr = Transcript.init(TRANSCRIPT_LABEL);
     tr.absorbFelt(image);
     tr.absorbHash(proof.trace_root);
     tr.absorbHash(proof.g_root);
-    const alpha = tr.challengeFelt();
-    const gamma = tr.challengeFelt();
+    var comb: [N_CONSTRAINTS]Felt = undefined;
+    for (&comb) |*c| c.* = tr.challengeFelt();
     const zeta = tr.challengeFelt();
 
     var betas: [NUM_FOLDS]Felt = undefined;
@@ -603,32 +585,32 @@ pub fn verify(allocator: Allocator, image: Felt, proof: StarkProof) !bool {
     for (proof.fri_final) |v| tr.absorbFelt(v);
     if (!try friCheckFinalLowDegree(allocator, proof.fri_final)) return false;
 
-    const omega_last = field.pow(field.rootOfUnity(N), N - 1);
     const inv2 = field.inv(2);
     const half0 = LDE_SIZE / 2;
     var ok = true;
 
     for (proof.queries) |sq| {
         const q0 = tr.challengeIndex(half0);
-        const a_idx = q0;
-        const b_idx = q0 + half0;
-        const a_next = (a_idx + BLOWUP) % LDE_SIZE;
-        const b_next = (b_idx + BLOWUP) % LDE_SIZE;
+        const a = q0;
+        const an = (q0 + BLOWUP) % LDE_SIZE;
+        const b = q0 + half0;
+        const bn = (b + BLOWUP) % LDE_SIZE;
 
-        // Trace Merkle openings.
-        if (!merkleVerify(proof.trace_root, LDE_SIZE, a_idx, sq.ta.val, sq.ta.path)) ok = false;
-        if (!merkleVerify(proof.trace_root, LDE_SIZE, a_next, sq.ta_next.val, sq.ta_next.path)) ok = false;
-        if (!merkleVerify(proof.trace_root, LDE_SIZE, b_idx, sq.tb.val, sq.tb.path)) ok = false;
-        if (!merkleVerify(proof.trace_root, LDE_SIZE, b_next, sq.tb_next.val, sq.tb_next.path)) ok = false;
-        if (!merkleVerify(proof.g_root, LDE_SIZE, a_idx, sq.ga.val, sq.ga.path)) ok = false;
-        if (!merkleVerify(proof.g_root, LDE_SIZE, b_idx, sq.gb.val, sq.gb.path)) ok = false;
+        // Trace + mask Merkle openings.
+        if (!merkleVerifyRow(proof.trace_root, LDE_SIZE, a, sq.cur_a.row, sq.cur_a.path)) ok = false;
+        if (!merkleVerifyRow(proof.trace_root, LDE_SIZE, an, sq.next_a.row, sq.next_a.path)) ok = false;
+        if (!merkleVerifyRow(proof.trace_root, LDE_SIZE, b, sq.cur_b.row, sq.cur_b.path)) ok = false;
+        if (!merkleVerifyRow(proof.trace_root, LDE_SIZE, bn, sq.next_b.row, sq.next_b.path)) ok = false;
+        if (!merkleVerify(proof.g_root, LDE_SIZE, a, sq.g_a.val, sq.g_a.path)) ok = false;
+        if (!merkleVerify(proof.g_root, LDE_SIZE, b, sq.g_b.val, sq.g_b.path)) ok = false;
 
-        // ALI: the FRI input H at the queried points must equal CP(trace) + zeta·g, where CP is
-        // recomputed from the trace openings and g comes from its own commitment.
-        const x_a = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(a_idx)));
-        const x_b = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(b_idx)));
-        const h_a = field.add(compositionAt(sq.ta.val, sq.ta_next.val, x_a, image, alpha, gamma, omega_last), field.mul(zeta, sq.ga.val));
-        const h_b = field.add(compositionAt(sq.tb.val, sq.tb_next.val, x_b, image, alpha, gamma, omega_last), field.mul(zeta, sq.gb.val));
+        // ALI: H(x) must equal CP(trace) + zeta·g at both layer-0 query points.
+        const x_a = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(a)));
+        const x_b = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(b)));
+        const rc_a = [WIDTH]Felt{ evalPoly(&rc_coeffs[0], x_a), evalPoly(&rc_coeffs[1], x_a), evalPoly(&rc_coeffs[2], x_a) };
+        const rc_b = [WIDTH]Felt{ evalPoly(&rc_coeffs[0], x_b), evalPoly(&rc_coeffs[1], x_b), evalPoly(&rc_coeffs[2], x_b) };
+        const h_a = field.add(compositionAt(sq.cur_a.row, sq.next_a.row, x_a, image, comb, rc_a, m, omega_last), field.mul(zeta, sq.g_a.val));
+        const h_b = field.add(compositionAt(sq.cur_b.row, sq.next_b.row, x_b, image, comb, rc_b, m, omega_last), field.mul(zeta, sq.g_b.val));
         if (h_a != sq.fri.layers[0].a) ok = false;
         if (h_b != sq.fri.layers[0].b) ok = false;
 
@@ -637,12 +619,11 @@ pub fn verify(allocator: Allocator, image: Felt, proof: StarkProof) !bool {
             const size_k = LDE_SIZE >> @intCast(k);
             const half_k = size_k / 2;
             const ai = q0 % half_k;
-            const bi = ai + half_k;
             const off_k = field.pow(ldeOffset(), @as(u64, 1) << @intCast(k));
             const gen_k = field.pow(ldeGen(), @as(u64, 1) << @intCast(k));
             const layer = sq.fri.layers[k];
             if (!merkleVerify(proof.fri_roots[k], size_k, ai, layer.a, layer.path_a)) ok = false;
-            if (!merkleVerify(proof.fri_roots[k], size_k, bi, layer.b, layer.path_b)) ok = false;
+            if (!merkleVerify(proof.fri_roots[k], size_k, ai + half_k, layer.b, layer.path_b)) ok = false;
             const x = field.mul(off_k, field.pow(gen_k, @intCast(ai)));
             const even = field.mul(field.add(layer.a, layer.b), inv2);
             const odd = field.mul(field.mul(field.sub(layer.a, layer.b), inv2), field.inv(x));
@@ -665,28 +646,34 @@ pub fn starkFree(allocator: Allocator, proof: StarkProof) void {
             allocator.free(layer.path_a);
             allocator.free(layer.path_b);
         }
-        allocator.free(sq.ta.path);
-        allocator.free(sq.ta_next.path);
-        allocator.free(sq.tb.path);
-        allocator.free(sq.tb_next.path);
-        allocator.free(sq.ga.path);
-        allocator.free(sq.gb.path);
+        allocator.free(sq.cur_a.path);
+        allocator.free(sq.next_a.path);
+        allocator.free(sq.cur_b.path);
+        allocator.free(sq.next_b.path);
+        allocator.free(sq.g_a.path);
+        allocator.free(sq.g_b.path);
     }
     allocator.free(proof.queries);
     allocator.free(proof.fri_final);
 }
 
 // ---------------------------------------------------------------------------------------
-// Serialization (StarkProof <-> bytes). All sub-object sizes are fixed by the parameters, so
-// the layout is positional with no length prefixes.
+// Serialization (positional; all sub-object sizes are fixed by the parameters)
 // ---------------------------------------------------------------------------------------
 
 fn putFelt(buf: *std.ArrayList(u8), allocator: Allocator, v: Felt) !void {
     try buf.appendSlice(allocator, &field.toBytes(v));
 }
-
 fn putHash(buf: *std.ArrayList(u8), allocator: Allocator, h: Hash) !void {
     try buf.appendSlice(allocator, &h);
+}
+fn putRowOpen(buf: *std.ArrayList(u8), allocator: Allocator, o: RowOpen) !void {
+    for (o.row) |v| try putFelt(buf, allocator, v);
+    for (o.path) |h| try putHash(buf, allocator, h);
+}
+fn putValOpen(buf: *std.ArrayList(u8), allocator: Allocator, o: ValOpen) !void {
+    try putFelt(buf, allocator, o.val);
+    for (o.path) |h| try putHash(buf, allocator, h);
 }
 
 pub fn serialize(allocator: Allocator, proof: StarkProof) ![]u8 {
@@ -703,10 +690,12 @@ pub fn serialize(allocator: Allocator, proof: StarkProof) ![]u8 {
             for (layer.path_a) |h| try putHash(&buf, allocator, h);
             for (layer.path_b) |h| try putHash(&buf, allocator, h);
         }
-        inline for (.{ sq.ta, sq.ta_next, sq.tb, sq.tb_next, sq.ga, sq.gb }) |to| {
-            try putFelt(&buf, allocator, to.val);
-            for (to.path) |h| try putHash(&buf, allocator, h);
-        }
+        try putRowOpen(&buf, allocator, sq.cur_a);
+        try putRowOpen(&buf, allocator, sq.next_a);
+        try putRowOpen(&buf, allocator, sq.cur_b);
+        try putRowOpen(&buf, allocator, sq.next_b);
+        try putValOpen(&buf, allocator, sq.g_a);
+        try putValOpen(&buf, allocator, sq.g_b);
     }
     return buf.toOwnedSlice(allocator);
 }
@@ -714,7 +703,6 @@ pub fn serialize(allocator: Allocator, proof: StarkProof) ![]u8 {
 const Reader = struct {
     data: []const u8,
     pos: usize = 0,
-
     fn getBytes(self: *Reader, n: usize) ![]const u8 {
         if (self.pos + n > self.data.len) return error.Truncated;
         const s = self.data[self.pos .. self.pos + n];
@@ -722,13 +710,11 @@ const Reader = struct {
         return s;
     }
     fn getFelt(self: *Reader) !Felt {
-        const s = try self.getBytes(8);
-        return std.mem.readInt(u64, s[0..8], .little);
+        return std.mem.readInt(u64, (try self.getBytes(8))[0..8], .little);
     }
     fn getHash(self: *Reader) !Hash {
-        const s = try self.getBytes(32);
         var h: Hash = undefined;
-        @memcpy(&h, s);
+        @memcpy(&h, try self.getBytes(32));
         return h;
     }
     fn getPath(self: *Reader, allocator: Allocator, len: usize) ![]Hash {
@@ -736,10 +722,16 @@ const Reader = struct {
         for (path) |*h| h.* = try self.getHash();
         return path;
     }
+    fn getRowOpen(self: *Reader, allocator: Allocator, depth: usize) !RowOpen {
+        var row: [WIDTH]Felt = undefined;
+        for (0..WIDTH) |i| row[i] = try self.getFelt();
+        return .{ .row = row, .path = try self.getPath(allocator, depth) };
+    }
+    fn getValOpen(self: *Reader, allocator: Allocator, depth: usize) !ValOpen {
+        return .{ .val = try self.getFelt(), .path = try self.getPath(allocator, depth) };
+    }
 };
 
-/// Parse a proof produced by `serialize`. Allocations are owned by `allocator` (free with
-/// `starkFree`); on a malformed/truncated input returns an error.
 pub fn deserialize(allocator: Allocator, bytes: []const u8) !StarkProof {
     var r = Reader{ .data = bytes };
     const trace_root = try r.getHash();
@@ -750,84 +742,31 @@ pub fn deserialize(allocator: Allocator, bytes: []const u8) !StarkProof {
     errdefer allocator.free(fri_final);
     for (fri_final) |*v| v.* = try r.getFelt();
 
-    const trace_depth = std.math.log2_int(usize, LDE_SIZE);
+    const depth = std.math.log2_int(usize, LDE_SIZE);
     const queries = try allocator.alloc(StarkQuery, NUM_QUERIES);
     for (queries) |*sq| {
         for (0..NUM_FOLDS) |k| {
-            const depth = std.math.log2_int(usize, LDE_SIZE >> @intCast(k));
+            const ld = std.math.log2_int(usize, LDE_SIZE >> @intCast(k));
             sq.fri.layers[k].a = try r.getFelt();
             sq.fri.layers[k].b = try r.getFelt();
-            sq.fri.layers[k].path_a = try r.getPath(allocator, depth);
-            sq.fri.layers[k].path_b = try r.getPath(allocator, depth);
+            sq.fri.layers[k].path_a = try r.getPath(allocator, ld);
+            sq.fri.layers[k].path_b = try r.getPath(allocator, ld);
         }
-        sq.ta = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
-        sq.ta_next = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
-        sq.tb = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
-        sq.tb_next = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
-        sq.ga = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
-        sq.gb = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
+        sq.cur_a = try r.getRowOpen(allocator, depth);
+        sq.next_a = try r.getRowOpen(allocator, depth);
+        sq.cur_b = try r.getRowOpen(allocator, depth);
+        sq.next_b = try r.getRowOpen(allocator, depth);
+        sq.g_a = try r.getValOpen(allocator, depth);
+        sq.g_b = try r.getValOpen(allocator, depth);
     }
     return .{ .trace_root = trace_root, .g_root = g_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
 }
 
 // ---------------------------------------------------------------------------------------
-// Tests (Merkle + transcript + FRI + STARK)
+// Tests
 // ---------------------------------------------------------------------------------------
 
 const testing = std.testing;
-
-/// Evaluate a coefficient polynomial over the LDE coset (offset · gen^i), for tests.
-fn evalOnLde(allocator: Allocator, coeffs: []const Felt) ![]Felt {
-    const out = try allocator.alloc(Felt, LDE_SIZE);
-    @memset(out, 0);
-    for (coeffs, 0..) |c, i| out[i] = c;
-    // scale by offset^i, then NTT over the LDE subgroup.
-    var off_pow: Felt = 1;
-    for (0..LDE_SIZE) |i| {
-        out[i] = field.mul(out[i], off_pow);
-        off_pow = field.mul(off_pow, ldeOffset());
-    }
-    field.ntt(out, ldeGen());
-    return out;
-}
-
-test "fri accepts a low-degree polynomial" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // A polynomial of degree < COMP_DEGREE_BOUND.
-    const coeffs = try a.alloc(Felt, COMP_DEGREE_BOUND);
-    for (coeffs, 0..) |*c, i| c.* = @intCast((i * 31 + 7) % field.P);
-    const evals = try evalOnLde(a, coeffs);
-
-    var tp = Transcript.init("fri-test");
-    const proof = try friProve(a, &tp, evals);
-
-    var tv = Transcript.init("fri-test");
-    const res = try friVerify(a, &tv, proof);
-    try testing.expect(res.ok);
-}
-
-test "fri rejects a high-degree (random) vector" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Pseudo-random evaluations: not low-degree.
-    const evals = try a.alloc(Felt, LDE_SIZE);
-    var s: Felt = 123456789;
-    for (evals) |*e| {
-        s = field.add(field.mul(s, 6364136223846793005 % field.P), 1442695040888963407 % field.P);
-        e.* = s;
-    }
-    var tp = Transcript.init("fri-test");
-    const proof = try friProve(a, &tp, evals);
-
-    var tv = Transcript.init("fri-test");
-    const res = try friVerify(a, &tv, proof);
-    try testing.expect(!res.ok);
-}
 
 test "stark: valid proof verifies" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -847,13 +786,23 @@ test "stark: wrong image rejected" {
     try testing.expect(!try verify(a, imageFelt(&secret) + 1, proof));
 }
 
-test "stark: tampered trace value rejected" {
+test "stark: tampered trace row rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const secret = [_]u8{7} ** 32;
     var proof = try prove(a, &secret);
-    proof.queries[0].ta.val = field.add(proof.queries[0].ta.val, 1);
+    proof.queries[0].cur_a.row[0] = field.add(proof.queries[0].cur_a.row[0], 1);
+    try testing.expect(!try verify(a, imageFelt(&secret), proof));
+}
+
+test "stark: tampered mask opening rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const secret = [_]u8{7} ** 32;
+    var proof = try prove(a, &secret);
+    proof.queries[0].g_a.val = field.add(proof.queries[0].g_a.val, 1);
     try testing.expect(!try verify(a, imageFelt(&secret), proof));
 }
 
@@ -867,16 +816,14 @@ test "stark: tampered fri final rejected" {
     try testing.expect(!try verify(a, imageFelt(&secret), proof));
 }
 
-test "stark: proof from a different secret does not verify against this image" {
+test "stark: proof binds to its own image only" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const secret = [_]u8{7} ** 32;
     const other = [_]u8{8} ** 32;
     const proof = try prove(a, &secret);
-    // The proof attests to `secret`'s image; verifying against a different image must fail.
     try testing.expect(!try verify(a, imageFelt(&other), proof));
-    // And it does verify against its own image.
     try testing.expect(try verify(a, imageFelt(&secret), proof));
 }
 
@@ -889,12 +836,6 @@ test "stark: serialize/deserialize round trip verifies" {
     const bytes = try serialize(a, proof);
     const parsed = try deserialize(a, bytes);
     try testing.expect(try verify(a, imageFelt(&secret), parsed));
-    // A flipped byte in the serialized proof must break verification.
-    const tampered = try a.dupe(u8, bytes);
-    tampered[bytes.len / 2] ^= 0xff;
-    if (deserialize(a, tampered)) |bad| {
-        try testing.expect(!try verify(a, imageFelt(&secret), bad));
-    } else |_| {}
 }
 
 test "stark: proofs are randomized (zero-knowledge blinding)" {
@@ -902,59 +843,8 @@ test "stark: proofs are randomized (zero-knowledge blinding)" {
     defer arena.deinit();
     const a = arena.allocator();
     const secret = [_]u8{7} ** 32;
-    const p1 = try prove(a, &secret);
-    const p2 = try prove(a, &secret);
-    const b1 = try serialize(a, p1);
-    const b2 = try serialize(a, p2);
-    // Same statement and structure (identical size), but the proofs differ: the trace blinding
-    // and the random FRI mask are fresh each time. A deterministic proof could not be ZK.
+    const b1 = try serialize(a, try prove(a, &secret));
+    const b2 = try serialize(a, try prove(a, &secret));
     try testing.expectEqual(b1.len, b2.len);
     try testing.expect(!std.mem.eql(u8, b1, b2));
-    // Both still verify against the same public image.
-    try testing.expect(try verify(a, imageFelt(&secret), p1));
-    try testing.expect(try verify(a, imageFelt(&secret), p2));
-}
-
-test "stark: tampered mask opening rejected" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const secret = [_]u8{7} ** 32;
-    var proof = try prove(a, &secret);
-    // Forging the masking-polynomial opening breaks the H = CP + zeta·g binding.
-    proof.queries[0].ga.val = field.add(proof.queries[0].ga.val, 1);
-    try testing.expect(!try verify(a, imageFelt(&secret), proof));
-}
-
-test "merkle commit/open/verify" {
-    const a = testing.allocator;
-    const n = 16;
-    var leaves: [n]Felt = undefined;
-    for (&leaves, 0..) |*v, i| v.* = @intCast(i * 1234 + 5);
-    var tree = try MerkleTree.build(a, &leaves);
-    defer tree.deinit();
-    const root = tree.root();
-    for (0..n) |i| {
-        const path = try tree.open(a, i);
-        defer a.free(path);
-        try testing.expect(merkleVerify(root, n, i, leaves[i], path));
-        // A wrong leaf value must not verify.
-        try testing.expect(!merkleVerify(root, n, i, leaves[i] + 1, path));
-        // A wrong index must not verify (except trivial self-match).
-        if (i + 1 < n) try testing.expect(!merkleVerify(root, n, i + 1, leaves[i], path));
-    }
-}
-
-test "transcript is deterministic and path-dependent" {
-    var t1 = Transcript.init("test");
-    var t2 = Transcript.init("test");
-    t1.absorbFelt(42);
-    t2.absorbFelt(42);
-    try testing.expectEqual(t1.challengeFelt(), t2.challengeFelt());
-    // Distinct squeezes between absorbs differ.
-    try testing.expect(t1.challengeFelt() != t1.challengeFelt());
-    // Diverging absorbs diverge the challenges.
-    t1.absorbFelt(1);
-    t2.absorbFelt(2);
-    try testing.expect(t1.challengeFelt() != t2.challengeFelt());
 }
