@@ -60,8 +60,10 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
    (`wrong_tx_binding_rejected`). 16/16 Rust tests.
 5. **Ownership** (recipient ↔ `nk`) and **position-consistency** (nullifier `pos` ↔ the path),
    reusing the persistent-column binding technique.
-6. **Balance** `in_value = out_value + fee` (+ `mint`/`burn`) and **range** (no field wraparound),
-   values hidden; bind `out_cm`.
+6. **Range** (no field wraparound): standalone AIR **done** (`range.rs`) — remainder-decomposition,
+   `value < 2^BITS`, in-range verifies / out-of-range rejected / handles `value=0`. **Balance**
+   `in = out + fee` (+ `mint`/`burn`) with `out_cm` binding and the range tied to the *hidden*
+   note/output values: remaining (integration into `spend.rs` via persistent value columns).
 7. Canonical proof serialization; the real `lattica_spend_verify` over `SpendPublicInputs`.
 8. Differential test the whole statement vs. the hand-rolled reference; production parameters +
    written soundness budget (Phase 5).

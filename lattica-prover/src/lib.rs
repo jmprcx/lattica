@@ -23,6 +23,7 @@ use winterfell::{
 };
 
 pub mod membership;
+pub mod range;
 pub mod spend;
 
 pub(crate) type Hf = Rp64_256;
