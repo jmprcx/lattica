@@ -14,7 +14,7 @@
 //! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip via a
 //! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
-use lattica_prover_p3::{full_spend_air, poseidon2_air, spend_air};
+use lattica_prover_p3::{full_spend_air, joinsplit_air, poseidon2_air, spend_air};
 
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
@@ -221,6 +221,19 @@ fn main() {
     println!(
         "  C-04 soundness: proven {} bits (UDR {}, LDR {}), conjectured FRI {} bits (capped ~127 by F_p2 / 128 collision)",
         s.proven_bits, s.proven_udr_bits, s.proven_ldr_bits, s.conjectured_fri_bits
+    );
+
+    // Join-split (N-in/M-out) — the audit-target shape, with soundness fixes A1/A2/A3.
+    let (jbytes, jprove, jverify, jproven) = joinsplit_air::measure(&joinsplit_air::demo_witness());
+    println!(
+        "  join-split {}-in/{}-out (DEPTH={}, ZK): proof {} bytes, prove {} ms, verify {} ms, proven {} bits",
+        joinsplit_air::N_IN,
+        joinsplit_air::M_OUT,
+        joinsplit_air::DEPTH,
+        jbytes,
+        jprove,
+        jverify,
+        jproven
     );
 }
 

@@ -107,16 +107,14 @@ calls, runs at **production parameters**, and carries a **machine-checked soundn
   Production (`DEPTH=32`): proof **~421 KB**, prove ~2.05 s, verify ~8 ms. 22 tests pass.
 
 **Remaining before production** (scope + threat model in `docs/audit-scope-p3.md`):
-- **Pre-audit circuit work:** A1 position-consistency (`pos` ↔ path), A2 domain separation across the
-  four hashes, A3 fee soundness, A4 nullifier-derivation argument; a **constraint-accounting
-  self-audit**.
-- **Transaction shape — decided (2026-06-26): generalize to join-split (N-in / M-out)** before audit,
-  so the audited circuit matches production shape (avoids a re-audit). Value balance becomes
-  `Σ in = Σ out + fee`; `N` nullifiers + `M` output commitments; likely an aggregate public-input
-  hash. Material redesign — see `docs/audit-scope-p3.md` §6.
+- ✅ **Pre-audit circuit work done:** the **join-split (N-in/M-out)** circuit `joinsplit_air` (fixed
+  2-in/2-out, `DEPTH=32`, ~444 KB / 8.3 s / 24 ms, proven 103-bit, 12/12) with the soundness fixes
+  baked in — A1 position-consistency, A2 domain separation, A3 fee+value range, A4 nullifier
+  argument. The 1-in/1-out `full_spend_air` stays as the reference.
 - **Protocol seam (C-03):** switch `tx.zig`/`primitives.zig` hashing to the exact in-circuit
-  Poseidon2-Goldilocks layouts (+ domain tags) with shared known-answer vectors; an end-to-end FFI
-  integration test (mint → prove → in-node verify → double-spend rejected).
+  Poseidon2-Goldilocks layouts (+ domain tags) with shared known-answer vectors; the join-split C ABI
+  + byte layout; an end-to-end FFI integration test (mint → prove → in-node verify → double-spend).
+- **Constraint-accounting self-audit**; variable `(N,M)` if the protocol needs it.
 - **M6** node cutover + `lattica_spend_prove`; then **Phase-3 external audit** (incl. a Poseidon2
   review).
 

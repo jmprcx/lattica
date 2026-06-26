@@ -130,10 +130,14 @@ counts below are historical, from the iteration that added each piece.)
 - Position-consistency (nullifier `pos` ↔ path); `mint`/`burn` issuance.
 
 **Pre-audit work (see `docs/audit-scope-p3.md` — scope, threat model, frozen params, readiness):**
-soundness gaps A1 position-consistency / A2 domain separation / A3 fee / A4 nullifier-derivation; the
-C-03 protocol↔circuit hash match + shared KATs + an end-to-end FFI test; a constraint-accounting
-self-audit; and the **join-split (N-in/M-out) generalization** (decided 2026-06-26) so the audited
-circuit matches production shape.
+- ✅ **Soundness gaps A1–A4 closed** in the new **join-split** circuit (`joinsplit_air`): A1
+  position-consistency (`pos = Σ bits·2^d` bound into the nullifier), A2 domain separation
+  (`DOM_OWN/DOM_CM/DOM_NF`), A3 fee+value range (all addends `< 2^BITS`, accumulator balance), A4
+  nullifier-derivation argument written.
+- ✅ **Join-split (N-in/M-out) landed** (decided 2026-06-26): `joinsplit_air`, fixed 2-in/2-out,
+  `DEPTH=32`, proof ~444 KB, prove ~8.3 s, verify ~24 ms, proven 103-bit, 12/12 tests (34 crate-wide).
+- ❌ **Remaining:** join-split C ABI + byte layout; C-03 protocol↔circuit hash match + shared KATs;
+  end-to-end FFI test; constraint-accounting self-audit; (variable `(N,M)` if needed).
 
 Then **Phase 3** (external audit of the circuit + protocol + FFI glue) gates value-bearing use; none
 of the audit's 8 release gates are met yet.

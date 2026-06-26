@@ -98,42 +98,72 @@ parameters and widens the public inputs accordingly; the freeze is re-confirmed 
 
 Tracked in detail in `docs/remediation-status.md`. The soundness-relevant ones:
 
-- **A1 — position-consistency.** `nf = H(nk, rho, pos)` uses `pos` as a *free* witness; it is **not**
-  yet tied to the membership path's position bits. Must constrain `pos` ↔ the proven path (or remove
-  `pos` from the nullifier) to prevent position/nullifier mismatch. **Open.**
-- **A2 — domain separation.** The four hashes share one permutation with zero-padding and **no
-  per-hash domain tag**; cross-context collisions are a theoretical attack. Add domain constants
-  (and mirror them on the protocol side). **Open.**
-- **A3 — fee soundness.** `fee` is a public input and is **not** range-checked in-circuit; decide
-  trusted-from-node vs constrain `fee < 2^BITS`. **Open.**
-- **A4 — nullifier-derivation argument.** A written analysis that `nf` derivation resists
-  faerie-gold / nullifier-collision attacks. **Open.**
-- **C-03 — protocol/circuit hash match.** `src/{tx,primitives}.zig` still hash with SHA3; the
-  on-chain `noteCommitment`/`nullifier`/Merkle **must** switch to the exact in-circuit
-  Poseidon2-Goldilocks layouts (incl. A2 domain tags), guarded by shared known-answer vectors.
-  **Open** (the seam is unaudited until matched).
-- Single-asset; no memo field; coinbase/mint/burn not yet modeled (§6).
+- **A1 — position-consistency. ✅ Closed** in the join-split circuit (`joinsplit_air`): `pos = Σ_d
+  bits_d·2^d` is accumulated from the membership path (a `pos_acc` column updated at each link with a
+  `2^d` coefficient) and bound into the nullifier input, so a note has exactly one nullifier tied to
+  its tree position. Validated natively (distinct positions ⇒ distinct nullifiers) and in-circuit
+  (the `pos_acc`→nullifier binding).
+- **A2 — domain separation. ✅ Closed**: ownership/commitment/nullifier carry distinct lane-0 tags
+  `DOM_OWN/DOM_CM/DOM_NF`; the Merkle merge is untagged but structurally separated (only ever a
+  2-to-1 over digests; the tree leaf is a `DOM_CM`-tagged commitment). See the A4 argument below.
+  Validated (same field input, different domain ⇒ different digest).
+- **A3 — fee soundness. ✅ Closed**: every input value, output value, **and the fee** are
+  range-checked (`< 2^BITS`, running-remainder) and the value balance is a global accumulator
+  `Σin − Σout − fee = 0`; all addends bounded ⇒ no field wraparound. Validated (out-of-range and
+  wrong-fee rejected).
+- **A4 — nullifier-derivation argument. ✅ Written** (see "A4 — nullifier-derivation" below).
+- **C-03 — protocol/circuit hash match. ❌ Open.** `src/{tx,primitives}.zig` still hash with SHA3;
+  the on-chain `noteCommitment`/`nullifier`/Merkle **must** switch to the exact in-circuit
+  Poseidon2-Goldilocks layouts (incl. the A2 domain tags), guarded by shared known-answer vectors.
+  The seam is unaudited until matched.
+- Single-asset; no memo field; coinbase/mint/burn not yet modeled.
 
-## 6. Audit target shape — **join-split (N-in / M-out)** *(decision: 2026-06-26)*
+### A4 — nullifier-derivation argument
+The nullifier is `nf = H(DOM_NF ‖ nk ‖ rho ‖ pos)` with `H` = Poseidon2-Goldilocks (vetted constants),
+modeled as a random oracle. Properties:
+- **Uniqueness / no double-spend.** `pos` is bound (A1) to the note's tree position and `rho` is the
+  note's per-note randomness; together with `nk` they fix a single `nf` per (note, position). A note
+  occupies one position, so it has exactly one nullifier — re-spending yields the same `nf`, caught by
+  the node's nullifier set.
+- **Binding / unforgeability.** Computing `nf` requires `nk` (the nullifier key, never revealed) and
+  the note opening; in the ROM, `nf` reveals nothing about `nk`/`rho` and cannot be produced without
+  them. Ownership binds `recipient = H(DOM_OWN ‖ nk)` into the spent commitment, so the same `nk`
+  that authorizes the spend derives the nullifier (no nullifier/authority split).
+- **No faerie-gold / cross-context collision.** Domain separation (A2) prevents an `nf` from
+  coinciding with a commitment, ownership digest, or Merkle node. `rho` must be unique per note
+  (a protocol-level invariant on note creation — flagged for the auditor as an assumption); given
+  that, `H`'s collision resistance gives distinct `nf` for distinct notes.
+- **Residual to audit:** the untagged merge (collision between a merge node and a data hash would
+  require a Poseidon2 preimage/collision — out of scope of the statement, in scope of the requested
+  Poseidon2 review), and the `rho`-uniqueness invariant on the note-creation side.
 
-The audited circuit will be generalized from the current 1-in/1-out spend to a **join-split**:
-- **N input notes**, each with ownership (`recipient = H(nk)`), commitment opening, membership under a
-  **shared `anchor`**, and a revealed **nullifier `nf_i`**.
-- **M output notes**, each a published commitment `out_cm_j` binding `out_value_j`.
-- **Value balance:** `Σ_i in_value_i = Σ_j out_value_j + fee`, with every `in_value_i`, `out_value_j`
-  range-checked (no wraparound).
-- **One `tx_binding`** for the whole transaction.
+## 6. Join-split (N-in / M-out) — **landed** *(decision 2026-06-26; built)*
 
-Open design questions to settle as part of the generalization (and to state for the auditor):
-- Fixed `(N, M)` vs a small set of supported shapes vs padded-variable; trace-height implications
-  (each input ≈ ownership+commitment+membership blocks; each output ≈ one block).
-- Public-input growth (`N` nullifiers + `M` output commitments + `anchor` + `fee` + `tx_binding`),
-  and whether to commit them via an **aggregate public-input hash** (keeps the public-input vector
-  bounded and dovetails with future per-block batching).
-- Per-input distinct `nk`/`rho` (the persistent-column binding becomes per-input, not global).
+`joinsplit_air` implements the audit-target shape (the 1-in/1-out `full_spend_air` is kept as the
+simpler reference):
+- **N input notes** (`N_IN`), each: ownership `recipient = H(DOM_OWN ‖ nk)`, commitment
+  `cm = H(DOM_CM ‖ recipient ‖ value ‖ rho ‖ rcm)`, general-position membership to a **shared public
+  `anchor`**, and a revealed nullifier `nf_i = H(DOM_NF ‖ nk ‖ rho ‖ pos)` (A1).
+- **M output notes** (`M_OUT`), each a published `out_cm_j` binding `out_value_j`.
+- **Value balance:** a global accumulator `Σ in − Σ out − fee = 0`, with every value + the fee
+  range-checked `< 2^BITS` (A3) ⇒ no wraparound.
+- **One `tx_binding`** bound by Fiat–Shamir.
+- Cross-region binding via local-persistent columns (`nk`/`rho`/`value`, constant within an input
+  span, freed at region boundaries).
 
-This is a material redesign; auditing 1-in/1-out and then redesigning would force a re-audit, so the
-generalization lands **before** the audit.
+**Parameters & numbers (current):** `N_IN=2, M_OUT=2, DEPTH=32, BITS=52`; production FRI params;
+proof ~**444 KB**, prove ~**8.3 s**, verify ~**24 ms**, **proven 103-bit**. Validated 12/12
+(valid; wrong anchor / nullifier / out_cm / fee; out-of-range; wrong tx_binding; native
+domain-separation / pos-from-bits / balance).
+
+**Design choices made:** fixed `(N, M)` as compile-time constants (2,2 now); per-instance public
+inputs `anchor ‖ N·nf ‖ M·out_cm ‖ fee ‖ tx_binding` with per-input/output one-hot bindings (not an
+aggregate hash — that is the future batching path); per-input distinct `nk`/`rho` via the
+local-persistent columns.
+
+**Remaining for the audited artifact:** (a) the join-split **C ABI + `SpendPublicInputs` byte layout**
+(the existing ABI is the 1-in/1-out shape — see §7); (b) variable/padded `(N, M)` if the protocol
+needs more than fixed 2-in/2-out; (c) the C-03 protocol-side hash match (§5).
 
 ## 7. Pre-audit readiness checklist
 
@@ -144,11 +174,12 @@ generalization lands **before** the audit.
 | Production parameters + proof-size tuning | ✅ |
 | Differential vs native Poseidon2 oracle | ✅ (per-region) |
 | Verifier ABI fail-closed tests | ✅ (basic) |
-| **A1 position-consistency** | ❌ |
-| **A2 domain separation** | ❌ |
-| **A3 fee soundness** | ❌ |
-| **A4 nullifier-derivation argument** | ❌ |
-| **B — join-split (N-in/M-out) generalization** | ❌ (decided; not built) |
+| **A1 position-consistency** | ✅ (join-split) |
+| **A2 domain separation** | ✅ (join-split) |
+| **A3 fee soundness** | ✅ (join-split) |
+| **A4 nullifier-derivation argument** | ✅ (§5) |
+| **B — join-split (N-in/M-out) circuit** | ✅ (`joinsplit_air`, fixed 2-in/2-out, 12/12) |
+| **Join-split C ABI + `SpendPublicInputs` byte layout** | ❌ (existing ABI is 1-in/1-out) |
 | **C-03 protocol↔circuit hash match + shared KATs** | ❌ |
 | **End-to-end FFI integration test** (Zig: mint→prove→verify→double-spend) | ❌ |
 | **Constraint-accounting self-audit** (every column/constraint, no vacuous binding) | ❌ |

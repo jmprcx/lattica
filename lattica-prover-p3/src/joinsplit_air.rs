@@ -34,7 +34,8 @@ use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilo
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, StarkConfig};
+use p3_air::symbolic::AirLayout;
+use p3_uni_stark::{prove, verify, Proof, ProvenSecurity, StarkConfig, StarkSecurityParams};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
@@ -672,6 +673,90 @@ pub fn prove_verify(w: &Witness) -> Result<(), String> {
     prove_verify_with(w, &public_values(w))
 }
 
+/// Number of public-input field elements: `anchor ‖ N·nf ‖ M·out_cm ‖ fee ‖ tx_binding`.
+pub const NUM_PUBLIC_INPUTS: usize = N_PUBLIC;
+
+/// Prove a join-split and return canonical (postcard) proof bytes.
+pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {
+    let config = make_config(1);
+    let trace = build_trace(w);
+    let proof = prove(&config, &JoinSplitAir, trace, &public_values(w));
+    postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+}
+
+/// Verify canonical proof bytes against public inputs. **Fail-closed** on any error.
+pub fn verify_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
+    if pis.len() != N_PUBLIC {
+        return false;
+    }
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(1), &JoinSplitAir, &proof, pis).is_ok()
+}
+
+/// A representative valid join-split witness (2 inputs at tree positions 0,1; balanced).
+pub fn demo_witness() -> Witness {
+    let in_values = [1000u64, 500];
+    let cms: Vec<[Val; DIGEST]> = (0..N_IN)
+        .map(|i| {
+            commit(
+                recipient_of(Val::from_u64(7 + i as u64)),
+                Val::from_u64(in_values[i]),
+                Val::from_u64(11 + i as u64),
+                Val::from_u64(100 + i as u64),
+            )
+        })
+        .collect();
+    let (_, paths) = build_paths(&cms);
+    let inputs = core::array::from_fn(|i| Input {
+        nk: 7 + i as u64,
+        value: in_values[i],
+        rho: Val::from_u64(11 + i as u64),
+        rcm: Val::from_u64(100 + i as u64),
+        sib: paths[i].0,
+        bits: paths[i].1,
+    });
+    let outputs = core::array::from_fn(|j| Output {
+        recipient: recipient_of(Val::from_u64(77 + j as u64)),
+        value: [900u64, 500][j],
+        rho: Val::from_u64(21 + j as u64),
+        rcm: Val::from_u64(22 + j as u64),
+    });
+    Witness { inputs, outputs, fee: 100, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+}
+
+/// (proof bytes, prove ms, verify ms, proven security bits) for a representative join-split.
+pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
+    let config = make_config(1);
+    let trace = build_trace(w);
+    let pis = public_values(w);
+    let t0 = std::time::Instant::now();
+    let proof = prove(&config, &JoinSplitAir, trace, &pis);
+    let prove_ms = t0.elapsed().as_millis();
+    let bytes = postcard::to_allocvec(&proof).unwrap();
+    let t1 = std::time::Instant::now();
+    assert!(verify(&config, &JoinSplitAir, &proof, &pis).is_ok());
+    let verify_ms = t1.elapsed().as_millis();
+    // proven security at this trace height
+    let perm = default_goldilocks_poseidon2_8();
+    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, SmallRng::seed_from_u64(1));
+    let fri = FriParameters {
+        log_blowup: 4,
+        log_final_poly_len: 0,
+        max_log_arity: 4,
+        num_queries: 96,
+        commit_proof_of_work_bits: 0,
+        query_proof_of_work_bits: 16,
+        mmcs: ChallengeMmcs::new(vm),
+    };
+    let layout = AirLayout::from_air::<Goldilocks>(&JoinSplitAir);
+    let params = StarkSecurityParams::from_air::<Val, Challenge, JoinSplitAir, ChallengeMmcs>(&fri, &JoinSplitAir, layout, 127, 128, 2);
+    let proven = ProvenSecurity::compute(&params, 1usize << (HEIGHT.trailing_zeros() as usize + 1)).security_bits();
+    (bytes.len(), prove_ms, verify_ms, proven)
+}
+
 /// Prove with the witness's real public inputs, verify against `verify_pis` (tests FS binding).
 #[allow(dead_code)]
 pub fn prove_real_verify_with(w: &Witness, verify_pis: &[Val]) -> Result<(), String> {
@@ -684,7 +769,6 @@ pub fn prove_real_verify_with(w: &Witness, verify_pis: &[Val]) -> Result<(), Str
 
 // --- sparse Merkle test helper: N leaves at positions 0..N (leftmost), shared anchor -----------
 
-#[cfg(test)]
 pub(crate) fn empty_hashes() -> [[Val; DIGEST]; DEPTH] {
     let mut e = [[Val::ZERO; DIGEST]; DEPTH];
     for d in 1..DEPTH {
@@ -695,7 +779,6 @@ pub(crate) fn empty_hashes() -> [[Val; DIGEST]; DEPTH] {
 
 /// Build a tree holding `leaves` at positions 0..leaves.len() (a power of two) in the leftmost
 /// subtree, the rest empty. Returns the anchor and each leaf's (sib, bits) authentication path.
-#[cfg(test)]
 pub(crate) fn build_paths(
     leaves: &[[Val; DIGEST]],
 ) -> ([Val; DIGEST], Vec<([[Val; DIGEST]; DEPTH], [bool; DEPTH])>) {
