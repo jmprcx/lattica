@@ -425,7 +425,6 @@ mod tests {
         use crate::spend::{self, Note, DEPTH, DIGEST};
 
         let note = Note {
-            recipient: BaseElement::new(0xABCD),
             value: BaseElement::new(1000),
             rho: BaseElement::new(0x1111_2222),
             rcm: BaseElement::new(0x3333_4444),

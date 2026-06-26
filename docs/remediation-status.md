@@ -42,16 +42,18 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
   `Rp64_256::merge`; the AIR trace root equals the native fold; valid-verifies; wrong-root and
   tampered-path rejected. **The heart of C-02.**
 - **Spend AIR** (`spend.rs`): one proof for public `(root, nf, out_cm, tx_binding, fee)` proving
-  (1) `cm = H(recipient, value, rho, rcm)`, (2) `cm` folds up a general-position path to `root`,
-  (3) `nf = H(nk, rho, pos)`, (4) `out_cm = H(out_recipient, out_value, out_rho, out_rcm)`,
-  (5) **value-balance** `value = out_value + fee`, (6) **range** (`value`/`out_value < 2^BITS`, via
-  parallel `rem` columns), (7) **tx-binding** — with the **same `rho`** in (1) and (3). Cross-region
-  binding via **persistent columns** (`rho`, `value`, `out_value`); no auxiliary grand-product
-  segment. Per-boundary periodic selectors gate round / merge-link / nullifier-load / output-load /
-  row-0 / range. Validated: `cm`/`nf`/`out_cm` equal `Rp64_256::hash_elements`; AIR `root`/`nf`/
-  `out_cm` equal the native oracles; valid-verifies; wrong-root, wrong-nf, wrong-out_cm,
-  tampered-opening, **inconsistent-`rho`**, **unbalanced**, **out-of-range**, and **wrong-tx-binding**
-  all rejected. **C-01/C-02/C-03 core + value-balance + range.**
+  (0) **ownership** `recipient = H(nk)[0]`, (1) `cm = H(recipient, value, rho, rcm)`, (2) `cm` folds
+  up a general-position path to `root`, (3) `nf = H(nk, rho, pos)`, (4) `out_cm =
+  H(out_recipient, out_value, out_rho, out_rcm)`, (5) **value-balance** `value = out_value + fee`,
+  (6) **range** (`value`/`out_value < 2^BITS`), (7) **tx-binding** — with the **same `rho`** in
+  (1)/(3) and the **same `nk`** in (0)/(3). Cross-region binding via **persistent columns**
+  (`rho`, `value`, `out_value`, `nk`); `recipient` flows ownership→commitment by adjacency; no
+  auxiliary grand-product segment. Per-boundary periodic selectors gate round / commit-load /
+  merge-link / nullifier-load / output-load / row-0 / range. Validated: `recipient`/`cm`/`nf`/
+  `out_cm` equal the native hashes; AIR `root`/`nf`/`out_cm` equal the native oracles;
+  valid-verifies; wrong-root, wrong-nf, wrong-out_cm, tampered-opening, **inconsistent-`rho`**,
+  **wrong-`nk`** (ownership), **unbalanced**, **out-of-range**, and **wrong-tx-binding** all
+  rejected. **C-01/C-02/C-03 core + ownership + value-balance + range.**
 - `lattica_spend_verify` C ABI is **real** (lib.rs): parses the `SpendPublicInputs` byte layout
   from `src/ffi.zig` (canonical field-element + length checks), deserializes the Winterfell proof,
   and calls `verify_spend` — fail-closed on any parse error. Round-trip tested (accept / tampered-
@@ -65,8 +67,10 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
 4. ~~Bind the public **tx-binding** digest.~~ **Done** (`spend.rs`): `tx_binding` is a public input
    absorbed into the Fiat-Shamir transcript; a proof for one tx fails against another
    (`wrong_tx_binding_rejected`). 16/16 Rust tests.
-5. **Ownership** (recipient ↔ `nk`) and **position-consistency** (nullifier `pos` ↔ the path),
-   reusing the persistent-column binding technique.
+5. ~~**Ownership** (recipient ↔ `nk`).~~ **Done** (`spend.rs`): ownership block `recipient =
+   H(nk)[0]`, with the same `nk` driving the nullifier (`wrong_nk_breaks_membership`). Demo-strength
+   (1-element recipient; production = full 4-element digest). **Position-consistency** (nullifier
+   `pos` ↔ the membership path) remains.
 6. ~~**Balance** `value = out_value + fee` with `out_cm` binding + **range** (no wraparound).~~
    **Done** (`spend.rs`): output-commitment region + value-conservation (`fee` a given public
    input, `unbalanced_rejected`) + two parallel `rem` columns carrying the range decompositions of
