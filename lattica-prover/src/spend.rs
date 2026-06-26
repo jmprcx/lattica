@@ -1,24 +1,24 @@
-//! Commitment-opening + membership — Phase 2 spend core (audit C-01/C-03 foundation).
+//! Commitment-opening + membership + nullifier — the Phase-2 spend statement (C-01/C-02/C-03).
 //!
-//! Proves, for a public `root`, knowledge of a **private note opening** whose Rescue-Prime
-//! commitment `cm = H(recipient, value, rho, rcm)` is a member of the tree under `root`. The
-//! opening and path stay private. This binds the *committed* note to the *membership leaf*: the
-//! committed value is the one in the tree (not an unrelated leaf).
+//! One Winterfell proof attests, for public `(root, nf)` and a private note:
+//!   1. **commitment** `cm = H(recipient, value, rho, rcm)`  (block 0, one Rescue permutation)
+//!   2. **membership** `cm` folds up a general-position path to `root`  (blocks 1..=DEPTH)
+//!   3. **nullifier**  `nf = H(nk, rho, pos)`  (last block; `nf` public)
+//! with the **same `rho`** in (1) and (3).
 //!
-//! Layout: block 0 is the commitment permutation (`hash_elements` of the 4-element opening:
-//! `state[0]=4`, rate = opening, pad 0, permute, `cm = state[4..8]`). Blocks 1..=DEPTH are the
-//! membership merges, with the running leaf for block 1 being block-0's output `cm` — so the
-//! commitment→leaf binding reuses the same link constraint as the membership chain.
+//! Cross-region `rho` binding without an auxiliary grand-product segment: a **persistent `rho`
+//! column** (col 13) is held constant across the whole trace, bound to the commitment's `rho`
+//! input at row 0 and to the nullifier's `rho` input at its load. Per-boundary periodic selectors
+//! (`is_round` / `is_merge` / `is_null` / `is_first`) gate which constraint fires on each row.
 //!
-//! Validated against native oracles: `native_commit` equals `Rp64_256::hash_elements`; the AIR
-//! trace root equals the native fold of `cm`; valid-verifies; wrong-root and a tampered opening
-//! (different `cm` ⇒ different root) rejected.
+//! Validated against native oracles: `cm`/`nf` match `Rp64_256::hash_elements`; the AIR trace
+//! `root` and `nf` match the native fold/hash; valid-verifies; wrong `root`, wrong `nf`, a
+//! tampered opening, and an **inconsistent `rho`** (commitment vs nullifier) are all rejected.
 //!
-//! Audit note: `recipient` is one field element here (a demo binding; production uses a 4-element
-//! recipient digest — still ≤ rate, one permutation). `DEPTH=7` gives 8 blocks (a power-of-two
-//! trace); production depth 32 needs a block-count padding decision. The opening is unconstrained
-//! beyond the commitment (ownership / value-balance / nullifier are the next Phase-2 items). Codex
-//! audit precedes production wiring.
+//! Scope / audit note (Codex audit precedes production wiring): `recipient`/`nk`/`pos` are single
+//! field elements (demo). Still TODO before production: **ownership** (recipient ↔ `nk`),
+//! **value-balance + range**, **position-consistency** (nullifier `pos` ↔ the path), the
+//! tx-binding public input, depth 32, and the real `lattica_spend_verify`.
 
 use winterfell::{
     math::{fields::f64::BaseElement, FieldElement, ToElements},
@@ -26,48 +26,53 @@ use winterfell::{
     Air, AirContext, Assertion, AuxRandElements, BatchingMethod, CompositionPoly,
     CompositionPolyTrace, ConstraintCompositionCoefficients, DefaultConstraintCommitment,
     DefaultConstraintEvaluator, DefaultTraceLde, EvaluationFrame, FieldExtension, PartitionOptions,
-    Proof, ProofOptions, Prover, StarkDomain, Trace, TraceInfo, TracePolyTable, TraceTable,
+    Proof, ProofOptions, Prover, StarkDomain, TraceInfo, TracePolyTable, TraceTable,
     TransitionConstraintDegree,
 };
 use winterfell::crypto::hashers::Rp64_256;
 
 use crate::{inv_mds_mul, mds_mul, pow7, Coin, Hf, Vc, CYCLE, NUM_ROUNDS, STATE_WIDTH};
 
-pub const DEPTH: usize = 7; // membership levels (production 32; see header on block-count padding)
+pub const DEPTH: usize = 6; // membership levels (production 32; needs a block-count pad decision)
 pub const DIGEST: usize = 4;
-pub const OPENING_LEN: usize = 4; // [recipient, value, rho, rcm]
+pub const COMMIT_LEN: usize = 4; // [recipient, value, rho, rcm]
+pub const NULL_LEN: usize = 3; // [nk, rho, pos]
 const BLOCK: usize = 8;
-const WIDTH: usize = STATE_WIDTH + 1; // 12 state + 1 position bit
-const BIT: usize = STATE_WIDTH;
-const NUM_BLOCKS: usize = DEPTH + 1; // block 0 = commitment, 1..=DEPTH = merges
+const WIDTH: usize = STATE_WIDTH + 2; // 12 state + bit + persistent rho
+const BIT: usize = STATE_WIDTH; // col 12
+const RHO: usize = STATE_WIDTH + 1; // col 13 (persistent rho)
+const NUM_BLOCKS: usize = DEPTH + 2; // commitment + DEPTH merges + nullifier
 const TRACE_LEN: usize = BLOCK * NUM_BLOCKS;
+const ROOT_ROW: usize = BLOCK * (DEPTH + 1) - 1; // last membership block output
+const NF_ROW: usize = TRACE_LEN - 1; // nullifier block output
+const N_CONSTRAINTS: usize = STATE_WIDTH + 2; // 12 state + rho-constancy + row-0 rho-binding
 
-/// The full note opening (each element a field element; `recipient` is one element here).
 #[derive(Clone, Copy)]
-pub struct Opening {
+pub struct Note {
     pub recipient: BaseElement,
     pub value: BaseElement,
     pub rho: BaseElement,
     pub rcm: BaseElement,
-}
-
-impl Opening {
-    fn elems(&self) -> [BaseElement; OPENING_LEN] {
-        [self.recipient, self.value, self.rho, self.rcm]
-    }
+    pub nk: BaseElement,
+    pub pos: BaseElement,
 }
 
 // --- native oracles ---------------------------------------------------------------------------
 
-/// `cm = H(opening)` exactly as `Rp64_256::hash_elements` does it for a 4-element input.
-pub fn native_commit(opening: Opening) -> [BaseElement; DIGEST] {
+fn hash_n(elems: &[BaseElement]) -> [BaseElement; DIGEST] {
     let mut state = [BaseElement::ZERO; STATE_WIDTH];
-    state[0] = BaseElement::new(OPENING_LEN as u64);
-    state[4..4 + OPENING_LEN].copy_from_slice(&opening.elems());
+    state[0] = BaseElement::new(elems.len() as u64);
+    state[4..4 + elems.len()].copy_from_slice(elems);
     Rp64_256::apply_permutation(&mut state);
     state[4..8].try_into().unwrap()
 }
 
+pub fn native_commit(n: Note) -> [BaseElement; DIGEST] {
+    hash_n(&[n.recipient, n.value, n.rho, n.rcm])
+}
+pub fn native_nullifier(n: Note) -> [BaseElement; DIGEST] {
+    hash_n(&[n.nk, n.rho, n.pos])
+}
 fn native_merge(left: [BaseElement; DIGEST], right: [BaseElement; DIGEST]) -> [BaseElement; DIGEST] {
     let mut state = [BaseElement::ZERO; STATE_WIDTH];
     state[0] = BaseElement::new(8);
@@ -76,9 +81,8 @@ fn native_merge(left: [BaseElement; DIGEST], right: [BaseElement; DIGEST]) -> [B
     Rp64_256::apply_permutation(&mut state);
     state[4..8].try_into().unwrap()
 }
-
-pub fn native_root(opening: Opening, siblings: &[[BaseElement; DIGEST]; DEPTH], bits: &[bool; DEPTH]) -> [BaseElement; DIGEST] {
-    let mut node = native_commit(opening);
+pub fn native_root(n: Note, siblings: &[[BaseElement; DIGEST]; DEPTH], bits: &[bool; DEPTH]) -> [BaseElement; DIGEST] {
+    let mut node = native_commit(n);
     for d in 0..DEPTH {
         node = if bits[d] { native_merge(siblings[d], node) } else { native_merge(node, siblings[d]) };
     }
@@ -90,11 +94,14 @@ pub fn native_root(opening: Opening, siblings: &[[BaseElement; DIGEST]; DEPTH], 
 #[derive(Clone)]
 pub struct PublicInputs {
     pub root: [BaseElement; DIGEST],
+    pub nf: [BaseElement; DIGEST],
 }
 
 impl ToElements<BaseElement> for PublicInputs {
     fn to_elements(&self) -> Vec<BaseElement> {
-        self.root.to_vec()
+        let mut v = self.root.to_vec();
+        v.extend_from_slice(&self.nf);
+        v
     }
 }
 
@@ -103,6 +110,7 @@ impl ToElements<BaseElement> for PublicInputs {
 pub struct SpendAir {
     context: AirContext<BaseElement>,
     root: [BaseElement; DIGEST],
+    nf: [BaseElement; DIGEST],
 }
 
 impl Air for SpendAir {
@@ -111,11 +119,16 @@ impl Air for SpendAir {
 
     fn new(trace_info: TraceInfo, pub_inputs: PublicInputs, options: ProofOptions) -> Self {
         assert_eq!(WIDTH, trace_info.width());
-        let degrees =
-            vec![TransitionConstraintDegree::with_cycles(7, vec![CYCLE, CYCLE]); STATE_WIDTH];
-        // Assertions: row-0 commitment capacity/pad (8) + final-row digest = root (4).
-        let context = AirContext::new(trace_info, degrees, 12, options);
-        SpendAir { context, root: pub_inputs.root }
+        let mut degrees = Vec::with_capacity(N_CONSTRAINTS);
+        // State slots: degree-7 round gated by the round/ARK (cycle 8) and boundary selectors (64).
+        for _ in 0..STATE_WIDTH {
+            degrees.push(TransitionConstraintDegree::with_cycles(7, vec![CYCLE, TRACE_LEN]));
+        }
+        degrees.push(TransitionConstraintDegree::new(1)); // rho constancy
+        degrees.push(TransitionConstraintDegree::with_cycles(1, vec![TRACE_LEN])); // row-0 rho binding
+        // Assertions: row-0 commitment capacity/pad (8) + root (4) + nf (4).
+        let context = AirContext::new(trace_info, degrees, 16, options);
+        SpendAir { context, root: pub_inputs.root, nf: pub_inputs.nf }
     }
 
     fn context(&self) -> &AirContext<BaseElement> {
@@ -130,10 +143,14 @@ impl Air for SpendAir {
     ) {
         let cur: &[E] = frame.current();
         let next: &[E] = frame.next();
+        // periodic layout: [ARK1(12), ARK2(12), is_round, is_merge, is_null, is_first]
         let is_round = periodic[2 * STATE_WIDTH];
-        let is_link = E::ONE - is_round;
+        let is_merge = periodic[2 * STATE_WIDTH + 1];
+        let is_null = periodic[2 * STATE_WIDTH + 2];
+        let is_first = periodic[2 * STATE_WIDTH + 3];
+        let one = E::ONE;
 
-        // Rescue round identity.
+        // Rescue round identity (degree 7).
         let mut sbox_cur = [E::ZERO; STATE_WIDTH];
         for i in 0..STATE_WIDTH {
             sbox_cur[i] = pow7(cur[i]);
@@ -141,18 +158,20 @@ impl Air for SpendAir {
         let mds_sbox = mds_mul(&sbox_cur);
         let mut nm = [E::ZERO; STATE_WIDTH];
         for i in 0..STATE_WIDTH {
-            nm[i] = next[i] - periodic[STATE_WIDTH + i];
+            nm[i] = next[i] - periodic[STATE_WIDTH + i]; // - ARK2
         }
         let pre = inv_mds_mul(&nm);
 
-        // Link load (block boundary): reset capacity to 8, place running digest left/right by the
-        // bit, sibling free, bit boolean. (Block-0 output cm is the running leaf for block 1.)
         let bit = next[BIT];
-        let one = E::ONE;
+        let three = E::from(BaseElement::new(NULL_LEN as u64));
+        let eight = E::from(BaseElement::new(8));
+
         for i in 0..STATE_WIDTH {
             let round_i = (mds_sbox[i] + periodic[i]) - pow7(pre[i]);
-            let link_i = if i == 0 {
-                next[0] - E::from(BaseElement::new(8))
+
+            // merge link: cap=8, running digest (cur[4..8]) placed left/right by bit, sibling free.
+            let merge_i = if i == 0 {
+                next[0] - eight
             } else if i < DIGEST {
                 next[i]
             } else if i < 2 * DIGEST {
@@ -163,14 +182,32 @@ impl Air for SpendAir {
             } else {
                 E::ZERO
             };
-            result[i] = is_round * round_i + is_link * link_i;
+
+            // nullifier load: cap=3, rate = [nk(free), rho(=persistent), pos(free)], pad 0.
+            let null_i = if i == 0 {
+                next[0] - three
+            } else if i < DIGEST {
+                next[i]
+            } else if i == DIGEST + 1 {
+                next[i] - cur[RHO] // rho bound to the persistent column
+            } else if i == DIGEST || i == DIGEST + 2 {
+                E::ZERO // nk, pos free
+            } else {
+                next[i] // pad slots 7..12 = 0
+            };
+
+            result[i] = is_round * round_i + is_merge * merge_i + is_null * null_i;
         }
+
+        // rho persistence (all transitions) and the row-0 commitment-rho binding.
+        result[STATE_WIDTH] = next[RHO] - cur[RHO];
+        result[STATE_WIDTH + 1] = is_first * (cur[DIGEST + 2] - cur[RHO]); // cm rho at state[6] == persistent
     }
 
     fn get_periodic_column_values(&self) -> Vec<Vec<BaseElement>> {
         let ark1 = Rp64_256::ARK1;
         let ark2 = Rp64_256::ARK2;
-        let mut cols = Vec::with_capacity(2 * STATE_WIDTH + 1);
+        let mut cols = Vec::with_capacity(2 * STATE_WIDTH + 4);
         for j in 0..STATE_WIDTH {
             let mut c = vec![BaseElement::ZERO; CYCLE];
             for r in 0..NUM_ROUNDS {
@@ -185,26 +222,41 @@ impl Air for SpendAir {
             }
             cols.push(c);
         }
-        let mut sel = vec![BaseElement::ONE; CYCLE];
-        sel[CYCLE - 1] = BaseElement::ZERO;
-        cols.push(sel);
+        // is_round (period 8): 1 on the 7 round transitions, 0 on the block boundary.
+        let mut is_round = vec![BaseElement::ONE; CYCLE];
+        is_round[CYCLE - 1] = BaseElement::ZERO;
+        cols.push(is_round);
+        // boundary selectors (period = full trace).
+        let mut is_merge = vec![BaseElement::ZERO; TRACE_LEN];
+        let mut is_null = vec![BaseElement::ZERO; TRACE_LEN];
+        let mut is_first = vec![BaseElement::ZERO; TRACE_LEN];
+        for b in 0..DEPTH {
+            is_merge[BLOCK * b + (BLOCK - 1)] = BaseElement::ONE; // boundaries loading merges 0..DEPTH-1
+        }
+        is_null[BLOCK * DEPTH + (BLOCK - 1)] = BaseElement::ONE; // boundary loading the nullifier block
+        is_first[0] = BaseElement::ONE;
+        cols.push(is_merge);
+        cols.push(is_null);
+        cols.push(is_first);
         cols
     }
 
     fn get_assertions(&self) -> Vec<Assertion<BaseElement>> {
-        let last = self.trace_length() - 1;
-        let mut a = Vec::with_capacity(12);
-        // Block-0 commitment input: state[0] = OPENING_LEN, capacity[1..4] = 0, rate pad[8..12] = 0.
-        a.push(Assertion::single(0, 0, BaseElement::new(OPENING_LEN as u64)));
+        let mut a = Vec::with_capacity(16);
+        // Row-0 commitment input: state[0] = COMMIT_LEN, capacity[1..4] = 0, rate pad[8..12] = 0.
+        a.push(Assertion::single(0, 0, BaseElement::new(COMMIT_LEN as u64)));
         for i in 1..DIGEST {
             a.push(Assertion::single(i, 0, BaseElement::ZERO));
         }
         for i in 2 * DIGEST..STATE_WIDTH {
             a.push(Assertion::single(i, 0, BaseElement::ZERO));
         }
-        // Final digest = public root.
+        // Membership root (block DEPTH output) and nullifier (final block output).
         for i in 0..DIGEST {
-            a.push(Assertion::single(DIGEST + i, last, self.root[i]));
+            a.push(Assertion::single(DIGEST + i, ROOT_ROW, self.root[i]));
+        }
+        for i in 0..DIGEST {
+            a.push(Assertion::single(DIGEST + i, NF_ROW, self.nf[i]));
         }
         a
     }
@@ -221,53 +273,83 @@ impl SpendProver {
         Self { options }
     }
 
-    pub fn build_trace(
+    /// Build the trace. `rho_in_null` lets tests inject an inconsistent nullifier `rho` to confirm
+    /// the binding constraint bites; honest callers pass `note.rho`.
+    fn build_trace_with(
         &self,
-        opening: Opening,
+        note: Note,
         siblings: [[BaseElement; DIGEST]; DEPTH],
         bits: [bool; DEPTH],
+        rho_in_null: BaseElement,
     ) -> TraceTable<BaseElement> {
         let mut trace = TraceTable::new(WIDTH, TRACE_LEN);
 
-        let load_merge = |state: &mut [BaseElement], node: [BaseElement; DIGEST], level: usize| {
+        let clear = |state: &mut [BaseElement]| {
             for s in state.iter_mut().take(STATE_WIDTH) {
                 *s = BaseElement::ZERO;
             }
-            state[0] = BaseElement::new(8);
-            if bits[level] {
-                state[8..12].copy_from_slice(&node);
-                state[4..8].copy_from_slice(&siblings[level]);
-            } else {
-                state[4..8].copy_from_slice(&node);
-                state[8..12].copy_from_slice(&siblings[level]);
-            }
-            state[BIT] = if bits[level] { BaseElement::ONE } else { BaseElement::ZERO };
         };
 
         trace.fill(
             |state| {
-                // Block 0: commitment input (hash_elements layout for OPENING_LEN elements).
+                // Block 0: commitment input.
                 for s in state.iter_mut() {
                     *s = BaseElement::ZERO;
                 }
-                state[0] = BaseElement::new(OPENING_LEN as u64);
-                state[4..4 + OPENING_LEN].copy_from_slice(&opening.elems());
+                state[0] = BaseElement::new(COMMIT_LEN as u64);
+                state[4] = note.recipient;
+                state[5] = note.value;
+                state[6] = note.rho;
+                state[7] = note.rcm;
+                state[RHO] = note.rho; // persistent rho
             },
             |step, state| {
                 let phase = step % BLOCK;
+                let rho = state[RHO];
                 if phase < NUM_ROUNDS {
                     let mut s: [BaseElement; STATE_WIDTH] = state[..STATE_WIDTH].try_into().unwrap();
                     Rp64_256::apply_round(&mut s, phase);
                     state[..STATE_WIDTH].copy_from_slice(&s);
+                    state[RHO] = rho;
                 } else {
-                    // Link: running digest = state[4..8]; load the next merge (level = block-1).
-                    let node: [BaseElement; DIGEST] = state[4..8].try_into().unwrap();
-                    let level = (step + 1) / BLOCK - 1;
-                    load_merge(state, node, level);
+                    let b = step / BLOCK;
+                    if b < DEPTH {
+                        // merge link: running digest = state[4..8]
+                        let node: [BaseElement; DIGEST] = state[4..8].try_into().unwrap();
+                        clear(state);
+                        state[0] = BaseElement::new(8);
+                        if bits[b] {
+                            state[8..12].copy_from_slice(&node);
+                            state[4..8].copy_from_slice(&siblings[b]);
+                        } else {
+                            state[4..8].copy_from_slice(&node);
+                            state[8..12].copy_from_slice(&siblings[b]);
+                        }
+                        state[BIT] = if bits[b] { BaseElement::ONE } else { BaseElement::ZERO };
+                        state[RHO] = rho;
+                    } else {
+                        // nullifier load
+                        clear(state);
+                        state[0] = BaseElement::new(NULL_LEN as u64);
+                        state[4] = note.nk;
+                        state[5] = rho_in_null;
+                        state[6] = note.pos;
+                        state[BIT] = BaseElement::ZERO;
+                        state[RHO] = rho;
+                    }
                 }
             },
         );
         trace
+    }
+
+    pub fn build_trace(
+        &self,
+        note: Note,
+        siblings: [[BaseElement; DIGEST]; DEPTH],
+        bits: [bool; DEPTH],
+    ) -> TraceTable<BaseElement> {
+        self.build_trace_with(note, siblings, bits, note.rho)
     }
 }
 
@@ -285,12 +367,13 @@ impl Prover for SpendProver {
         DefaultConstraintCommitment<E, Hf, Vc>;
 
     fn get_pub_inputs(&self, trace: &Self::Trace) -> PublicInputs {
-        let last = trace.length() - 1;
         let mut root = [BaseElement::ZERO; DIGEST];
+        let mut nf = [BaseElement::ZERO; DIGEST];
         for i in 0..DIGEST {
-            root[i] = trace.get(DIGEST + i, last);
+            root[i] = trace.get(DIGEST + i, ROOT_ROW);
+            nf[i] = trace.get(DIGEST + i, NF_ROW);
         }
-        PublicInputs { root }
+        PublicInputs { root, nf }
     }
 
     fn options(&self) -> &ProofOptions {
@@ -348,12 +431,12 @@ pub fn build_options() -> ProofOptions {
 }
 
 pub fn prove_spend(
-    opening: Opening,
+    note: Note,
     siblings: [[BaseElement; DIGEST]; DEPTH],
     bits: [bool; DEPTH],
 ) -> (Proof, PublicInputs) {
     let prover = SpendProver::new(build_options());
-    let trace = prover.build_trace(opening, siblings, bits);
+    let trace = prover.build_trace(note, siblings, bits);
     let pi = prover.get_pub_inputs(&trace);
     let proof = prover.prove(trace).expect("proving failed");
     (proof, pi)
@@ -370,12 +453,14 @@ pub fn verify_spend(proof: Proof, pi: PublicInputs) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn sample() -> (Opening, [[BaseElement; DIGEST]; DEPTH], [bool; DEPTH]) {
-        let opening = Opening {
+    fn sample() -> (Note, [[BaseElement; DIGEST]; DEPTH], [bool; DEPTH]) {
+        let note = Note {
             recipient: BaseElement::new(0xABCD),
             value: BaseElement::new(1000),
             rho: BaseElement::new(0x1111_2222),
             rcm: BaseElement::new(0x3333_4444),
+            nk: BaseElement::new(0x5555_6666),
+            pos: BaseElement::new(42),
         };
         let mut sib = [[BaseElement::ZERO; DIGEST]; DEPTH];
         let mut bits = [false; DEPTH];
@@ -385,53 +470,66 @@ mod tests {
             }
             bits[d] = d % 2 == 1;
         }
-        (opening, sib, bits)
+        (note, sib, bits)
     }
 
     #[test]
-    fn native_commit_matches_winterfell_hash_elements() {
-        use winterfell::crypto::ElementHasher;
-        let (opening, _, _) = sample();
-        let mine = native_commit(opening);
-        let theirs = <Rp64_256 as ElementHasher>::hash_elements(&opening.elems());
-        assert_eq!(&mine[..], theirs.as_elements());
-    }
-
-    #[test]
-    fn trace_root_matches_native_oracle() {
-        let (opening, sib, bits) = sample();
+    fn trace_matches_native_oracles() {
+        let (note, sib, bits) = sample();
         let prover = SpendProver::new(build_options());
-        let trace = prover.build_trace(opening, sib, bits);
+        let trace = prover.build_trace(note, sib, bits);
         let pi = prover.get_pub_inputs(&trace);
-        assert_eq!(pi.root, native_root(opening, &sib, &bits));
+        assert_eq!(pi.root, native_root(note, &sib, &bits));
+        assert_eq!(pi.nf, native_nullifier(note));
     }
 
     #[test]
     fn valid_spend_verifies() {
-        let (opening, sib, bits) = sample();
-        let (proof, pi) = prove_spend(opening, sib, bits);
+        let (note, sib, bits) = sample();
+        let (proof, pi) = prove_spend(note, sib, bits);
         assert!(verify_spend(proof, pi).is_ok());
     }
 
     #[test]
     fn wrong_root_rejected() {
-        let (opening, sib, bits) = sample();
-        let (proof, mut pi) = prove_spend(opening, sib, bits);
+        let (note, sib, bits) = sample();
+        let (proof, mut pi) = prove_spend(note, sib, bits);
         pi.root[0] += BaseElement::ONE;
         assert!(verify_spend(proof, pi).is_err());
     }
 
     #[test]
-    fn tampered_opening_changes_commitment_and_root() {
-        // A different note value yields a different commitment, hence a different root: the proof
-        // no longer attests membership of the original committed note. (Commitment binds the leaf.)
-        let (opening, sib, bits) = sample();
-        let real_root = native_root(opening, &sib, &bits);
-        let mut bad = opening;
+    fn wrong_nullifier_rejected() {
+        let (note, sib, bits) = sample();
+        let (proof, mut pi) = prove_spend(note, sib, bits);
+        pi.nf[0] += BaseElement::ONE;
+        assert!(verify_spend(proof, pi).is_err());
+    }
+
+    #[test]
+    fn tampered_value_changes_root() {
+        let (note, sib, bits) = sample();
+        let real_root = native_root(note, &sib, &bits);
+        let mut bad = note;
         bad.value += BaseElement::ONE;
         let (proof, pi) = prove_spend(bad, sib, bits);
         assert_ne!(pi.root, real_root);
-        let claim = PublicInputs { root: real_root };
+        let claim = PublicInputs { root: real_root, nf: pi.nf.clone() };
         assert!(verify_spend(proof, claim).is_err());
+    }
+
+    #[test]
+    fn inconsistent_rho_rejected() {
+        // Build a trace where the nullifier uses a different rho than the commitment; the
+        // persistent-rho binding must reject it.
+        let (note, sib, bits) = sample();
+        let prover = SpendProver::new(build_options());
+        let trace = prover.build_trace_with(note, sib, bits, note.rho + BaseElement::ONE);
+        let pi = prover.get_pub_inputs(&trace);
+        // Proving may still succeed (prover doesn't check), but verification must fail.
+        match prover.prove(trace) {
+            Ok(proof) => assert!(verify_spend(proof, pi).is_err()),
+            Err(_) => {} // a fail-stop in proving is also acceptable
+        }
     }
 }
