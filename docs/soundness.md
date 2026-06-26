@@ -170,23 +170,25 @@ Progress:
 1. ~~Implement the grand-product permutation argument.~~ **Done** (`src/permutation.zig`,
    multiset form). The copy-constraint specialization is the same `Z` with an id/σ encoding:
    `num=∏(v+β·id+γ)`, `den=∏(v+β·σ(id)+γ)`, `id(c,r)=k_c·ω^r`; a 2-cycle `σ` forces two cells equal.
-2. ~~Assemble multiple hash regions + a non-hash constraint + copy-constraint wiring into one
-   proof.~~ **Demonstrated** (`src/spend.zig`): a single trace proving `cm=H(value,ρ)`,
-   `nf=H(nk,ρ)`, `value=send+fee`, with `ρ` wired equal across the two regions by an id/σ grand
-   product. The decisive test is that an inconsistent `ρ` (different in the two regions) is
-   **rejected** — the copy constraint is non-vacuous. This is the full R3 assembly pattern on a
-   minimal example; the two-round Fiat-Shamir (commit trace → β,γ → commit `Z` → constraint
-   challenges → FRI) is exercised end-to-end.
-3. **Remaining to complete R3:** widen the commitment to the real opening (`recipient`/`rcm`),
-   fold the Merkle membership region (`membership.zig`) in and wire `cm`→leaf, include the
-   position in the nullifier and wire shared `nk`, then switch the protocol's commitment/
-   nullifier/Merkle hashing to the field hash and have the node verify the single proof instead of
-   its native checks. Plus: ZK blinding + masked FRI (additive, as in `stark.zig`), and a generic
-   engine to replace the per-module duplication.
+2. ~~Assemble the four constraints + copy-constraint wiring into one proof.~~ **Done**
+   (`src/spend.zig`): a single trace proving **all four constraints** for public
+   `(anchor, nf, send, fee)` and hidden `(value, ρ, nk, siblings)` —
+   (1) `cm = H(value, ρ)`, (2) `cm` folds up the path to `anchor` (DEPTH=6 levels),
+   (3) `nf = H(nk, ρ)`, (4) `value = send + fee` — with `ρ` wired equal across the commitment and
+   nullifier regions by the id/σ grand product, and `cm`→leaf wired by **adjacency** (the
+   commitment block precedes the first membership block). `cm` is never revealed (ZK membership).
+   Soundness tests: wrong anchor, wrong nf, unbalanced, tampered trace, a **wrong sibling/path**,
+   and the decisive **inconsistent-`ρ`** case are all rejected; the two-round Fiat-Shamir
+   (commit trace → β,γ → commit `Z` → constraint challenges → FRI) runs end-to-end.
+3. **Remaining to complete/harden R3:** widen the commitment to the real opening
+   (`recipient`/`rcm`) and add an owner binding; general (non-leftmost) path positions; ZK
+   blinding + masked FRI (additive, as in `stark.zig`); switch the protocol's commitment/
+   nullifier/Merkle hashing to the field hash; node integration (verify the single proof instead
+   of native checks); and a generic engine to replace the per-module duplication.
 
-The remaining step 3 is mostly more regions and wires of the kinds already validated, plus the
-protocol-hashing switch and node integration — substantial, but no longer gated on an unbuilt
-mechanism. `src/permutation.zig` and `src/spend.zig` are non-ZK and standalone (the assembly is
+The four-constraint fold and its wiring are now demonstrated; what remains is hardening and
+integration, not an unbuilt mechanism. `src/permutation.zig` and `src/spend.zig` are non-ZK and
+standalone (the assembly is
 the point).
 
 ### Other gaps (carried from the assessment)

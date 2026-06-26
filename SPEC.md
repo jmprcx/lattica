@@ -152,14 +152,16 @@ formally proven.
 - Constraint (3) authorization is a **real, zero-knowledge FRI-STARK** proving knowledge of a
   hash preimage (`src/stark.zig` + `src/rescue.zig`). **Constraint (1) membership is now also
   in-circuit** as a standalone ZK proof (`src/membership.zig`): a multi-column AIR folding a leaf
-  up `DEPTH` field-hash compressions to the public anchor. **(R3, partial)** The **grand-product
-  permutation argument** wiring needs is built (`src/permutation.zig`), and the **assembly is
-  demonstrated** (`src/spend.zig`): one proof folding `cm=H(value,ρ)`, `nf=H(nk,ρ)`, and
-  `value=send+fee`, with `ρ` wired equal across regions by an id/σ copy constraint — an
-  inconsistent `ρ` is rejected, so the wiring is non-vacuous. Remaining to complete R3: the full
-  commitment opening (`recipient`/`rcm`), folding the Merkle membership region in (wire `cm`→
-  leaf), wiring shared `nk`, then switching the protocol's commitment/nullifier/Merkle hashing to
-  the field hash and node integration. See [`soundness.md §6`](./soundness.md).
+  up `DEPTH` field-hash compressions to the public anchor. **(R3, circuit complete)** A single proof
+  now folds **all four constraints** (`src/spend.zig`): for public `(anchor, nf, send, fee)` and
+  hidden `(value, ρ, nk, path)` it proves `cm=H(value,ρ)`, that `cm` folds up the path to
+  `anchor`, `nf=H(nk,ρ)`, and `value=send+fee` — with `ρ` wired equal across regions by an id/σ
+  grand-product copy constraint and `cm`→leaf wired by adjacency. `cm` stays hidden. Soundness
+  tests reject a wrong anchor, wrong nf, unbalanced tx, wrong path, and an inconsistent `ρ`.
+  Remaining is hardening/integration, not new mechanism: the full commitment opening
+  (`recipient`/`rcm`) + owner binding, general path positions, ZK blinding, switching the
+  protocol's commitment/nullifier/Merkle hashing to the field hash, and node integration. See
+  [`soundness.md §6`](./soundness.md).
 - **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
   and PoC-grade — a formal ZK proof and production parameters are future work.
 - **One-way in-circuit hash (R1).** Closed: the authorization relation is a Poseidon-style SPN

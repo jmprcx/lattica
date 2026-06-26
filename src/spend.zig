@@ -1,28 +1,27 @@
-//! A first **integrated multi-region spend circuit** — the R3 assembly on a minimal example.
+//! A **fully in-circuit shielded-spend proof** — the R3 goal on a self-contained example.
 //!
-//! It proves, in one FRI-STARK trace, knowledge of `(value, rho, nk)` such that:
-//!   * **commitment**   `cm = H(value, rho)`          (region 0)
-//!   * **nullifier**    `nf = H(nk, rho)`             (region 1)
-//!   * **balance**      `value = send + fee`          (a linear constraint)
-//!   * **consistency**  the `rho` used in both regions is the same cell
+//! One zero-... (non-ZK here; ZK is additive) FRI-STARK trace proves, for public
+//! `(anchor, nf, send, fee)` and hidden witness `(value, rho, nk, siblings)`:
+//!   1. **commitment opening** `cm = H(value, rho)`                         (region: block 0)
+//!   2. **membership**         `cm` folds up the path to `anchor`           (blocks 1..DEPTH)
+//!   3. **nullifier**          `nf = H(nk, rho)`                            (block DEPTH+1)
+//!   4. **balance**            `value = send + fee`                         (linear constraint)
+//! with `rho` the *same* in (1) and (3).  `H` is the arithmetization-friendly hash (`rescue`).
 //!
-//! with `cm, nf, send, fee` public. `H` is the arithmetization-friendly hash (`rescue`). This is
-//! the smallest circuit that combines every mechanism a full shielded spend needs: multiple
-//! in-circuit hash regions, a non-hash (balance) constraint, and — the load-bearing part — a
-//! **copy constraint** wiring a witness value (`rho`) shared across regions, enforced by a
-//! PLONK-style grand product (the id/σ specialization validated in `permutation.zig`).
-//!
-//! ## What this demonstrates for R3
-//! The full spend is "more of the same": add a commitment with `recipient`/`rcm`, fold `cm` up a
-//! Merkle path (`membership.zig`), include the position in the nullifier, and add the copy
-//! constraints (cm→leaf, shared `nk`). The trace/constraint/wiring machinery is exactly what is
-//! here. Remaining beyond that: ZK blinding + masked FRI (additive, see `stark.zig`), switching
-//! the protocol's commitment/nullifier/Merkle hashing to the field hash, and node integration.
+//! `cm` is never revealed (ZK membership): it is an internal cell, carried into the Merkle leaf
+//! by **adjacency** (the commitment block's output row precedes the first membership block's
+//! input row), so it needs no copy constraint. The single copy constraint is the `rho` sharing
+//! between the commitment and nullifier regions — the single-column grand product validated in
+//! the permutation work. So all four constraints are folded with exactly one validated wiring
+//! mechanism.
 //!
 //! ## Scope / honesty
-//! Non-zero-knowledge (focus is the assembly + wiring; ZK is additive). `cm = H(value,rho)` drops
-//! `recipient`/`rcm` for minimality. The engine is duplicated from the other modules pending a
-//! generic-engine refactor. Not formally proven or audited.
+//! Non-zero-knowledge (ZK blinding + masked FRI are additive, see `stark.zig`). The commitment is
+//! `H(value, rho)` (omits `recipient`/`rcm`), and authorization is "knowledge of `nk` for `nf`
+//! plus an opening of a committed leaf in the tree" (no explicit owner binding). The path is
+//! leftmost-position. The engine is duplicated pending a generic-engine refactor. Not yet
+//! node-integrated; not formally proven or audited. This demonstrates the full four-constraint
+//! fold; production hardening (the items above, plus protocol-hash switch) remains.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,27 +34,38 @@ const Hash = [32]u8;
 const WIDTH = rescue.WIDTH; // 3 state columns
 
 // ---------------------------------------------------------------------------------------
-// Parameters
+// Parameters / trace layout
 // ---------------------------------------------------------------------------------------
 
+const DEPTH: usize = 6; // Merkle levels (demo; production 32)
 const BLOCK: usize = rescue.ROUNDS + 1; // 16 rows per hash region
-const N: usize = 2 * BLOCK; // 32 (region 0 = rows 0..15, region 1 = rows 16..31)
-const N_CONSTRAINTS: usize = WIDTH + 1 + 2 + 2 + 2; // 3 round + 1 balance + 2 cap + 2 output + 2 grand-product
+const NUM_BLOCKS: usize = 2 + DEPTH; // commitment + DEPTH membership + nullifier = 8
+const N: usize = NUM_BLOCKS * BLOCK; // 128
 const BLOWUP: usize = 32;
-const LDE_SIZE: usize = N * BLOWUP; // 1024
-const NUM_FOLDS: usize = 6;
+const LDE_SIZE: usize = N * BLOWUP; // 4096
+const NUM_FOLDS: usize = 8;
 const FINAL_SIZE: usize = LDE_SIZE >> NUM_FOLDS; // 16
-const COMP_DEGREE_BOUND: usize = 256;
+const COMP_DEGREE_BOUND: usize = 1024; // > round-constraint quotient degree (~769)
 const FINAL_DEGREE_BOUND: usize = COMP_DEGREE_BOUND >> NUM_FOLDS; // 4
 const NUM_QUERIES: usize = 40;
+const N_CONSTRAINTS: usize = WIDTH + 1 + 1 + 1 + 2 + 2; // 3 round, 1 carry, 1 cap, 1 balance, 2 outputs, 2 grand-product
 
-// Rows with special roles.
-const ROW_R0_OUT: usize = BLOCK - 1; // 15: region-0 output
-const ROW_R1_IN: usize = BLOCK; // 16: region-1 input
-const ROW_LAST: usize = N - 1; // 31: region-1 output
-// The rho copy constraint wires (col1, row 0) ↔ (col1, ROW_R1_IN).
-const RHO_A: usize = 0;
-const RHO_B: usize = ROW_R1_IN;
+// Block index → first/last row.
+fn blockStart(b: usize) usize {
+    return b * BLOCK;
+}
+fn blockLast(b: usize) usize {
+    return b * BLOCK + BLOCK - 1;
+}
+const CM_BLOCK: usize = 0;
+const MEM_FIRST: usize = 1;
+const MEM_LAST: usize = DEPTH; // block index of the last membership level
+const NF_BLOCK: usize = NUM_BLOCKS - 1; // 7
+const ROW_ANCHOR: usize = blockLast(MEM_LAST); // 111: membership output = anchor
+const ROW_NF: usize = blockLast(NF_BLOCK); // 127
+const ROW_NF_IN: usize = blockStart(NF_BLOCK); // 112
+const RHO_A: usize = 0; // commitment-region rho cell (col1, row 0)
+const RHO_B: usize = ROW_NF_IN; // nullifier-region rho cell (col1, row 112)
 
 fn ldeOffset() Felt {
     return field.GENERATOR;
@@ -285,7 +295,7 @@ fn friCheckFinalLowDegree(allocator: Allocator, final_layer: []const Felt) !bool
 }
 
 // ---------------------------------------------------------------------------------------
-// AIR helpers: periodic round constants (period BLOCK), the σ wiring polynomial
+// AIR helpers
 // ---------------------------------------------------------------------------------------
 
 fn roundConstantCoeffs() [WIDTH][BLOCK]Felt {
@@ -307,20 +317,44 @@ fn rcAt(rc_coeffs: [WIDTH][BLOCK]Felt, x: Felt) [WIDTH]Felt {
     return out;
 }
 
-/// σ over col1's position ids: identity except the 2-cycle (row RHO_A) ↔ (row RHO_B). The id of
-/// (col1, r) is `ω^r`; this returns the interpolation coefficients of `σ(ω^r)`.
+/// σ over col1: identity except the 2-cycle (row RHO_A) ↔ (row RHO_B), wiring the two `rho`
+/// cells equal. Returns the interpolation coefficients of `σ(ω^r)`.
 fn sigmaCoeffs() [N]Felt {
     const w = field.rootOfUnity(N);
     var vals: [N]Felt = undefined;
     for (0..N) |r| vals[r] = field.pow(w, @intCast(r));
-    vals[RHO_A] = field.pow(w, RHO_B); // σ(id_A) = id_B
-    vals[RHO_B] = field.pow(w, RHO_A); // σ(id_B) = id_A
+    vals[RHO_A] = field.pow(w, RHO_B);
+    vals[RHO_B] = field.pow(w, RHO_A);
     field.intt(&vals, w);
     return vals;
 }
 
+/// `Π_{r ∈ rows} (x − ω^r)`.
+fn zProduct(x: Felt, comptime rows: []const usize, w: Felt) Felt {
+    var z: Felt = 1;
+    inline for (rows) |r| z = field.mul(z, field.sub(x, field.pow(w, @intCast(r))));
+    return z;
+}
+
+// Row sets (block boundaries), computed from the layout.
+const ROUND_EXCLUDED = blk: { // last row of every block
+    var rows: [NUM_BLOCKS]usize = undefined;
+    for (0..NUM_BLOCKS) |b| rows[b] = b * BLOCK + BLOCK - 1;
+    break :blk rows;
+};
+const CARRY_ROWS = blk: { // last row of blocks 0..MEM_LAST-... i.e. the chained boundaries cm→memL0, memLd→memL(d+1)
+    var rows: [MEM_LAST]usize = undefined; // blocks 0..MEM_LAST-1 → MEM_LAST carries
+    for (0..MEM_LAST) |b| rows[b] = b * BLOCK + BLOCK - 1;
+    break :blk rows;
+};
+const CAP_ROWS = blk: { // first row of every block
+    var rows: [NUM_BLOCKS]usize = undefined;
+    for (0..NUM_BLOCKS) |b| rows[b] = b * BLOCK;
+    break :blk rows;
+};
+
 const Ctx = struct {
-    cm: Felt,
+    anchor: Felt,
     nf: Felt,
     send_plus_fee: Felt,
     beta: Felt,
@@ -329,81 +363,87 @@ const Ctx = struct {
     mds: [WIDTH][WIDTH]Felt,
     rc_coeffs: [WIDTH][BLOCK]Felt,
     sigma_coeffs: [N]Felt,
-    w_r0_out: Felt, // ω^15
-    w_r1_in: Felt, // ω^16
-    w_last: Felt, // ω^31
+    w: Felt, // ω = rootOfUnity(N)
+    w_anchor: Felt, // ω^ROW_ANCHOR
+    w_nf: Felt, // ω^ROW_NF
 };
 
-/// Composition at one point. `cur = T(x)`, `next = T(ωx)`, `z = Z(x)`, `z_next = Z(ωx)`.
 fn compositionAt(cur: [WIDTH]Felt, next: [WIDTH]Felt, z: Felt, z_next: Felt, x: Felt, ctx: Ctx) Felt {
     const x_n_minus_1 = field.sub(field.pow(x, N), 1);
-    // Z_round vanishes on every transition row except the two non-round rows (region-0 output and
-    // last), so the round constraint is enforced exactly on the 2·ROUNDS round-transitions.
-    const z_round = field.mul(x_n_minus_1, field.inv(field.mul(field.sub(x, ctx.w_r0_out), field.sub(x, ctx.w_last))));
+    const z_round = field.mul(x_n_minus_1, field.inv(zProduct(x, &ROUND_EXCLUDED, ctx.w)));
     const inv_zr = field.inv(z_round);
+    const inv_zcarry = field.inv(zProduct(x, &CARRY_ROWS, ctx.w));
+    const inv_zcap = field.inv(zProduct(x, &CAP_ROWS, ctx.w));
+    const inv_x1 = field.inv(field.sub(x, 1));
     const rc_row = rcAt(ctx.rc_coeffs, x);
 
     var sb: [WIDTH]Felt = undefined;
     for (0..WIDTH) |j| sb[j] = rescue.sbox(cur[j]);
 
     var cp: Felt = 0;
-    // (a) Rescue round: next_i = Σ_j M[i][j]·cur_j^7 + rc_i.
+    // (a) Rescue round on the round rows.
     for (0..WIDTH) |i| {
         var roundi = rc_row[i];
         for (0..WIDTH) |j| roundi = field.add(roundi, field.mul(ctx.mds[i][j], sb[j]));
-        const c = field.sub(next[i], roundi);
-        cp = field.add(cp, field.mul(ctx.comb[i], field.mul(c, inv_zr)));
+        cp = field.add(cp, field.mul(ctx.comb[i], field.mul(field.sub(next[i], roundi), inv_zr)));
     }
-    // (b) Balance: value (col0 at row 0) = send + fee.
-    const inv_x1 = field.inv(field.sub(x, 1));
-    cp = field.add(cp, field.mul(ctx.comb[WIDTH], field.mul(field.sub(cur[0], ctx.send_plus_fee), inv_x1)));
-    // (c) Capacity 0 at both region inputs (row 0 and row ROW_R1_IN).
-    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 1], field.mul(cur[2], inv_x1)));
-    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 2], field.mul(cur[2], field.inv(field.sub(x, ctx.w_r1_in)))));
-    // (d) Outputs: cm at region-0 output (row 15), nf at region-1 output (row 31).
-    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 3], field.mul(field.sub(cur[0], ctx.cm), field.inv(field.sub(x, ctx.w_r0_out)))));
-    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 4], field.mul(field.sub(cur[0], ctx.nf), field.inv(field.sub(x, ctx.w_last)))));
-    // (e) Grand-product copy constraint on col1 (rho): Z(ωx)·D − Z(x)·Nu on all rows; Z(1)=1.
-    //     Nu = col1 + β·id + γ (id = ω^r = x);  D = col1 + β·σ(x) + γ.
+    // (b) Carry on the chained boundaries: next left input = compressed output.
+    cp = field.add(cp, field.mul(ctx.comb[WIDTH], field.mul(field.sub(next[0], cur[0]), inv_zcarry)));
+    // (c) Capacity 0 at every block start.
+    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 1], field.mul(cur[2], inv_zcap)));
+    // (d) Balance: value (col0, row 0) = send + fee.
+    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 2], field.mul(field.sub(cur[0], ctx.send_plus_fee), inv_x1)));
+    // (e) Outputs: anchor at the membership output row, nf at the nullifier output row.
+    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 3], field.mul(field.sub(cur[0], ctx.anchor), field.inv(field.sub(x, ctx.w_anchor)))));
+    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 4], field.mul(field.sub(cur[0], ctx.nf), field.inv(field.sub(x, ctx.w_nf)))));
+    // (f) Grand-product copy constraint on col1 (rho): Z(ωx)·D − Z(x)·Nu on all rows; Z(1)=1.
     const nu = field.add(field.add(cur[1], field.mul(ctx.beta, x)), ctx.gamma);
     const sigma_x = evalPoly(&ctx.sigma_coeffs, x);
     const d = field.add(field.add(cur[1], field.mul(ctx.beta, sigma_x)), ctx.gamma);
-    const z_trans = field.sub(field.mul(z_next, d), field.mul(z, nu));
-    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 5], field.mul(z_trans, field.inv(x_n_minus_1))));
+    cp = field.add(cp, field.mul(ctx.comb[WIDTH + 5], field.mul(field.sub(field.mul(z_next, d), field.mul(z, nu)), field.inv(x_n_minus_1))));
     cp = field.add(cp, field.mul(ctx.comb[WIDTH + 6], field.mul(field.sub(z, 1), inv_x1)));
     return cp;
 }
 
 // ---------------------------------------------------------------------------------------
-// Trace
+// Witness / public inputs
 // ---------------------------------------------------------------------------------------
 
-const PublicInputs = struct { cm: Felt, nf: Felt, send: Felt, fee: Felt };
+pub const PublicInputs = struct { anchor: Felt, nf: Felt, send: Felt, fee: Felt };
 
-/// Compute the public outputs for a witness (for tests / wallet use).
-pub fn publicFor(value: Felt, rho: Felt, nk: Felt, fee: Felt) PublicInputs {
-    return .{
-        .cm = rescue.permute(.{ value, rho, 0 })[0],
-        .nf = rescue.permute(.{ nk, rho, 0 })[0],
-        .send = field.sub(value, fee),
-        .fee = fee,
-    };
+/// Compute the public inputs for a witness (commitment, fold to anchor, nullifier, balance).
+pub fn publicFor(value: Felt, rho: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt) PublicInputs {
+    const cm = rescue.permute(.{ value, rho, 0 })[0];
+    var cur = cm;
+    for (0..DEPTH) |d| cur = rescue.permute(.{ cur, siblings[d], 0 })[0];
+    return .{ .anchor = cur, .nf = rescue.permute(.{ nk, rho, 0 })[0], .send = field.sub(value, fee), .fee = fee };
 }
 
-/// The raw two-region trace rows. `rho_a` feeds the commitment region, `rho_b` the nullifier
-/// region; an honest spend has `rho_a == rho_b` (the copy constraint enforces it).
-fn buildRows(value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt) [N][WIDTH]Felt {
+/// Raw trace rows. `rho_a` feeds the commitment, `rho_b` the nullifier (honest: equal).
+fn buildRows(value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, siblings: [DEPTH]Felt) [N][WIDTH]Felt {
     const m = rescue.mds();
     const rc = rescue.roundConstants();
     var rows: [N][WIDTH]Felt = undefined;
-    rows[0] = .{ value, rho_a, 0 }; // region 0: cm = H(value, rho_a)
-    for (0..rescue.ROUNDS) |r| rows[r + 1] = rescue.round(rows[r], m, rc[r]);
-    rows[ROW_R1_IN] = .{ nk, rho_b, 0 }; // region 1: nf = H(nk, rho_b), loaded fresh
-    for (0..rescue.ROUNDS) |r| rows[ROW_R1_IN + r + 1] = rescue.round(rows[ROW_R1_IN + r], m, rc[r]);
+
+    // Block 0: cm = H(value, rho_a).
+    rows[blockStart(CM_BLOCK)] = .{ value, rho_a, 0 };
+    for (0..rescue.ROUNDS) |r| rows[blockStart(CM_BLOCK) + r + 1] = rescue.round(rows[blockStart(CM_BLOCK) + r], m, rc[r]);
+
+    // Blocks 1..DEPTH: membership. Each input left = previous block output (adjacency carry),
+    // right = sibling, capacity 0.
+    for (0..DEPTH) |level| {
+        const b = MEM_FIRST + level;
+        const prev_out = rows[blockLast(b - 1)][0];
+        rows[blockStart(b)] = .{ prev_out, siblings[level], 0 };
+        for (0..rescue.ROUNDS) |r| rows[blockStart(b) + r + 1] = rescue.round(rows[blockStart(b) + r], m, rc[r]);
+    }
+
+    // Block NF_BLOCK: nf = H(nk, rho_b), loaded fresh.
+    rows[blockStart(NF_BLOCK)] = .{ nk, rho_b, 0 };
+    for (0..rescue.ROUNDS) |r| rows[blockStart(NF_BLOCK) + r + 1] = rescue.round(rows[blockStart(NF_BLOCK) + r], m, rc[r]);
     return rows;
 }
 
-/// Build the two-region trace columns over the LDE.
 fn buildTraceLde(allocator: Allocator, rows: [N][WIDTH]Felt) ![WIDTH][]Felt {
     var out: [WIDTH][]Felt = undefined;
     for (0..WIDTH) |i| {
@@ -414,17 +454,13 @@ fn buildTraceLde(allocator: Allocator, rows: [N][WIDTH]Felt) ![WIDTH][]Felt {
     return out;
 }
 
-/// The grand-product column on H for the rho copy constraint (over col1 values).
 fn grandProduct(col1: [N]Felt, ctx: Ctx) [N]Felt {
-    const w = field.rootOfUnity(N);
     var z: [N]Felt = undefined;
     z[0] = 1;
     for (0..N - 1) |r| {
-        const xr = field.pow(w, @intCast(r));
-        const id = xr;
-        const sg = evalPoly(&ctx.sigma_coeffs, xr);
-        const nu = field.add(field.add(col1[r], field.mul(ctx.beta, id)), ctx.gamma);
-        const den = field.add(field.add(col1[r], field.mul(ctx.beta, sg)), ctx.gamma);
+        const xr = field.pow(ctx.w, @intCast(r));
+        const nu = field.add(field.add(col1[r], field.mul(ctx.beta, xr)), ctx.gamma);
+        const den = field.add(field.add(col1[r], field.mul(ctx.beta, evalPoly(&ctx.sigma_coeffs, xr))), ctx.gamma);
         z[r + 1] = field.mul(z[r], field.mul(nu, field.inv(den)));
     }
     return z;
@@ -455,7 +491,7 @@ pub const Proof = struct {
     queries: []Query,
 };
 
-const LABEL = "lattica:spend:v1";
+const LABEL = "lattica:spend:v2-full";
 
 fn rowAt(cols: [WIDTH][]const Felt, idx: usize) [WIDTH]Felt {
     var row: [WIDTH]Felt = undefined;
@@ -463,20 +499,40 @@ fn rowAt(cols: [WIDTH][]const Felt, idx: usize) [WIDTH]Felt {
     return row;
 }
 
-pub fn prove(allocator: Allocator, value: Felt, rho: Felt, nk: Felt, fee: Felt) !Proof {
-    return proveRhos(allocator, value, rho, rho, nk, fee);
+fn newCtx(pub_in: PublicInputs, beta: Felt, gamma: Felt) Ctx {
+    const w = field.rootOfUnity(N);
+    return .{
+        .anchor = pub_in.anchor,
+        .nf = pub_in.nf,
+        .send_plus_fee = field.add(pub_in.send, pub_in.fee),
+        .beta = beta,
+        .gamma = gamma,
+        .comb = undefined,
+        .mds = rescue.mds(),
+        .rc_coeffs = roundConstantCoeffs(),
+        .sigma_coeffs = sigmaCoeffs(),
+        .w = w,
+        .w_anchor = field.pow(w, ROW_ANCHOR),
+        .w_nf = field.pow(w, ROW_NF),
+    };
 }
 
-/// Prover allowing distinct rho per region — used by tests to exercise the copy constraint. An
-/// honest spend sets `rho_a == rho_b`; if they differ the grand product cannot telescope to 1.
-fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, fee: Felt) !Proof {
+pub fn prove(allocator: Allocator, value: Felt, rho: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt) !Proof {
+    return proveRhos(allocator, value, rho, rho, nk, fee, siblings);
+}
+
+/// Prover allowing distinct rho per region — used by tests to exercise the copy constraint.
+fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt) !Proof {
+    const cm = rescue.permute(.{ value, rho_a, 0 })[0];
+    var cur_root = cm;
+    for (0..DEPTH) |d| cur_root = rescue.permute(.{ cur_root, siblings[d], 0 })[0];
     const pub_in = PublicInputs{
-        .cm = rescue.permute(.{ value, rho_a, 0 })[0],
+        .anchor = cur_root,
         .nf = rescue.permute(.{ nk, rho_b, 0 })[0],
         .send = field.sub(value, fee),
         .fee = fee,
     };
-    const rows = buildRows(value, rho_a, rho_b, nk);
+    const rows = buildRows(value, rho_a, rho_b, nk, siblings);
 
     const trace_lde = try buildTraceLde(allocator, rows);
     defer for (trace_lde) |c| allocator.free(c);
@@ -488,30 +544,12 @@ fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Fe
     const trace_root = trace_tree.root();
 
     var tr = Transcript.init(LABEL);
-    tr.absorbFelt(pub_in.cm);
-    tr.absorbFelt(pub_in.nf);
-    tr.absorbFelt(pub_in.send);
-    tr.absorbFelt(pub_in.fee);
+    inline for (.{ pub_in.anchor, pub_in.nf, pub_in.send, pub_in.fee }) |v| tr.absorbFelt(v);
     tr.absorbHash(trace_root);
-    const beta = tr.challengeFelt(); // round-1 challenges (after the trace commitment)
+    const beta = tr.challengeFelt();
     const gamma = tr.challengeFelt();
 
-    var ctx = Ctx{
-        .cm = pub_in.cm,
-        .nf = pub_in.nf,
-        .send_plus_fee = field.add(pub_in.send, pub_in.fee),
-        .beta = beta,
-        .gamma = gamma,
-        .comb = undefined,
-        .mds = rescue.mds(),
-        .rc_coeffs = roundConstantCoeffs(),
-        .sigma_coeffs = sigmaCoeffs(),
-        .w_r0_out = field.pow(field.rootOfUnity(N), ROW_R0_OUT),
-        .w_r1_in = field.pow(field.rootOfUnity(N), ROW_R1_IN),
-        .w_last = field.pow(field.rootOfUnity(N), ROW_LAST),
-    };
-
-    // Grand-product column from col1 (rho) values on H.
+    var ctx = newCtx(pub_in, beta, gamma);
     var col1_h: [N]Felt = undefined;
     for (0..N) |r| col1_h[r] = rows[r][1];
     const z_h = grandProduct(col1_h, ctx);
@@ -565,29 +603,12 @@ pub fn verify(allocator: Allocator, pub_in: PublicInputs, proof: Proof) !bool {
     if (proof.fri_final.len != FINAL_SIZE or proof.queries.len != NUM_QUERIES) return false;
 
     var tr = Transcript.init(LABEL);
-    tr.absorbFelt(pub_in.cm);
-    tr.absorbFelt(pub_in.nf);
-    tr.absorbFelt(pub_in.send);
-    tr.absorbFelt(pub_in.fee);
+    inline for (.{ pub_in.anchor, pub_in.nf, pub_in.send, pub_in.fee }) |v| tr.absorbFelt(v);
     tr.absorbHash(proof.trace_root);
     const beta = tr.challengeFelt();
     const gamma = tr.challengeFelt();
     tr.absorbHash(proof.z_root);
-
-    var ctx = Ctx{
-        .cm = pub_in.cm,
-        .nf = pub_in.nf,
-        .send_plus_fee = field.add(pub_in.send, pub_in.fee),
-        .beta = beta,
-        .gamma = gamma,
-        .comb = undefined,
-        .mds = rescue.mds(),
-        .rc_coeffs = roundConstantCoeffs(),
-        .sigma_coeffs = sigmaCoeffs(),
-        .w_r0_out = field.pow(field.rootOfUnity(N), ROW_R0_OUT),
-        .w_r1_in = field.pow(field.rootOfUnity(N), ROW_R1_IN),
-        .w_last = field.pow(field.rootOfUnity(N), ROW_LAST),
-    };
+    var ctx = newCtx(pub_in, beta, gamma);
     for (&ctx.comb) |*c| c.* = tr.challengeFelt();
 
     var betas: [NUM_FOLDS]Felt = undefined;
@@ -654,26 +675,30 @@ pub fn verify(allocator: Allocator, pub_in: PublicInputs, proof: Proof) !bool {
 
 const testing = std.testing;
 
-test "spend: valid witness verifies" {
+fn sampleSiblings(seed: u64) [DEPTH]Felt {
+    var s: [DEPTH]Felt = undefined;
+    for (0..DEPTH) |i| s[i] = (@as(Felt, @intCast(i)) *% 1099511627791 +% seed +% 1) % field.P;
+    return s;
+}
+
+test "spend: valid full spend verifies" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
-    const value: Felt = 1000;
-    const rho: Felt = 0xABCDEF;
-    const nk: Felt = 0x123456;
-    const fee: Felt = 100;
-    const pub_in = publicFor(value, rho, nk, fee);
-    const proof = try prove(al, value, rho, nk, fee);
+    const sib = sampleSiblings(1);
+    const pub_in = publicFor(1000, 0xABCDEF, 0x123456, 100, sib);
+    const proof = try prove(al, 1000, 0xABCDEF, 0x123456, 100, sib);
     try testing.expect(try verify(al, pub_in, proof));
 }
 
-test "spend: wrong cm rejected" {
+test "spend: wrong anchor rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
-    var pub_in = publicFor(1000, 7, 9, 100);
-    const proof = try prove(al, 1000, 7, 9, 100);
-    pub_in.cm = field.add(pub_in.cm, 1);
+    const sib = sampleSiblings(2);
+    var pub_in = publicFor(1000, 7, 9, 100, sib);
+    const proof = try prove(al, 1000, 7, 9, 100, sib);
+    pub_in.anchor = field.add(pub_in.anchor, 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
 
@@ -681,19 +706,21 @@ test "spend: wrong nf rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
-    var pub_in = publicFor(1000, 7, 9, 100);
-    const proof = try prove(al, 1000, 7, 9, 100);
+    const sib = sampleSiblings(3);
+    var pub_in = publicFor(1000, 7, 9, 100, sib);
+    const proof = try prove(al, 1000, 7, 9, 100, sib);
     pub_in.nf = field.add(pub_in.nf, 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
 
-test "spend: unbalanced (send+fee != value) rejected" {
+test "spend: unbalanced rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
-    var pub_in = publicFor(1000, 7, 9, 100); // send=900, fee=100
-    const proof = try prove(al, 1000, 7, 9, 100);
-    pub_in.send = field.add(pub_in.send, 1); // now send+fee = 1001 != value
+    const sib = sampleSiblings(4);
+    var pub_in = publicFor(1000, 7, 9, 100, sib);
+    const proof = try prove(al, 1000, 7, 9, 100, sib);
+    pub_in.send = field.add(pub_in.send, 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
 
@@ -701,43 +728,38 @@ test "spend: tampered trace row rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
-    const pub_in = publicFor(1000, 7, 9, 100);
-    var proof = try prove(al, 1000, 7, 9, 100);
+    const sib = sampleSiblings(5);
+    const pub_in = publicFor(1000, 7, 9, 100, sib);
+    var proof = try prove(al, 1000, 7, 9, 100, sib);
     proof.queries[0].cur_a.row[1] = field.add(proof.queries[0].cur_a.row[1], 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
 
-test "spend: proof binds to its own public inputs" {
+test "spend: inconsistent rho across regions rejected (copy constraint bites)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
-    const proof = try prove(al, 1000, 7, 9, 100);
-    try testing.expect(try verify(al, publicFor(1000, 7, 9, 100), proof));
-    try testing.expect(!try verify(al, publicFor(1000, 8, 9, 100), proof)); // different rho ⇒ different cm,nf
-}
-
-test "spend: inconsistent rho across regions is rejected (the copy constraint bites)" {
-    // The attack the copy constraint prevents: use rho_a in the commitment but a different rho_b
-    // in the nullifier. cm,nf are each internally consistent, so without the wiring this would
-    // pass — but the grand product forces a single rho and cannot telescope to 1, so it rejects.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const al = arena.allocator();
+    const sib = sampleSiblings(6);
     const value: Felt = 1000;
     const rho_a: Felt = 7;
     const rho_b: Felt = 8; // != rho_a
     const nk: Felt = 9;
     const fee: Felt = 100;
-    const pub_in = PublicInputs{
-        .cm = rescue.permute(.{ value, rho_a, 0 })[0],
-        .nf = rescue.permute(.{ nk, rho_b, 0 })[0],
-        .send = field.sub(value, fee),
-        .fee = fee,
-    };
-    const proof = try proveRhos(al, value, rho_a, rho_b, nk, fee);
+    var cur_root = rescue.permute(.{ value, rho_a, 0 })[0];
+    for (0..DEPTH) |d| cur_root = rescue.permute(.{ cur_root, sib[d], 0 })[0];
+    const pub_in = PublicInputs{ .anchor = cur_root, .nf = rescue.permute(.{ nk, rho_b, 0 })[0], .send = field.sub(value, fee), .fee = fee };
+    const proof = try proveRhos(al, value, rho_a, rho_b, nk, fee, sib);
     try testing.expect(!try verify(al, pub_in, proof));
+}
 
-    // Sanity: the same prover with rho_a == rho_b does verify.
-    const good = try proveRhos(al, value, rho_a, rho_a, nk, fee);
-    try testing.expect(try verify(al, .{ .cm = rescue.permute(.{ value, rho_a, 0 })[0], .nf = rescue.permute(.{ nk, rho_a, 0 })[0], .send = field.sub(value, fee), .fee = fee }, good));
+test "spend: a wrong sibling (not the real path) rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const sib = sampleSiblings(7);
+    const pub_in = publicFor(1000, 7, 9, 100, sib); // anchor for the true path
+    var wrong = sib;
+    wrong[2] = field.add(wrong[2], 1); // prove with a different path ⇒ different root ≠ anchor
+    const proof = try prove(al, 1000, 7, 9, 100, wrong);
+    try testing.expect(!try verify(al, pub_in, proof));
 }
