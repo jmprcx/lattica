@@ -9,6 +9,9 @@ test {
     _ = @import("membership.zig");
     _ = @import("permutation.zig");
     _ = @import("spend.zig");
+    _ = @import("codec.zig");
+    _ = @import("protocol.zig");
+    _ = @import("ffi.zig");
     _ = @import("tree.zig");
     _ = @import("tx.zig");
     _ = @import("circuit.zig");
