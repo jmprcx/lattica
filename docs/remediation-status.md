@@ -31,15 +31,21 @@ Legend: ✅ done · 🔜 scheduled core work · ⏳ subsumed by the framework de
 serialization + tx-binding digest + checked-arithmetic supply model), `src/ffi.zig` (spend verify
 boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97/97 Zig tests.
 
-## Phase 2 — foundation built (in progress)
-`lattica-prover/` (Winterfell): the **Rescue-Prime `Rp64_256` permutation AIR**, cross-validated
-against the native hash (`trace_output_matches_native_oracle`), valid-verifies, tamper-rejected,
-and the `lattica_spend_verify` C ABI present and **fail-closed**. 4/4 Rust tests. This is the
-vetted in-circuit hash that the full statement is built from.
+## Phase 2 — in progress (hash + membership validated)
+`lattica-prover/` (Winterfell), 9/9 Rust tests:
+- **Rescue-Prime `Rp64_256` permutation AIR**, cross-validated against the native hash
+  (`trace_output_matches_native_oracle`), valid-verifies, tamper-rejected. The vetted in-circuit
+  hash (C-05 in-circuit).
+- **Merkle membership AIR** (`membership.rs`): a multi-permutation trace folding a private leaf up
+  a **general-position** authentication path (position-bit column + periodic round/link selector)
+  to a public root via the Rescue 2-to-1 compression. Validated: `native_merge` equals
+  `Rp64_256::merge`; the AIR trace root equals the native fold; valid-verifies; wrong-root and
+  tampered-path rejected. `DEPTH=8` for fast tests (production 32 = a const). **The heart of C-02.**
+- `lattica_spend_verify` C ABI present and **fail-closed**.
 
-### Remaining within Phase 2 (the spend statement on top of the validated hash)
-1. Chain the permutation into a **2-to-1 merge** and a **depth-32 Merkle membership** of the note
-   commitment under the public anchor.
+### Remaining within Phase 2 (the spend statement on top of the validated membership)
+1. ~~Chain the permutation into a 2-to-1 merge and a Merkle membership.~~ **Done** (general
+   position; depth-32 is a const change). Bind the membership leaf to the commitment region next.
 2. **Commitment opening** `cm = H(recipient, value, rho, rcm)` and **nullifier** `nf = H(nk, rho,
    pos)` as in-circuit hashes; **ownership** binding (recipient ↔ `nk`).
 3. **Balance** `in_value = out_value + fee` (+ `mint`/`burn`) and **range** (no field wraparound),

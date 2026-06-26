@@ -22,26 +22,28 @@ use winterfell::{
     TransitionConstraintDegree,
 };
 
-type Hf = Rp64_256;
-type Vc = MerkleTree<Hf>;
-type Coin = DefaultRandomCoin<Hf>;
+pub mod membership;
 
-const STATE_WIDTH: usize = 12; // Rp64_256::STATE_WIDTH
-const NUM_ROUNDS: usize = 7; // Rp64_256::NUM_ROUNDS
+pub(crate) type Hf = Rp64_256;
+pub(crate) type Vc = MerkleTree<Hf>;
+pub(crate) type Coin = DefaultRandomCoin<Hf>;
+
+pub(crate) const STATE_WIDTH: usize = 12; // Rp64_256::STATE_WIDTH
+pub(crate) const NUM_ROUNDS: usize = 7; // Rp64_256::NUM_ROUNDS
 const TRACE_LEN: usize = 8; // next power of two >= NUM_ROUNDS + 1
-const CYCLE: usize = 8; // periodic round-constant cycle
+pub(crate) const CYCLE: usize = 8; // periodic round-constant cycle
 
 // --- field helpers ----------------------------------------------------------------------------
 
 #[inline]
-fn pow7<E: FieldElement>(x: E) -> E {
+pub(crate) fn pow7<E: FieldElement>(x: E) -> E {
     let x2 = x * x;
     let x4 = x2 * x2;
     x4 * x2 * x
 }
 
 /// `MDS · v` with the (BaseElement) MDS matrix lifted into the working field `E`.
-fn mds_mul<E: FieldElement<BaseField = BaseElement>>(v: &[E; STATE_WIDTH]) -> [E; STATE_WIDTH] {
+pub(crate) fn mds_mul<E: FieldElement<BaseField = BaseElement>>(v: &[E; STATE_WIDTH]) -> [E; STATE_WIDTH] {
     let mds = Rp64_256::MDS;
     let mut out = [E::ZERO; STATE_WIDTH];
     for i in 0..STATE_WIDTH {
@@ -54,7 +56,7 @@ fn mds_mul<E: FieldElement<BaseField = BaseElement>>(v: &[E; STATE_WIDTH]) -> [E
     out
 }
 
-fn inv_mds_mul<E: FieldElement<BaseField = BaseElement>>(v: &[E; STATE_WIDTH]) -> [E; STATE_WIDTH] {
+pub(crate) fn inv_mds_mul<E: FieldElement<BaseField = BaseElement>>(v: &[E; STATE_WIDTH]) -> [E; STATE_WIDTH] {
     let inv = Rp64_256::INV_MDS;
     let mut out = [E::ZERO; STATE_WIDTH];
     for i in 0..STATE_WIDTH {
