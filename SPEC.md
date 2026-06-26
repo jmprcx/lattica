@@ -79,10 +79,9 @@ No assumption depends on the hardness of any group discrete log or factoring.
 A 32-byte **spending seed** is the root of the wallet. From it:
 
 - `nk = PRF_expand(seed, "nk")` — nullifier key.
-- an **ML-KEM keypair** (note encryption) and an **ML-DSA keypair** (authorization). *PoC
-  note:* these are generated from the CSPRNG and stored beside the seed for clarity;
-  production derives both deterministically from the seed (both schemes support seeded
-  keygen) so the wallet restores from the seed alone.
+- an **ML-KEM keypair** (note encryption) and an **ML-DSA keypair** (authorization). The Zig
+  reference derives both **deterministically from the seed** (the 64-byte ML-KEM seed and the
+  32-byte ML-DSA seed are expanded from it), so the wallet restores from the seed alone.
 - **Address** = (`ivk_tag`, `kem_ek`), where `ivk_tag = H_IVK(seed, nk)`. The recipient
   identifier bound into commitments is `recipient_id = H_IVK(ivk_tag, kem_ek)`.
 
@@ -122,14 +121,21 @@ A spend proves, in zero knowledge, the conjunction:
 
 **Proof system: FRI-STARK.** Soundness depends only on a collision-resistant hash; the
 setup is transparent (no toxic waste). This is the load-bearing quantum-safe choice,
-replacing Halo 2 whose soundness rests on ECDLP. The PoC uses Winterfell.
+replacing Halo 2 whose soundness rests on ECDLP.
+
+**Status in the Zig reference implementation.** A transparent FRI-STARK prover has no
+`std.crypto` equivalent, so `src/circuit.zig` currently ships a **stub**: it computes the real
+authorization image (the 1024-step `x → x³ + C` chain over a prime field) and binds a
+placeholder proof to it so tampering is detectable — but it is **not zero-knowledge and proves
+nothing** about knowledge of the secret. A genuine FRI-STARK (the design here) is the
+documented next phase.
 
 **PoC scope and honest gaps.**
 
-- Constraint (3) is implemented as a **real, verifying FRI-STARK** (`lattica-circuit`).
-  Constraints (1), (2), (4) are enforced natively by the node in the PoC; because they use
-  the same commitment/nullifier/Merkle framing, moving them inside the AIR is additive, not
-  a redesign.
+- In the design, constraint (3) is a **real, verifying FRI-STARK** (`src/circuit.zig`); in this
+  Zig port it is the stub described above. Constraints (1), (2), (4) are enforced natively by
+  the node; because they use the same commitment/nullifier/Merkle framing, moving them inside
+  the AIR is additive, not a redesign.
 - **Zero-knowledge masking.** Winterfell STARKs are sound and transparent but not yet
   zero-knowledge (the trace LDE can leak). Production adds the standard ZK randomization
   (masked trace / random columns). We demonstrate soundness + transparency + post-quantum
@@ -144,7 +150,7 @@ A **ShieldedTx** is `{ spends[], outputs[], fee, binding_pk, binding_sig }`. The
 `binding_sig` is an ML-DSA signature over a canonical, domain-separated digest of the whole
 body (everything but the signature).
 
-**Node validation** (`Chain::verify_and_apply`), all-or-nothing:
+**Node validation** (`Chain.verifyAndApply`), all-or-nothing:
 
 1. Binding signature verifies over the tx digest.
 2. For each spend: anchor is a known historical root; Merkle path verifies `cm` under it;
@@ -160,18 +166,24 @@ alternative. Networking, mempool, and fee-market are out of PoC scope.
 
 ## 10. Implementation map
 
-| Crate | Responsibility |
+The reference implementation is a **Zig** (0.16) workspace; every post-quantum and symmetric
+primitive comes from `std.crypto`.
+
+| Module | Responsibility |
 |---|---|
-| `lattica-primitives` | ML-KEM, ML-DSA, SHA3 hashing/commitments/nullifiers/PRF/KDF, AEAD |
-| `lattica-tree` | incremental Merkle commitment tree + authentication paths |
-| `lattica-tx` | notes, keys, addresses, ML-KEM note encryption / trial decryption |
-| `lattica-circuit` | FRI-STARK spend-authorization proof (Winterfell) |
-| `lattica-node` | chain state + shielded-transaction validation rules |
-| `lattica-wallet` | keygen, scanning, transfer builder, end-to-end `demo` |
+| `src/primitives.zig` | ML-KEM, ML-DSA, SHA3 hashing/commitments/nullifiers/PRF/KDF, AEAD |
+| `src/tree.zig` | incremental Merkle commitment tree + authentication paths |
+| `src/tx.zig` | notes, keys (seed-deterministic), addresses, ML-KEM note encryption / trial decryption |
+| `src/circuit.zig` | spend-authorization proof — **stub** in this port (see §8) |
+| `src/node.zig` | chain state + shielded-transaction validation rules |
+| `src/wallet.zig` | keygen, scanning, transfer builder, end-to-end `demo` (CLI) |
 
-## 11. Performance (measured)
+## 11. Performance
 
-Release build, single core, ML-DSA-44 / ML-KEM-768 / 1024-step authorization AIR:
+The proof rows below describe the **FRI-STARK design**, measured on the original Winterfell
+reference (release build, single core, 1024-step authorization AIR). The current Zig port
+**stubs the proof** (a 32-byte placeholder), so those rows do not apply to it; the ML-DSA and
+ML-KEM sizes, which come straight from `std.crypto`, do.
 
 | Metric | Lattica | For comparison |
 |---|---|---|
