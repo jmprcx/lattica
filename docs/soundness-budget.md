@@ -114,9 +114,36 @@ Poseidon2 is **width 16** (298 cols vs 180); (2) the **extension field is ~16 by
 Net ~4% for a full circuit rewrite plus multi-limb `u64` value/range/balance arithmetic. **Not
 worth it** — Goldilocks stays.
 
-**Conclusion:** the realized proof-size win is the FRI encoding (arity + cap, −49%, already adopted).
-Beyond that, the lever with real headroom is **structural — per-block recursive aggregation** (one
-proof per block instead of per spend), not field or trace changes.
+## Batch aggregation — one proof per block (measured)
+
+`cargo run --release --bin batch` proves a batch of `n` spends as a **single** proof (the spend AIR
+tiled `n` times in one trace) at the production FRI params:
+
+| n | proven | proof KB | per-spend KB | vs n separate | prove ms | verify ms |
+|---|---|---|---|---|---|---|
+| 1 | 103 | 421 | 421 | 1× | 2067 | 7 |
+| 2 | 103 | 446 | 223 | 1.9× | 4161 | 7 |
+| 4 | 103 | 468 | 117 | 3.6× | 8380 | 8 |
+| 8 | 103 | 497 | 62 | 6.8× | 16785 | 8 |
+| 16 | 103 | 532 | 33 | 12.6× | 34194 | 9 |
+| 32 | 102 | 560 | **17.5** | **24×** | 70025 | 9 |
+
+- Proof size grows **~log n** (~+28 KB per doubling), so **per-spend bytes collapse**: 421 → 17.5 KB
+  at n=32 (24×). Extrapolating (~+28 KB/doubling): a **1024-spend block ≈ ~700 KB** single proof vs
+  ~431 MB as separate proofs (**~600×**).
+- **Verify is ~constant** (7–9 ms) regardless of n — a validator checks **one** proof per block.
+- Security holds (proven ≥ 102 through n=32).
+- **Cost: proving is monolithic and ~linear in n** (n=32 ≈ 70 s) — the block producer proves the
+  whole block. This is the batch AIR's limit vs *true recursion* (each user proves their own spend;
+  the producer aggregates fixed-size proofs in parallel). The batch AIR needs **no recursive
+  verifier**, so it's the pragmatic first step; recursion is the scale-out when monolithic / per-user
+  independent proving becomes the constraint. (The `n` spans here are identical — size-representative;
+  a production batch carries distinct spends bound by an aggregate public-input hash, same size.)
+
+**Conclusion:** the realized per-proof win is the FRI encoding (arity + cap, −49%, adopted). The
+field and trace levers don't help proof size (≤5% / ~4%). The structural lever — **batching toward
+one proof per block** — is the real headroom: measured ~log(n) growth ⇒ ~600× smaller and constant
+verify at block scale, at the cost of monolithic proving (which true recursion later removes).
 
 ## Parameter hardening (was demo-sized in M4c)
 

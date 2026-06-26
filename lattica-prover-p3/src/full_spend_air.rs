@@ -598,6 +598,52 @@ pub fn demo_witness() -> Witness {
     }
 }
 
+/// Prove a **batch of `n` spends** in one proof (batch AIR = the spend statement tiled `n` times in
+/// one trace, height `n·HEIGHT`). `n` must be a power of two. Returns proof size + timings +
+/// the proven security at the batch height. The `n` spans are identical here (the proof size depends
+/// on the trace dimensions, not on whether spends differ), so the single, periodic-only AIR is
+/// reused unchanged — every per-spend constraint is periodic, and the persistent columns are
+/// globally constant across identical spans.
+pub fn batch_measure(n: usize) -> SweepResult {
+    assert!(n.is_power_of_two(), "batch n must be a power of two (trace height must stay 2^k)");
+    let w = demo_witness();
+    let single = build_trace(&w);
+    let mut vals = Vec::with_capacity(single.values.len() * n);
+    for _ in 0..n {
+        vals.extend_from_slice(&single.values);
+    }
+    let trace = RowMajorMatrix::new(vals, WIDTH);
+    let height = HEIGHT * n;
+    let config = make_config(1);
+    let air = FullSpendAir;
+    let pis = public_values(&w);
+    let t0 = std::time::Instant::now();
+    let proof = prove(&config, &air, trace, &pis);
+    let prove_ms = t0.elapsed().as_millis();
+    let bytes = postcard::to_allocvec(&proof).expect("serialize");
+    let t1 = std::time::Instant::now();
+    assert!(verify(&config, &air, &proof, &pis).is_ok(), "batch n={n} failed to verify");
+    let verify_ms = t1.elapsed().as_millis();
+
+    // proven security at the batch trace height
+    let perm = default_goldilocks_poseidon2_8();
+    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), CAP_HEIGHT, SmallRng::seed_from_u64(1));
+    let fri = production_fri_params(ChallengeMmcs::new(val_mmcs));
+    let layout = AirLayout::from_air::<Goldilocks>(&air);
+    let params = StarkSecurityParams::from_air::<Val, Challenge, FullSpendAir, ChallengeMmcs>(
+        &fri, &air, layout, EXT_FIELD_BITS, COLLISION_RESISTANCE_BITS, 2,
+    );
+    let zk_bits = height.trailing_zeros() as usize + 1;
+    let proven = ProvenSecurity::compute(&params, 1usize << zk_bits).security_bits();
+    SweepResult {
+        conjectured_bits: fri.conjectured_soundness_bits().min(EXT_FIELD_BITS).min(COLLISION_RESISTANCE_BITS),
+        proven_bits: proven,
+        proof_bytes: bytes.len(),
+        prove_ms,
+        verify_ms,
+    }
+}
+
 pub fn security_report() -> SecurityReport {
     let perm = default_goldilocks_poseidon2_8();
     let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, SmallRng::seed_from_u64(1));
