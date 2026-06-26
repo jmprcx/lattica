@@ -30,7 +30,7 @@ use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilo
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, StarkConfig};
+use p3_uni_stark::{prove, verify, Proof, StarkConfig};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
@@ -89,8 +89,8 @@ const PI_ROOT: usize = 0; // 0..4
 const PI_NF: usize = 4; // 4..8
 const PI_OUTCM: usize = 8; // 8..12
 const PI_FEE: usize = 12;
-const PI_TXBIND: usize = 13;
-const N_PUBLIC: usize = 14;
+const PI_TXBIND: usize = 13; // 13..17 (full 4-element sighash digest)
+const N_PUBLIC: usize = 17;
 
 #[derive(Clone, Copy)]
 pub struct Witness {
@@ -106,7 +106,7 @@ pub struct Witness {
     pub out_rho: Val,
     pub out_rcm: Val,
     pub fee: u64,
-    pub tx_binding: Val,
+    pub tx_binding: [Val; DIGEST],
 }
 
 // --- native oracle ----------------------------------------------------------------------------
@@ -161,7 +161,7 @@ pub fn public_values(w: &Witness) -> Vec<Val> {
     pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&o.nf);
     pis[PI_OUTCM..PI_OUTCM + DIGEST].copy_from_slice(&o.out_cm);
     pis[PI_FEE] = Val::from_u64(w.fee);
-    pis[PI_TXBIND] = w.tx_binding;
+    pis[PI_TXBIND..PI_TXBIND + DIGEST].copy_from_slice(&w.tx_binding);
     pis
 }
 
@@ -466,6 +466,32 @@ pub fn prove_real_verify_with(w: &Witness, verify_pis: &[Val]) -> Result<(), Str
     verify(&config, &air, &proof, verify_pis).map_err(|e| format!("{e:?}"))
 }
 
+/// Number of public-input field elements the statement binds.
+pub const NUM_PUBLIC_INPUTS: usize = N_PUBLIC;
+
+/// Prove the spend and return the canonical (postcard) proof bytes.
+pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {
+    let config = make_config(1);
+    let air = FullSpendAir;
+    let tr = build_trace(w);
+    let proof = prove(&config, &air, tr, &public_values(w));
+    postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+}
+
+/// Verify canonical proof bytes against the public inputs. **Fail-closed**: any deserialization
+/// error, wrong public-input count, or verification failure returns `false`.
+pub fn verify_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
+    if pis.len() != N_PUBLIC {
+        return false;
+    }
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let config = make_config(1);
+    verify(&config, &FullSpendAir, &proof, pis).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,8 +510,24 @@ mod tests {
             out_rho: Val::from_u64(11),
             out_rcm: Val::from_u64(13),
             fee: 400, // value = out_value + fee  (1000 = 600 + 400)
-            tx_binding: Val::from_u64(0xABCDEF),
+            tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCDEF + i as u64)),
         }
+    }
+
+    #[test]
+    fn proof_bytes_roundtrip_and_tamper() {
+        let w = sample();
+        let bytes = prove_to_bytes(&w);
+        assert!(verify_bytes(&bytes, &public_values(&w)), "round-trip should verify");
+        // tampered public inputs rejected
+        let mut bad = public_values(&w);
+        bad[PI_ROOT] += Val::ONE;
+        assert!(!verify_bytes(&bytes, &bad));
+        // truncated / malformed proof bytes fail closed
+        assert!(!verify_bytes(&bytes[..bytes.len() - 1], &public_values(&w)));
+        assert!(!verify_bytes(&[], &public_values(&w)));
+        // wrong public-input count fails closed
+        assert!(!verify_bytes(&bytes, &public_values(&w)[..N_PUBLIC - 1]));
     }
 
     #[test]

@@ -14,9 +14,7 @@
 //! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip via a
 //! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
-mod full_spend_air;
-mod poseidon2_air;
-mod spend_air;
+use lattica_prover_p3::{full_spend_air, poseidon2_air, spend_air};
 
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
@@ -199,7 +197,7 @@ fn main() {
         out_rho: Val::new(11),
         out_rcm: Val::new(13),
         fee: 400,
-        tx_binding: Val::new(0xABCDEF),
+        tx_binding: core::array::from_fn(|i| Val::new(0xABCDEF + i as u64)),
     };
     match full_spend_air::prove_verify(&w) {
         Ok(()) => println!("  M4c full spend statement (ZK): ACCEPTED"),

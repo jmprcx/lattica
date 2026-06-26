@@ -23,7 +23,7 @@ None of the audit's 8 release gates are met; the Phase-3 external audit has not 
 | **C-01** auth not bound | C | 🟡 circuit built, **NOT live** | `spend.rs` binds ownership+nullifier+commitment+membership+balance+tx-binding (validated). But `node.zig` still calls `circuit.verifyAuthorization` (generic preimage). Cutover = P4. |
 | **C-02** full spend not live | C | 🟡 circuit + ABI built, **NOT live** | Full spend AIR + real `lattica_spend_verify` exist; `verifyAndApply` does not call them yet. Cutover = P4. |
 | **C-03** demo-depth / not protocol-complete | C | 🟡 partly | Binds ownership/balance/range, but `DEPTH=4` (not 32), `recipient` is 1 element (not full digest), and the in-circuit `Rp64_256` does **not** match the protocol's SHA3 `noteCommitment`/`nullifier` in `tx.zig`/`primitives.zig`. |
-| **ZK-01** spend proof not zero-knowledge *(found in the remediation review)* | C | ❌ **Open (blocking)** | Winterfell 0.13 has no ZK (its "Randomized AIR" = multiset/aux args, not ZK); `spend.rs` has no trace blinding → FRI openings leak the witness. The hand-rolled `spend.zig` had ZK; the port lost it. A shielded proof must be ZK. |
+| **ZK-01** spend proof not zero-knowledge *(found in the remediation review)* | C | ✅ resolved in new stack (not live) | Re-built on **Plonky3** (`lattica-prover-p3/`): the full spend statement proves/verifies under the **hiding (ZK) FRI PCS** on stable. Winterfell 0.13 had no ZK; the new production stack does. Live cutover = P4 (M6). |
 
 Legend: ✅ closed · 🟡 partial (mechanism built, not closed) · ❌ open · ⏳ subsumed.
 
@@ -109,8 +109,16 @@ counts below are historical, from the iteration that added each piece.)
   `DuplexChallenger`, `F_p²`) on stable. **M3 done** — investigated the composition architecture:
   `p3-lookup` (LogUp) exists but p3 ships no multi-table prover, so chose a single-`uni-stark` AIR
   (vetted Poseidon2 constants + hand-written rounds, differential-tested) over building un-vetted
-  multi-table orchestration. Remaining: M4 full spend statement (the big one); C-04 budget; M5
-  differential tests + C ABI; M6 Phase-4 node cutover. Winterfell `lattica-prover` = the oracle.
+  multi-table orchestration. **M4 done** — the full spend statement (ownership + commitment +
+  general-position membership + nullifier + output + value-balance + range + tx-binding) proves and
+  verifies in **zero-knowledge** on stable, validated against an independent native
+  `Poseidon2Goldilocks` oracle with a negative test for every binding (`poseidon2_air.rs`,
+  `spend_air.rs`, `full_spend_air.rs`). **M5 done** — canonical proof serialization + the
+  `lattica_spend_verify` **C ABI** matching `src/ffi.zig` (fail-closed; staticlib exports the
+  symbol). **ZK-01 is resolved in the new stack** (the production proof is now ZK). Remaining: C-04
+  (production params + soundness budget), parameter widening (DEPTH 4→32, recipient→4-elem, wider
+  BITS), and M6 Phase-4 node cutover (`lattica_spend_prove` + wire into `node.zig`). 21/21
+  `lattica-prover-p3` tests.
 - **C-03 protocol match:** the in-circuit `Rp64_256` hash must match the protocol's
   `noteCommitment`/`nullifier` (switch `tx.zig`/`primitives.zig` to the field hash); full note
   format; `recipient` → 4-element digest; `DEPTH` → 32; widen `BITS`.

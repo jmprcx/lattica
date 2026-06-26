@@ -61,13 +61,20 @@ testable hand-rolled hash-AIR for avoiding an un-vetted multi-table prover build
 - **M3 — done (investigation + decision):** no multi-table prover in p3 0.6.1; **chose option B**
   (single `uni-stark` AIR, vetted Poseidon2 constants + hand-written round constraints) for the
   first full statement (see the architecture section above).
-- **M4:** the **full spend statement** as a single multi-region `uni-stark` AIR — Poseidon2 rounds
-  (vetted constants, differential-tested vs `Poseidon2Goldilocks`) for the commitment / depth-D
-  membership / nullifier / output / ownership hashes, plus the wiring (link region outputs→inputs),
-  value-balance, range, and tx-binding — under the hiding (ZK) PCS. This is the analogue of the
-  validated Winterfell `lattica-prover` statement; build it incrementally (one hash region →
-  membership chain → + nullifier/output → + balance/range/ownership/tx-binding), each
-  differential-tested against the Winterfell oracle.
+- **M4 — done:** the **full spend statement** as a single multi-region `uni-stark` AIR under the
+  hiding (ZK) PCS, built incrementally and each step differential-tested against an **independent
+  native `Poseidon2Goldilocks` oracle** (note: a *proof-level* differential vs Winterfell is not
+  meaningful — Winterfell uses Rescue, Plonky3 uses Poseidon2; Winterfell remains a *structural*
+  reference for the statement shape):
+  - **M4a** (`poseidon2_air.rs`): the across-rows Poseidon2-Goldilocks permutation AIR (vetted
+    constants/layers; hand-written S-box + RC + sequencing), output == native. 3 tests.
+  - **M4b** (`spend_air.rs`): commitment + general-position Merkle membership (block-boundary links,
+    boolean position bit), root == native fold. 4 tests.
+  - **M4c** (`full_spend_air.rs`): ownership + commitment + membership + nullifier + output +
+    value-balance + range + tx-binding, with cross-region binding via **persistent columns**
+    (nk, rho, value, out_value) and **period-256 per-boundary selectors** + the period-32 round
+    schedule. A negative test for every binding (wrong root/nf/out_cm, unbalanced, out-of-range,
+    wrong tx-binding via prove-real/verify-other, forged nk). 9 tests.
   - **M4 de-risked:** `GenericPoseidon2LinearLayers::{external,internal}_linear_layer<R:
     PrimeCharacteristicRing>` is generic over the algebra, and the AIR builder's `AB::Expr`
     implements `PrimeCharacteristicRing` — so the custom AIR can **call the vetted linear layers
@@ -75,12 +82,26 @@ testable hand-rolled hash-AIR for avoiding an un-vetted multi-table prover build
     the vetted round constants, the full/partial round sequencing, and the spend wiring. The vetted
     constants + linear algebra are reused; correctness of the round structure is pinned by the
     differential test against native `Poseidon2Goldilocks`.
-- **M5:** native oracle + **differential tests** vs the Winterfell `lattica-prover`; canonical proof
-  serialization; the `lattica_spend_verify` / `lattica_spend_prove` C ABI (matches `src/ffi.zig`).
-- **M6:** Phase-4 node cutover — wire the verifier into `node.zig`, switch protocol hashing to
+- **M5 — done** (`lib.rs`): canonical **proof serialization** (postcard; round-trip + tamper +
+  malformed-fail-closed tests) and the **`lattica_spend_verify` C ABI** matching `src/ffi.zig`'s
+  136-byte `SpendPublicInputs` layout (anchor‖nullifier‖out_cm‖tx_binding‖fee), with canonical
+  field-element parsing — fail-closed on null pointers, wrong length, non-canonical limbs, or
+  malformed proof bytes. The crate now builds a `staticlib` exporting `lattica_spend_verify`.
+  Differential = the independent native Poseidon2 oracle (per-region `native_*` tests). 21 tests.
+- **M6:** Phase-4 node cutover — wire the verifier into `node.zig` (via `ffi.setBackend`), add
+  `lattica_spend_prove` (wallet side), link the staticlib, switch protocol hashing to
   Poseidon2-Goldilocks, demote native checks. Then the Phase-3 external audit gates value use.
+
+## Status: M1–M5 complete
+The production spend circuit exists, is zero-knowledge, builds on stable, and exposes the C ABI the
+node calls. **Remaining before production:** (1) **C-04** — production FRI parameters + a written
+≥120-bit soundness budget (current params are dev-sized: `num_queries=24`, low PoW); (2) **parameter
+widening** — `DEPTH 4→32`, `recipient` 1→4-element digest, `BITS 32→` wider; (3) **M6** node cutover
++ `lattica_spend_prove`; (4) **Phase-3 external audit**. These are scaling/integration, not new
+architecture.
 
 ## Notes
 - Goldilocks Poseidon2: WIDTH 8, S-box degree 7, 8 full + 22 partial rounds (vetted Grain-LFSR
-  constants). DEPTH/recipient-digest/value-bit-width are parameters to finalize in M4/M5.
-- Toolchain: stable (no nightly). Keep `lattica-prover` (Winterfell) building as the oracle.
+  constants). DEPTH/recipient-digest/value-bit-width are parameters (small here; widened for prod).
+- Toolchain: stable (no nightly). Keep `lattica-prover` (Winterfell) building as a structural
+  reference.

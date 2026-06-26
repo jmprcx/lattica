@@ -9,6 +9,14 @@ edition = "2021"
 
 [workspace]
 
+[lib]
+name = "lattica_prover_p3"
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "lattica-prover-p3"
+path = "src/main.rs"
+
 [dependencies]
 p3-air = "0.6.1"
 p3-field = "0.6.1"
@@ -24,3 +32,5 @@ p3-matrix = "0.6.1"
 p3-merkle-tree = "0.6.1"
 p3-uni-stark = "0.6.1"
 rand = "0.10"
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
