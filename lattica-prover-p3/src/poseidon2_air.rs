@@ -33,30 +33,30 @@ use p3_uni_stark::{prove, verify, StarkConfig};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
-const W: usize = 8; // state width
-const BLOCK: usize = 32; // rows per permutation (31 transitions + output row)
+pub(crate) const W: usize = 8; // state width
+pub(crate) const BLOCK: usize = 32; // rows per permutation (31 transitions + output row)
 const FULL_HALF: usize = 4; // initial / terminal full rounds
 const PARTIAL: usize = 22; // partial rounds
 
 type Val = Goldilocks;
 type LL = GenericPoseidon2LinearLayersGoldilocks;
 
-fn pow7<R: PrimeCharacteristicRing>(x: R) -> R {
+pub(crate) fn pow7<R: PrimeCharacteristicRing>(x: R) -> R {
     let x2 = x.clone() * x.clone();
     let x4 = x2.clone() * x2.clone();
     x4 * x2 * x
 }
 
-fn ext_linear<R: PrimeCharacteristicRing>(s: &mut [R; W]) {
+pub(crate) fn ext_linear<R: PrimeCharacteristicRing>(s: &mut [R; W]) {
     LL::external_linear_layer(s);
 }
-fn int_linear<R: PrimeCharacteristicRing>(s: &mut [R; W]) {
+pub(crate) fn int_linear<R: PrimeCharacteristicRing>(s: &mut [R; W]) {
     LL::internal_linear_layer(s);
 }
 
 /// The native permutation, computed step-by-step with the vetted constants/layers (so it can fill
 /// the trace). Equals `Poseidon2Goldilocks::permute` (checked in tests).
-fn native_steps(input: [Val; W]) -> [[Val; W]; BLOCK] {
+pub(crate) fn native_steps(input: [Val; W]) -> [[Val; W]; BLOCK] {
     let mut rows = [[Val::ZERO; W]; BLOCK];
     let mut s = input;
     rows[0] = s;
@@ -98,7 +98,7 @@ pub fn native_permute(input: [Val; W]) -> [Val; W] {
 
 const N_PERIODIC: usize = 3 + W; // 11
 
-fn periodic_table() -> Vec<Vec<Val>> {
+pub(crate) fn periodic_table() -> Vec<Vec<Val>> {
     let mut is_init = vec![Val::ZERO; BLOCK];
     let mut is_full = vec![Val::ZERO; BLOCK];
     let mut is_partial = vec![Val::ZERO; BLOCK];

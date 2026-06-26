@@ -15,6 +15,7 @@
 //! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
 mod poseidon2_air;
+mod spend_air;
 
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
