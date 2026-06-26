@@ -92,13 +92,19 @@ testable hand-rolled hash-AIR for avoiding an un-vetted multi-table prover build
   `lattica_spend_prove` (wallet side), link the staticlib, switch protocol hashing to
   Poseidon2-Goldilocks, demote native checks. Then the Phase-3 external audit gates value use.
 
-## Status: M1–M5 complete
-The production spend circuit exists, is zero-knowledge, builds on stable, and exposes the C ABI the
-node calls. **Remaining before production:** (1) **C-04** — production FRI parameters + a written
-≥120-bit soundness budget (current params are dev-sized: `num_queries=24`, low PoW); (2) **parameter
-widening** — `DEPTH 4→32`, `recipient` 1→4-element digest, `BITS 32→` wider; (3) **M6** node cutover
-+ `lattica_spend_prove`; (4) **Phase-3 external audit**. These are scaling/integration, not new
-architecture.
+## Status: M1–M5 complete + C-04 + parameter hardening done
+The production spend circuit exists, is zero-knowledge, builds on stable, exposes the C ABI the node
+calls, runs at **production parameters**, and carries a **machine-checked soundness budget**.
+- **C-04 — done** (`docs/soundness-budget.md`): challenges in `F_p²` (~127-bit) + FRI `log_blowup=4`,
+  `num_queries=96`, `query_pow=16` ⇒ **≈103-bit proven** / **≈127-bit conjectured** (vs the audited
+  ~50). `full_spend_air::security_report()` computes it via Plonky3's `ProvenSecurity`/
+  `ConjecturedSecurity`; the `production_security_budget` test gates proven ≥ 100, conjectured ≥ 128.
+- **Parameter hardening — done**: `DEPTH 4→32` (block count padded 36→64), `recipient` 1→**4-element
+  digest** (input & output notes share the commitment layout), value `BITS 32→52` (wraparound-safe).
+  Production proof ~848 KB, prove ~2.2 s, verify ~14 ms (`DEPTH=32`). 22 tests pass.
+
+**Remaining before production:** (1) **M6** node cutover + `lattica_spend_prove`; (2) **Phase-3
+external audit** (incl. a Poseidon2 review). These are integration + audit, not new architecture.
 
 ## Notes
 - Goldilocks Poseidon2: WIDTH 8, S-box degree 7, 8 full + 22 partial rounds (vetted Grain-LFSR

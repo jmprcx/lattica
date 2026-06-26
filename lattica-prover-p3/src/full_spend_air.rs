@@ -19,6 +19,7 @@
 //! flagged). Validated against an independent native Poseidon2 oracle and proven/verified under the
 //! hiding (ZK) PCS.
 
+use p3_air::symbolic::AirLayout;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
@@ -30,7 +31,7 @@ use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilo
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, Proof, StarkConfig};
+use p3_uni_stark::{prove, verify, Proof, ProvenSecurity, StarkConfig, StarkSecurityParams};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
@@ -38,11 +39,14 @@ use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps,
 
 type Val = Goldilocks;
 
-pub const DEPTH: usize = 4;
-const NUM_BLOCKS: usize = 4 + DEPTH; // ownership, commitment, DEPTH merges, nullifier, output = 8
-const HEIGHT: usize = NUM_BLOCKS * BLOCK; // 256
+pub const DEPTH: usize = 32; // production Merkle depth
+const NUM_BLOCKS_USED: usize = 4 + DEPTH; // ownership, commitment, DEPTH merges, nullifier, output = 36
+const NUM_BLOCKS: usize = NUM_BLOCKS_USED.next_power_of_two(); // pad the trace to a power of two = 64
+const HEIGHT: usize = NUM_BLOCKS * BLOCK; // 2048
 const DIGEST: usize = 4;
-const BITS: usize = 32; // value range bound (value, out_value < 2^32)
+// Value range bound. Goldilocks p ≈ 2^64; `value = out_value + fee` is checked in the field, so all
+// three must stay < 2^BITS with 2·2^BITS < p (no wraparound). BITS=52 covers any realistic supply.
+const BITS: usize = 52;
 
 // column layout (WIDTH = 17)
 const BIT: usize = W; // 8  membership position bit
@@ -101,7 +105,7 @@ pub struct Witness {
     pub pos: Val,
     pub sib: [[Val; DIGEST]; DEPTH],
     pub bits: [bool; DEPTH],
-    pub out_recipient: Val,
+    pub out_recipient: [Val; DIGEST],
     pub out_value: u64,
     pub out_rho: Val,
     pub out_rcm: Val,
@@ -116,11 +120,22 @@ fn perm_in(elems: &[Val]) -> [Val; W] {
     s[..elems.len()].copy_from_slice(elems);
     s
 }
-fn recipient_of(nk: Val) -> Val {
-    native_permute(perm_in(&[nk]))[0]
+fn recipient_of(nk: Val) -> [Val; DIGEST] {
+    native_permute(perm_in(&[nk]))[..DIGEST].try_into().unwrap()
 }
-fn commit(recipient: Val, value: Val, rho: Val, rcm: Val) -> [Val; DIGEST] {
-    native_permute(perm_in(&[recipient, value, rho, rcm]))[..DIGEST].try_into().unwrap()
+/// The Poseidon2 input layout shared by the input- and output-note commitments:
+/// `[recipient(4), value, rho, rcm, pad]`.
+fn note_input(recipient: [Val; DIGEST], value: Val, rho: Val, rcm: Val) -> [Val; W] {
+    let mut s = [Val::ZERO; W];
+    s[..DIGEST].copy_from_slice(&recipient);
+    s[DIGEST] = value;
+    s[DIGEST + 1] = rho;
+    s[DIGEST + 2] = rcm;
+    s
+}
+/// A note commitment over a full 4-element recipient digest: `H(recipient‖value‖rho‖rcm)` (7 inputs).
+fn commit(recipient: [Val; DIGEST], value: Val, rho: Val, rcm: Val) -> [Val; DIGEST] {
+    native_permute(note_input(recipient, value, rho, rcm))[..DIGEST].try_into().unwrap()
 }
 fn merge(l: [Val; DIGEST], r: [Val; DIGEST]) -> [Val; DIGEST] {
     let mut s = [Val::ZERO; W];
@@ -143,14 +158,7 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
         node = if w.bits[d] { merge(w.sib[d], node) } else { merge(node, w.sib[d]) };
     }
     let nf: [Val; DIGEST] = native_permute(perm_in(&[nk, w.rho, w.pos]))[..DIGEST].try_into().unwrap();
-    let out_cm = native_permute(perm_in(&[
-        w.out_recipient,
-        Val::from_u64(w.out_value),
-        w.out_rho,
-        w.out_rcm,
-    ]))[..DIGEST]
-        .try_into()
-        .unwrap();
+    let out_cm = commit(w.out_recipient, Val::from_u64(w.out_value), w.out_rho, w.out_rcm);
     PublicOutputs { root: node, nf, out_cm }
 }
 
@@ -249,10 +257,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullSpendAir {
             builder.when_transition().assert_zero(nxt[c].clone() - cur[c].clone());
         }
 
-        // ---- recipient link (boundary ownership→commitment): commit.in[0] = own.out[0] ----
-        builder
-            .when_transition()
-            .assert_zero(p[P_RECIP_LINK].clone() * (nxt[0].clone() - cur[0].clone()));
+        // ---- recipient link (boundary ownership→commitment): commit.in[0..4] = own.out[0..4] ----
+        // recipient = H(nk) is the full 4-element digest; carry all four into the commitment input.
+        for i in 0..DIGEST {
+            builder
+                .when_transition()
+                .assert_zero(p[P_RECIP_LINK].clone() * (nxt[i].clone() - cur[i].clone()));
+        }
 
         // ---- membership links (boundaries into each merge): place running digest by the bit ----
         let bit = nxt[BIT].clone();
@@ -298,13 +309,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullSpendAir {
         builder.assert_zero(rc_close.clone() * cur[REMV].clone());
         builder.assert_zero(rc_close.clone() * cur[REMO].clone());
 
-        // commitment input (row 32): state = [recipient(link), value, rho, rcm(free), 0,0,0,0].
+        // commitment input: [recipient(0..4, via link), value(4), rho(5), rcm(6, free), pad(7)].
         let ci = p[P_COMMIT_IN].clone();
-        builder.assert_zero(ci.clone() * (cur[1].clone() - cur[VALUE].clone()));
-        builder.assert_zero(ci.clone() * (cur[2].clone() - cur[RHO].clone()));
-        for i in DIGEST..W {
-            builder.assert_zero(ci.clone() * cur[i].clone());
-        }
+        builder.assert_zero(ci.clone() * (cur[DIGEST].clone() - cur[VALUE].clone())); // value
+        builder.assert_zero(ci.clone() * (cur[DIGEST + 1].clone() - cur[RHO].clone())); // rho
+        builder.assert_zero(ci.clone() * cur[DIGEST + 3].clone()); // pad (index 7)
 
         // root output (row 191): state[0..4] = public root.
         let pr = p[P_ROOT].clone();
@@ -328,12 +337,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullSpendAir {
             builder.assert_zero(no.clone() * (cur[i].clone() - pis[PI_NF + i].clone()));
         }
 
-        // output-commitment input (row 224): state[1] = out_value; state[4..8] = 0 (0/2/3 free).
+        // output-commitment input: [out_recipient(0..4, free), out_value(4), out_rho(5, free),
+        // out_rcm(6, free), pad(7)]. Only out_value (bound to its persistent column) and the pad fix.
         let oi = p[P_OUT_IN].clone();
-        builder.assert_zero(oi.clone() * (cur[1].clone() - cur[OUTVAL].clone()));
-        for i in DIGEST..W {
-            builder.assert_zero(oi.clone() * cur[i].clone());
-        }
+        builder.assert_zero(oi.clone() * (cur[DIGEST].clone() - cur[OUTVAL].clone())); // out_value
+        builder.assert_zero(oi.clone() * cur[DIGEST + 3].clone()); // pad (index 7)
         // output-commitment output (row 255): state[0..4] = public out_cm.
         let oo = p[P_OUT_OUT].clone();
         for i in 0..DIGEST {
@@ -366,7 +374,7 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
     // states
     set_state(&mut t, B_OWN, perm_in(&[nk]));
     let recipient = recipient_of(nk);
-    set_state(&mut t, B_COMMIT, perm_in(&[recipient, value, w.rho, w.rcm]));
+    set_state(&mut t, B_COMMIT, note_input(recipient, value, w.rho, w.rcm));
     let mut node = commit(recipient, value, w.rho, w.rcm);
     for d in 0..DEPTH {
         let (l, r) = if w.bits[d] { (w.sib[d], node) } else { (node, w.sib[d]) };
@@ -379,7 +387,12 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         node = native_permute(min)[..DIGEST].try_into().unwrap();
     }
     set_state(&mut t, B_NULL, perm_in(&[nk, w.rho, w.pos]));
-    set_state(&mut t, B_OUT, perm_in(&[w.out_recipient, out_value, w.out_rho, w.out_rcm]));
+    set_state(&mut t, B_OUT, note_input(w.out_recipient, out_value, w.out_rho, w.out_rcm));
+    // padding blocks (NUM_BLOCKS rounded up to a power of two): valid permutations of zero so the
+    // round constraints hold; no boundary selector references them, so they bind nothing.
+    for b in NUM_BLOCKS_USED..NUM_BLOCKS {
+        set_state(&mut t, b, [Val::ZERO; W]);
+    }
 
     // persistent columns
     for r in 0..HEIGHT {
@@ -410,7 +423,22 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
 // --- ZK config (hiding FRI PCS over Goldilocks) ------------------------------------------------
 
 type Perm = Poseidon2Goldilocks<8>;
-const LOG_BLOWUP: usize = 4; // period-256 selectors raise the constraint degree
+
+// --- C-04 production FRI / soundness parameters ------------------------------------------------
+// Rate ρ = 2^-LOG_BLOWUP. LOG_BLOWUP=4 (blowup 16) is the minimum the constraint degree allows
+// (degree ≤ blowup+1) and gives the FRI rate. Conjectured query soundness (ethSTARK) =
+// LOG_BLOWUP·NUM_QUERIES + QUERY_POW bits; challenges live in F_p² (~127-bit) and the Poseidon2
+// 4-Goldilocks commitment digest gives ~128-bit collision resistance. The numbers are
+// machine-checked by `security_report` / the `production_security_budget` test against Plonky3's
+// `ProvenSecurity`/`ConjecturedSecurity` (docs/soundness-budget.md).
+pub const LOG_BLOWUP: usize = 4;
+pub const NUM_QUERIES: usize = 96;
+pub const COMMIT_POW_BITS: usize = 0;
+pub const QUERY_POW_BITS: usize = 16;
+/// Bit-length of the extension field FRI/challenges operate in (Goldilocks², ⌊log2 p²⌋).
+pub const EXT_FIELD_BITS: usize = 127;
+/// Collision resistance of the Poseidon2 4-Goldilocks Merkle digest (birthday bound).
+pub const COLLISION_RESISTANCE_BITS: usize = 128;
 type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
 type ValMmcs =
@@ -429,18 +457,68 @@ fn make_config(seed: u64) -> MyConfig {
     let val_mmcs = ValMmcs::new(hash, compress, 0, SmallRng::seed_from_u64(seed));
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let dft = Dft::default();
-    let fri_params = FriParameters {
-        log_blowup: LOG_BLOWUP,
-        log_final_poly_len: 0,
-        max_log_arity: 1,
-        num_queries: 24,
-        commit_proof_of_work_bits: 1,
-        query_proof_of_work_bits: 1,
-        mmcs: challenge_mmcs,
-    };
+    let fri_params = production_fri_params(challenge_mmcs);
     let pcs = Pcs::new(dft, val_mmcs, fri_params, 4, SmallRng::seed_from_u64(seed));
     let challenger = Challenger::new(perm);
     MyConfig::new(pcs, challenger)
+}
+
+fn production_fri_params(mmcs: ChallengeMmcs) -> FriParameters<ChallengeMmcs> {
+    FriParameters {
+        log_blowup: LOG_BLOWUP,
+        log_final_poly_len: 0,
+        max_log_arity: 1,
+        num_queries: NUM_QUERIES,
+        commit_proof_of_work_bits: COMMIT_POW_BITS,
+        query_proof_of_work_bits: QUERY_POW_BITS,
+        mmcs,
+    }
+}
+
+/// C-04 soundness budget, computed from the *actual* AIR + production FRI parameters using
+/// Plonky3's security accounting (ethSTARK conjectured FRI soundness + the proven UDR/LDR bounds of
+/// [2024/1553] / [2025/2055], capped by the commitment's collision resistance and the field size).
+#[derive(Debug, Clone, Copy)]
+pub struct SecurityReport {
+    /// ethSTARK conjectured FRI query soundness: `LOG_BLOWUP·NUM_QUERIES + QUERY_POW_BITS`.
+    pub conjectured_fri_bits: usize,
+    /// Proven round-by-round soundness = max(unique-decoding, list-decoding), capped.
+    pub proven_bits: usize,
+    pub proven_udr_bits: usize,
+    pub proven_ldr_bits: usize,
+    pub num_constraints: usize,
+    pub max_constraint_degree: usize,
+    pub trace_height: usize,
+}
+
+pub fn security_report() -> SecurityReport {
+    let perm = default_goldilocks_poseidon2_8();
+    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0, SmallRng::seed_from_u64(1));
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs);
+    let fri_params = production_fri_params(challenge_mmcs);
+
+    let air = FullSpendAir;
+    let layout = AirLayout::from_air::<Goldilocks>(&air);
+    let params = StarkSecurityParams::from_air::<Val, Challenge, FullSpendAir, ChallengeMmcs>(
+        &fri_params,
+        &air,
+        layout,
+        EXT_FIELD_BITS,
+        COLLISION_RESISTANCE_BITS,
+        2, // max_combo: local + next rotations
+    );
+    // committed-polynomial size = HEIGHT plus the hiding PCS's +1 zk degree bump.
+    let zk_degree_bits = HEIGHT.trailing_zeros() as usize + 1;
+    let proven = ProvenSecurity::compute(&params, 1usize << zk_degree_bits);
+    SecurityReport {
+        conjectured_fri_bits: fri_params.conjectured_soundness_bits(),
+        proven_bits: proven.security_bits(),
+        proven_udr_bits: proven.unique_decoding_bits,
+        proven_ldr_bits: proven.list_decoding_bits,
+        num_constraints: params.num_constraints,
+        max_constraint_degree: params.air_max_constraint_degree,
+        trace_height: HEIGHT,
+    }
 }
 
 pub fn prove_verify_with(w: &Witness, pis: &[Val]) -> Result<(), String> {
@@ -504,8 +582,8 @@ mod tests {
             rcm: Val::from_u64(9),
             pos: Val::from_u64(3),
             sib: core::array::from_fn(|d| core::array::from_fn(|k| Val::from_u64((d * 4 + k + 50) as u64))),
-            bits: [false, true, true, false],
-            out_recipient: Val::from_u64(77),
+            bits: core::array::from_fn(|d| d % 3 == 0),
+            out_recipient: core::array::from_fn(|i| Val::from_u64(77 + i as u64)),
             out_value: 600,
             out_rho: Val::from_u64(11),
             out_rcm: Val::from_u64(13),
@@ -533,6 +611,16 @@ mod tests {
     #[test]
     fn valid_spend_verifies() {
         prove_verify(&sample()).expect("valid spend should verify");
+    }
+
+    #[test]
+    fn production_security_budget() {
+        let r = security_report();
+        println!("C-04 security report: {r:?}");
+        // the prover requires max_constraint_degree ≤ blowup + 1
+        assert!(r.max_constraint_degree <= (1 << LOG_BLOWUP) + 1, "degree {} too high", r.max_constraint_degree);
+        assert!(r.conjectured_fri_bits >= 128, "conjectured {} < 128", r.conjectured_fri_bits);
+        assert!(r.proven_bits >= 100, "proven {} < 100", r.proven_bits);
     }
 
     #[test]
@@ -570,7 +658,7 @@ mod tests {
     #[test]
     fn out_of_range_value_rejected() {
         let mut w = sample();
-        w.value = 1u64 << 40; // >= 2^32
+        w.value = 1u64 << 53; // >= 2^BITS (52)
         w.out_value = 0;
         w.fee = w.value; // keep balance so only range fails
         assert!(prove_verify(&w).is_err());

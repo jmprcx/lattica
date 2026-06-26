@@ -19,10 +19,10 @@ None of the audit's 8 release gates are met; the Phase-3 external audit has not 
 | **C-05** unvetted hash | C | ✅ in new stack (not live) | `lattica-prover` AIR for vetted `Rp64_256`, differential-tested. Live node still uses `rescue.zig`. |
 | **I-02** RNG via debug assert | I | ✅ in new stack (not live) | Production prover RNG is Winterfell's; live node still uses `stark.zig`. |
 | **I-03** engine duplication | I | ✅ in new stack (not live) | Production = single Winterfell engine; hand-rolled engines remain in `src/` and on the live path. |
-| **C-04** ~50-bit soundness | C | 🟡 mechanism in place | `FieldExtension::Quadratic` (127-bit in the spike). Production params + **written soundness budget** pending (P5). |
+| **C-04** ~50-bit soundness | C | ✅ resolved in new stack (not live) | `lattica-prover-p3` draws challenges from `F_p²` (~127-bit) with FRI `log_blowup=4`/`num_queries=96`/`query_pow=16` ⇒ **≈103-bit proven / ~127-bit conjectured**, machine-checked (`docs/soundness-budget.md`, `production_security_budget` test). Live cutover = P4. |
 | **C-01** auth not bound | C | 🟡 circuit built, **NOT live** | `spend.rs` binds ownership+nullifier+commitment+membership+balance+tx-binding (validated). But `node.zig` still calls `circuit.verifyAuthorization` (generic preimage). Cutover = P4. |
 | **C-02** full spend not live | C | 🟡 circuit + ABI built, **NOT live** | Full spend AIR + real `lattica_spend_verify` exist; `verifyAndApply` does not call them yet. Cutover = P4. |
-| **C-03** demo-depth / not protocol-complete | C | 🟡 partly | Binds ownership/balance/range, but `DEPTH=4` (not 32), `recipient` is 1 element (not full digest), and the in-circuit `Rp64_256` does **not** match the protocol's SHA3 `noteCommitment`/`nullifier` in `tx.zig`/`primitives.zig`. |
+| **C-03** demo-depth / not protocol-complete | C | 🟡 mostly (new stack) | New `lattica-prover-p3` circuit is **production-shaped**: `DEPTH=32`, `recipient` = full 4-element digest, `BITS=52`, vetted Poseidon2 = the in-circuit hash. Residual: the protocol side (`tx.zig`/`primitives.zig`) must switch its `noteCommitment`/`nullifier`/Merkle hashing to Poseidon2-Goldilocks so on-chain == in-circuit (part of P4/M6). |
 | **ZK-01** spend proof not zero-knowledge *(found in the remediation review)* | C | ✅ resolved in new stack (not live) | Re-built on **Plonky3** (`lattica-prover-p3/`): the full spend statement proves/verifies under the **hiding (ZK) FRI PCS** on stable. Winterfell 0.13 had no ZK; the new production stack does. Live cutover = P4 (M6). |
 
 Legend: ✅ closed · 🟡 partial (mechanism built, not closed) · ❌ open · ⏳ subsumed.
@@ -115,16 +115,18 @@ counts below are historical, from the iteration that added each piece.)
   `Poseidon2Goldilocks` oracle with a negative test for every binding (`poseidon2_air.rs`,
   `spend_air.rs`, `full_spend_air.rs`). **M5 done** — canonical proof serialization + the
   `lattica_spend_verify` **C ABI** matching `src/ffi.zig` (fail-closed; staticlib exports the
-  symbol). **ZK-01 is resolved in the new stack** (the production proof is now ZK). Remaining: C-04
-  (production params + soundness budget), parameter widening (DEPTH 4→32, recipient→4-elem, wider
-  BITS), and M6 Phase-4 node cutover (`lattica_spend_prove` + wire into `node.zig`). 21/21
-  `lattica-prover-p3` tests.
+  symbol). **ZK-01 is resolved in the new stack** (the production proof is now ZK). **C-04 + the
+  parameter hardening are also done**: `F_p²` challenges + FRI (`log_blowup=4`/`q=96`/`pow=16`) ⇒
+  ≈103-bit proven / ~127-bit conjectured (machine-checked, `docs/soundness-budget.md`); `DEPTH=32`,
+  4-element recipient, `BITS=52`. Remaining: M6 Phase-4 node cutover (`lattica_spend_prove` + wire
+  into `node.zig` + switch protocol hashing). 22/22 `lattica-prover-p3` tests.
 - **C-03 protocol match:** the in-circuit `Rp64_256` hash must match the protocol's
   `noteCommitment`/`nullifier` (switch `tx.zig`/`primitives.zig` to the field hash); full note
   format; `recipient` → 4-element digest; `DEPTH` → 32; widen `BITS`.
 - **C-01/C-02 live cutover (Phase 4):** wire `lattica_spend_verify` into `node.zig:verifyAndApply`
   (via `ffi.setBackend`), add `lattica_spend_prove`, link the static lib, demote native checks.
-- **C-04:** finalize production parameters + the ≥120-bit soundness budget.
+- ~~**C-04:** finalize production parameters + the soundness budget.~~ **Done** (new stack):
+  ≈103-bit proven / ~127-bit conjectured, machine-checked (`docs/soundness-budget.md`).
 - Position-consistency (nullifier `pos` ↔ path); `mint`/`burn` issuance.
 
 Then **Phase 3** (external audit of the circuit + protocol + FFI glue) gates value-bearing use; none

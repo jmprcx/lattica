@@ -191,21 +191,37 @@ fn main() {
         rcm: Val::new(9),
         pos: Val::new(3),
         sib: core::array::from_fn(|d| core::array::from_fn(|k| Val::new((d * 4 + k + 50) as u64))),
-        bits: [false, true, true, false],
-        out_recipient: Val::new(77),
+        bits: core::array::from_fn(|d| d % 3 == 0),
+        out_recipient: core::array::from_fn(|i| Val::new(77 + i as u64)),
         out_value: 600,
         out_rho: Val::new(11),
         out_rcm: Val::new(13),
         fee: 400,
         tx_binding: core::array::from_fn(|i| Val::new(0xABCDEF + i as u64)),
     };
-    match full_spend_air::prove_verify(&w) {
-        Ok(()) => println!("  M4c full spend statement (ZK): ACCEPTED"),
-        Err(e) => {
-            println!("  M4c full spend statement: FAILED ({e})");
-            std::process::exit(1);
-        }
+    let t0 = std::time::Instant::now();
+    let proof = full_spend_air::prove_to_bytes(&w);
+    let prove_ms = t0.elapsed().as_millis();
+    let pis = full_spend_air::public_values(&w);
+    let t1 = std::time::Instant::now();
+    let ok = full_spend_air::verify_bytes(&proof, &pis);
+    let verify_ms = t1.elapsed().as_millis();
+    if !ok {
+        println!("  M4c full spend statement: FAILED");
+        std::process::exit(1);
     }
+    println!(
+        "  M4c full spend (DEPTH={}, ZK): ACCEPTED | proof {} bytes, prove {} ms, verify {} ms",
+        full_spend_air::DEPTH,
+        proof.len(),
+        prove_ms,
+        verify_ms
+    );
+    let s = full_spend_air::security_report();
+    println!(
+        "  C-04 soundness: proven {} bits (UDR {}, LDR {}), conjectured FRI {} bits (capped ~127 by F_p2 / 128 collision)",
+        s.proven_bits, s.proven_udr_bits, s.proven_ldr_bits, s.conjectured_fri_bits
+    );
 }
 
 #[cfg(test)]
