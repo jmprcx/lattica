@@ -129,5 +129,11 @@ counts below are historical, from the iteration that added each piece.)
   ≈103-bit proven / ~127-bit conjectured, machine-checked (`docs/soundness-budget.md`).
 - Position-consistency (nullifier `pos` ↔ path); `mint`/`burn` issuance.
 
+**Pre-audit work (see `docs/audit-scope-p3.md` — scope, threat model, frozen params, readiness):**
+soundness gaps A1 position-consistency / A2 domain separation / A3 fee / A4 nullifier-derivation; the
+C-03 protocol↔circuit hash match + shared KATs + an end-to-end FFI test; a constraint-accounting
+self-audit; and the **join-split (N-in/M-out) generalization** (decided 2026-06-26) so the audited
+circuit matches production shape.
+
 Then **Phase 3** (external audit of the circuit + protocol + FFI glue) gates value-bearing use; none
 of the audit's 8 release gates are met yet.

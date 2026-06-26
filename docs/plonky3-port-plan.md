@@ -106,8 +106,19 @@ calls, runs at **production parameters**, and carries a **machine-checked soundn
   security (verify 13→8 ms). Raising the blowup or grinding were shown counter-productive.
   Production (`DEPTH=32`): proof **~421 KB**, prove ~2.05 s, verify ~8 ms. 22 tests pass.
 
-**Remaining before production:** (1) **M6** node cutover + `lattica_spend_prove`; (2) **Phase-3
-external audit** (incl. a Poseidon2 review). These are integration + audit, not new architecture.
+**Remaining before production** (scope + threat model in `docs/audit-scope-p3.md`):
+- **Pre-audit circuit work:** A1 position-consistency (`pos` ↔ path), A2 domain separation across the
+  four hashes, A3 fee soundness, A4 nullifier-derivation argument; a **constraint-accounting
+  self-audit**.
+- **Transaction shape — decided (2026-06-26): generalize to join-split (N-in / M-out)** before audit,
+  so the audited circuit matches production shape (avoids a re-audit). Value balance becomes
+  `Σ in = Σ out + fee`; `N` nullifiers + `M` output commitments; likely an aggregate public-input
+  hash. Material redesign — see `docs/audit-scope-p3.md` §6.
+- **Protocol seam (C-03):** switch `tx.zig`/`primitives.zig` hashing to the exact in-circuit
+  Poseidon2-Goldilocks layouts (+ domain tags) with shared known-answer vectors; an end-to-end FFI
+  integration test (mint → prove → in-node verify → double-spend rejected).
+- **M6** node cutover + `lattica_spend_prove`; then **Phase-3 external audit** (incl. a Poseidon2
+  review).
 
 ## Notes
 - Goldilocks Poseidon2: WIDTH 8, S-box degree 7, 8 full + 22 partial rounds (vetted Grain-LFSR
