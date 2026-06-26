@@ -10,12 +10,12 @@ P3 external audit · P4 rubble integration · P5 testnet.
 | **L-01** value overflow | L | ✅ **Done** | `node.zig`: `std.math.add` in `buildTransfer` + `verifyAndApply`; `TxError.ValueOverflow`; overflow test. |
 | **I-01** malleable encoding | I | ✅ **Done (reference layer)** | `stark.zig` reader rejects field elements ≥ `P` (`NonCanonical`) and trailing bytes (`TrailingBytes`); 2 adversarial tests. Re-apply to the final unified-tx serialization in P1. |
 | **C-04** ~50-bit soundness | C | ⏳ Framework selected; shown in spike | Winterfell with `FieldExtension::Quadratic` → **127-bit** in the spike (vs ~50-bit). Final budget in P5. |
-| **C-05** unvetted hash | C | ⏳ Framework selected; shown in spike | Winterfell ships vetted Rescue-Prime `Rp64_256`; used in the spike. Full sponge AIR in P2. |
-| **I-02** RNG via debug assert | I | ⏳ Subsumed (P2) | Prover RNG owned by Winterfell; Zig reference engine stays test-only. |
-| **I-03** engine duplication | I | ⏳ Subsumed (P2) | Hand-rolled engines leave the production path; keep one as a differential-test oracle. |
-| **C-01** auth not bound to spend authority | C | 🔜 Core circuit work (P2) | Production circuit binds ownership+nullifier+commitment+membership+balance+tx-binding. |
-| **C-02** full spend not live | C | 🔜 Core circuit work (P2/P4) | Node verifies the single proof; native checks demoted to public-input consistency. |
-| **C-03** demo-depth / not protocol-complete | C | 🔜 Core circuit work (P2) | Depth-32, real note commitment (`recipient`/`rcm`) + exact nullifier derivation. |
+| **C-05** unvetted hash | C | ✅ **In-circuit, validated** | `lattica-prover` AIR for Rescue-Prime `Rp64_256` reproduces the native permutation (differential-tested); the vetted hash *is* the in-circuit hash. |
+| **I-02** RNG via debug assert | I | ✅ Subsumed | Prover RNG owned by Winterfell; Zig reference engine stays test-only. |
+| **I-03** engine duplication | I | ✅ Subsumed | Production proving is the single Winterfell engine; hand-rolled Zig STARK is the differential-test oracle only. |
+| **C-01** auth not bound to spend authority | C | 🟡 Foundation built (P2) | Hash AIR validated; binding ownership+nullifier+commitment+membership+balance+tx-binding into one statement is the remaining P2 work. |
+| **C-02** full spend not live | C | 🟡 Foundation built (P2/P4) | Verify boundary (`src/ffi.zig`) + fail-closed ABI in place; node wiring is P4. |
+| **C-03** demo-depth / not protocol-complete | C | 🟡 Foundation built (P2) | Vetted-hash AIR done; depth-32 membership + real note commitment + exact nullifier derivation are the remaining P2 increments. |
 
 Legend: ✅ done · 🔜 scheduled core work · ⏳ subsumed by the framework decision.
 
@@ -26,8 +26,27 @@ Legend: ✅ done · 🔜 scheduled core work · ⏳ subsumed by the framework de
   Winterfell with Goldilocks `f64` + vetted `Rp64_256` + F_p² challenges at **127-bit**
   conjectured security; 3/3 spike tests pass.
 
-## Next
-- **Phase 1:** finalize the `lattica` Zig protocol package + canonical unified-tx serialization
-  (re-apply the I-01 rule there); wire the hand-rolled STARK as a differential-test oracle.
-- **Phase 2:** full spend circuit (Rescue sponge + depth-32 membership + nullifier + balance +
-  tx-binding) in a `lattica-prover` Winterfell crate over a C ABI (closes C-01/C-02/C-03).
+## Phase 1 — done
+`src/codec.zig` (canonical encoding), `src/protocol.zig` (unified shielded tx + canonical
+serialization + tx-binding digest + checked-arithmetic supply model), `src/ffi.zig` (spend verify
+boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97/97 Zig tests.
+
+## Phase 2 — foundation built (in progress)
+`lattica-prover/` (Winterfell): the **Rescue-Prime `Rp64_256` permutation AIR**, cross-validated
+against the native hash (`trace_output_matches_native_oracle`), valid-verifies, tamper-rejected,
+and the `lattica_spend_verify` C ABI present and **fail-closed**. 4/4 Rust tests. This is the
+vetted in-circuit hash that the full statement is built from.
+
+### Remaining within Phase 2 (the spend statement on top of the validated hash)
+1. Chain the permutation into a **2-to-1 merge** and a **depth-32 Merkle membership** of the note
+   commitment under the public anchor.
+2. **Commitment opening** `cm = H(recipient, value, rho, rcm)` and **nullifier** `nf = H(nk, rho,
+   pos)` as in-circuit hashes; **ownership** binding (recipient ↔ `nk`).
+3. **Balance** `in_value = out_value + fee` (+ `mint`/`burn`) and **range** (no field wraparound),
+   values hidden; bind `out_cm`.
+4. Bind the public **tx-binding digest**; finalize canonical proof serialization; implement the
+   real `lattica_spend_verify` over `SpendPublicInputs`.
+5. Differential test the whole statement vs. the hand-rolled reference; production parameters +
+   written soundness budget (Phase 5).
+
+Then **Phase 3** (external audit of the circuit + protocol + FFI glue) gates value-bearing use.

@@ -1,0 +1,16 @@
+# Phase-2 production prover (see docs/framework-decision.md + the plan).
+# The in-circuit hash (Rescue-Prime Rp64_256) + spend circuit, on the vetted Winterfell
+# transparent post-quantum FRI-STARK framework. Exposed to the Zig node over a C ABI
+# (matches src/ffi.zig: SpendPublicInputs + lattica_spend_verify).
+[package]
+name = "lattica-prover"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+winterfell = "=0.13.1"

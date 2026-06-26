@@ -3,3 +3,4 @@ zig-out/
 .serena/
 AGENTS.md
 framework-spike/target/
+lattica-prover/target/
