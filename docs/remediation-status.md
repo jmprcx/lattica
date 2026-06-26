@@ -97,9 +97,12 @@ counts below are historical, from the iteration that added each piece.)
   would leak the hidden witness. **Path validated:** the `plonky2-spike/` proves the full spend-core
   statement with zero-knowledge on (vetted Poseidon + range/select gadgets, Goldilocks, FRI/PQ;
   `ZK re-randomized: true`, 5/5 tests). Recommendation (`docs/framework-decision.md` "ZK-01 spike
-  result"): **adopt plonky2** for the production circuit (ZK + smaller audit surface; cost: nightly
-  toolchain, ~149 KB proofs). Final framework decision pending; then re-express `lattica-prover` in
-  plonky2 (Winterfell kept as a differential oracle).
+  result"): a ZK-capable framework is needed (Winterfell has none). Options evaluated — **plonky2**
+  (ZK, gadgets/small audit surface; *nightly*), **Plonky3** (ZK + **stable** + **proven-security**;
+  AIR-style, our AIR ports), **zkVM** (ZK by construction; heavy, large TCB). **Front-runner:
+  Plonky3** (ZK on stable + proven security). Final framework decision pending (suggest a short
+  Plonky3 ZK prove-spike to confirm parity); then re-express `lattica-prover`, keeping Winterfell as
+  a differential oracle.
 - **C-03 protocol match:** the in-circuit `Rp64_256` hash must match the protocol's
   `noteCommitment`/`nullifier` (switch `tx.zig`/`primitives.zig` to the field hash); full note
   format; `recipient` → 4-element digest; `DEPTH` → 32; widen `BITS`.

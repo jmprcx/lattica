@@ -122,13 +122,50 @@ ZK-randomized).
 | Prove / verify | fast | ~0.9 s / ~5 ms (depth-2, demo params) |
 | Maturity | Polygon Miden | Polygon zkEVM |
 
-**Decision recommendation: adopt plonky2 for the production spend circuit.** ZK is non-negotiable
-for a shielded protocol, and plonky2 delivers it on the *same* field with *vetted gadgets* — which
-also **shrinks the audit surface** (the membership/range/hash logic that we hand-wrote as a
-Winterfell AIR becomes library gadget calls). Costs are acceptable and manageable: the nightly
-toolchain is pinned (`rust-toolchain.toml`) and is standard for plonky2 production deployments
-(Polygon zkEVM); ~149 KB proofs are fine for a payment transaction (and recursion can compress if
-needed). The Winterfell `lattica-prover` work stays valuable as a **differential-test oracle** and a
-second verifier path. Open caveats to confirm pre-adoption: plonky2's FRI/PQ parameterization and a
-written soundness budget (C-04), and the nightly supply-chain/reproducibility story for a
-value-bearing node.
+### ZK-01 further evaluation — Plonky3 and zkVM
+
+To avoid plonky2's **nightly** requirement, also evaluated **Plonky3** (`p3-*` 0.6.1) and a
+**zkVM** (SP1 6.3.1 / RISC0 5.0):
+
+- **Plonky3** — *empirically builds on **stable*** (verified: `p3-field`/`p3-goldilocks`/
+  `p3-uni-stark`/`p3-fri`/`p3-poseidon2` all compile on the stable toolchain). **Supports ZK**: the
+  PCS carries `ZK` — enabled via `HidingFriPcs` + `MerkleTreeHidingMmcs` (hiding/salted
+  commitments) — and the framework's own `fib_air` test runs both a ZK and a non-ZK config. Ships
+  **`p3-goldilocks`** (our field) and **Poseidon2**, and a `security.rs` giving **proven *and*
+  conjectured** soundness bounds (round-by-round, per 2024/1553) — a direct **C-04** advantage over
+  Winterfell/plonky2's conjectured-only. Style is **AIR** (`impl Air` + `prove(&config, air, trace,
+  pis)` / `verify`), so the existing `lattica-prover` AIR logic ports relatively directly. Cost:
+  verbose config assembly (the `Val/Perm/Mmcs/Challenge/Pcs/Challenger` type stack) and hand-written
+  AIR (larger audit surface than plonky2 gadgets); newer, faster-moving API. *(Confirmed via build +
+  source/test inspection; a full prove-spike with the ZK PCS was not run here — fast follow-up.)*
+- **zkVM (SP1 / RISC0)** — ZK by construction; the spend statement is written as an ordinary Rust
+  program (no hand-written constraints → smallest *application* code/audit surface). Stable *host*
+  toolchain, but needs a special *guest* toolchain (RISC-V) — **not installable in this sandbox**
+  (`cargo-prove`/`sp1up`/`rzup`/`r0vm` absent, no `riscv` target), so no prove-spike. Tradeoffs:
+  heaviest proving and largest proofs (compressible via their wrap/recursion), and the **largest
+  trusted base** — you trust the entire (vetted) VM circuit, not just your statement.
+
+### Decision matrix
+
+| | Winterfell | plonky2 | **Plonky3** | zkVM (SP1/RISC0) |
+|---|---|---|---|---|
+| Zero-knowledge | ❌ | ✅ (spiked) | ✅ (framework-tested; not spiked here) | ✅ by construction |
+| Toolchain | **stable** | **nightly** | **stable** | stable host + RISC-V guest |
+| Field | Goldilocks | Goldilocks | Goldilocks (or BabyBear/Koala) | RISC-V VM |
+| In-circuit hash | Rescue-Prime | Poseidon | Poseidon2 | VM-internal |
+| Soundness accounting | conjectured | conjectured | **proven + conjectured** | VM's |
+| Statement style | hand-AIR | **gadgets (small surface)** | hand-AIR (ports from our work) | plain Rust program |
+| App audit surface | high | low | high (but reuses validated AIR) | tiny app / huge VM TCB |
+| Proof size (spiked) | ~73 KB | ~149 KB | STARK-range (not spiked) | large, compressible |
+| Maturity | Polygon Miden | Polygon zkEVM | SP1/Valida; newer | RISC0/SP1 production |
+
+### Recommendation (updated)
+
+**Plonky3 is the front-runner:** it is the only option giving **ZK + stable toolchain +
+proven-security**, on our field, and our existing AIR work ports to it. **plonky2** is the strong
+alternative when the smallest hand-written audit surface (gadgets) matters more than avoiding
+nightly. A **zkVM** is the right call only if developer velocity / protocol-agility outweighs proof
+size and a large trusted base. Suggested next step: a short **Plonky3 ZK prove-spike** (port the
+spend core, enable `HidingFriPcs`) to confirm end-to-end parity with the plonky2 result before
+committing. This is the user's design decision; C-04 (final FRI/PQ params + soundness budget) is
+owed for whichever framework is chosen.
