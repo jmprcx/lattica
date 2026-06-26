@@ -1,0 +1,26 @@
+# Production spend circuit on Plonky3 (transparent, FRI, zero-knowledge via the hiding PCS).
+# Goldilocks field + vetted Poseidon2 (constants + AIR from p3-*). Built on stable Rust.
+# Replaces the Winterfell `lattica-prover` for production; that crate is kept as a differential
+# oracle. See docs/framework-decision.md.
+[package]
+name = "lattica-prover-p3"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+p3-air = "0.6.1"
+p3-field = "0.6.1"
+p3-goldilocks = "0.6.1"
+p3-poseidon2 = "0.6.1"
+p3-poseidon2-air = "0.6.1"
+p3-symmetric = "0.6.1"
+p3-challenger = "0.6.1"
+p3-commit = "0.6.1"
+p3-dft = "0.6.1"
+p3-fri = "0.6.1"
+p3-matrix = "0.6.1"
+p3-merkle-tree = "0.6.1"
+p3-uni-stark = "0.6.1"
+rand = "0.10"
