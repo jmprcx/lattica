@@ -60,3 +60,41 @@ Run: `cd framework-spike && cargo run --release` / `cargo test --release`.
   unified shielded tx + canonical serialization, sighash, the `verify()` FFI boundary), with the
   hand-rolled STARK retained as a differential-test oracle.
 - **Phase 2:** the full spend circuit in Winterfell (`lattica-prover` crate).
+
+---
+
+## ZK reassessment (ZK-01) — Winterfell does **not** provide zero-knowledge
+
+**Found in the remediation review.** This decision selected Winterfell for *transparency +
+post-quantum + soundness* — but **zero-knowledge was not a selection criterion**, and a *shielded*
+spend proof fundamentally requires it: a non-ZK FRI-STARK reveals trace cells at the query points
+and the queried Merkle rows, leaking the hidden witness (value, recipient, `rho`, `nk`, and which
+leaf/note is spent — breaking unlinkability). Note encryption hides note *contents* from third
+parties; it does **not** hide the witness from the validator that checks the proof.
+
+Investigation of the cached `winterfell-0.13.1` (the latest published version):
+- `ProofOptions` has no ZK/salt toggle (only queries, blowup, grinding, field-extension, FRI, batching).
+- No `salt` / `blind` / `hiding` / `zero-knowledge` in `winter-prover`; the trace/constraint
+  commitments are plain Merkle trees over the LDE (no salting), and the DEEP-composition invariant
+  (`poly_size−2 == degree`) assumes a non-randomized trace.
+- The README does not mention zero-knowledge. Winterfell is an *integrity* STARK, not a ZK system.
+
+So the current `lattica-prover` spend proof is **sound but not zero-knowledge** — a blocking gap.
+(The hand-rolled `spend.zig` *did* implement ZK: trace blinding `T'=T+Z_H·b` + masked FRI; the
+Winterfell port dropped it.)
+
+### Options
+- **A. Manual ZK on Winterfell** — add blinding columns/rows + salted commitments + masked FRI as a
+  custom layer. *Re-introduces hand-rolled, soundness-critical ZK crypto and fights Winterfell's
+  non-ZK assumptions — partly defeats the "use a vetted framework" rationale.*
+- **B. Switch to a ZK-capable transparent-PQ FRI framework — `plonky2` (1.1.0 on crates.io, FRI over
+  Goldilocks, ships a `zero_knowledge` config).** *ZK by construction from a vetted framework;
+  keeps transparent + FRI/PQ. Re-expresses the circuit in plonky2's gate API; revisits this Phase-0
+  decision. The circuit **design** (and the differential oracle) carries over.* **Recommended.**
+- **C. Plonky3** (`p3-*`, modular; ZK story varies by component) — more assembly.
+- **D. A FRI zkVM (`risc0-zkvm`, SP1)** — ZK by construction, prove the spend as a program; heaviest.
+
+**Recommendation:** treat ZK-01 as reopening this framework choice. Because the entire product is a
+*shielded* (ZK) protocol and Winterfell cannot provide ZK without substantial hand-rolled additions,
+evaluate **plonky2** (option B) against the validated circuit design before further hardening. This
+is a decision to make with the user / pre-audit, not a mechanical change.
