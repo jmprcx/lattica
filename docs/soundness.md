@@ -166,23 +166,28 @@ the total product to 1), and the **two-round Fiat-Shamir flow** (commit → `γ`
 constraint challenges → FRI). Tests cover completeness (reversal, cyclic shift, identity,
 duplicate-swap) and soundness (a single changed element is rejected).
 
-Concretely, the remaining R3 work is:
-1. ~~Implement the grand-product permutation argument.~~ **Done** (multiset form). The
-   copy-constraint specialization is the same `Z` with an id/σ encoding:
-   `num=∏(v+β·id+γ)`, `den=∏(v+β·σ(id)+γ)`, where `id(c,r)=k_c·ω^r` and `σ` is the wiring
-   permutation; a 2-cycle `σ` forces the two wired cells equal.
-2. Add the nullifier (`nf = H(nk, ρ, pos)`) and commitment-opening (`cm = H(value, recipient, ρ,
-   rcm)`) hash regions and the linear balance constraint, in one multi-region trace (reusing the
-   `rescue` round AIR and the membership block layout).
-3. Wire the regions with copy constraints (id/σ): membership leaf = `cm`; nullifier/commitment
-   share `ρ`/`nk`; balance uses the committed `value`. Then switch the protocol's commitment/
-   nullifier/Merkle hashing to the field hash and have the node verify the single proof instead
-   of its native checks.
+Progress:
+1. ~~Implement the grand-product permutation argument.~~ **Done** (`src/permutation.zig`,
+   multiset form). The copy-constraint specialization is the same `Z` with an id/σ encoding:
+   `num=∏(v+β·id+γ)`, `den=∏(v+β·σ(id)+γ)`, `id(c,r)=k_c·ω^r`; a 2-cycle `σ` forces two cells equal.
+2. ~~Assemble multiple hash regions + a non-hash constraint + copy-constraint wiring into one
+   proof.~~ **Demonstrated** (`src/spend.zig`): a single trace proving `cm=H(value,ρ)`,
+   `nf=H(nk,ρ)`, `value=send+fee`, with `ρ` wired equal across the two regions by an id/σ grand
+   product. The decisive test is that an inconsistent `ρ` (different in the two regions) is
+   **rejected** — the copy constraint is non-vacuous. This is the full R3 assembly pattern on a
+   minimal example; the two-round Fiat-Shamir (commit trace → β,γ → commit `Z` → constraint
+   challenges → FRI) is exercised end-to-end.
+3. **Remaining to complete R3:** widen the commitment to the real opening (`recipient`/`rcm`),
+   fold the Merkle membership region (`membership.zig`) in and wire `cm`→leaf, include the
+   position in the nullifier and wire shared `nk`, then switch the protocol's commitment/
+   nullifier/Merkle hashing to the field hash and have the node verify the single proof instead of
+   its native checks. Plus: ZK blinding + masked FRI (additive, as in `stark.zig`), and a generic
+   engine to replace the per-module duplication.
 
-Steps 2–3 are the largest remaining soundness surface and should be built and reviewed as their
-own increment. `src/permutation.zig` is non-ZK and standalone (the grand product is the point);
-ZK blinding + masked FRI are additive (as in `stark.zig`), and a generic engine should replace
-the per-module duplication.
+The remaining step 3 is mostly more regions and wires of the kinds already validated, plus the
+protocol-hashing switch and node integration — substantial, but no longer gated on an unbuilt
+mechanism. `src/permutation.zig` and `src/spend.zig` are non-ZK and standalone (the assembly is
+the point).
 
 ### Other gaps (carried from the assessment)
 - **64-bit-field soundness bottleneck** → extension-field challenges (`parameters.md §1`).

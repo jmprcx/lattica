@@ -153,11 +153,13 @@ formally proven.
   hash preimage (`src/stark.zig` + `src/rescue.zig`). **Constraint (1) membership is now also
   in-circuit** as a standalone ZK proof (`src/membership.zig`): a multi-column AIR folding a leaf
   up `DEPTH` field-hash compressions to the public anchor. **(R3, partial)** The **grand-product
-  permutation argument** that wiring needs is now built and tested (`src/permutation.zig`,
-  multiset form; copy-constraints are the same `Z` mechanism with an id/σ encoding). Remaining:
-  the nullifier and balance regions, the commitment opening, and assembling everything into one
-  multi-region spend trace wired by copy constraints, then node integration. See
-  [`soundness.md §6`](./soundness.md).
+  permutation argument** wiring needs is built (`src/permutation.zig`), and the **assembly is
+  demonstrated** (`src/spend.zig`): one proof folding `cm=H(value,ρ)`, `nf=H(nk,ρ)`, and
+  `value=send+fee`, with `ρ` wired equal across regions by an id/σ copy constraint — an
+  inconsistent `ρ` is rejected, so the wiring is non-vacuous. Remaining to complete R3: the full
+  commitment opening (`recipient`/`rcm`), folding the Merkle membership region in (wire `cm`→
+  leaf), wiring shared `nk`, then switching the protocol's commitment/nullifier/Merkle hashing to
+  the field hash and node integration. See [`soundness.md §6`](./soundness.md).
 - **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
   and PoC-grade — a formal ZK proof and production parameters are future work.
 - **One-way in-circuit hash (R1).** Closed: the authorization relation is a Poseidon-style SPN

@@ -29,6 +29,7 @@ src/
   stark.zig            from-scratch ZK FRI-STARK: multi-column AIR, Merkle, FRI, prover/verifier
   membership.zig       in-circuit ZK Merkle membership proof (R3, partial)
   permutation.zig      grand-product permutation argument (R3 wiring primitive)
+  spend.zig            integrated multi-region spend circuit w/ copy-constraint wiring (R3)
   tree.zig             incremental Merkle commitment tree
   tx.zig               notes, keys, addresses, ML-KEM note encryption
   circuit.zig          spend-authorization proof (façade over stark.zig)
