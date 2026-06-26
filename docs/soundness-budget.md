@@ -81,6 +81,43 @@ What the data shows:
 - The proven floor for ≥100 bits is `num_queries = 96`; fewer queries (≤80) sit at the 96-bit LDR
   plateau. So the production choice is "96 queries at the smallest encoding."
 
+## Two further levers, measured (and rejected)
+
+### Trace height / padding (`DEPTH` recompiles)
+`DEPTH=32` uses 36 blocks, padded to 64 (height 2048, ~44% "dead"). Measured at the production FRI
+params:
+
+| `DEPTH` | height | padding | proof | prove | verify |
+|---|---|---|---|---|---|
+| 28 | 1024 | none | 398 KB | 1.17 s | 6 ms |
+| **32** (production) | 2048 | 44% | 421 KB | 2.05 s | 8 ms |
+| 60 | 2048 | none (full use) | 431 KB | 2.10 s | 7 ms |
+
+Takeaways: proof size is ~**logarithmic** in height — halving the trace (2048→1024) cuts prove time
+~**43%** but proof size only ~**5%**. And the padding is **not wasted**: `DEPTH` up to 60 (a 2⁶⁰-leaf
+tree) costs the same as 32 (2³² leaves), so the headroom is free depth. Trace tightening (incl. the
+deferred lookup-based dense layout) is therefore a **prover-time/memory** lever, not a proof-size one.
+
+### Base field — Goldilocks vs BabyBear (`cargo run --bin field_compare`)
+Same logical work (128 Poseidon2 compressions), each field's native Poseidon2, matched FRI params,
+algebraic commitments + `DuplexChallenger`:
+
+| field | trace width | proof | prove | verify |
+|---|---|---|---|---|
+| Goldilocks (w8) | 180 | 643 KB | 189 ms | 9 ms |
+| BabyBear (w16) | 298 | **616 KB** (−4%) | 225 ms | 13 ms |
+
+The naive "31-bit field ⇒ 4-byte elements ⇒ half the proof" does **not** hold for this circuit. Two
+effects cancel the smaller elements: (1) a ~256-bit digest needs **2× the BabyBear elements**, so its
+Poseidon2 is **width 16** (298 cols vs 180); (2) the **extension field is ~16 bytes on both**
+(`F_p⁴` vs `F_p²`), and the FRI-phase openings — which dominate the proof — live in the extension.
+Net ~4% for a full circuit rewrite plus multi-limb `u64` value/range/balance arithmetic. **Not
+worth it** — Goldilocks stays.
+
+**Conclusion:** the realized proof-size win is the FRI encoding (arity + cap, −49%, already adopted).
+Beyond that, the lever with real headroom is **structural — per-block recursive aggregation** (one
+proof per block instead of per spend), not field or trace changes.
+
 ## Parameter hardening (was demo-sized in M4c)
 
 | Parameter | Demo | Production | Why |
