@@ -14,6 +14,7 @@
 //! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip via a
 //! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
+mod full_spend_air;
 mod poseidon2_air;
 mod spend_air;
 
@@ -165,6 +166,45 @@ fn main() {
         Ok(()) => println!("  M4a across-rows Poseidon2 AIR (ZK): ACCEPTED"),
         Err(e) => {
             println!("  M4a across-rows Poseidon2 AIR: FAILED ({e})");
+            std::process::exit(1);
+        }
+    }
+
+    // M4b: commitment + general-position Merkle membership.
+    let opening: [Val; 4] = core::array::from_fn(|i| Val::new(i as u64 + 1));
+    let sib: [[Val; 4]; spend_air::DEPTH] =
+        core::array::from_fn(|d| core::array::from_fn(|k| Val::new((d * 10 + k + 100) as u64)));
+    let bits: [bool; spend_air::DEPTH] = core::array::from_fn(|d| d % 2 == 1);
+    let root = spend_air::native_root(opening, &sib, &bits);
+    match spend_air::prove_verify(opening, sib, bits, root) {
+        Ok(()) => println!("  M4b commitment + membership (ZK): ACCEPTED"),
+        Err(e) => {
+            println!("  M4b commitment + membership: FAILED ({e})");
+            std::process::exit(1);
+        }
+    }
+
+    // M4c: the full spend statement (ownership, commitment, membership, nullifier, output,
+    // value-balance, range, tx-binding) in zero-knowledge.
+    let w = full_spend_air::Witness {
+        nk: 12345,
+        value: 1000,
+        rho: Val::new(7),
+        rcm: Val::new(9),
+        pos: Val::new(3),
+        sib: core::array::from_fn(|d| core::array::from_fn(|k| Val::new((d * 4 + k + 50) as u64))),
+        bits: [false, true, true, false],
+        out_recipient: Val::new(77),
+        out_value: 600,
+        out_rho: Val::new(11),
+        out_rcm: Val::new(13),
+        fee: 400,
+        tx_binding: Val::new(0xABCDEF),
+    };
+    match full_spend_air::prove_verify(&w) {
+        Ok(()) => println!("  M4c full spend statement (ZK): ACCEPTED"),
+        Err(e) => {
+            println!("  M4c full spend statement: FAILED ({e})");
             std::process::exit(1);
         }
     }
