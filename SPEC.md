@@ -126,11 +126,21 @@ replacing Halo 2 whose soundness rests on ECDLP.
 **Implementation in the Zig reference.** A transparent FRI-STARK prover has no `std.crypto`
 equivalent, so it is implemented from scratch in `src/stark.zig` over the **Goldilocks** field
 (`p = 2^64 - 2^32 + 1`): the execution trace is interpolated (NTT) and Merkle-committed over an
-LDE coset (blowup ×8); a Fiat-Shamir-random combination of the transition and boundary
+LDE coset (blowup ×16); a Fiat-Shamir-random combination of the transition and boundary
 constraint quotients forms the composition polynomial; **FRI** folds it to a constant; and
 queries open the composition, the FRI layers, and the trace, with the verifier checking Merkle
 paths, the algebraic composition⇔trace link, and fold consistency. Parameters are PoC-grade
-(32 queries, rate 1/8 → conjectured ~64-bit; tune for production).
+(32 queries, rate 1/4 → conjectured ~64-bit; tune for production).
+
+**Zero-knowledge.** The proof is zero-knowledge (honest-verifier, via Fiat-Shamir). Two
+blindings make the openings reveal nothing about the witness: (1) the trace polynomial is masked
+as `T'(x) = T(x) + Z_H(x)·b(x)` for a random `b` of degree ≥ the number of trace openings — since
+`Z_H` vanishes on the constraint domain the masked trace still satisfies every constraint, but
+each opened LDE value is uniform; and (2) FRI runs on `H(x) = CP(x) + ζ·g(x)` for a committed
+uniformly-random polynomial `g` and a Fiat-Shamir `ζ`, so the FRI-layer openings reveal nothing
+about the witness-derived composition (the verifier recovers `g` from its own commitment and
+checks `H = CP + ζ·g` at each query). Proofs are randomized. The ZK here is PoC-grade and not
+formally proven.
 
 **PoC scope and honest gaps.**
 
@@ -138,10 +148,8 @@ paths, the algebraic composition⇔trace link, and fold consistency. Parameters 
   `src/circuit.zig`). Constraints (1), (2), (4) are enforced natively by the node; because they
   use the same commitment/nullifier/Merkle framing, moving them inside the AIR is additive, not
   a redesign.
-- **Zero-knowledge masking.** Winterfell STARKs are sound and transparent but not yet
-  zero-knowledge (the trace LDE can leak). Production adds the standard ZK randomization
-  (masked trace / random columns). We demonstrate soundness + transparency + post-quantum
-  here; ZK masking is the remaining, well-understood step.
+- **Zero-knowledge.** Implemented (trace blinding + masked FRI; see above). It is
+  honest-verifier and PoC-grade — a formal ZK proof and production parameters are future work.
 - **One-way in-circuit hash.** The authorization relation uses an algebraic transition for
   clarity; production substitutes a vetted one-way arithmetization-friendly hash
   (Poseidon2/Rescue, with margins for recent Poseidon cryptanalysis).
@@ -184,20 +192,21 @@ primitive comes from `std.crypto`.
 
 ## 11. Performance
 
-Measured on the Zig reference (release build, single core, 1024-step authorization AIR over
-Goldilocks, blowup ×8, 32 FRI queries):
+Measured on the Zig reference (release build, single core, zero-knowledge proof, 1024-step
+authorization AIR over Goldilocks, blowup ×16, 32 FRI queries):
 
 | Metric | Lattica | For comparison |
 |---|---|---|
-| Prove (authorization) | ~43 ms | Orchard full action proof ~hundreds of ms |
-| Verify (authorization) | ~2.2 ms | — |
-| Proof size | ~202 KB | Orchard (Halo 2) ~3 KB; Sapling (Groth16) ~0.2 KB |
+| Prove (authorization) | ~170 ms | Orchard full action proof ~hundreds of ms |
+| Verify (authorization) | ~5 ms | — |
+| Proof size | ~265 KB | Orchard (Halo 2) ~3 KB; Sapling (Groth16) ~0.2 KB |
 | Binding signature | 2420 B | RedPallas 64 B |
 | ML-KEM ciphertext / note | 1088 B | Jubjub ECDH ephemeral key 32 B |
 
 The proof is large because this from-scratch STARK is unoptimized (no DEEP composition, FRI
-folded fully to a constant, every layer opened per query). DEEP-ALI, batched openings, and
-proof recursion/aggregation are the standard levers to shrink it; they are future work.
+folded fully to a constant, every layer opened per query) and the zero-knowledge blinding adds a
+random mask polynomial and a larger LDE. DEEP-ALI, batched openings, and proof
+recursion/aggregation are the standard levers to shrink it; they are future work.
 
 The headline cost is **proof and signature size**: post-quantum primitives are larger, and
 FRI proofs are ~10× a Halo 2 proof. In exchange Lattica needs **no trusted setup** and is

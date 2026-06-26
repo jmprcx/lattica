@@ -144,22 +144,62 @@ const Transcript = struct {
 
 /// Trace length (steps in the authorization chain); a power of two.
 const N: usize = 1024;
+/// Number of random coefficients masking the trace (zero-knowledge). Must be at least the total
+/// number of trace openings (4 per query · NUM_QUERIES = 128) so the opened values are uniform.
+const TRACE_BLIND: usize = 256;
 /// LDE blowup factor (RS code rate 1/BLOWUP).
-const BLOWUP: usize = 8;
+const BLOWUP: usize = 16;
 /// Size of the low-degree-extension evaluation domain.
-const LDE_SIZE: usize = N * BLOWUP; // 8192
+const LDE_SIZE: usize = N * BLOWUP; // 16384
 /// Number of FRI folding rounds.
-const NUM_FOLDS: usize = 7;
+const NUM_FOLDS: usize = 8;
 /// Size of the final (uncommitted) FRI layer, sent in the clear.
 const FINAL_SIZE: usize = LDE_SIZE >> NUM_FOLDS; // 64
-/// Degree bound asserted for the composition polynomial (> its true max degree 2046).
-const COMP_DEGREE_BOUND: usize = 2048;
+/// Degree bound asserted for the composition polynomial. The blinded trace has degree < N +
+/// TRACE_BLIND, so the cubic transition quotient has degree ~2814 < this bound.
+const COMP_DEGREE_BOUND: usize = 4096;
 /// Degree bound the final FRI layer must satisfy.
 const FINAL_DEGREE_BOUND: usize = COMP_DEGREE_BOUND >> NUM_FOLDS; // 16
 /// Number of FRI query repetitions (soundness amplification).
 const NUM_QUERIES: usize = 32;
 /// Round constant of the transition `x -> x^3 + C`.
 const C_CONST: Felt = 42;
+
+// ---------------------------------------------------------------------------------------
+// Randomness for the zero-knowledge blinding (OS CSPRNG)
+// ---------------------------------------------------------------------------------------
+
+fn osRandom(buf: []u8) void {
+    var off: usize = 0;
+    while (off < buf.len) {
+        // On success `getrandom` returns the number of bytes written (1..len); on error it
+        // returns a wrapped -errno that is far larger than the request. For a PoC, treat any
+        // non-progress as fatal.
+        const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
+        std.debug.assert(rc != 0 and rc <= buf.len - off);
+        off += rc;
+    }
+}
+
+/// A fresh CSPRNG seeded from the OS, used to draw the blinding factors. The blinding is what
+/// makes the proof zero-knowledge, so it must be unpredictable to the verifier.
+const Rng = struct {
+    inner: std.Random.DefaultCsprng,
+
+    fn init() Rng {
+        var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        osRandom(&seed);
+        return .{ .inner = std.Random.DefaultCsprng.init(seed) };
+    }
+
+    fn felt(self: *Rng) Felt {
+        return self.inner.random().int(u64) % field.P;
+    }
+
+    fn fillFelts(self: *Rng, out: []Felt) void {
+        for (out) |*v| v.* = self.felt();
+    }
+};
 
 /// Coset shift for the LDE domain: a generator of F_p^*, so the coset is disjoint from every
 /// subgroup used (keeps the vanishing polynomials nonzero on the domain).
@@ -404,20 +444,12 @@ fn compositionAt(t: Felt, t_next: Felt, x: Felt, image: Felt, alpha: Felt, gamma
     return field.add(field.mul(alpha, q_trans), field.mul(gamma, q_bound));
 }
 
-/// Build the trace, interpolate it, and evaluate the trace polynomial over the LDE coset.
-fn buildTraceLde(allocator: Allocator, secret_felt: Felt) ![]Felt {
-    const trace = try allocator.alloc(Felt, N);
-    defer allocator.free(trace);
-    trace[0] = secret_felt;
-    for (1..N) |i| trace[i] = chainStep(trace[i - 1]);
-
-    // Interpolate: trace values are evaluations over <omega>; iNTT gives the coefficients.
-    field.intt(trace, field.rootOfUnity(N));
-
-    // Evaluate the degree-<N polynomial over the LDE coset (offset · gen^j).
+/// Evaluate a coefficient vector (length <= LDE_SIZE) over the LDE coset (offset · gen^i).
+fn coeffsToLde(allocator: Allocator, coeffs: []const Felt) ![]Felt {
+    std.debug.assert(coeffs.len <= LDE_SIZE);
     const lde = try allocator.alloc(Felt, LDE_SIZE);
     @memset(lde, 0);
-    @memcpy(lde[0..N], trace);
+    @memcpy(lde[0..coeffs.len], coeffs);
     var off_pow: Felt = 1;
     for (0..LDE_SIZE) |i| {
         lde[i] = field.mul(lde[i], off_pow);
@@ -425,6 +457,43 @@ fn buildTraceLde(allocator: Allocator, secret_felt: Felt) ![]Felt {
     }
     field.ntt(lde, ldeGen());
     return lde;
+}
+
+/// Build the trace, interpolate it, add the zero-knowledge blinding `Z_H(x)·b(x)` (random `b` of
+/// degree < TRACE_BLIND), and evaluate the masked trace polynomial over the LDE coset.
+///
+/// Because `Z_H(x) = x^N - 1` vanishes on the constraint domain H, the masked trace agrees with
+/// the real trace on H — all constraints still hold — but every LDE opening is randomized, so
+/// the opened values leak nothing about the witness.
+fn buildMaskedTraceLde(allocator: Allocator, secret_felt: Felt, rng: *Rng) ![]Felt {
+    const trace = try allocator.alloc(Felt, N);
+    defer allocator.free(trace);
+    trace[0] = secret_felt;
+    for (1..N) |i| trace[i] = chainStep(trace[i - 1]);
+    field.intt(trace, field.rootOfUnity(N)); // trace now holds coefficients (degree < N)
+
+    // Coefficients of T'(x) = T(x) + (x^N - 1)·b(x), degree < N + TRACE_BLIND.
+    const mc = try allocator.alloc(Felt, N + TRACE_BLIND);
+    defer allocator.free(mc);
+    @memset(mc, 0);
+    @memcpy(mc[0..N], trace);
+    var b: [TRACE_BLIND]Felt = undefined;
+    rng.fillFelts(&b);
+    for (0..TRACE_BLIND) |i| {
+        mc[i] = field.sub(mc[i], b[i]); // -b(x)
+        mc[N + i] = field.add(mc[N + i], b[i]); // + x^N · b(x)
+    }
+    return coeffsToLde(allocator, mc);
+}
+
+/// A uniformly random polynomial of degree < COMP_DEGREE_BOUND, evaluated over the LDE coset.
+/// Folded into the FRI input, it masks the low-degree test so the FRI-layer openings reveal
+/// nothing about the witness-derived composition polynomial.
+fn buildRandomPolyLde(allocator: Allocator, rng: *Rng) ![]Felt {
+    const coeffs = try allocator.alloc(Felt, COMP_DEGREE_BOUND);
+    defer allocator.free(coeffs);
+    rng.fillFelts(coeffs);
+    return coeffsToLde(allocator, coeffs);
 }
 
 const TraceOpen = struct {
@@ -438,10 +507,13 @@ const StarkQuery = struct {
     ta_next: TraceOpen, // trace at (q0 + BLOWUP) mod LDE_SIZE
     tb: TraceOpen, // trace at q0 + LDE_SIZE/2
     tb_next: TraceOpen, // trace at (q0 + LDE_SIZE/2 + BLOWUP) mod LDE_SIZE
+    ga: TraceOpen, // mask polynomial g at q0
+    gb: TraceOpen, // mask polynomial g at q0 + LDE_SIZE/2
 };
 
 pub const StarkProof = struct {
     trace_root: Hash,
+    g_root: Hash,
     fri_roots: [NUM_FOLDS]Hash,
     fri_final: []Felt,
     queries: []StarkQuery,
@@ -449,33 +521,45 @@ pub const StarkProof = struct {
 
 const TRANSCRIPT_LABEL = "lattica:auth-stark:v1";
 
-/// Produce a real FRI-STARK proof that the prover knows a secret whose chain image is `image`.
+/// Produce a real, zero-knowledge FRI-STARK proof that the prover knows a secret whose chain
+/// image is `image`. The proof is randomized (trace blinding + a random FRI mask), so repeated
+/// proofs of the same statement differ and reveal nothing about the witness.
 pub fn prove(allocator: Allocator, secret: *const [32]u8) !StarkProof {
+    var rng = Rng.init();
     const image = imageFelt(secret);
-    const trace_lde = try buildTraceLde(allocator, secretToField(secret));
+
+    const trace_lde = try buildMaskedTraceLde(allocator, secretToField(secret), &rng);
     defer allocator.free(trace_lde);
+    const g_lde = try buildRandomPolyLde(allocator, &rng);
+    defer allocator.free(g_lde);
 
     var trace_tree = try MerkleTree.build(allocator, trace_lde);
     defer trace_tree.deinit();
+    var g_tree = try MerkleTree.build(allocator, g_lde);
+    defer g_tree.deinit();
     const trace_root = trace_tree.root();
+    const g_root = g_tree.root();
 
     var tr = Transcript.init(TRANSCRIPT_LABEL);
     tr.absorbFelt(image);
     tr.absorbHash(trace_root);
+    tr.absorbHash(g_root);
     const alpha = tr.challengeFelt();
     const gamma = tr.challengeFelt();
+    const zeta = tr.challengeFelt();
 
-    // Composition polynomial evaluations over the LDE.
+    // FRI input H(x) = CP(x) + zeta·g(x): the composition masked by the random polynomial.
     const omega_last = field.pow(field.rootOfUnity(N), N - 1);
-    const cp = try allocator.alloc(Felt, LDE_SIZE);
-    defer allocator.free(cp);
+    const h = try allocator.alloc(Felt, LDE_SIZE);
+    defer allocator.free(h);
     var x = ldeOffset();
     for (0..LDE_SIZE) |j| {
-        cp[j] = compositionAt(trace_lde[j], trace_lde[(j + BLOWUP) % LDE_SIZE], x, image, alpha, gamma, omega_last);
+        const cp = compositionAt(trace_lde[j], trace_lde[(j + BLOWUP) % LDE_SIZE], x, image, alpha, gamma, omega_last);
+        h[j] = field.add(cp, field.mul(zeta, g_lde[j]));
         x = field.mul(x, ldeGen());
     }
 
-    var fri = try FriProver.commit(allocator, &tr, cp);
+    var fri = try FriProver.commit(allocator, &tr, h);
     const fri_roots = fri.roots;
     const fri_final = try allocator.dupe(Felt, fri.final_layer);
 
@@ -490,10 +574,12 @@ pub fn prove(allocator: Allocator, secret: *const [32]u8) !StarkProof {
         sq.ta_next = .{ .val = trace_lde[(a_idx + BLOWUP) % LDE_SIZE], .path = try trace_tree.open(allocator, (a_idx + BLOWUP) % LDE_SIZE) };
         sq.tb = .{ .val = trace_lde[b_idx], .path = try trace_tree.open(allocator, b_idx) };
         sq.tb_next = .{ .val = trace_lde[(b_idx + BLOWUP) % LDE_SIZE], .path = try trace_tree.open(allocator, (b_idx + BLOWUP) % LDE_SIZE) };
+        sq.ga = .{ .val = g_lde[a_idx], .path = try g_tree.open(allocator, a_idx) };
+        sq.gb = .{ .val = g_lde[b_idx], .path = try g_tree.open(allocator, b_idx) };
     }
     allocator.free(fri.final_layer);
     fri.deinit();
-    return .{ .trace_root = trace_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
+    return .{ .trace_root = trace_root, .g_root = g_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
 }
 
 /// Verify a FRI-STARK proof against the public `image`.
@@ -504,8 +590,10 @@ pub fn verify(allocator: Allocator, image: Felt, proof: StarkProof) !bool {
     var tr = Transcript.init(TRANSCRIPT_LABEL);
     tr.absorbFelt(image);
     tr.absorbHash(proof.trace_root);
+    tr.absorbHash(proof.g_root);
     const alpha = tr.challengeFelt();
     const gamma = tr.challengeFelt();
+    const zeta = tr.challengeFelt();
 
     var betas: [NUM_FOLDS]Felt = undefined;
     for (0..NUM_FOLDS) |k| {
@@ -532,12 +620,17 @@ pub fn verify(allocator: Allocator, image: Felt, proof: StarkProof) !bool {
         if (!merkleVerify(proof.trace_root, LDE_SIZE, a_next, sq.ta_next.val, sq.ta_next.path)) ok = false;
         if (!merkleVerify(proof.trace_root, LDE_SIZE, b_idx, sq.tb.val, sq.tb.path)) ok = false;
         if (!merkleVerify(proof.trace_root, LDE_SIZE, b_next, sq.tb_next.val, sq.tb_next.path)) ok = false;
+        if (!merkleVerify(proof.g_root, LDE_SIZE, a_idx, sq.ga.val, sq.ga.path)) ok = false;
+        if (!merkleVerify(proof.g_root, LDE_SIZE, b_idx, sq.gb.val, sq.gb.path)) ok = false;
 
-        // ALI: composition at the queried points must match what the trace implies.
+        // ALI: the FRI input H at the queried points must equal CP(trace) + zeta·g, where CP is
+        // recomputed from the trace openings and g comes from its own commitment.
         const x_a = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(a_idx)));
         const x_b = field.mul(ldeOffset(), field.pow(ldeGen(), @intCast(b_idx)));
-        if (compositionAt(sq.ta.val, sq.ta_next.val, x_a, image, alpha, gamma, omega_last) != sq.fri.layers[0].a) ok = false;
-        if (compositionAt(sq.tb.val, sq.tb_next.val, x_b, image, alpha, gamma, omega_last) != sq.fri.layers[0].b) ok = false;
+        const h_a = field.add(compositionAt(sq.ta.val, sq.ta_next.val, x_a, image, alpha, gamma, omega_last), field.mul(zeta, sq.ga.val));
+        const h_b = field.add(compositionAt(sq.tb.val, sq.tb_next.val, x_b, image, alpha, gamma, omega_last), field.mul(zeta, sq.gb.val));
+        if (h_a != sq.fri.layers[0].a) ok = false;
+        if (h_b != sq.fri.layers[0].b) ok = false;
 
         // FRI fold-consistency chain.
         for (0..NUM_FOLDS) |k| {
@@ -576,6 +669,8 @@ pub fn starkFree(allocator: Allocator, proof: StarkProof) void {
         allocator.free(sq.ta_next.path);
         allocator.free(sq.tb.path);
         allocator.free(sq.tb_next.path);
+        allocator.free(sq.ga.path);
+        allocator.free(sq.gb.path);
     }
     allocator.free(proof.queries);
     allocator.free(proof.fri_final);
@@ -598,6 +693,7 @@ pub fn serialize(allocator: Allocator, proof: StarkProof) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try putHash(&buf, allocator, proof.trace_root);
+    try putHash(&buf, allocator, proof.g_root);
     for (proof.fri_roots) |r| try putHash(&buf, allocator, r);
     for (proof.fri_final) |v| try putFelt(&buf, allocator, v);
     for (proof.queries) |sq| {
@@ -607,7 +703,7 @@ pub fn serialize(allocator: Allocator, proof: StarkProof) ![]u8 {
             for (layer.path_a) |h| try putHash(&buf, allocator, h);
             for (layer.path_b) |h| try putHash(&buf, allocator, h);
         }
-        inline for (.{ sq.ta, sq.ta_next, sq.tb, sq.tb_next }) |to| {
+        inline for (.{ sq.ta, sq.ta_next, sq.tb, sq.tb_next, sq.ga, sq.gb }) |to| {
             try putFelt(&buf, allocator, to.val);
             for (to.path) |h| try putHash(&buf, allocator, h);
         }
@@ -647,6 +743,7 @@ const Reader = struct {
 pub fn deserialize(allocator: Allocator, bytes: []const u8) !StarkProof {
     var r = Reader{ .data = bytes };
     const trace_root = try r.getHash();
+    const g_root = try r.getHash();
     var fri_roots: [NUM_FOLDS]Hash = undefined;
     for (&fri_roots) |*x| x.* = try r.getHash();
     const fri_final = try allocator.alloc(Felt, FINAL_SIZE);
@@ -667,8 +764,10 @@ pub fn deserialize(allocator: Allocator, bytes: []const u8) !StarkProof {
         sq.ta_next = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
         sq.tb = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
         sq.tb_next = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
+        sq.ga = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
+        sq.gb = .{ .val = try r.getFelt(), .path = try r.getPath(allocator, trace_depth) };
     }
-    return .{ .trace_root = trace_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
+    return .{ .trace_root = trace_root, .g_root = g_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -796,6 +895,35 @@ test "stark: serialize/deserialize round trip verifies" {
     if (deserialize(a, tampered)) |bad| {
         try testing.expect(!try verify(a, imageFelt(&secret), bad));
     } else |_| {}
+}
+
+test "stark: proofs are randomized (zero-knowledge blinding)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const secret = [_]u8{7} ** 32;
+    const p1 = try prove(a, &secret);
+    const p2 = try prove(a, &secret);
+    const b1 = try serialize(a, p1);
+    const b2 = try serialize(a, p2);
+    // Same statement and structure (identical size), but the proofs differ: the trace blinding
+    // and the random FRI mask are fresh each time. A deterministic proof could not be ZK.
+    try testing.expectEqual(b1.len, b2.len);
+    try testing.expect(!std.mem.eql(u8, b1, b2));
+    // Both still verify against the same public image.
+    try testing.expect(try verify(a, imageFelt(&secret), p1));
+    try testing.expect(try verify(a, imageFelt(&secret), p2));
+}
+
+test "stark: tampered mask opening rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const secret = [_]u8{7} ** 32;
+    var proof = try prove(a, &secret);
+    // Forging the masking-polynomial opening breaks the H = CP + zeta·g binding.
+    proof.queries[0].ga.val = field.add(proof.queries[0].ga.val, 1);
+    try testing.expect(!try verify(a, imageFelt(&secret), proof));
 }
 
 test "merkle commit/open/verify" {

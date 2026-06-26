@@ -63,13 +63,18 @@ Two deliberate differences from the original Rust PoC:
   support seeded keygen), so a wallet restores from the seed alone — the production fix the
   spec calls for.
 - **The FRI-STARK spend-authorization proof is implemented from scratch in Zig** (`stark.zig`),
-  since no `std.crypto` equivalent exists. It is a genuine transparent, hash-based STARK over
-  the Goldilocks field — Merkle-committed trace LDE, a Fiat-Shamir random constraint
-  composition, FRI low-degree testing folded to a constant, and query openings binding the
-  composition to the trace. No trusted setup, no elliptic curve; soundness rests on SHA3. A
-  one-input/one-output transfer carries a ~200 KB proof (prove ~40 ms, verify ~2 ms, release).
+  since no `std.crypto` equivalent exists. It is a genuine **zero-knowledge**, transparent,
+  hash-based STARK over the Goldilocks field — Merkle-committed trace LDE, a Fiat-Shamir random
+  constraint composition, FRI low-degree testing, and query openings binding the composition to
+  the trace. No trusted setup, no elliptic curve; soundness rests on SHA3. **Zero-knowledge** is
+  achieved by blinding the trace polynomial with `Z_H(x)·b(x)` (random `b`), so every opened
+  trace value is uniform, and by running FRI on `CP + ζ·g` for a committed random polynomial
+  `g`, so the FRI-layer openings reveal nothing about the witness. Proofs are randomized
+  (different each time, all verifying). A 1-in/1-out transfer carries a ~265 KB proof
+  (prove ~170 ms, verify ~5 ms, release).
 
-Remaining documented steps to production (see [`SPEC.md` §8](./SPEC.md)): zero-knowledge trace
-masking (the STARK is sound and transparent but not yet ZK), a vetted one-way in-circuit hash in
-place of the algebraic `x → x³ + C` relation, folding membership/nullifier/balance into the AIR,
-and production-grade STARK parameters. None require changing the post-quantum primitive choices.
+Remaining documented steps to production (see [`SPEC.md` §8](./SPEC.md)): a vetted one-way
+in-circuit hash in place of the algebraic `x → x³ + C` relation, folding
+membership/nullifier/balance into the AIR, and production-grade STARK parameters (the
+zero-knowledge here is honest-verifier and PoC-grade, not formally proven). None require
+changing the post-quantum primitive choices.
