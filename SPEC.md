@@ -149,12 +149,14 @@ formally proven.
 
 **PoC scope and honest gaps.**
 
-- Constraint (3) is a **real, zero-knowledge FRI-STARK** proving knowledge of a hash preimage
-  (`src/stark.zig` + `src/rescue.zig`, exposed via `src/circuit.zig`). **(R3, open)** Constraints
-  (1) membership, (2) nullifier, (4) balance are still enforced natively by the node; folding
-  them into the same AIR is the remaining in-circuit work (additive — reuses the in-circuit hash;
-  needs Merkle-path rows, a nullifier hash, balance columns, and copy/permutation wiring). See
-  [`soundness.md §6`](./soundness.md).
+- Constraint (3) authorization is a **real, zero-knowledge FRI-STARK** proving knowledge of a
+  hash preimage (`src/stark.zig` + `src/rescue.zig`). **Constraint (1) membership is now also
+  in-circuit** as a standalone ZK proof (`src/membership.zig`): a multi-column AIR folding a leaf
+  up `DEPTH` field-hash compressions to the public anchor. **(R3, partial)** Constraints (2)
+  nullifier and (4) balance, the commitment opening, and — crucially — *wiring all regions into a
+  single proof* remain. The last needs a **copy-constraint / permutation argument** (shared
+  witness like `ρ`/`nk`/`value` appears in multiple constraints), which is the main remaining
+  soundness surface. See [`soundness.md §6`](./soundness.md).
 - **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
   and PoC-grade — a formal ZK proof and production parameters are future work.
 - **One-way in-circuit hash (R1).** Closed: the authorization relation is a Poseidon-style SPN

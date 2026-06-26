@@ -134,21 +134,40 @@ AIR (`src/stark.zig`):
   a standardized vetted Poseidon2/Rescue-Prime instance, and the state width `m = 3` is small.
   Production must adopt published constants, the spec's round count, and a wider state.
 
-### R3 — fold all four constraints into one AIR
-Today only constraint (3) is in-circuit; (1) membership, (2) nullifier, (4) balance are
-node-enforced. To fold them in (which requires R1's in-circuit hash so commitments/nullifiers/
-Merkle nodes are cheap in the field):
-- **(4) Balance** — add columns for input/output values; a single linear constraint
-  `Σ in = Σ out + fee`. (Easiest; no hashing.)
-- **(2) Nullifier** — in-circuit hash rows computing `nf = H(nk, ρ, pos)`; boundary binds the
-  output to the revealed nullifier.
-- **(1) Membership** — `depth` in-circuit hash invocations folding the leaf up the authentication
-  path; boundary binds the top to the public anchor; a **selector/periodic column** chooses
-  left/right per level.
-- **Wiring** — the note commitment recomputed in-circuit must equal the Merkle leaf, the spend's
-  `nk/ρ` must be the ones used by both the nullifier and commitment, etc. This needs **copy
-  constraints** (a permutation argument) or careful shared boundary cells — the main new soundness
-  surface, and the part most needing review.
+### R3 — fold all four constraints into one AIR (partial)
+
+Constraint (3) authorization is in-circuit (R1). **Constraint (1) membership is now also
+in-circuit**, as a standalone zero-knowledge proof (`src/membership.zig`): a multi-column AIR
+that folds a leaf up `DEPTH` field-hash (`rescue`) 2:1 compressions to the public anchor. Its
+trace is `DEPTH` blocks of one permutation each; the per-block transition is the Rescue round
+(periodic round constants, evaluated as `RC_i(x^{N/BLOCK})`), the block-boundary transition is a
+**link** (carry the compressed output into the next block's left input, reset the capacity), and
+boundary constraints fix the capacity to 0 at row 0 and the output to the anchor at row N-1. The
+round/link constraints are separated by **fixed enumerated vanishing polynomials**
+(`Z_round = (x^N−1)/((x−ω^{N-1})·Z_link)`), avoiding a periodic selector column. It needs **no
+permutation argument** because its wiring is a pure chain (adjacency). The path is leftmost-only;
+general positions add one boolean ordering selector per level.
+
+Still node-enforced (not yet in-circuit): **(2) nullifier**, **(4) balance**, and the
+**commitment opening**.
+
+**The blocker for a *single* spend proof is a copy-constraint / permutation argument.** Unlike
+membership (a chain), a full spend reuses the same witness in several constraints — `value` in
+both the commitment and balance, `ρ` in both the commitment and nullifier, `nk` in both the
+nullifier and the owner binding. Proving those cells are equal across regions requires a
+PLONK-style **grand-product permutation argument**, which this STARK does not yet have and which
+is itself soundness-critical. Concretely, the remaining R3 work is:
+1. Implement a permutation/copy-constraint argument (a committed grand-product column with a
+   Fiat-Shamir challenge enforcing a multiset equality between "cell" and "copy" sequences).
+2. Add the nullifier (`nf = H(nk, ρ, pos)`) and commitment-opening (`cm = H(value, recipient, ρ,
+   rcm)`) hash regions and the linear balance constraint, in the same multi-region trace.
+3. Wire the regions with copy constraints: membership leaf = `cm`; nullifier/commitment share
+   `ρ`/`nk`; balance uses the committed `value`. Then switch the protocol's commitment/nullifier/
+   Merkle hashing to the field hash and have the node verify the single proof instead of its
+   native checks.
+
+This is the largest remaining soundness surface and should be built and reviewed as its own
+increment.
 
 ### Other gaps (carried from the assessment)
 - **64-bit-field soundness bottleneck** → extension-field challenges (`parameters.md §1`).

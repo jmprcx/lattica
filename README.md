@@ -27,6 +27,7 @@ src/
   field.zig            Goldilocks field (p = 2^64-2^32+1), roots of unity, NTT
   rescue.zig           arithmetization-friendly hash (Poseidon-style SPN, x^7 + MDS)
   stark.zig            from-scratch ZK FRI-STARK: multi-column AIR, Merkle, FRI, prover/verifier
+  membership.zig       in-circuit ZK Merkle membership proof (R3, partial)
   tree.zig             incremental Merkle commitment tree
   tx.zig               notes, keys, addresses, ML-KEM note encryption
   circuit.zig          spend-authorization proof (façade over stark.zig)
