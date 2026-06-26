@@ -123,19 +123,21 @@ A spend proves, in zero knowledge, the conjunction:
 setup is transparent (no toxic waste). This is the load-bearing quantum-safe choice,
 replacing Halo 2 whose soundness rests on ECDLP.
 
-**Status in the Zig reference implementation.** A transparent FRI-STARK prover has no
-`std.crypto` equivalent, so `src/circuit.zig` currently ships a **stub**: it computes the real
-authorization image (the 1024-step `x → x³ + C` chain over a prime field) and binds a
-placeholder proof to it so tampering is detectable — but it is **not zero-knowledge and proves
-nothing** about knowledge of the secret. A genuine FRI-STARK (the design here) is the
-documented next phase.
+**Implementation in the Zig reference.** A transparent FRI-STARK prover has no `std.crypto`
+equivalent, so it is implemented from scratch in `src/stark.zig` over the **Goldilocks** field
+(`p = 2^64 - 2^32 + 1`): the execution trace is interpolated (NTT) and Merkle-committed over an
+LDE coset (blowup ×8); a Fiat-Shamir-random combination of the transition and boundary
+constraint quotients forms the composition polynomial; **FRI** folds it to a constant; and
+queries open the composition, the FRI layers, and the trace, with the verifier checking Merkle
+paths, the algebraic composition⇔trace link, and fold consistency. Parameters are PoC-grade
+(32 queries, rate 1/8 → conjectured ~64-bit; tune for production).
 
 **PoC scope and honest gaps.**
 
-- In the design, constraint (3) is a **real, verifying FRI-STARK** (`src/circuit.zig`); in this
-  Zig port it is the stub described above. Constraints (1), (2), (4) are enforced natively by
-  the node; because they use the same commitment/nullifier/Merkle framing, moving them inside
-  the AIR is additive, not a redesign.
+- Constraint (3) is a **real, verifying FRI-STARK** (`src/stark.zig`, exposed via
+  `src/circuit.zig`). Constraints (1), (2), (4) are enforced natively by the node; because they
+  use the same commitment/nullifier/Merkle framing, moving them inside the AIR is additive, not
+  a redesign.
 - **Zero-knowledge masking.** Winterfell STARKs are sound and transparent but not yet
   zero-knowledge (the trace LDE can leak). Production adds the standard ZK randomization
   (masked trace / random columns). We demonstrate soundness + transparency + post-quantum
@@ -172,26 +174,30 @@ primitive comes from `std.crypto`.
 | Module | Responsibility |
 |---|---|
 | `src/primitives.zig` | ML-KEM, ML-DSA, SHA3 hashing/commitments/nullifiers/PRF/KDF, AEAD |
+| `src/field.zig` | Goldilocks field, roots of unity, NTT/iNTT |
+| `src/stark.zig` | from-scratch FRI-STARK: Merkle, Fiat-Shamir transcript, FRI, prover/verifier |
 | `src/tree.zig` | incremental Merkle commitment tree + authentication paths |
 | `src/tx.zig` | notes, keys (seed-deterministic), addresses, ML-KEM note encryption / trial decryption |
-| `src/circuit.zig` | spend-authorization proof — **stub** in this port (see §8) |
+| `src/circuit.zig` | spend-authorization proof (façade over `stark.zig`) |
 | `src/node.zig` | chain state + shielded-transaction validation rules |
 | `src/wallet.zig` | keygen, scanning, transfer builder, end-to-end `demo` (CLI) |
 
 ## 11. Performance
 
-The proof rows below describe the **FRI-STARK design**, measured on the original Winterfell
-reference (release build, single core, 1024-step authorization AIR). The current Zig port
-**stubs the proof** (a 32-byte placeholder), so those rows do not apply to it; the ML-DSA and
-ML-KEM sizes, which come straight from `std.crypto`, do.
+Measured on the Zig reference (release build, single core, 1024-step authorization AIR over
+Goldilocks, blowup ×8, 32 FRI queries):
 
 | Metric | Lattica | For comparison |
 |---|---|---|
-| Prove (authorization) | ~12.7 ms | Orchard full action proof ~hundreds of ms |
-| Verify (authorization) | ~0.4 ms | — |
-| Proof size | ~26.8 KB | Orchard (Halo 2) ~3 KB; Sapling (Groth16) ~0.2 KB |
+| Prove (authorization) | ~43 ms | Orchard full action proof ~hundreds of ms |
+| Verify (authorization) | ~2.2 ms | — |
+| Proof size | ~202 KB | Orchard (Halo 2) ~3 KB; Sapling (Groth16) ~0.2 KB |
 | Binding signature | 2420 B | RedPallas 64 B |
 | ML-KEM ciphertext / note | 1088 B | Jubjub ECDH ephemeral key 32 B |
+
+The proof is large because this from-scratch STARK is unoptimized (no DEEP composition, FRI
+folded fully to a constant, every layer opened per query). DEEP-ALI, batched openings, and
+proof recursion/aggregation are the standard levers to shrink it; they are future work.
 
 The headline cost is **proof and signature size**: post-quantum primitives are larger, and
 FRI proofs are ~10× a Halo 2 proof. In exchange Lattica needs **no trusted setup** and is

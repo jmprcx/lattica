@@ -3,6 +3,8 @@
 
 test {
     _ = @import("primitives.zig");
+    _ = @import("field.zig");
+    _ = @import("stark.zig");
     _ = @import("tree.zig");
     _ = @import("tx.zig");
     _ = @import("circuit.zig");

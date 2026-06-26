@@ -71,10 +71,10 @@ fn bench(a: std.mem.Allocator, io: std.Io) !void {
     while (i < iters) : (i += 1) std.debug.assert(circuit.verifyAuthorization(proof));
     const verify_ms = elapsedMs(v0, std.Io.Clock.now(.awake, io)) / @as(f64, @floatFromInt(iters));
 
-    std.debug.print("Lattica authorization proof — STUB (real FRI-STARK is future work) ({d} iters)\n", .{iters});
+    std.debug.print("Lattica FRI-STARK authorization proof ({d} iters)\n", .{iters});
     std.debug.print("  prove       : {d:.4} ms\n", .{prove_ms});
     std.debug.print("  verify      : {d:.4} ms\n", .{verify_ms});
-    std.debug.print("  proof size  : {d} bytes (stub placeholder)\n", .{proof.proof.len});
+    std.debug.print("  proof size  : {d} bytes (transparent, hash-based, no trusted setup)\n", .{proof.proof.len});
     std.debug.print("  ML-DSA sig  : {d} bytes\n", .{p.SIG_LEN});
     std.debug.print("  ML-DSA pk   : {d} bytes\n", .{p.PK_LEN});
     std.debug.print("  ML-KEM ct   : {d} bytes\n", .{p.CT_LEN});
@@ -104,7 +104,7 @@ fn demo(a: std.mem.Allocator) !void {
     const t = try node.buildTransfer(a, alice, minted.note, minted.pos, path, anchor, bob.address(), 900, 100);
     std.debug.print("[build]  Alice spends her note: 900 to Bob, 100 fee.\n", .{});
     std.debug.print("         nullifier    {s}… (revealed; unlinkable to the note)\n", .{hex6(&t.spends[0].nullifier)});
-    std.debug.print("         auth proof   {d} bytes (STUB — structural placeholder; real FRI-STARK is future work)\n", .{t.spends[0].auth.proof.len});
+    std.debug.print("         FRI proof    {d} bytes (transparent, hash-based, no trusted setup)\n", .{t.spends[0].auth.proof.len});
     std.debug.print("         binding sig  {d} bytes (ML-DSA)\n", .{p.SIG_LEN});
     const total = t.spends[0].auth.proof.len + p.SIG_LEN + t.outputs[0].note.ciphertext.len + t.outputs[0].note.kem_ct.len;
     std.debug.print("         tx size     ~{d} bytes\n\n", .{total});

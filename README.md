@@ -24,9 +24,11 @@ ML-KEM-768, ML-DSA-44, SHA3-256, and ChaCha20-Poly1305. No cryptography is hand-
 build.zig              Zig build: the wallet executable + the `test` step
 src/
   primitives.zig       ML-KEM, ML-DSA, SHA3 commitments/nullifiers/PRF/KDF, AEAD
+  field.zig            Goldilocks field (p = 2^64-2^32+1), roots of unity, NTT
+  stark.zig            from-scratch FRI-STARK: Merkle, transcript, FRI, prover/verifier
   tree.zig             incremental Merkle commitment tree
   tx.zig               notes, keys, addresses, ML-KEM note encryption
-  circuit.zig          spend-authorization proof (STUB — see Status)
+  circuit.zig          spend-authorization proof (façade over stark.zig)
   node.zig             chain state + shielded-transaction validation
   wallet.zig           keygen, scanning, transfer builder, end-to-end demo (CLI)
   tests.zig            test aggregator for `zig build test`
@@ -60,13 +62,14 @@ Two deliberate differences from the original Rust PoC:
 - **Wallet keys are derived deterministically from the 32-byte seed** (ML-KEM and ML-DSA both
   support seeded keygen), so a wallet restores from the seed alone — the production fix the
   spec calls for.
-- **The FRI-STARK spend-authorization proof is a stub in this port.** A transparent, hash-based
-  FRI-STARK prover has no `std.crypto` equivalent, so `circuit.zig` ships a clearly-labeled
-  placeholder that preserves the relation shape (the 1024-step `x → x³ + C` authorization image)
-  and binds proof↔image so tampering is detectable, but **proves nothing in zero knowledge**.
-  Membership, nullifier, balance, and the binding signature are enforced by the node exactly as
-  in the reference. Implementing a genuine FRI-STARK in Zig is the documented next phase.
+- **The FRI-STARK spend-authorization proof is implemented from scratch in Zig** (`stark.zig`),
+  since no `std.crypto` equivalent exists. It is a genuine transparent, hash-based STARK over
+  the Goldilocks field — Merkle-committed trace LDE, a Fiat-Shamir random constraint
+  composition, FRI low-degree testing folded to a constant, and query openings binding the
+  composition to the trace. No trusted setup, no elliptic curve; soundness rests on SHA3. A
+  one-input/one-output transfer carries a ~200 KB proof (prove ~40 ms, verify ~2 ms, release).
 
-Zero-knowledge trace masking and a one-way in-circuit hash remain the documented steps to
-production — see [`SPEC.md` §8](./SPEC.md). None require changing the post-quantum primitive
-choices.
+Remaining documented steps to production (see [`SPEC.md` §8](./SPEC.md)): zero-knowledge trace
+masking (the STARK is sound and transparent but not yet ZK), a vetted one-way in-circuit hash in
+place of the algebraic `x → x³ + C` relation, folding membership/nullifier/balance into the AIR,
+and production-grade STARK parameters. None require changing the post-quantum primitive choices.
