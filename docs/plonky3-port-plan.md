@@ -28,8 +28,9 @@ constraints (value-balance, range, tx-binding). Options:
   chip carries the values/structure (balance, range, tx-binding, the path shape); a **lookup/bus
   argument (LogUp)** enforces that each `(input → output)` hash used by the spend chip appears in
   the Poseidon2 chip. This is the real Plonky3/SP1 pattern, reuses the vetted Poseidon2 chip, and
-  scales to depth-32. Cost: `p3-uni-stark` is single-table, so this needs a **lookup framework** —
-  investigate the p3 ecosystem (a multi-table prover / LogUp) or implement a minimal LogUp.
+  scales to depth-32. **`p3-lookup` 0.6.1 (LogUp) exists** on crates.io, so the lookup argument is a
+  library, not a from-scratch build; `p3-uni-stark` is single-table, so M3 wires `p3-lookup` to a
+  multi-table prover (investigate `p3-lookup`'s prover integration / `p3-air` interaction builder).
 - **B. Single hand-rolled AIR** — reuse the vetted *constants* but re-implement the Poseidon2 round
   constraints inline (≈ what the Winterfell `lattica-prover` did), plus the wiring. Avoids the
   lookup machinery but re-hand-rolls the soundness-critical hash AIR (larger audit surface).
@@ -40,10 +41,12 @@ the lookup framework is the next investigation.
 ## Incremental milestones
 
 - **M1 — done:** vetted Poseidon2-Goldilocks AIR proves/verifies in-repo (stable).
-- **M2:** ZK swap — `HidingFriPcs` + extension-field challenges on M1; write the C-04 soundness
-  budget (Plonky3 `security.rs` gives proven bounds). (ZK already shown in `plonky3-spike/`.)
-- **M3:** lookup/bus decision + a minimal **two-hash linked** example (commitment → one membership
-  merge) proving the linking via a lookup.
+- **M2 — done:** ZK swap — the foundation now proves/verifies under the **hiding FRI PCS**
+  (`HidingFriPcs` + salted `MerkleTreeHidingMmcs`) with a Goldilocks-native `DuplexChallenger` and
+  `F_p²` challenges. Still owed: the written C-04 soundness budget (Plonky3 `security.rs` gives
+  proven bounds to anchor it).
+- **M3:** wire `p3-lookup` (LogUp) to a multi-table prover; a minimal **two-hash linked** example
+  (commitment → one membership merge) proving the linking via a lookup.
 - **M4:** the **full spend statement** — ownership + commitment + depth-D membership + nullifier +
   output commitment + value-balance + range + tx-binding (the `lattica-prover` statement, now ZK).
 - **M5:** native oracle + **differential tests** vs the Winterfell `lattica-prover`; canonical proof

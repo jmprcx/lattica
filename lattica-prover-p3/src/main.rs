@@ -6,20 +6,20 @@
 //!   * hash     = Poseidon2 with the **vetted** `GOLDILOCKS_POSEIDON2_RC_8_*` constants, via the
 //!                vetted `p3-poseidon2-air` AIR (so the in-circuit hash equals the protocol's
 //!                native `Poseidon2Goldilocks` — no circuit/protocol hash mismatch, cf. C-03);
-//!   * proof    = FRI STARK (transparent, post-quantum). ZK is a PCS swap to `HidingFriPcs`
-//!                (already shown end-to-end in `plonky3-spike/`); milestone 1 uses the simpler
-//!                two-adic config to validate the AIR + Goldilocks config first.
+//!   * proof    = FRI STARK (transparent, post-quantum), **zero-knowledge** (M2) via the hiding
+//!                Merkle PCS (`HidingFriPcs` + salted `MerkleTreeHidingMmcs`) and a Goldilocks-native
+//!                `DuplexChallenger`.
 //!
 //! Remaining (see `docs/plonky3-port-plan.md`): compose the full spend statement (commitment +
-//! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip, and
-//! switch to the hiding (ZK) PCS. The Winterfell `lattica-prover` stays as a differential oracle.
+//! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip via a
+//! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
 use p3_field::extension::BinomialExtensionField;
 use p3_field::Field;
-use p3_fri::{FriParameters, TwoAdicFriPcs};
+use p3_fri::{FriParameters, HidingFriPcs};
 use p3_goldilocks::{
     default_goldilocks_poseidon2_8, GenericPoseidon2LinearLayersGoldilocks, Goldilocks,
     Poseidon2Goldilocks, GOLDILOCKS_POSEIDON2_HALF_FULL_ROUNDS,
@@ -27,10 +27,12 @@ use p3_goldilocks::{
     GOLDILOCKS_POSEIDON2_RC_8_EXTERNAL_INITIAL, GOLDILOCKS_POSEIDON2_RC_8_INTERNAL,
 };
 use p3_matrix::dense::RowMajorMatrix;
-use p3_merkle_tree::MerkleTreeMmcs;
+use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_poseidon2_air::{Poseidon2Air, RoundConstants};
 use p3_symmetric::{PaddingFreeSponge, Permutation, TruncatedPermutation};
 use p3_uni_stark::{prove, verify, StarkConfig};
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 
 const WIDTH: usize = 8;
 const SBOX_DEGREE: u64 = 7;
@@ -70,28 +72,38 @@ fn native_permute(input: [Val; WIDTH]) -> [Val; WIDTH] {
     s
 }
 
-// --- STARK config (two-adic, non-ZK milestone-1; ZK = HidingFriPcs swap, see plonky3-spike) -----
+// --- STARK config (zero-knowledge: hiding Merkle PCS + DuplexChallenger, Goldilocks-native) ------
 
+const LOG_BLOWUP: usize = 3; // supports the degree-7 S-box
 type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
+// Hiding (salted) Merkle commitment ⇒ zero-knowledge.
+type ValMmcs = MerkleTreeHidingMmcs<
+    <Val as Field>::Packing,
+    <Val as Field>::Packing,
+    MyHash,
+    MyCompress,
+    SmallRng,
+    2,
+    4,
+    4,
+>;
 type Challenge = BinomialExtensionField<Val, 2>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
 type Dft = Radix2DitParallel<Val>;
-type Pcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
+type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, SmallRng>;
 type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
 
-fn make_config() -> MyConfig {
+fn make_config(seed: u64) -> MyConfig {
     let perm = default_goldilocks_poseidon2_8();
     let hash = MyHash::new(perm.clone());
     let compress = MyCompress::new(perm.clone());
-    let val_mmcs = ValMmcs::new(hash, compress, 0);
+    let val_mmcs = ValMmcs::new(hash, compress, 0, SmallRng::seed_from_u64(seed));
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let dft = Dft::default();
     let fri_params = FriParameters {
-        log_blowup: 3, // supports the degree-7 S-box
+        log_blowup: LOG_BLOWUP,
         log_final_poly_len: 0,
         max_log_arity: 1,
         num_queries: 24,
@@ -99,17 +111,23 @@ fn make_config() -> MyConfig {
         query_proof_of_work_bits: 1,
         mmcs: challenge_mmcs,
     };
-    let pcs = Pcs::new(dft, val_mmcs, fri_params);
+    let pcs = Pcs::new(dft, val_mmcs, fri_params, 4, SmallRng::seed_from_u64(seed));
     let challenger = Challenger::new(perm);
     MyConfig::new(pcs, challenger)
 }
 
+fn prove_perms(seed: u64) -> (MyConfig, p3_uni_stark::Proof<MyConfig>) {
+    let air: SpendPoseidon2Air = Poseidon2Air::new(vetted_constants());
+    let config = make_config(seed);
+    let num_perms = 1 << 6;
+    let trace: RowMajorMatrix<Val> = air.generate_trace_rows(num_perms, LOG_BLOWUP);
+    let proof = prove(&config, &air, trace, &[]);
+    (config, proof)
+}
+
 fn run() -> Result<(), impl core::fmt::Debug> {
     let air: SpendPoseidon2Air = Poseidon2Air::new(vetted_constants());
-    let config = make_config();
-    let num_perms = 1 << 6;
-    let trace: RowMajorMatrix<Val> = air.generate_trace_rows(num_perms, 3);
-    let proof = prove(&config, &air, trace, &[]);
+    let (config, proof) = prove_perms(1);
     verify(&config, &air, &proof, &[])
 }
 
@@ -125,12 +143,13 @@ fn main() {
         Val::new(8),
     ];
     let out = native_permute(input);
-    println!("plonky3 production milestone 1: vetted Poseidon2-Goldilocks AIR");
+    println!("plonky3 production M1+M2: vetted Poseidon2-Goldilocks AIR, zero-knowledge");
     println!("  field   : Goldilocks (64-bit)");
     println!("  hash    : Poseidon2, vetted GOLDILOCKS_POSEIDON2_RC_8_* constants");
+    println!("  proof   : hiding FRI PCS (zero-knowledge), transparent, PQ, stable toolchain");
     println!("  native H(1..8)[0] = {}", out[0]);
     match run() {
-        Ok(()) => println!("  AIR prove -> verify: ACCEPTED"),
+        Ok(()) => println!("  ZK AIR prove -> verify: ACCEPTED"),
         Err(e) => {
             println!("  AIR prove -> verify: FAILED ({e:?})");
             std::process::exit(1);
