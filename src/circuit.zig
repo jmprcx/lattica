@@ -51,11 +51,16 @@ pub fn proveAuthorization(allocator: Allocator, secret: *const [32]u8) !AuthProo
 
 /// Verify a spend-authorization proof.
 pub fn verifyAuthorization(auth: AuthProof) bool {
+    // Canonical image: a Goldilocks element fits in 8 bytes (< p), and the upper 8 bytes of the
+    // 16-byte field must be zero. Rejecting non-canonical encodings removes image malleability.
+    if (!std.mem.eql(u8, auth.image[8..16], &[_]u8{0} ** 8)) return false;
+    const image = std.mem.readInt(u64, auth.image[0..8], .little);
+    if (image >= field.P) return false;
+
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
     const sp = stark.deserialize(a, auth.proof) catch return false;
-    const image = std.mem.readInt(u64, auth.image[0..8], .little);
     return stark.verify(a, image, sp) catch return false;
 }
 
