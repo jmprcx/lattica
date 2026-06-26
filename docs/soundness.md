@@ -151,23 +151,38 @@ general positions add one boolean ordering selector per level.
 Still node-enforced (not yet in-circuit): **(2) nullifier**, **(4) balance**, and the
 **commitment opening**.
 
-**The blocker for a *single* spend proof is a copy-constraint / permutation argument.** Unlike
+**Wiring a *single* spend proof needs a copy-constraint / permutation argument.** Unlike
 membership (a chain), a full spend reuses the same witness in several constraints — `value` in
 both the commitment and balance, `ρ` in both the commitment and nullifier, `nk` in both the
 nullifier and the owner binding. Proving those cells are equal across regions requires a
-PLONK-style **grand-product permutation argument**, which this STARK does not yet have and which
-is itself soundness-critical. Concretely, the remaining R3 work is:
-1. Implement a permutation/copy-constraint argument (a committed grand-product column with a
-   Fiat-Shamir challenge enforcing a multiset equality between "cell" and "copy" sequences).
-2. Add the nullifier (`nf = H(nk, ρ, pos)`) and commitment-opening (`cm = H(value, recipient, ρ,
-   rcm)`) hash regions and the linear balance constraint, in the same multi-region trace.
-3. Wire the regions with copy constraints: membership leaf = `cm`; nullifier/commitment share
-   `ρ`/`nk`; balance uses the committed `value`. Then switch the protocol's commitment/nullifier/
-   Merkle hashing to the field hash and have the node verify the single proof instead of its
-   native checks.
+PLONK-style grand-product argument.
 
-This is the largest remaining soundness surface and should be built and reviewed as its own
-increment.
+**The grand-product mechanism is now built and tested** (`src/permutation.zig`): a committed
+running-product column `Z` with `Z[0]=1`, `Z[r+1]=Z[r]·(A[r]+γ)/(B[r]+γ)`, whose cyclic
+transition telescopes to `∏(A+γ)=∏(B+γ)`, proving (over a Fiat-Shamir `γ` drawn *after* the
+columns are committed) that two columns hold the same multiset. This validates the
+soundness-critical parts: the running-product column and its transition/boundary (the wrap forces
+the total product to 1), and the **two-round Fiat-Shamir flow** (commit → `γ` → commit `Z` →
+constraint challenges → FRI). Tests cover completeness (reversal, cyclic shift, identity,
+duplicate-swap) and soundness (a single changed element is rejected).
+
+Concretely, the remaining R3 work is:
+1. ~~Implement the grand-product permutation argument.~~ **Done** (multiset form). The
+   copy-constraint specialization is the same `Z` with an id/σ encoding:
+   `num=∏(v+β·id+γ)`, `den=∏(v+β·σ(id)+γ)`, where `id(c,r)=k_c·ω^r` and `σ` is the wiring
+   permutation; a 2-cycle `σ` forces the two wired cells equal.
+2. Add the nullifier (`nf = H(nk, ρ, pos)`) and commitment-opening (`cm = H(value, recipient, ρ,
+   rcm)`) hash regions and the linear balance constraint, in one multi-region trace (reusing the
+   `rescue` round AIR and the membership block layout).
+3. Wire the regions with copy constraints (id/σ): membership leaf = `cm`; nullifier/commitment
+   share `ρ`/`nk`; balance uses the committed `value`. Then switch the protocol's commitment/
+   nullifier/Merkle hashing to the field hash and have the node verify the single proof instead
+   of its native checks.
+
+Steps 2–3 are the largest remaining soundness surface and should be built and reviewed as their
+own increment. `src/permutation.zig` is non-ZK and standalone (the grand product is the point);
+ZK blinding + masked FRI are additive (as in `stark.zig`), and a generic engine should replace
+the per-module duplication.
 
 ### Other gaps (carried from the assessment)
 - **64-bit-field soundness bottleneck** → extension-field challenges (`parameters.md §1`).

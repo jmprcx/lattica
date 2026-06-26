@@ -7,6 +7,7 @@ test {
     _ = @import("rescue.zig");
     _ = @import("stark.zig");
     _ = @import("membership.zig");
+    _ = @import("permutation.zig");
     _ = @import("tree.zig");
     _ = @import("tx.zig");
     _ = @import("circuit.zig");

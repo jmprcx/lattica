@@ -152,11 +152,12 @@ formally proven.
 - Constraint (3) authorization is a **real, zero-knowledge FRI-STARK** proving knowledge of a
   hash preimage (`src/stark.zig` + `src/rescue.zig`). **Constraint (1) membership is now also
   in-circuit** as a standalone ZK proof (`src/membership.zig`): a multi-column AIR folding a leaf
-  up `DEPTH` field-hash compressions to the public anchor. **(R3, partial)** Constraints (2)
-  nullifier and (4) balance, the commitment opening, and — crucially — *wiring all regions into a
-  single proof* remain. The last needs a **copy-constraint / permutation argument** (shared
-  witness like `ρ`/`nk`/`value` appears in multiple constraints), which is the main remaining
-  soundness surface. See [`soundness.md §6`](./soundness.md).
+  up `DEPTH` field-hash compressions to the public anchor. **(R3, partial)** The **grand-product
+  permutation argument** that wiring needs is now built and tested (`src/permutation.zig`,
+  multiset form; copy-constraints are the same `Z` mechanism with an id/σ encoding). Remaining:
+  the nullifier and balance regions, the commitment opening, and assembling everything into one
+  multi-region spend trace wired by copy constraints, then node integration. See
+  [`soundness.md §6`](./soundness.md).
 - **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
   and PoC-grade — a formal ZK proof and production parameters are future work.
 - **One-way in-circuit hash (R1).** Closed: the authorization relation is a Poseidon-style SPN
