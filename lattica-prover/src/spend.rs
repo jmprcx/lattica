@@ -7,22 +7,24 @@
 //!   3. **nullifier**  `nf = H(nk, rho, pos)`                          (block DEPTH+1)
 //!   4. **output commitment** `out_cm = H(out_recipient, out_value, out_rho, out_rcm)` (block DEPTH+2)
 //!   5. **value-balance** `value = out_value + fee`                    (no value created)
-//!   6. **tx-binding** via Fiat-Shamir.
+//!   6. **range** `value, out_value < 2^BITS`                          (no field wraparound)
+//!   7. **tx-binding** via Fiat-Shamir.
 //! with the **same `rho`** in (1) and (3).
 //!
 //! Cross-region binding uses **persistent columns** (constant across the trace): `rho` (shared
-//! commitment↔nullifier), `value` (the input note value), `out_value` (the output note value).
-//! Per-boundary periodic selectors gate round / merge-link / nullifier-load / output-load / row-0.
+//! commitment↔nullifier), `value`, `out_value`. Two parallel `rem` columns carry the range
+//! (bit-peeling) decompositions of `value`/`out_value`, seeded at row 0 and closed by `rem[BITS]=0`,
+//! so balance is wraparound-sound. Per-boundary periodic selectors gate round / merge-link /
+//! nullifier-load / output-load / row-0 / range.
 //!
 //! Validated against native oracles: `cm`/`nf`/`out_cm` match `Rp64_256::hash_elements`; the AIR
 //! `root`/`nf`/`out_cm` match; valid-verifies; wrong root/nf/out_cm, tampered opening, inconsistent
-//! `rho`, **unbalanced** (`value ≠ out_value + fee`), and wrong tx-binding are all rejected.
+//! `rho`, **unbalanced** (`value ≠ out_value + fee`), **out-of-range** value, and wrong tx-binding
+//! are all rejected.
 //!
-//! SOUNDNESS NOTE (Codex audit precedes production): value-balance here is `value = out_value +
-//! fee` over the field. It is **only fully sound with range proofs** on `value`/`out_value`
-//! (otherwise a wrapped `out_value = value − fee + p` would mint value). The range AIR is built
-//! (`range.rs`); tying it to these hidden values (parallel `rem` columns) is the immediate
-//! companion step. Other TODO: ownership (recipient ↔ `nk`), position-consistency, depth 32.
+//! Scope (Codex audit precedes production): `recipient`/`nk`/`pos` are single field elements;
+//! `BITS=31`, `DEPTH=5` (demo). Remaining: **ownership** (recipient ↔ `nk`), **position-
+//! consistency** (nullifier `pos` ↔ path), `mint`/`burn` issuance, depth 32, production params.
 
 use winterfell::{
     math::{fields::f64::BaseElement, FieldElement, ToElements},
@@ -42,12 +44,15 @@ pub const DIGEST: usize = 4;
 pub const COMMIT_LEN: usize = 4; // [recipient, value, rho, rcm]
 pub const NULL_LEN: usize = 3; // [nk, rho, pos]
 const BLOCK: usize = 8;
-// columns: 0..12 state, 12 bit, 13 rho, 14 value, 15 out_value
-const WIDTH: usize = STATE_WIDTH + 4; // 16
+// columns: 0..12 state, 12 bit, 13 rho, 14 value, 15 out_value, 16 rem_in, 17 rem_out
+const WIDTH: usize = STATE_WIDTH + 6; // 18
 const BIT: usize = STATE_WIDTH; // 12
 const RHO: usize = STATE_WIDTH + 1; // 13
 const VAL: usize = STATE_WIDTH + 2; // 14
 const OUTVAL: usize = STATE_WIDTH + 3; // 15
+const REM_IN: usize = STATE_WIDTH + 4; // 16 — range decomposition of `value`
+const REM_OUT: usize = STATE_WIDTH + 5; // 17 — range decomposition of `out_value`
+const BITS: usize = 31; // value range: < 2^31 (rem decomposition over rows 0..BITS)
 const NUM_BLOCKS: usize = DEPTH + 3; // commitment + DEPTH merges + nullifier + output commitment
 const TRACE_LEN: usize = BLOCK * NUM_BLOCKS;
 const ROOT_ROW: usize = BLOCK * (DEPTH + 1) - 1; // last membership block output
@@ -55,7 +60,7 @@ const NF_ROW: usize = BLOCK * (DEPTH + 2) - 1; // nullifier block output
 const OUT_CM_ROW: usize = TRACE_LEN - 1; // output-commitment block output
 const VALUE_SLOT: usize = 5; // state index of the `value` element in a commitment input
 const RHO_SLOT: usize = 6; // state index of the `rho` element in the input commitment
-const N_CONSTRAINTS: usize = STATE_WIDTH + 6; // 12 state + 3 constancy + 3 row-0 (rho/value/balance)
+const N_CONSTRAINTS: usize = STATE_WIDTH + 10; // 12 state + 3 constancy + 3 row-0 + 2 range-bit + 2 range-bind
 
 #[derive(Clone, Copy)]
 pub struct Note {
@@ -151,12 +156,16 @@ impl Air for SpendAir {
         for _ in 0..3 {
             degrees.push(TransitionConstraintDegree::new(1));
         }
-        // row-0 bindings: rho, value, and balance (degree 1, gated by is_first cycle).
-        for _ in 0..3 {
+        // row-0 bindings: rho, value, balance, and the two range-input binds (degree 1, is_first).
+        for _ in 0..5 {
             degrees.push(TransitionConstraintDegree::with_cycles(1, vec![TRACE_LEN]));
         }
-        // Assertions: row-0 commitment cap/pad (8) + root (4) + nf (4) + out_cm (4) = 20.
-        let context = AirContext::new(trace_info, degrees, 20, options);
+        // range bit-booleans for rem_in / rem_out (degree 2, gated by is_range cycle).
+        for _ in 0..2 {
+            degrees.push(TransitionConstraintDegree::with_cycles(2, vec![TRACE_LEN]));
+        }
+        // Assertions: row-0 cap/pad (8) + root (4) + nf (4) + out_cm (4) + rem_in/out tail (2) = 22.
+        let context = AirContext::new(trace_info, degrees, 22, options);
         SpendAir {
             context,
             root: pub_inputs.root,
@@ -184,6 +193,7 @@ impl Air for SpendAir {
         let is_null = periodic[2 * STATE_WIDTH + 2];
         let is_out = periodic[2 * STATE_WIDTH + 3];
         let is_first = periodic[2 * STATE_WIDTH + 4];
+        let is_range = periodic[2 * STATE_WIDTH + 5];
         let one = E::ONE;
 
         // Rescue round identity.
@@ -255,12 +265,21 @@ impl Air for SpendAir {
         result[STATE_WIDTH + 1] = next[VAL] - cur[VAL];
         result[STATE_WIDTH + 2] = next[OUTVAL] - cur[OUTVAL];
 
-        // Row-0 bindings (is_first): commitment rho/value pinned to their persistent columns, and
-        // value-balance value = out_value + fee.
+        // Row-0 bindings (is_first): commitment rho/value pinned to their persistent columns,
+        // value-balance value = out_value + fee, and the range inputs seeded to value/out_value.
         let fee = E::from(self.fee);
         result[STATE_WIDTH + 3] = is_first * (cur[RHO_SLOT] - cur[RHO]);
         result[STATE_WIDTH + 4] = is_first * (cur[VALUE_SLOT] - cur[VAL]);
         result[STATE_WIDTH + 5] = is_first * (cur[VAL] - cur[OUTVAL] - fee);
+        result[STATE_WIDTH + 6] = is_first * (cur[REM_IN] - cur[VAL]);
+        result[STATE_WIDTH + 7] = is_first * (cur[REM_OUT] - cur[OUTVAL]);
+
+        // Range (no field wraparound): each rem column peels one bit per row; the peeled bit must
+        // be boolean, and rem[BITS] = 0 (boundary). value = Σ bit·2^i with boolean bits ⇒ < 2^BITS.
+        let bit_in = cur[REM_IN] - E::from(BaseElement::new(2)) * next[REM_IN];
+        let bit_out = cur[REM_OUT] - E::from(BaseElement::new(2)) * next[REM_OUT];
+        result[STATE_WIDTH + 8] = is_range * (bit_in * (bit_in - one));
+        result[STATE_WIDTH + 9] = is_range * (bit_out * (bit_out - one));
     }
 
     fn get_periodic_column_values(&self) -> Vec<Vec<BaseElement>> {
@@ -295,10 +314,16 @@ impl Air for SpendAir {
         is_null[BLOCK * DEPTH + (BLOCK - 1)] = BaseElement::ONE; // loads the nullifier block
         is_out[BLOCK * (DEPTH + 1) + (BLOCK - 1)] = BaseElement::ONE; // loads the output-commitment block
         is_first[0] = BaseElement::ONE;
+        // is_range: 1 on the BITS bit-peeling transitions (rows 0..BITS-1) of the rem columns.
+        let mut is_range = vec![BaseElement::ZERO; TRACE_LEN];
+        for r in 0..BITS {
+            is_range[r] = BaseElement::ONE;
+        }
         cols.push(is_merge);
         cols.push(is_null);
         cols.push(is_out);
         cols.push(is_first);
+        cols.push(is_range);
         cols
     }
 
@@ -320,6 +345,9 @@ impl Air for SpendAir {
         for i in 0..DIGEST {
             a.push(Assertion::single(DIGEST + i, OUT_CM_ROW, self.out_cm[i]));
         }
+        // Range tails: rem_in[BITS] = rem_out[BITS] = 0 (closes the bit decomposition).
+        a.push(Assertion::single(REM_IN, BITS, BaseElement::ZERO));
+        a.push(Assertion::single(REM_OUT, BITS, BaseElement::ZERO));
         a
     }
 }
@@ -345,6 +373,8 @@ impl SpendProver {
         rho_in_null: BaseElement,
     ) -> TraceTable<BaseElement> {
         let mut trace = TraceTable::new(WIDTH, TRACE_LEN);
+        let value_u64 = note.value.as_int();
+        let out_value_u64 = note.out_value.as_int();
         let clear = |state: &mut [BaseElement]| {
             for s in state.iter_mut().take(STATE_WIDTH) {
                 *s = BaseElement::ZERO;
@@ -361,10 +391,12 @@ impl SpendProver {
                 state[5] = note.value;
                 state[6] = note.rho;
                 state[7] = note.rcm;
-                // persistent columns
+                // persistent columns + range decompositions (rem[0] = value / out_value)
                 state[RHO] = note.rho;
                 state[VAL] = note.value;
                 state[OUTVAL] = note.out_value;
+                state[REM_IN] = note.value;
+                state[REM_OUT] = note.out_value;
             },
             |step, state| {
                 let phase = step % BLOCK;
@@ -409,6 +441,9 @@ impl SpendProver {
                 state[RHO] = rho;
                 state[VAL] = val;
                 state[OUTVAL] = outv;
+                let row = step + 1;
+                state[REM_IN] = BaseElement::new(value_u64 >> row);
+                state[REM_OUT] = BaseElement::new(out_value_u64 >> row);
             },
         );
         trace
@@ -629,5 +664,21 @@ mod tests {
         let (proof, mut pi) = prove_spend(note, sib, bits, txb(), fee());
         pi.tx_binding[0] += BaseElement::ONE;
         assert!(verify_spend(proof, pi).is_err());
+    }
+
+    #[test]
+    fn out_of_range_value_rejected() {
+        // value = 2^31 is out of range (BITS=31): the rem decomposition can't reach rem[BITS]=0,
+        // so the range constraint rejects it — even though value-balance still holds.
+        let (mut note, sib, bits) = sample();
+        note.value = BaseElement::new(1u64 << 31);
+        note.out_value = BaseElement::new((1u64 << 31) - 100); // balance: value = out_value + fee(100)
+        let prover = SpendProver::new(build_options(), txb(), fee());
+        let trace = prover.build_trace(note, sib, bits);
+        let pi = prover.get_pub_inputs(&trace);
+        match prover.prove(trace) {
+            Ok(proof) => assert!(verify_spend(proof, pi).is_err()),
+            Err(_) => {}
+        }
     }
 }
