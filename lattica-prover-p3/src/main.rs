@@ -14,6 +14,8 @@
 //! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip via a
 //! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
+mod poseidon2_air;
+
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
@@ -152,6 +154,16 @@ fn main() {
         Ok(()) => println!("  ZK AIR prove -> verify: ACCEPTED"),
         Err(e) => {
             println!("  AIR prove -> verify: FAILED ({e:?})");
+            std::process::exit(1);
+        }
+    }
+
+    // M4a: the across-rows Poseidon2 AIR (the spend statement's hash building block).
+    let p2_in: [Val; 8] = core::array::from_fn(|i| Val::new(i as u64 * 11 + 1));
+    match poseidon2_air::prove_verify(p2_in) {
+        Ok(()) => println!("  M4a across-rows Poseidon2 AIR (ZK): ACCEPTED"),
+        Err(e) => {
+            println!("  M4a across-rows Poseidon2 AIR: FAILED ({e})");
             std::process::exit(1);
         }
     }
