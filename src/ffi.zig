@@ -42,6 +42,44 @@ pub const SpendPublicInputs = struct {
     }
 };
 
+/// The public statement of a **join-split** (N-input, M-output) shielded transaction — the
+/// audit-target shape (`lattica-prover-p3::joinsplit_air`). All inputs are proven under one
+/// `anchor`; `N` nullifiers + `M` output commitments are revealed; the proof enforces
+/// `Σ in_value = Σ out_value + fee` with every value range-bounded. Must match the circuit's
+/// `N_IN`/`M_OUT`.
+pub const JOINSPLIT_N_IN: usize = 2;
+pub const JOINSPLIT_M_OUT: usize = 2;
+
+pub const JoinSplitPublicInputs = struct {
+    anchor: Hash32,
+    nullifiers: [JOINSPLIT_N_IN]Hash32,
+    out_cms: [JOINSPLIT_M_OUT]Hash32,
+    tx_binding: Hash32,
+    fee: u64,
+
+    pub const ENCODED_LEN: usize = 32 * (2 + JOINSPLIT_N_IN + JOINSPLIT_M_OUT) + 8;
+
+    /// Canonical byte layout: anchor ‖ N·nullifier ‖ M·out_cm ‖ tx_binding ‖ fee(LE).
+    pub fn encode(self: JoinSplitPublicInputs) [ENCODED_LEN]u8 {
+        var out: [ENCODED_LEN]u8 = undefined;
+        var off: usize = 0;
+        @memcpy(out[off..][0..32], &self.anchor);
+        off += 32;
+        for (self.nullifiers) |nf| {
+            @memcpy(out[off..][0..32], &nf);
+            off += 32;
+        }
+        for (self.out_cms) |oc| {
+            @memcpy(out[off..][0..32], &oc);
+            off += 32;
+        }
+        @memcpy(out[off..][0..32], &self.tx_binding);
+        off += 32;
+        std.mem.writeInt(u64, out[off..][0..8], self.fee, .little);
+        return out;
+    }
+};
+
 /// The C ABI shape the production verifier implements.
 pub const VerifyFn = *const fn (
     proof_ptr: [*]const u8,
@@ -66,6 +104,20 @@ pub fn clearBackend() void {
 /// false (never accepts an unverified proof).
 pub fn verifySpend(proof: []const u8, pi: SpendPublicInputs) bool {
     const f = backend orelse return false;
+    const enc = pi.encode();
+    return f(proof.ptr, proof.len, &enc, enc.len) == 0;
+}
+
+/// Join-split verifier backend (the Rust `lattica_joinsplit_verify`), installed at startup.
+var joinsplit_backend: ?VerifyFn = null;
+
+pub fn setJoinSplitBackend(f: VerifyFn) void {
+    joinsplit_backend = f;
+}
+
+/// Verify a join-split proof against its public inputs. Fail-closed (no backend ⇒ reject).
+pub fn verifyJoinSplit(proof: []const u8, pi: JoinSplitPublicInputs) bool {
+    const f = joinsplit_backend orelse return false;
     const enc = pi.encode();
     return f(proof.ptr, proof.len, &enc, enc.len) == 0;
 }
@@ -95,6 +147,26 @@ test "ffi: fail-closed without a backend" {
     clearBackend();
     const pi = std.mem.zeroes(SpendPublicInputs);
     try testing.expect(!verifySpend("proof", pi));
+}
+
+test "ffi: join-split public inputs encode to the fixed canonical layout" {
+    var pi = std.mem.zeroes(JoinSplitPublicInputs);
+    pi.anchor = [_]u8{1} ** 32;
+    pi.nullifiers[1] = [_]u8{9} ** 32;
+    pi.tx_binding = [_]u8{4} ** 32;
+    pi.fee = 0x0102_0304_0506_0708;
+    const e = pi.encode();
+    // anchor(32) ‖ 2·nf(32) ‖ 2·out_cm(32) ‖ tx_binding(32) ‖ fee(8) = 200
+    try testing.expectEqual(@as(usize, 200), JoinSplitPublicInputs.ENCODED_LEN);
+    try testing.expectEqual(@as(u8, 1), e[0]); // anchor
+    try testing.expectEqual(@as(u8, 9), e[64]); // nullifiers[1] starts at 32+32
+    try testing.expectEqual(@as(u8, 4), e[160]); // tx_binding at 32·5
+    try testing.expectEqual(@as(u8, 0x08), e[192]); // fee LSB at 32·6
+}
+
+test "ffi: join-split fail-closed without a backend" {
+    const pi = std.mem.zeroes(JoinSplitPublicInputs);
+    try testing.expect(!verifyJoinSplit("proof", pi));
 }
 
 // A stub backend that accepts iff the proof is exactly "good" and the anchor's first byte is 7 —

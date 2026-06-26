@@ -161,9 +161,10 @@ inputs `anchor ‖ N·nf ‖ M·out_cm ‖ fee ‖ tx_binding` with per-input/ou
 aggregate hash — that is the future batching path); per-input distinct `nk`/`rho` via the
 local-persistent columns.
 
-**Remaining for the audited artifact:** (a) the join-split **C ABI + `SpendPublicInputs` byte layout**
-(the existing ABI is the 1-in/1-out shape — see §7); (b) variable/padded `(N, M)` if the protocol
-needs more than fixed 2-in/2-out; (c) the C-03 protocol-side hash match (§5).
+**Remaining for the audited artifact:** (a) variable/padded `(N, M)` if the protocol needs more than
+fixed 2-in/2-out; (b) the C-03 protocol-side hash match (§5) + shared KATs + the end-to-end FFI test;
+(c) the constraint-accounting self-audit. The join-split **C ABI + byte layout** is done
+(`lattica_joinsplit_verify`, round-trip tested; `ffi.zig::JoinSplitPublicInputs`).
 
 ## 7. Pre-audit readiness checklist
 
@@ -179,7 +180,7 @@ needs more than fixed 2-in/2-out; (c) the C-03 protocol-side hash match (§5).
 | **A3 fee soundness** | ✅ (join-split) |
 | **A4 nullifier-derivation argument** | ✅ (§5) |
 | **B — join-split (N-in/M-out) circuit** | ✅ (`joinsplit_air`, fixed 2-in/2-out, 12/12) |
-| **Join-split C ABI + `SpendPublicInputs` byte layout** | ❌ (existing ABI is 1-in/1-out) |
+| **Join-split C ABI + byte layout** | ✅ (`lattica_joinsplit_verify` + `ffi.zig::JoinSplitPublicInputs`) |
 | **C-03 protocol↔circuit hash match + shared KATs** | ❌ |
 | **End-to-end FFI integration test** (Zig: mint→prove→verify→double-spend) | ❌ |
 | **Constraint-accounting self-audit** (every column/constraint, no vacuous binding) | ❌ |
