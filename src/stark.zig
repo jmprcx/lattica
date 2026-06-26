@@ -710,7 +710,11 @@ const Reader = struct {
         return s;
     }
     fn getFelt(self: *Reader) !Felt {
-        return std.mem.readInt(u64, (try self.getBytes(8))[0..8], .little);
+        // Canonical encoding: a field element must be < P. Reject the non-canonical
+        // representatives (v and v+P would otherwise both decode), so proof bytes are unique.
+        const v = std.mem.readInt(u64, (try self.getBytes(8))[0..8], .little);
+        if (v >= field.P) return error.NonCanonical;
+        return v;
     }
     fn getHash(self: *Reader) !Hash {
         var h: Hash = undefined;
@@ -759,6 +763,8 @@ pub fn deserialize(allocator: Allocator, bytes: []const u8) !StarkProof {
         sq.g_a = try r.getValOpen(allocator, depth);
         sq.g_b = try r.getValOpen(allocator, depth);
     }
+    // Canonical encoding: the proof must consume exactly its bytes — no trailing data.
+    if (r.pos != bytes.len) return error.TrailingBytes;
     return .{ .trace_root = trace_root, .g_root = g_root, .fri_roots = fri_roots, .fri_final = fri_final, .queries = queries };
 }
 
@@ -775,6 +781,31 @@ test "stark: valid proof verifies" {
     const secret = [_]u8{7} ** 32;
     const proof = try prove(a, &secret);
     try testing.expect(try verify(a, imageFelt(&secret), proof));
+}
+
+test "stark: deserialize rejects trailing bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const secret = [_]u8{7} ** 32;
+    const bytes = try serialize(a, try prove(a, &secret));
+    const extended = try a.alloc(u8, bytes.len + 1);
+    @memcpy(extended[0..bytes.len], bytes);
+    extended[bytes.len] = 0xAA;
+    try testing.expectError(error.TrailingBytes, deserialize(a, extended));
+}
+
+test "stark: deserialize rejects a non-canonical field element" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const secret = [_]u8{7} ** 32;
+    const bytes = try serialize(a, try prove(a, &secret));
+    // The first field element (fri_final[0]) follows trace_root, g_root, and the FRI roots.
+    // Overwrite it with P, which is not a canonical residue in [0, P).
+    const off = 32 + 32 + NUM_FOLDS * 32;
+    std.mem.writeInt(u64, bytes[off..][0..8], field.P, .little);
+    try testing.expectError(error.NonCanonical, deserialize(a, bytes));
 }
 
 test "stark: wrong image rejected" {

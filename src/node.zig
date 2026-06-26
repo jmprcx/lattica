@@ -23,6 +23,7 @@ pub const TxError = error{
     DoubleSpend,
     BadAuthProof,
     Unbalanced,
+    ValueOverflow,
     TreeFull,
     Internal,
 };
@@ -105,7 +106,8 @@ pub fn buildTransfer(
     send_value: u64,
     fee: u64,
 ) !ShieldedTx {
-    if (send_value + fee != spend_note.value) return TxError.Unbalanced;
+    const total_out = std.math.add(u64, send_value, fee) catch return TxError.ValueOverflow;
+    if (total_out != spend_note.value) return TxError.Unbalanced;
 
     const nullifier = spend_note.nullifier(&sender.nk, spend_position);
 
@@ -243,11 +245,12 @@ pub const Chain = struct {
             if (!circuit.verifyAuthorization(s.auth)) return TxError.BadAuthProof;
         }
 
-        // 3. Value balance: inputs == outputs + fee.
+        // 3. Value balance: inputs == outputs + fee. Checked sums — a malicious tx must not be
+        //    able to wrap a u64 total (panic in safe builds; ambiguity in optimized builds).
         var inputs: u64 = 0;
-        for (t.spends) |s| inputs += s.value;
+        for (t.spends) |s| inputs = std.math.add(u64, inputs, s.value) catch return TxError.ValueOverflow;
         var outputs_plus_fee: u64 = t.fee;
-        for (t.outputs) |o| outputs_plus_fee += o.value;
+        for (t.outputs) |o| outputs_plus_fee = std.math.add(u64, outputs_plus_fee, o.value) catch return TxError.ValueOverflow;
         if (inputs != outputs_plus_fee) return TxError.Unbalanced;
 
         // 4. Apply (only after all checks pass).
@@ -333,6 +336,25 @@ test "tampered value breaks binding signature" {
     // Tamper with the output value after signing: the binding signature must now fail.
     t.outputs[0].value = 950;
     try testing.expectError(TxError.BadBindingSignature, chain.verifyAndApply(t));
+}
+
+test "value overflow rejected (checked arithmetic)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    const minted = try chain.mint(alice.address(), 1000, [_]u8{7} ** 32);
+    const path = try chain.merklePath(a, minted.pos);
+    var t = try buildTransfer(a, alice, minted.note, minted.pos, path, chain.anchor(), bob.address(), 900, 100);
+    // Force the output+fee sum to wrap u64, then re-sign so the binding signature passes and the
+    // checked value sum is what rejects (rather than a panic in safe builds).
+    t.outputs[0].value = std.math.maxInt(u64);
+    t.fee = 1;
+    const dg = t.digest();
+    t.binding_sig = try alice.sig.sign(&dg);
+    try testing.expectError(TxError.ValueOverflow, chain.verifyAndApply(t));
 }
 
 test "unknown anchor rejected" {
