@@ -184,8 +184,14 @@ Progress:
    (the three trace columns and the grand-product `Z`) with `Z_H·b` and runs FRI on `CP + ζ·g`
    for a committed random `g`, so trace/`Z`/FRI openings are uniform and proofs are randomized
    (tested). The four-constraint fold is therefore both complete and zero-knowledge.
-4. **Remaining to harden/integrate R3:** widen the commitment to the real opening
-   (`recipient`/`rcm`) + an owner binding; general (non-leftmost) path positions; switch the
+4. ~~General (non-leftmost) Merkle path positions.~~ **Done** — the carry constraint at each
+   chained boundary is the degree-2 `(next₀−cur₀)·(next₁−cur₀)=0` ("the running hash is one of
+   the two child inputs"), so the path may turn left or right at every level and the position
+   stays hidden. Tested across all-left, all-right, and mixed patterns, with a wrong-position
+   (different path shape) rejected.
+5. **Remaining to harden/integrate R3:** widen the commitment to the real opening
+   (`recipient`/`rcm`) + an owner binding (needs a fixed-carry sub-hash region distinct from the
+   one-of Merkle carries, or the multi-column grand product for cross-column wiring); switch the
    protocol's commitment/nullifier/Merkle hashing to the field hash; node integration (verify the
    single proof instead of native checks); and a generic engine to replace the per-module
    duplication.

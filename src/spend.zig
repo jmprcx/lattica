@@ -440,8 +440,11 @@ fn compositionAt(cur: [WIDTH]Felt, next: [WIDTH]Felt, z: Felt, z_next: Felt, x: 
         for (0..WIDTH) |j| roundi = field.add(roundi, field.mul(ctx.mds[i][j], sb[j]));
         cp = field.add(cp, field.mul(ctx.comb[i], field.mul(field.sub(next[i], roundi), inv_zr)));
     }
-    // (b) Carry on the chained boundaries: next left input = compressed output.
-    cp = field.add(cp, field.mul(ctx.comb[WIDTH], field.mul(field.sub(next[0], cur[0]), inv_zcarry)));
+    // (b) Carry on the chained boundaries: the running hash `cur[0]` must be one of the next
+    //     block's two inputs (general Merkle position — left or right child). The other input is
+    //     the free sibling. Degree-2 "one-of" constraint; the position bit stays hidden.
+    const carry = field.mul(field.sub(next[0], cur[0]), field.sub(next[1], cur[0]));
+    cp = field.add(cp, field.mul(ctx.comb[WIDTH], field.mul(carry, inv_zcarry)));
     // (c) Capacity 0 at every block start.
     cp = field.add(cp, field.mul(ctx.comb[WIDTH + 1], field.mul(cur[2], inv_zcap)));
     // (d) Balance: value (col0, row 0) = send + fee.
@@ -464,16 +467,19 @@ fn compositionAt(cur: [WIDTH]Felt, next: [WIDTH]Felt, z: Felt, z_next: Felt, x: 
 
 pub const PublicInputs = struct { anchor: Felt, nf: Felt, send: Felt, fee: Felt };
 
-/// Compute the public inputs for a witness (commitment, fold to anchor, nullifier, balance).
-pub fn publicFor(value: Felt, rho: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt) PublicInputs {
+/// Compute the public inputs for a witness. `positions[d] = true` means the running hash is the
+/// *right* child at level `d` (sibling on the left); `false` means left child.
+pub fn publicFor(value: Felt, rho: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt, positions: [DEPTH]bool) PublicInputs {
     const cm = rescue.permute(.{ value, rho, 0 })[0];
     var cur = cm;
-    for (0..DEPTH) |d| cur = rescue.permute(.{ cur, siblings[d], 0 })[0];
+    for (0..DEPTH) |d| {
+        cur = if (positions[d]) rescue.permute(.{ siblings[d], cur, 0 })[0] else rescue.permute(.{ cur, siblings[d], 0 })[0];
+    }
     return .{ .anchor = cur, .nf = rescue.permute(.{ nk, rho, 0 })[0], .send = field.sub(value, fee), .fee = fee };
 }
 
 /// Raw trace rows. `rho_a` feeds the commitment, `rho_b` the nullifier (honest: equal).
-fn buildRows(value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, siblings: [DEPTH]Felt) [N][WIDTH]Felt {
+fn buildRows(value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, siblings: [DEPTH]Felt, positions: [DEPTH]bool) [N][WIDTH]Felt {
     const m = rescue.mds();
     const rc = rescue.roundConstants();
     var rows: [N][WIDTH]Felt = undefined;
@@ -482,12 +488,12 @@ fn buildRows(value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, siblings: [DEPTH]F
     rows[blockStart(CM_BLOCK)] = .{ value, rho_a, 0 };
     for (0..rescue.ROUNDS) |r| rows[blockStart(CM_BLOCK) + r + 1] = rescue.round(rows[blockStart(CM_BLOCK) + r], m, rc[r]);
 
-    // Blocks 1..DEPTH: membership. Each input left = previous block output (adjacency carry),
-    // right = sibling, capacity 0.
+    // Blocks 1..DEPTH: membership. The running hash is placed left or right per the position bit;
+    // the sibling takes the other input. Capacity 0.
     for (0..DEPTH) |level| {
         const b = MEM_FIRST + level;
         const prev_out = rows[blockLast(b - 1)][0];
-        rows[blockStart(b)] = .{ prev_out, siblings[level], 0 };
+        rows[blockStart(b)] = if (positions[level]) .{ siblings[level], prev_out, 0 } else .{ prev_out, siblings[level], 0 };
         for (0..rescue.ROUNDS) |r| rows[blockStart(b) + r + 1] = rescue.round(rows[blockStart(b) + r], m, rc[r]);
     }
 
@@ -573,22 +579,24 @@ fn newCtx(pub_in: PublicInputs, beta: Felt, gamma: Felt) Ctx {
     };
 }
 
-pub fn prove(allocator: Allocator, value: Felt, rho: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt) !Proof {
-    return proveRhos(allocator, value, rho, rho, nk, fee, siblings);
+pub fn prove(allocator: Allocator, value: Felt, rho: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt, positions: [DEPTH]bool) !Proof {
+    return proveRhos(allocator, value, rho, rho, nk, fee, siblings, positions);
 }
 
 /// Prover allowing distinct rho per region — used by tests to exercise the copy constraint.
-fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt) !Proof {
+fn proveRhos(allocator: Allocator, value: Felt, rho_a: Felt, rho_b: Felt, nk: Felt, fee: Felt, siblings: [DEPTH]Felt, positions: [DEPTH]bool) !Proof {
     const cm = rescue.permute(.{ value, rho_a, 0 })[0];
     var cur_root = cm;
-    for (0..DEPTH) |d| cur_root = rescue.permute(.{ cur_root, siblings[d], 0 })[0];
+    for (0..DEPTH) |d| {
+        cur_root = if (positions[d]) rescue.permute(.{ siblings[d], cur_root, 0 })[0] else rescue.permute(.{ cur_root, siblings[d], 0 })[0];
+    }
     const pub_in = PublicInputs{
         .anchor = cur_root,
         .nf = rescue.permute(.{ nk, rho_b, 0 })[0],
         .send = field.sub(value, fee),
         .fee = fee,
     };
-    const rows = buildRows(value, rho_a, rho_b, nk, siblings);
+    const rows = buildRows(value, rho_a, rho_b, nk, siblings, positions);
 
     var rng = Rng.init();
     const trace_lde = try buildTraceLde(allocator, rows, &rng);
@@ -756,14 +764,36 @@ fn sampleSiblings(seed: u64) [DEPTH]Felt {
     return s;
 }
 
-test "spend: valid full spend verifies" {
+/// A mixed left/right path (general position) derived from a seed bit pattern.
+fn samplePositions(bits: u8) [DEPTH]bool {
+    var pos: [DEPTH]bool = undefined;
+    for (0..DEPTH) |i| pos[i] = (bits >> @intCast(i)) & 1 == 1;
+    return pos;
+}
+
+test "spend: valid full spend verifies (general positions)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(1);
-    const pub_in = publicFor(1000, 0xABCDEF, 0x123456, 100, sib);
-    const proof = try prove(al, 1000, 0xABCDEF, 0x123456, 100, sib);
+    const pos = samplePositions(0b101101); // mixed left/right path
+    const pub_in = publicFor(1000, 0xABCDEF, 0x123456, 100, sib, pos);
+    const proof = try prove(al, 1000, 0xABCDEF, 0x123456, 100, sib, pos);
     try testing.expect(try verify(al, pub_in, proof));
+}
+
+test "spend: every position pattern verifies" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const sib = sampleSiblings(11);
+    // A few representative patterns including all-left and all-right.
+    for ([_]u8{ 0b000000, 0b111111, 0b010101, 0b110010 }) |bits| {
+        const pos = samplePositions(bits);
+        const pub_in = publicFor(500, 3, 4, 50, sib, pos);
+        const proof = try prove(al, 500, 3, 4, 50, sib, pos);
+        try testing.expect(try verify(al, pub_in, proof));
+    }
 }
 
 test "spend: wrong anchor rejected" {
@@ -771,8 +801,9 @@ test "spend: wrong anchor rejected" {
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(2);
-    var pub_in = publicFor(1000, 7, 9, 100, sib);
-    const proof = try prove(al, 1000, 7, 9, 100, sib);
+    const pos = samplePositions(0b011010);
+    var pub_in = publicFor(1000, 7, 9, 100, sib, pos);
+    const proof = try prove(al, 1000, 7, 9, 100, sib, pos);
     pub_in.anchor = field.add(pub_in.anchor, 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
@@ -782,8 +813,9 @@ test "spend: wrong nf rejected" {
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(3);
-    var pub_in = publicFor(1000, 7, 9, 100, sib);
-    const proof = try prove(al, 1000, 7, 9, 100, sib);
+    const pos = samplePositions(0b001100);
+    var pub_in = publicFor(1000, 7, 9, 100, sib, pos);
+    const proof = try prove(al, 1000, 7, 9, 100, sib, pos);
     pub_in.nf = field.add(pub_in.nf, 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
@@ -793,8 +825,9 @@ test "spend: unbalanced rejected" {
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(4);
-    var pub_in = publicFor(1000, 7, 9, 100, sib);
-    const proof = try prove(al, 1000, 7, 9, 100, sib);
+    const pos = samplePositions(0b100001);
+    var pub_in = publicFor(1000, 7, 9, 100, sib, pos);
+    const proof = try prove(al, 1000, 7, 9, 100, sib, pos);
     pub_in.send = field.add(pub_in.send, 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
@@ -804,8 +837,9 @@ test "spend: tampered trace row rejected" {
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(5);
-    const pub_in = publicFor(1000, 7, 9, 100, sib);
-    var proof = try prove(al, 1000, 7, 9, 100, sib);
+    const pos = samplePositions(0b010010);
+    const pub_in = publicFor(1000, 7, 9, 100, sib, pos);
+    var proof = try prove(al, 1000, 7, 9, 100, sib, pos);
     proof.queries[0].cur_a.row[1] = field.add(proof.queries[0].cur_a.row[1], 1);
     try testing.expect(!try verify(al, pub_in, proof));
 }
@@ -815,15 +849,16 @@ test "spend: inconsistent rho across regions rejected (copy constraint bites)" {
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(6);
+    const pos = samplePositions(0b101010);
     const value: Felt = 1000;
     const rho_a: Felt = 7;
     const rho_b: Felt = 8; // != rho_a
     const nk: Felt = 9;
     const fee: Felt = 100;
     var cur_root = rescue.permute(.{ value, rho_a, 0 })[0];
-    for (0..DEPTH) |d| cur_root = rescue.permute(.{ cur_root, sib[d], 0 })[0];
+    for (0..DEPTH) |d| cur_root = if (pos[d]) rescue.permute(.{ sib[d], cur_root, 0 })[0] else rescue.permute(.{ cur_root, sib[d], 0 })[0];
     const pub_in = PublicInputs{ .anchor = cur_root, .nf = rescue.permute(.{ nk, rho_b, 0 })[0], .send = field.sub(value, fee), .fee = fee };
-    const proof = try proveRhos(al, value, rho_a, rho_b, nk, fee, sib);
+    const proof = try proveRhos(al, value, rho_a, rho_b, nk, fee, sib, pos);
     try testing.expect(!try verify(al, pub_in, proof));
 }
 
@@ -832,10 +867,23 @@ test "spend: a wrong sibling (not the real path) rejected" {
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(7);
-    const pub_in = publicFor(1000, 7, 9, 100, sib); // anchor for the true path
+    const pos = samplePositions(0b001011);
+    const pub_in = publicFor(1000, 7, 9, 100, sib, pos); // anchor for the true path
     var wrong = sib;
-    wrong[2] = field.add(wrong[2], 1); // prove with a different path ⇒ different root ≠ anchor
-    const proof = try prove(al, 1000, 7, 9, 100, wrong);
+    wrong[2] = field.add(wrong[2], 1); // different path ⇒ different root ≠ anchor
+    const proof = try prove(al, 1000, 7, 9, 100, wrong, pos);
+    try testing.expect(!try verify(al, pub_in, proof));
+}
+
+test "spend: a wrong position (different path shape) rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const sib = sampleSiblings(9);
+    const pos = samplePositions(0b010101);
+    const pub_in = publicFor(1000, 7, 9, 100, sib, pos); // anchor for this position pattern
+    const other_pos = samplePositions(0b010111); // flip one position bit
+    const proof = try prove(al, 1000, 7, 9, 100, sib, other_pos); // folds to a different root
     try testing.expect(!try verify(al, pub_in, proof));
 }
 
@@ -844,9 +892,10 @@ test "spend: proofs are randomized (zero-knowledge blinding)" {
     defer arena.deinit();
     const al = arena.allocator();
     const sib = sampleSiblings(8);
-    const pub_in = publicFor(1000, 7, 9, 100, sib);
-    const p1 = try prove(al, 1000, 7, 9, 100, sib);
-    const p2 = try prove(al, 1000, 7, 9, 100, sib);
+    const pos = samplePositions(0b110011);
+    const pub_in = publicFor(1000, 7, 9, 100, sib, pos);
+    const p1 = try prove(al, 1000, 7, 9, 100, sib, pos);
+    const p2 = try prove(al, 1000, 7, 9, 100, sib, pos);
     // Fresh blinding each time ⇒ different commitments, but both verify against the same publics.
     try testing.expect(!std.mem.eql(u8, &p1.trace_root, &p2.trace_root));
     try testing.expect(try verify(al, pub_in, p1));

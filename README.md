@@ -81,8 +81,8 @@ All four spend constraints now also fold into a single in-circuit proof (`spend.
 commitment opening, Merkle membership, nullifier, and balance, wired together — though the
 node demo still uses the native per-check path; integrating the single proof is pending.
 Remaining documented steps to production (see [`SPEC.md` §8](./SPEC.md)): node-integrate the
-folded spend proof, complete the commitment opening (`recipient`/`rcm`) + general path
-positions, swap the SPN's generated constants for a vetted
+folded spend proof, complete the commitment opening (`recipient`/`rcm`), swap the SPN's
+generated constants for a vetted
 standardized instance + wider state, and production-grade STARK parameters (the zero-knowledge
 here is honest-verifier and PoC-grade, not formally proven). None require changing the
 post-quantum primitive choices.

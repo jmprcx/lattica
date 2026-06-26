@@ -159,10 +159,10 @@ formally proven.
   grand-product copy constraint and `cm`→leaf wired by adjacency. `cm` stays hidden. Soundness
   tests reject a wrong anchor, wrong nf, unbalanced tx, wrong path, and an inconsistent `ρ`. The
   proof is **zero-knowledge** (all committed columns blinded + masked FRI; proofs randomized).
+  General (non-leftmost) Merkle positions are supported (degree-2 one-of carry; position hidden).
   Remaining is hardening/integration, not new mechanism: the full commitment opening
-  (`recipient`/`rcm`) + owner binding, general path positions, switching the protocol's
-  commitment/nullifier/Merkle hashing to the field hash, and node integration. See
-  [`soundness.md §6`](./soundness.md).
+  (`recipient`/`rcm`) + owner binding, switching the protocol's commitment/nullifier/Merkle
+  hashing to the field hash, and node integration. See [`soundness.md §6`](./soundness.md).
 - **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
   and PoC-grade — a formal ZK proof and production parameters are future work.
 - **One-way in-circuit hash (R1).** Closed: the authorization relation is a Poseidon-style SPN
