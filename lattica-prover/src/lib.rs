@@ -326,9 +326,8 @@ fn read_digest(bytes: &[u8]) -> Option<[BaseElement; 4]> {
 /// `src/ffi.zig`). Returns 0 to accept, non-zero to reject (always fail-closed on any parse error).
 ///
 /// `public_inputs` is the canonical `SpendPublicInputs` layout from `ffi.zig`:
-/// `anchor(32) ‖ nullifier(32) ‖ out_cm(32) ‖ tx_binding(32) ‖ fee(8)` = 136 bytes. The current
-/// spend statement binds `anchor`(=root), `nullifier`, and `tx_binding`; `out_cm`/`fee` are parsed
-/// for forward-compatibility and consumed once value-balance is integrated.
+/// `anchor(32) ‖ nullifier(32) ‖ out_cm(32) ‖ tx_binding(32) ‖ fee(8)` = 136 bytes, all consumed
+/// by the spend statement (anchor=root, nullifier, out_cm, tx_binding, and the value-balance fee).
 #[no_mangle]
 pub extern "C" fn lattica_spend_verify(
     proof_ptr: *const u8,
@@ -354,16 +353,23 @@ pub extern "C" fn lattica_spend_verify(
         Some(d) => d,
         None => return -1,
     };
-    // pi_bytes[64..96] = out_cm, pi_bytes[128..136] = fee — used once balance is integrated.
+    let out_cm = match read_digest(&pi_bytes[64..96]) {
+        Some(d) => d,
+        None => return -1,
+    };
     let tx_binding = match read_digest(&pi_bytes[96..128]) {
         Some(d) => d,
+        None => return -1,
+    };
+    let fee = match read_felt(&pi_bytes[128..136]) {
+        Some(f) => f,
         None => return -1,
     };
     let proof = match Proof::from_bytes(proof_bytes) {
         Ok(p) => p,
         Err(_) => return -1,
     };
-    let pi = spend::PublicInputs { root, nf, tx_binding };
+    let pi = spend::PublicInputs { root, nf, out_cm, tx_binding, fee };
     match spend::verify_spend(proof, pi) {
         Ok(()) => 0,
         Err(_) => 1,
@@ -425,6 +431,10 @@ mod tests {
             rcm: BaseElement::new(0x3333_4444),
             nk: BaseElement::new(0x5555_6666),
             pos: BaseElement::new(42),
+            out_recipient: BaseElement::new(0xBEEF),
+            out_value: BaseElement::new(900),
+            out_rho: BaseElement::new(0x7777),
+            out_rcm: BaseElement::new(0x8888),
         };
         let mut sib = [[BaseElement::ZERO; DIGEST]; DEPTH];
         let mut bits = [false; DEPTH];
@@ -435,7 +445,8 @@ mod tests {
             bits[d] = d % 2 == 1;
         }
         let txb = [BaseElement::new(7), BaseElement::new(8), BaseElement::new(9), BaseElement::new(10)];
-        let (proof, pi) = spend::prove_spend(note, sib, bits, txb);
+        let fee = BaseElement::new(100); // value(1000) = out_value(900) + fee(100)
+        let (proof, pi) = spend::prove_spend(note, sib, bits, txb, fee);
         let proof_bytes = proof.to_bytes();
 
         // Encode SpendPublicInputs (src/ffi.zig layout): anchor(root) ‖ nullifier ‖ out_cm ‖ tx_binding ‖ fee.
@@ -447,9 +458,9 @@ mod tests {
         };
         put(&mut pib, &pi.root);
         put(&mut pib, &pi.nf);
-        pib.extend_from_slice(&[0u8; 32]); // out_cm (unused until balance)
+        put(&mut pib, &pi.out_cm);
         put(&mut pib, &pi.tx_binding);
-        pib.extend_from_slice(&0u64.to_le_bytes()); // fee (unused until balance)
+        pib.extend_from_slice(&pi.fee.as_int().to_le_bytes());
         assert_eq!(pib.len(), 136);
 
         // Accepts a valid proof.

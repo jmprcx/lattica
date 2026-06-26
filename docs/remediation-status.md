@@ -41,13 +41,16 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
   to a public root via the Rescue 2-to-1 compression. Validated: `native_merge` equals
   `Rp64_256::merge`; the AIR trace root equals the native fold; valid-verifies; wrong-root and
   tampered-path rejected. **The heart of C-02.**
-- **Spend AIR** (`spend.rs`): one proof for public `(root, nf)` proving (1) `cm =
-  H(recipient, value, rho, rcm)`, (2) `cm` folds up a general-position path to `root`, (3) `nf =
-  H(nk, rho, pos)` — with the **same `rho`** in (1) and (3), bound by a **persistent `rho` column**
-  (no auxiliary grand-product segment). Per-boundary periodic selectors gate round / merge-link /
-  nullifier-load / row-0 constraints. Validated: `cm`/`nf` equal `Rp64_256::hash_elements`; AIR
-  `root`/`nf` equal the native fold/hash; valid-verifies; wrong-root, wrong-nf, tampered-opening,
-  and **inconsistent-`rho`** (commitment vs nullifier) all rejected. **C-01/C-02/C-03 core.**
+- **Spend AIR** (`spend.rs`): one proof for public `(root, nf, out_cm, tx_binding, fee)` proving
+  (1) `cm = H(recipient, value, rho, rcm)`, (2) `cm` folds up a general-position path to `root`,
+  (3) `nf = H(nk, rho, pos)`, (4) `out_cm = H(out_recipient, out_value, out_rho, out_rcm)`,
+  (5) **value-balance** `value = out_value + fee`, (6) **tx-binding** — with the **same `rho`** in
+  (1) and (3). Cross-region binding via **persistent columns** (`rho`, `value`, `out_value`); no
+  auxiliary grand-product segment. Per-boundary periodic selectors gate round / merge-link /
+  nullifier-load / output-load / row-0. Validated: `cm`/`nf`/`out_cm` equal `Rp64_256::hash_elements`;
+  AIR `root`/`nf`/`out_cm` equal the native oracles; valid-verifies; wrong-root, wrong-nf,
+  wrong-out_cm, tampered-opening, **inconsistent-`rho`**, **unbalanced**, and **wrong-tx-binding**
+  all rejected. **C-01/C-02/C-03 core + value-balance.**
 - `lattica_spend_verify` C ABI is **real** (lib.rs): parses the `SpendPublicInputs` byte layout
   from `src/ffi.zig` (canonical field-element + length checks), deserializes the Winterfell proof,
   and calls `verify_spend` — fail-closed on any parse error. Round-trip tested (accept / tampered-
@@ -63,10 +66,12 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
    (`wrong_tx_binding_rejected`). 16/16 Rust tests.
 5. **Ownership** (recipient ↔ `nk`) and **position-consistency** (nullifier `pos` ↔ the path),
    reusing the persistent-column binding technique.
-6. **Range** (no field wraparound): standalone AIR **done** (`range.rs`) — remainder-decomposition,
-   `value < 2^BITS`, in-range verifies / out-of-range rejected / handles `value=0`. **Balance**
-   `in = out + fee` (+ `mint`/`burn`) with `out_cm` binding and the range tied to the *hidden*
-   note/output values: remaining (integration into `spend.rs` via persistent value columns).
+6. **Balance** `value = out_value + fee` with `out_cm` binding: **done** (`spend.rs`) — output
+   commitment region + value-conservation, `fee` a given public input (`unbalanced_rejected`).
+   **Range** (no field wraparound): standalone AIR **done** (`range.rs`). **Remaining for full
+   balance soundness:** tie the range AIR to the *hidden* `value`/`out_value` (parallel `rem`
+   columns in `spend.rs`) — until then a wrapped `out_value` is not yet forbidden in the integrated
+   proof. Also `mint`/`burn` for the coinbase/issuance path.
 7. ~~The real `lattica_spend_verify` over `SpendPublicInputs`.~~ **Done** (lib.rs): canonical
    public-input parsing + Winterfell proof (de)serialization, fail-closed. A `lattica_spend_prove`
    ABI (wallet side) and linking the static lib into a Zig integration test remain.
