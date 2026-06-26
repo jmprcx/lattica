@@ -1,9 +1,11 @@
 //! Commitment-opening + membership + nullifier — the Phase-2 spend statement (C-01/C-02/C-03).
 //!
-//! One Winterfell proof attests, for public `(root, nf)` and a private note:
+//! One Winterfell proof attests, for public `(root, nf, tx_binding)` and a private note:
 //!   1. **commitment** `cm = H(recipient, value, rho, rcm)`  (block 0, one Rescue permutation)
 //!   2. **membership** `cm` folds up a general-position path to `root`  (blocks 1..=DEPTH)
 //!   3. **nullifier**  `nf = H(nk, rho, pos)`  (last block; `nf` public)
+//!   4. **tx-binding** the proof is bound to `tx_binding` (the tx sighash) via Fiat-Shamir, so it
+//!      cannot be lifted/replayed onto another transaction.
 //! with the **same `rho`** in (1) and (3).
 //!
 //! Cross-region `rho` binding without an auxiliary grand-product segment: a **persistent `rho`
@@ -17,8 +19,8 @@
 //!
 //! Scope / audit note (Codex audit precedes production wiring): `recipient`/`nk`/`pos` are single
 //! field elements (demo). Still TODO before production: **ownership** (recipient ↔ `nk`),
-//! **value-balance + range**, **position-consistency** (nullifier `pos` ↔ the path), the
-//! tx-binding public input, depth 32, and the real `lattica_spend_verify`.
+//! **value-balance + range** (bind `out_cm`), **position-consistency** (nullifier `pos` ↔ the
+//! path), depth 32, canonical proof serialization, and the real `lattica_spend_verify`.
 
 use winterfell::{
     math::{fields::f64::BaseElement, FieldElement, ToElements},
@@ -95,12 +97,17 @@ pub fn native_root(n: Note, siblings: &[[BaseElement; DIGEST]; DEPTH], bits: &[b
 pub struct PublicInputs {
     pub root: [BaseElement; DIGEST],
     pub nf: [BaseElement; DIGEST],
+    /// Transaction-binding digest (the tx sighash as field elements). It is not constrained in the
+    /// trace; it is absorbed into the Fiat-Shamir transcript via `to_elements`, so a proof produced
+    /// for one transaction fails to verify against any other (no proof lifting/replay across txs).
+    pub tx_binding: [BaseElement; DIGEST],
 }
 
 impl ToElements<BaseElement> for PublicInputs {
     fn to_elements(&self) -> Vec<BaseElement> {
         let mut v = self.root.to_vec();
         v.extend_from_slice(&self.nf);
+        v.extend_from_slice(&self.tx_binding);
         v
     }
 }
@@ -266,11 +273,12 @@ impl Air for SpendAir {
 
 pub struct SpendProver {
     options: ProofOptions,
+    tx_binding: [BaseElement; DIGEST],
 }
 
 impl SpendProver {
-    pub fn new(options: ProofOptions) -> Self {
-        Self { options }
+    pub fn new(options: ProofOptions, tx_binding: [BaseElement; DIGEST]) -> Self {
+        Self { options, tx_binding }
     }
 
     /// Build the trace. `rho_in_null` lets tests inject an inconsistent nullifier `rho` to confirm
@@ -373,7 +381,7 @@ impl Prover for SpendProver {
             root[i] = trace.get(DIGEST + i, ROOT_ROW);
             nf[i] = trace.get(DIGEST + i, NF_ROW);
         }
-        PublicInputs { root, nf }
+        PublicInputs { root, nf, tx_binding: self.tx_binding }
     }
 
     fn options(&self) -> &ProofOptions {
@@ -434,8 +442,9 @@ pub fn prove_spend(
     note: Note,
     siblings: [[BaseElement; DIGEST]; DEPTH],
     bits: [bool; DEPTH],
+    tx_binding: [BaseElement; DIGEST],
 ) -> (Proof, PublicInputs) {
-    let prover = SpendProver::new(build_options());
+    let prover = SpendProver::new(build_options(), tx_binding);
     let trace = prover.build_trace(note, siblings, bits);
     let pi = prover.get_pub_inputs(&trace);
     let proof = prover.prove(trace).expect("proving failed");
@@ -473,10 +482,14 @@ mod tests {
         (note, sib, bits)
     }
 
+    fn txb() -> [BaseElement; DIGEST] {
+        [BaseElement::new(7), BaseElement::new(8), BaseElement::new(9), BaseElement::new(10)]
+    }
+
     #[test]
     fn trace_matches_native_oracles() {
         let (note, sib, bits) = sample();
-        let prover = SpendProver::new(build_options());
+        let prover = SpendProver::new(build_options(), txb());
         let trace = prover.build_trace(note, sib, bits);
         let pi = prover.get_pub_inputs(&trace);
         assert_eq!(pi.root, native_root(note, &sib, &bits));
@@ -486,14 +499,14 @@ mod tests {
     #[test]
     fn valid_spend_verifies() {
         let (note, sib, bits) = sample();
-        let (proof, pi) = prove_spend(note, sib, bits);
+        let (proof, pi) = prove_spend(note, sib, bits, txb());
         assert!(verify_spend(proof, pi).is_ok());
     }
 
     #[test]
     fn wrong_root_rejected() {
         let (note, sib, bits) = sample();
-        let (proof, mut pi) = prove_spend(note, sib, bits);
+        let (proof, mut pi) = prove_spend(note, sib, bits, txb());
         pi.root[0] += BaseElement::ONE;
         assert!(verify_spend(proof, pi).is_err());
     }
@@ -501,7 +514,7 @@ mod tests {
     #[test]
     fn wrong_nullifier_rejected() {
         let (note, sib, bits) = sample();
-        let (proof, mut pi) = prove_spend(note, sib, bits);
+        let (proof, mut pi) = prove_spend(note, sib, bits, txb());
         pi.nf[0] += BaseElement::ONE;
         assert!(verify_spend(proof, pi).is_err());
     }
@@ -512,9 +525,9 @@ mod tests {
         let real_root = native_root(note, &sib, &bits);
         let mut bad = note;
         bad.value += BaseElement::ONE;
-        let (proof, pi) = prove_spend(bad, sib, bits);
+        let (proof, pi) = prove_spend(bad, sib, bits, txb());
         assert_ne!(pi.root, real_root);
-        let claim = PublicInputs { root: real_root, nf: pi.nf.clone() };
+        let claim = PublicInputs { root: real_root, nf: pi.nf.clone(), tx_binding: pi.tx_binding };
         assert!(verify_spend(proof, claim).is_err());
     }
 
@@ -523,7 +536,7 @@ mod tests {
         // Build a trace where the nullifier uses a different rho than the commitment; the
         // persistent-rho binding must reject it.
         let (note, sib, bits) = sample();
-        let prover = SpendProver::new(build_options());
+        let prover = SpendProver::new(build_options(), txb());
         let trace = prover.build_trace_with(note, sib, bits, note.rho + BaseElement::ONE);
         let pi = prover.get_pub_inputs(&trace);
         // Proving may still succeed (prover doesn't check), but verification must fail.
@@ -531,5 +544,14 @@ mod tests {
             Ok(proof) => assert!(verify_spend(proof, pi).is_err()),
             Err(_) => {} // a fail-stop in proving is also acceptable
         }
+    }
+
+    #[test]
+    fn wrong_tx_binding_rejected() {
+        // A proof produced for one tx-binding must not verify against another (no proof lifting).
+        let (note, sib, bits) = sample();
+        let (proof, mut pi) = prove_spend(note, sib, bits, txb());
+        pi.tx_binding[0] += BaseElement::ONE;
+        assert!(verify_spend(proof, pi).is_err());
     }
 }

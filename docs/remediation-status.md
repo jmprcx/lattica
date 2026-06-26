@@ -55,13 +55,15 @@ boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97
 2. ~~Commitment opening + leaf binding.~~ **Done.**
 3. ~~Nullifier + shared-`rho` binding.~~ **Done** (`spend.rs`). `recipient`/`nk`/`pos` are single
    field elements (demo); `DEPTH=6` (8 blocks, pow-2 trace) — depth-32 needs a block-count pad.
-4. **Ownership** (recipient ↔ `nk`) and **position-consistency** (nullifier `pos` ↔ the path),
+4. ~~Bind the public **tx-binding** digest.~~ **Done** (`spend.rs`): `tx_binding` is a public input
+   absorbed into the Fiat-Shamir transcript; a proof for one tx fails against another
+   (`wrong_tx_binding_rejected`). 16/16 Rust tests.
+5. **Ownership** (recipient ↔ `nk`) and **position-consistency** (nullifier `pos` ↔ the path),
    reusing the persistent-column binding technique.
-5. **Balance** `in_value = out_value + fee` (+ `mint`/`burn`) and **range** (no field wraparound),
+6. **Balance** `in_value = out_value + fee` (+ `mint`/`burn`) and **range** (no field wraparound),
    values hidden; bind `out_cm`.
-6. Bind the public **tx-binding digest**; canonical proof serialization; the real
-   `lattica_spend_verify` over `SpendPublicInputs`.
-7. Differential test the whole statement vs. the hand-rolled reference; production parameters +
+7. Canonical proof serialization; the real `lattica_spend_verify` over `SpendPublicInputs`.
+8. Differential test the whole statement vs. the hand-rolled reference; production parameters +
    written soundness budget (Phase 5).
 
 Then **Phase 3** (external audit of the circuit + protocol + FFI glue) gates value-bearing use.
