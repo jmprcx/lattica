@@ -1,0 +1,18 @@
+# Phase-0 framework spike (see docs/remediation-status.md + the plan).
+# Goal: validate that the production proving framework — Winterfell, a transparent,
+# post-quantum FRI-STARK system — can express our hash-based statements over the same
+# Goldilocks field, with a vetted Rescue-Prime hash and extension-field soundness.
+[package]
+name = "lattica-framework-spike"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate (the lattica repo is not a Cargo workspace).
+[workspace]
+
+[dependencies]
+winterfell = "=0.13.1"
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
