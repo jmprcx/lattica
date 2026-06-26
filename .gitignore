@@ -4,3 +4,4 @@ zig-out/
 AGENTS.md
 framework-spike/target/
 lattica-prover/target/
+plonky2-spike/target/

@@ -1,0 +1,5 @@
+# plonky2 requires a nightly toolchain (it uses `#![feature(...)]`). Pinned for reproducibility.
+# This is a real production tradeoff vs. Winterfell (which builds on stable) — see
+# docs/framework-decision.md "ZK-01 spike result".
+[toolchain]
+channel = "nightly"

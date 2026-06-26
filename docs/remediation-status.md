@@ -93,10 +93,13 @@ counts below are historical, from the iteration that added each piece.)
    written soundness budget (Phase 5).
 
 ## Open items not yet closed (the gaps the remediation review surfaced)
-- **ZK-01 (blocking):** the spend proof is **not zero-knowledge** — FRI openings would leak the
-  hidden witness (value, recipient, `rho`, `nk`). Winterfell 0.13 has no ZK toggle; the circuit has
-  no trace blinding. Must be resolved (trace blinding/salting, a ZK-capable Winterfell path, or a
-  framework reassessment) before the shielded protocol is viable.
+- **ZK-01 (blocking):** the spend proof is **not zero-knowledge** under Winterfell — FRI openings
+  would leak the hidden witness. **Path validated:** the `plonky2-spike/` proves the full spend-core
+  statement with zero-knowledge on (vetted Poseidon + range/select gadgets, Goldilocks, FRI/PQ;
+  `ZK re-randomized: true`, 5/5 tests). Recommendation (`docs/framework-decision.md` "ZK-01 spike
+  result"): **adopt plonky2** for the production circuit (ZK + smaller audit surface; cost: nightly
+  toolchain, ~149 KB proofs). Final framework decision pending; then re-express `lattica-prover` in
+  plonky2 (Winterfell kept as a differential oracle).
 - **C-03 protocol match:** the in-circuit `Rp64_256` hash must match the protocol's
   `noteCommitment`/`nullifier` (switch `tx.zig`/`primitives.zig` to the field hash); full note
   format; `recipient` → 4-element digest; `DEPTH` → 32; widen `BITS`.

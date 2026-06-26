@@ -98,3 +98,37 @@ Winterfell port dropped it.)
 *shielded* (ZK) protocol and Winterfell cannot provide ZK without substantial hand-rolled additions,
 evaluate **plonky2** (option B) against the validated circuit design before further hardening. This
 is a decision to make with the user / pre-audit, not a mechanical change.
+
+### ZK-01 spike result (`plonky2-spike/`)
+
+Built the **full spend-core statement** on plonky2 with zero-knowledge enabled
+(`standard_recursion_zk_config`): ownership `recipient=Poseidon(nk)[0]`, commitment, general-position
+2-level membership, nullifier, output commitment, value-balance, 32-bit range, and a tx-binding
+public input. **Prove→verify ACCEPTED; `ZK re-randomized: true`** (two proofs of the same statement
+differ — blinding confirmed); public inputs cross-check the native Poseidon oracle; 5/5 tests
+(valid+native-match, unbalanced-fails-to-prove, out-of-range-fails-to-prove, tampered-root-rejected,
+ZK-randomized).
+
+| | Winterfell (`lattica-prover`) | **plonky2** (`plonky2-spike`) |
+|---|---|---|
+| Zero-knowledge | ❌ none (ZK-01) | ✅ built-in, validated |
+| Field | Goldilocks 64-bit | Goldilocks 64-bit (same) |
+| Transparent + post-quantum (FRI) | ✅ | ✅ |
+| In-circuit hash | vetted Rescue-Prime `Rp64_256` | vetted Poseidon (gadget) |
+| Arithmetization | **hand-written AIR** (periodic selectors, `rem` columns, round constraints) | **PLONKish gadgets** (hash / `range_check` / `select` built-in) |
+| Hand-written soundness-critical code | high (the whole spend AIR) | low (compose gadgets) — **smaller audit surface** |
+| Toolchain | **stable** | **nightly required** (`#![feature]`) |
+| Proof size | ~73 KB (x⁷ core) | ~149 KB (full spend core) |
+| Prove / verify | fast | ~0.9 s / ~5 ms (depth-2, demo params) |
+| Maturity | Polygon Miden | Polygon zkEVM |
+
+**Decision recommendation: adopt plonky2 for the production spend circuit.** ZK is non-negotiable
+for a shielded protocol, and plonky2 delivers it on the *same* field with *vetted gadgets* — which
+also **shrinks the audit surface** (the membership/range/hash logic that we hand-wrote as a
+Winterfell AIR becomes library gadget calls). Costs are acceptable and manageable: the nightly
+toolchain is pinned (`rust-toolchain.toml`) and is standard for plonky2 production deployments
+(Polygon zkEVM); ~149 KB proofs are fine for a payment transaction (and recursion can compress if
+needed). The Winterfell `lattica-prover` work stays valuable as a **differential-test oracle** and a
+second verifier path. Open caveats to confirm pre-adoption: plonky2's FRI/PQ parameterization and a
+written soundness budget (C-04), and the nightly supply-chain/reproducibility story for a
+value-bearing node.

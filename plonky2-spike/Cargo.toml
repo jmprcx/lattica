@@ -1,0 +1,13 @@
+# ZK-01 spike (see docs/framework-decision.md "ZK reassessment").
+# Evaluate plonky2 — a transparent, FRI-based, ZK-capable proof system over Goldilocks — as a
+# zero-knowledge alternative to Winterfell for the shielded spend statement.
+[package]
+name = "lattica-plonky2-spike"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+plonky2 = "1.1.0"
+anyhow = "1"
