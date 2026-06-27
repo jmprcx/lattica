@@ -40,7 +40,7 @@ int main(void) {
     size_t proof_len = 0, pi_len = 0;
     uint8_t pi[256];
     if (lattica_joinsplit_prove_demo(proof, 1 << 20, &proof_len, pi, sizeof pi, &pi_len)) { printf("FAIL prove\n"); return 1; }
-    if (pi_len != 200) { printf("FAIL pi_len=%zu\n", pi_len); return 1; }
+    if (pi_len != 208) { printf("FAIL pi_len=%zu\n", pi_len); return 1; }
     printf("proved: proof=%zu bytes, pi=%zu bytes\n", proof_len, pi_len);
 
     if (lattica_joinsplit_verify(proof, proof_len, pi, pi_len) != 0) { printf("FAIL verify-valid\n"); return 1; }

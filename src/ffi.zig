@@ -56,10 +56,11 @@ pub const JoinSplitPublicInputs = struct {
     out_cms: [JOINSPLIT_M_OUT]Hash32,
     tx_binding: Hash32,
     fee: u64,
+    mint: u64, // public issuance (0 for a normal tx; consensus enforces issuance rules)
 
-    pub const ENCODED_LEN: usize = 32 * (2 + JOINSPLIT_N_IN + JOINSPLIT_M_OUT) + 8;
+    pub const ENCODED_LEN: usize = 32 * (2 + JOINSPLIT_N_IN + JOINSPLIT_M_OUT) + 8 + 8;
 
-    /// Canonical byte layout: anchor ‖ N·nullifier ‖ M·out_cm ‖ tx_binding ‖ fee(LE).
+    /// Canonical byte layout: anchor ‖ N·nullifier ‖ M·out_cm ‖ tx_binding ‖ fee(LE) ‖ mint(LE).
     pub fn encode(self: JoinSplitPublicInputs) [ENCODED_LEN]u8 {
         var out: [ENCODED_LEN]u8 = undefined;
         var off: usize = 0;
@@ -76,6 +77,8 @@ pub const JoinSplitPublicInputs = struct {
         @memcpy(out[off..][0..32], &self.tx_binding);
         off += 32;
         std.mem.writeInt(u64, out[off..][0..8], self.fee, .little);
+        off += 8;
+        std.mem.writeInt(u64, out[off..][0..8], self.mint, .little);
         return out;
     }
 };
@@ -155,13 +158,16 @@ test "ffi: join-split public inputs encode to the fixed canonical layout" {
     pi.nullifiers[1] = [_]u8{9} ** 32;
     pi.tx_binding = [_]u8{4} ** 32;
     pi.fee = 0x0102_0304_0506_0708;
+    pi.mint = 0x1100;
     const e = pi.encode();
-    // anchor(32) ‖ 2·nf(32) ‖ 2·out_cm(32) ‖ tx_binding(32) ‖ fee(8) = 200
-    try testing.expectEqual(@as(usize, 200), JoinSplitPublicInputs.ENCODED_LEN);
+    // anchor(32) ‖ 2·nf(32) ‖ 2·out_cm(32) ‖ tx_binding(32) ‖ fee(8) ‖ mint(8) = 208
+    try testing.expectEqual(@as(usize, 208), JoinSplitPublicInputs.ENCODED_LEN);
     try testing.expectEqual(@as(u8, 1), e[0]); // anchor
     try testing.expectEqual(@as(u8, 9), e[64]); // nullifiers[1] starts at 32+32
     try testing.expectEqual(@as(u8, 4), e[160]); // tx_binding at 32·5
     try testing.expectEqual(@as(u8, 0x08), e[192]); // fee LSB at 32·6
+    try testing.expectEqual(@as(u8, 0x00), e[200]); // mint LSB
+    try testing.expectEqual(@as(u8, 0x11), e[201]); // mint next byte
 }
 
 test "ffi: join-split fail-closed without a backend" {

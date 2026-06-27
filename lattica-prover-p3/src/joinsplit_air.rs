@@ -131,6 +131,7 @@ pub struct Witness {
     pub inputs: [Input; N_IN],
     pub outputs: [Output; M_OUT],
     pub fee: u64,
+    pub mint: u64, // public issuance (0 for a normal tx; > 0 for coinbase)
     pub tx_binding: [Val; DIGEST],
 }
 
@@ -167,7 +168,7 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
         out_sum += out.value as u128;
     }
     // value balance (A3: all values range-bounded ⇒ no wraparound)
-    assert_eq!(in_sum, out_sum + w.fee as u128, "value balance Σin = Σout + fee");
+    assert_eq!(in_sum + w.mint as u128, out_sum + w.fee as u128, "value balance Σin + mint = Σout + fee");
     PublicOutputs { anchor: anchor.unwrap(), nullifiers, out_cms }
 }
 
@@ -180,7 +181,8 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
 const SPAN_BLOCKS: usize = 3 + DEPTH; // ownership, commitment, DEPTH merges, nullifier
 const OUT_BLOCKS: usize = 2; // out_cm perm + range overflow (BITS > 32 ⇒ 2 blocks)
 const FEE_BLOCKS: usize = 2; // fee binding + range
-const USED_BLOCKS: usize = N_IN * SPAN_BLOCKS + M_OUT * OUT_BLOCKS + FEE_BLOCKS;
+const MINT_BLOCKS: usize = 2; // mint (issuance) binding + range
+const USED_BLOCKS: usize = N_IN * SPAN_BLOCKS + M_OUT * OUT_BLOCKS + FEE_BLOCKS + MINT_BLOCKS;
 const NUM_BLOCKS: usize = USED_BLOCKS.next_power_of_two();
 const HEIGHT: usize = NUM_BLOCKS * BLOCK;
 
@@ -188,9 +190,9 @@ const HEIGHT: usize = NUM_BLOCKS * BLOCK;
 const BIT: usize = 8; // membership position bit
 const NK: usize = 9; // local-persistent within an input span
 const RHO: usize = 10;
-const VAL: usize = 11; // value within input / output / fee region
+const VAL: usize = 11; // value within input / output / fee / mint region
 const POSACC: usize = 12; // Σ bit_d·2^d within an input's membership (A1)
-const VALACC: usize = 13; // global balance accumulator: +in, −out, −fee ⇒ 0
+const VALACC: usize = 13; // global balance accumulator: +in +mint −out −fee ⇒ 0
 const REM: usize = 14; // range running remainder
 const RBIT: usize = 15;
 const WIDTH: usize = 16;
@@ -205,22 +207,24 @@ const P_ROOT: usize = 16;
 const P_NULL_IN: usize = 17;
 const P_OUT_IN: usize = 18;
 const P_FEE_IN: usize = 19;
-const P_REGION_LAST: usize = 20; // last row of each region (gates local-persistent columns)
-const P_RANGE_SEED: usize = 21; // rem = VAL (each value's first range row)
-const P_RANGE_ACTIVE: usize = 22; // decomposition rows
-const P_RANGE_CLOSE: usize = 23; // rem = 0 (value < 2^BITS)
-const P_ROW0: usize = 24; // VALACC = 0
-const P_FINAL: usize = 25; // VALACC = 0 (balance)
-const P_NULLOUT: usize = 26; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 26 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 26 + N_IN + M_OUT;
+const P_MINT_IN: usize = 20; // issuance amount binding row
+const P_REGION_LAST: usize = 21; // last row of each region (gates local-persistent columns)
+const P_RANGE_SEED: usize = 22; // rem = VAL (each value's first range row)
+const P_RANGE_ACTIVE: usize = 23; // decomposition rows
+const P_RANGE_CLOSE: usize = 24; // rem = 0 (value < 2^BITS)
+const P_ROW0: usize = 25; // VALACC = 0
+const P_FINAL: usize = 26; // VALACC = 0 (balance)
+const P_NULLOUT: usize = 27; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 27 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 27 + N_IN + M_OUT;
 
-// public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ tx_binding(4)
+// public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
 const PI_ANCHOR: usize = 0;
 const PI_NF: usize = 4;
 const PI_OUTCM: usize = 4 + N_IN * DIGEST;
 const PI_FEE: usize = 4 + N_IN * DIGEST + M_OUT * DIGEST;
-const PI_TXBIND: usize = PI_FEE + 1;
+const PI_MINT: usize = PI_FEE + 1;
+const PI_TXBIND: usize = PI_MINT + 1;
 const N_PUBLIC: usize = PI_TXBIND + DIGEST;
 
 const fn input_base(i: usize) -> usize {
@@ -262,6 +266,12 @@ const fn fee_base() -> usize {
 const fn fee_in_row() -> usize {
     fee_base() * BLOCK
 }
+const fn mint_base() -> usize {
+    fee_base() + FEE_BLOCKS
+}
+const fn mint_in_row() -> usize {
+    mint_base() * BLOCK
+}
 
 fn one_hot(rows: &[usize]) -> Vec<Val> {
     let mut c = vec![Val::ZERO; HEIGHT];
@@ -293,10 +303,12 @@ fn periodic() -> Vec<Vec<Val>> {
     let mut region_last: Vec<usize> = (0..N_IN).map(null_out_row).collect();
     region_last.extend((0..M_OUT).map(|j| out_in_row(j) + OUT_BLOCKS * BLOCK - 1));
     region_last.push(fee_in_row() + FEE_BLOCKS * BLOCK - 1);
-    // range windows: one per value (each input value, output value, and the fee)
+    region_last.push(mint_in_row() + MINT_BLOCKS * BLOCK - 1);
+    // range windows: one per value (each input value, output value, the fee, and the mint)
     let mut seeds: Vec<usize> = (0..N_IN).map(commit_in_row).collect();
     seeds.extend((0..M_OUT).map(out_in_row));
     seeds.push(fee_in_row());
+    seeds.push(mint_in_row());
     let mut range_active: Vec<usize> = Vec::new();
     let mut range_close: Vec<usize> = Vec::new();
     for &s in &seeds {
@@ -313,12 +325,13 @@ fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&null_in)); // P_NULL_IN
     cols.push(one_hot(&out_in)); // P_OUT_IN
     cols.push(one_hot(&[fee_in_row()])); // P_FEE_IN
+    cols.push(one_hot(&[mint_in_row()])); // P_MINT_IN
     cols.push(one_hot(&region_last)); // P_REGION_LAST
     cols.push(one_hot(&seeds)); // P_RANGE_SEED
     cols.push(one_hot(&range_active)); // P_RANGE_ACTIVE
     cols.push(one_hot(&range_close)); // P_RANGE_CLOSE
     cols.push(one_hot(&[0])); // P_ROW0
-    cols.push(one_hot(&[fee_in_row() + FEE_BLOCKS * BLOCK - 1])); // P_FINAL
+    cols.push(one_hot(&[mint_in_row() + MINT_BLOCKS * BLOCK - 1])); // P_FINAL (after mint contribution)
     for i in 0..N_IN {
         cols.push(one_hot(&[null_out_row(i)])); // P_NULLOUT + i
     }
@@ -393,7 +406,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
 
         // ---- global value accumulator: +in (commit), −out, −fee ⇒ 0 ----
         builder.assert_zero(p[P_ROW0].clone() * cur[VALACC].clone());
-        let acc_delta = (p[P_COMMIT_IN].clone() - p[P_OUT_IN].clone() - p[P_FEE_IN].clone()) * cur[VAL].clone();
+        let acc_delta = (p[P_COMMIT_IN].clone() + p[P_MINT_IN].clone() - p[P_OUT_IN].clone() - p[P_FEE_IN].clone())
+            * cur[VAL].clone();
         builder.when_transition().assert_zero(nxt[VALACC].clone() - cur[VALACC].clone() - acc_delta);
         builder.assert_zero(p[P_FINAL].clone() * cur[VALACC].clone()); // balance: Σin = Σout + fee
 
@@ -472,6 +486,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
 
         // ---- fee region: VAL = public fee (range-checked like any value; A3) ----
         builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - pis[PI_FEE].clone()));
+
+        // ---- mint region: VAL = public mint (issuance; range-checked; added to the balance) ----
+        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - pis[PI_MINT].clone()));
 
         // tx_binding (pis[PI_TXBIND..]) is bound to the proof by Fiat–Shamir (observed public input).
     }
@@ -622,12 +639,19 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
     fill_col(&mut t, flo, fhi, VAL, Val::from_u64(w.fee));
     fill_range(&mut t, fee_in_row(), w.fee);
 
+    // --- mint region: VAL = mint (issuance), range-checked ---
+    set_block(&mut t, mint_base(), [Val::ZERO; 8]);
+    set_block(&mut t, mint_base() + 1, [Val::ZERO; 8]);
+    let (mlo, mhi) = (mint_in_row(), mint_in_row() + MINT_BLOCKS * BLOCK - 1);
+    fill_col(&mut t, mlo, mhi, VAL, Val::from_u64(w.mint));
+    fill_range(&mut t, mint_in_row(), w.mint);
+
     // --- padding blocks: valid permutations of zero ---
     for b in USED_BLOCKS..NUM_BLOCKS {
         set_block(&mut t, b, [Val::ZERO; 8]);
     }
 
-    // --- global value accumulator: +in at each commit, −out at each output, −fee ⇒ 0 ---
+    // --- global value accumulator: +in (commit) +mint −out −fee ⇒ 0 ---
     let mut delta = vec![0i128; HEIGHT];
     for (i, inp) in w.inputs.iter().enumerate() {
         delta[commit_in_row(i)] += inp.value as i128;
@@ -636,6 +660,7 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         delta[out_in_row(j)] -= out.value as i128;
     }
     delta[fee_in_row()] -= w.fee as i128;
+    delta[mint_in_row()] += w.mint as i128;
     let mut acc: i128 = 0;
     for r in 0..HEIGHT {
         t[r * WIDTH + VALACC] = if acc >= 0 {
@@ -660,6 +685,7 @@ pub fn public_values(w: &Witness) -> Vec<Val> {
         pis[PI_OUTCM + j * DIGEST..PI_OUTCM + (j + 1) * DIGEST].copy_from_slice(&o.out_cms[j]);
     }
     pis[PI_FEE] = Val::from_u64(w.fee);
+    pis[PI_MINT] = Val::from_u64(w.mint);
     pis[PI_TXBIND..PI_TXBIND + DIGEST].copy_from_slice(&w.tx_binding);
     pis
 }
@@ -727,7 +753,7 @@ pub fn demo_witness() -> Witness {
         rho: Val::from_u64(21 + j as u64),
         rcm: Val::from_u64(22 + j as u64),
     });
-    Witness { inputs, outputs, fee: 100, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+    Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
 }
 
 /// (proof bytes, prove ms, verify ms, proven security bits) for a representative join-split.
@@ -851,7 +877,7 @@ mod tests {
             Output { recipient: recipient_of(Val::from_u64(88)), value: 500, rho: Val::from_u64(23), rcm: Val::from_u64(24) },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
-        Witness { inputs, outputs, fee: 100, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+        Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
     }
 
     #[test]
@@ -915,7 +941,7 @@ mod tests {
             rho: Val::from_u64(21 + j as u64),
             rcm: Val::from_u64(22 + j as u64),
         });
-        Witness { inputs, outputs, fee, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+        Witness { inputs, outputs, fee, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
     }
 
     #[test]
@@ -934,6 +960,23 @@ mod tests {
         // both still verify
         assert!(verify_bytes(&a, &public_values(&w)));
         assert!(verify_bytes(&b, &public_values(&w)));
+    }
+
+    #[test]
+    fn mint_issuance_verifies() {
+        // coinbase: dummy (zero-value) inputs, one output funded by issuance, no fee.
+        let mut w = witness_with([0, 0], [1000, 0], 0);
+        w.mint = 1000; // Σin(0) + mint(1000) = Σout(1000) + fee(0)
+        prove_verify(&w).expect("coinbase mint should verify");
+    }
+
+    #[test]
+    fn wrong_mint_rejected() {
+        let mut w = witness_with([0, 0], [1000, 0], 0);
+        w.mint = 1000;
+        let mut pis = public_values(&w);
+        pis[PI_MINT] += Val::ONE; // claim a different issuance ⇒ mint binding fails
+        assert!(prove_verify_with(&w, &pis).is_err());
     }
 
     #[test]

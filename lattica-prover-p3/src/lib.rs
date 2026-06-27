@@ -110,7 +110,7 @@ pub unsafe extern "C" fn lattica_spend_verify(
 /// `JoinSplitPublicInputs` byte layout: anchor(32) ‖ N·nullifier(32) ‖ M·out_cm(32) ‖
 /// tx_binding(32) ‖ fee(8 LE). Each 32-byte field is a 4-element Goldilocks digest.
 const JS_PUBLIC_INPUTS_LEN: usize =
-    DIGEST_BYTES * (2 + joinsplit_air::N_IN + joinsplit_air::M_OUT) + 8;
+    DIGEST_BYTES * (2 + joinsplit_air::N_IN + joinsplit_air::M_OUT) + 8 + 8; // … ‖ fee(8) ‖ mint(8)
 
 /// Parse the join-split public-input bytes into the circuit's vector
 /// `anchor ‖ nf_i ‖ out_cm_j ‖ fee ‖ tx_binding`. Fail-closed on length / non-canonical limbs.
@@ -131,9 +131,11 @@ fn parse_joinsplit_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
         off += 32;
     }
     let mut txb = Vec::with_capacity(4);
-    push_digest(&b[off..off + 32], &mut txb)?; // tx_binding (appended after fee, circuit order)
+    push_digest(&b[off..off + 32], &mut txb)?; // tx_binding (appended after fee/mint, circuit order)
     off += 32;
     pis.push(parse_felt(&b[off..off + 8])?); // fee
+    off += 8;
+    pis.push(parse_felt(&b[off..off + 8])?); // mint
     pis.extend_from_slice(&txb);
     Some(pis)
 }
@@ -226,9 +228,11 @@ pub fn encode_joinsplit_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
         off += 32;
     }
     let fee_idx = oc + m * d;
-    put(&mut out[off..off + 32], &pis[fee_idx + 1..fee_idx + 1 + d]); // tx_binding
+    put(&mut out[off..off + 32], &pis[fee_idx + 2..fee_idx + 2 + d]); // tx_binding
     off += 32;
     out[off..off + 8].copy_from_slice(&pis[fee_idx].as_canonical_u64().to_le_bytes()); // fee
+    off += 8;
+    out[off..off + 8].copy_from_slice(&pis[fee_idx + 1].as_canonical_u64().to_le_bytes()); // mint
     Some(out)
 }
 
