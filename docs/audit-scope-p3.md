@@ -232,6 +232,7 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | Validated coinbase issuance (`mint` only via consensus-authorized reward) | ✅ (`Chain.applyCoinbase`; normal path requires `mint == 0`) |
 | Constraint self-audit current (covers `mint`, 128-bit `nk`) | ✅ (`docs/joinsplit-constraint-audit.md`; re-audited pass 3, no gaps) |
 | ≥128-bit note randomness (`rho`/`rcm`) | ✅ two-permutation commitment (128-bit; rho1-persistence soundness fix + regression test) |
+| Diversified addresses + delegatable incoming viewing key | ✅ (`tx.zig` hierarchy; circuit recipient = H(nk‖d); unlinkable addresses, watch-only viewing) |
 | ≥128-bit *proven* soundness | ⏳ ~103 proven / ~127 conjectured = Goldilocks ceiling (larger field needed) — auditor sign-off |
 
 > **Self-review note (2026-06-26):** a recheck found the prover was seeding the hiding-PCS / Merkle

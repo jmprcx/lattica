@@ -10,20 +10,22 @@ carry no asset field. Rationale: matches Zcash's launch; multi-asset (per-asset 
 commitments, ZSA-style) is a major addition. **Future:** add an `asset_id` lane to the note
 commitment and make the balance per-asset.
 
-## 2. Keys / addresses — **minimal model (v1)**
-- `seed → nk` (the spend authority / nullifier key, one Goldilocks element). The circuit binds
-  ownership `recipient = H(DOM_OWN ‖ nk)` and derives `nf = H(DOM_NF ‖ nk ‖ rho ‖ pos)`.
-- **Address** = (`recipientId = poseidon2.recipient(nk)` digest, `ML-KEM` encapsulation key). The
-  sender encrypts the note to the ML-KEM key and sets `note.recipient = recipientId`.
-- **Detection** = ML-KEM trial-decryption (the recipient decrypts candidate notes).
-- **Authorization** = ML-DSA signature over the tx-binding (sighash).
-- **Limitations (threat model):** no **diversified addresses** — repeated payments to one address
-  share `recipientId`, so they are protocol-linkable (mitigated only by using fresh addresses); no
-  separate **incoming-viewing key** — detection needs the ML-KEM secret, so viewing can't be
-  delegated without the spend-adjacent secret; `nk` is the single spend authority (no ask/nsk split).
-- **Future:** diversified addresses (per-payment `recipientId`) and an `ivk`/`ovk` viewing hierarchy.
-- **Cutover requirement:** `Address.recipientId` must equal `poseidon2.recipient(nk)` so the on-chain
-  commitment equals the circuit's.
+## 2. Keys / addresses — **diversified addresses + incoming viewing key** *(implemented)*
+- `seed → nk` (the 128-bit spend / nullifier key; §2a), `div_master`, `kem_master`, `sig` (ML-DSA).
+- **Diversified address** at index `i`: `(d_i, recipientId = H(DOM_OWN ‖ nk0 ‖ nk1 ‖ d_i), ek_i)` where
+  `d_i` is a per-address diversifier and `ek_i` a per-address ML-KEM key. The sender encrypts the note
+  to `ek_i` and sets `note.recipient = recipientId`, `note.div = d_i`. One `nk` spends notes to **any**
+  of a wallet's addresses; the circuit's ownership input takes `d` as a free lane (a spender must use
+  the note's real `d` or the recomputed `cm` won't be in the tree). Different addresses are
+  **unlinkable** (no shared tag / KEM key).
+- **Incoming viewing key** = `(div_master, kem_master)`: derives every address's diversifier + KEM
+  keypair, so it **detects and decrypts** incoming notes for all of a wallet's addresses **without**
+  `nk` — delegatable (watch-only / auditor) and cannot spend. (ML-KEM has no "one secret, many public
+  keys" structure, so the KEM key is per-diversifier rather than shared as in Sapling's `ivk·g_d`;
+  detection scans the wallet's diversifiers.)
+- **Authorization** = the join-split proof (knowledge of `nk`); the tx-binding replaces a signature.
+- **Residual / future:** an **outgoing** viewing key (decrypt one's own sends) and a wider diversifier
+  search window are simple follow-ups; `nk` is still the single spend authority (no ask/nsk split).
 
 ## 2a. Spend authority `nk` — **128-bit (two field elements)** *(fixed during M6)*
 Starting the M6 cutover surfaced that a single-element `nk` gives only **~64-bit spend authority**

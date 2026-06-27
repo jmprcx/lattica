@@ -52,8 +52,11 @@ randomness; the proof binds only what the statement needs (the digests + values)
 5. **Range** (A3). `rem=val` at seed, `rem=2·rem'+rbit` (`rbit` boolean), `rem=0` at close ⇒
    `val < 2^BITS`. Applied to every input value, every output value, **the fee, and the mint** (so a
    wrapping mint cannot fake balance).
-6. **Ownership input** = `[DOM_OWN, nk0, nk1, 0,0,0,0,0]`. Pins the domain tag (A2), both nk limbs,
-   and the pad ⇒ `recipient = H(DOM_OWN ‖ nk0 ‖ nk1)`.
+6. **Ownership input** = `[DOM_OWN, nk0, nk1, d, 0,0,0,0]`. Pins the domain tag (A2), both nk limbs,
+   and lanes 4–7 = 0 ⇒ `recipient = H(DOM_OWN ‖ nk0 ‖ nk1 ‖ d)`. `d` (lane 3, the diversifier) is a
+   **free** input: a spender must use the note's real `d` or the recomputed `cm` won't be in the tree,
+   and mapping one's own `nk` onto another address's tag is a 2¹²⁸ preimage — so no extra constraint
+   is needed. One `nk` thus spends notes to any of a wallet's diversified addresses.
 7. **Recipient link.** `commit_a.in[1..5] = own.out[0..4]` ⇒ `recipient = H(DOM_OWN ‖ nk0 ‖ nk1)`
    flows into the commitment. Non-vacuous: gated by the boundary selector.
 8. **Commitment (two permutations).**
