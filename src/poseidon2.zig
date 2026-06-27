@@ -102,8 +102,8 @@ fn h(domain: u64, elems: []const Felt) Digest {
     return s[0..4].*;
 }
 
-pub fn recipient(nk0: Felt, nk1: Felt) Digest {
-    return h(DOM_OWN, &.{ nk0, nk1 }); // 128-bit nullifier key
+pub fn recipient(nk0: Felt, nk1: Felt, d: Felt) Digest {
+    return h(DOM_OWN, &.{ nk0, nk1, d }); // 128-bit nullifier key + diversifier
 }
 
 /// Two-permutation commitment (128-bit note randomness; must match joinsplit_air::commit):
@@ -161,9 +161,9 @@ test "poseidon2: permute matches the circuit (KAT)" {
 }
 
 test "poseidon2: domain-tagged hashes match the circuit (KAT)" {
-    const rcp = recipient(7, 70);
-    try testing.expectEqual(Digest{ 6469389008428325857, 2098789990759076109, 3483504872978708866, 10944715271802619590 }, rcp);
-    try testing.expectEqual(Digest{ 13531505093193624395, 17945392665132654789, 3289291828361804556, 14986895994367102023 }, commitNote(rcp, 1000, .{ 11, 211 }, .{ 100, 300 }));
+    const rcp = recipient(7, 70, 5);
+    try testing.expectEqual(Digest{ 12117778067832875188, 10864618677725252023, 10798466789515031362, 11357075400886075001 }, rcp);
+    try testing.expectEqual(Digest{ 14056358681591825965, 5540776654529801612, 4068112119617669722, 6062265260024842144 }, commitNote(rcp, 1000, .{ 11, 211 }, .{ 100, 300 }));
     try testing.expectEqual(Digest{ 2354178473207051117, 1485123762175440172, 16578445368892662424, 12056995742034228502 }, nullifierHash(7, 70, .{ 11, 211 }, 9));
     try testing.expectEqual(Digest{ 15506260347376358782, 2994144798473533345, 1833939590059144543, 15204941819943812974 }, merge(.{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 }));
 }

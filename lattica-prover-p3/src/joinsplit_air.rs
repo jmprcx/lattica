@@ -65,8 +65,11 @@ fn h(domain: u64, elems: &[Val]) -> [Val; DIGEST] {
     native_permute(s)[..DIGEST].try_into().unwrap()
 }
 
-pub fn recipient_of(nk0: Val, nk1: Val) -> [Val; DIGEST] {
-    h(DOM_OWN, &[nk0, nk1]) // 128-bit nullifier key ⇒ 128-bit spend authority
+/// Diversified ownership tag: `recipient = H(DOM_OWN ‖ nk0 ‖ nk1 ‖ d)`. The 128-bit key `nk` is the
+/// single spend authority; the diversifier `d` makes per-address tags unlinkable while remaining
+/// spendable by the same `nk`. (`d = 0` is a non-diversified address.)
+pub fn recipient_of(nk0: Val, nk1: Val, d: Val) -> [Val; DIGEST] {
+    h(DOM_OWN, &[nk0, nk1, d])
 }
 
 /// Two-permutation (128-bit-randomness) commitment:
@@ -122,6 +125,7 @@ pub fn fold(leaf: [Val; DIGEST], sib: &[[Val; DIGEST]; DEPTH], bits: &[bool; DEP
 #[derive(Clone)]
 pub struct Input {
     pub nk: [u64; 2], // 128-bit nullifier key / spend authority
+    pub div: Val, // diversifier of the address this note was sent to (recipient = H(nk ‖ div))
     pub value: u64,
     pub rho: [Val; 2], // 128-bit note randomness
     pub rcm: [Val; 2], // 128-bit commitment trapdoor
@@ -161,7 +165,7 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let mut in_sum: u128 = 0;
     for (i, inp) in w.inputs.iter().enumerate() {
         let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
-        let recipient = recipient_of(nk0, nk1);
+        let recipient = recipient_of(nk0, nk1, inp.div);
         let cm = commit(recipient, Val::from_u64(inp.value), inp.rho, inp.rcm);
         let root = fold(cm, &inp.sib, &inp.bits);
         match anchor {
@@ -459,12 +463,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         builder.when_transition().assert_zero(ra.clone() * (cur[RBIT].clone() * (one.clone() - cur[RBIT].clone())));
         builder.assert_zero(p[P_RANGE_CLOSE].clone() * cur[REM].clone());
 
-        // ---- ownership input: [DOM_OWN, nk0, nk1, 0,..] ----
+        // ---- ownership input: [DOM_OWN, nk0, nk1, d, 0,0,0,0] ----
+        // `d` (lane 3) is the diversifier — a FREE input: the spender uses the note's actual
+        // diversifier (else the recomputed recipient → cm won't be in the tree), so no extra
+        // constraint is needed (matching someone else's tag is a 2^128 preimage). recipient = H(DOM_OWN
+        // ‖ nk0 ‖ nk1 ‖ d).
         let own = p[P_OWN_IN].clone();
         builder.assert_zero(own.clone() * (cur[0].clone() - dom_own.clone()));
         builder.assert_zero(own.clone() * (cur[1].clone() - cur[NK].clone()));
         builder.assert_zero(own.clone() * (cur[2].clone() - cur[NK1].clone()));
-        for i in 3..8 {
+        for i in 4..8 {
             builder.assert_zero(own.clone() * cur[i].clone());
         }
 
@@ -623,8 +631,9 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         own[0] = Val::from_u64(DOM_OWN);
         own[1] = nk0;
         own[2] = nk1;
+        own[3] = inp.div; // diversifier (free input)
         set_block(&mut t, base, own);
-        let recipient = recipient_of(nk0, nk1);
+        let recipient = recipient_of(nk0, nk1, inp.div);
         // commit_a: H1 = perm([DOM_CM, recipient(4), value, rho0, rho1]); its digest is the chain.
         let mut a = [Val::ZERO; 8];
         a[0] = Val::from_u64(DOM_CM);
@@ -804,10 +813,11 @@ pub fn demo_witness() -> Witness {
     let nks: [[u64; 2]; N_IN] = core::array::from_fn(|i| [7 + i as u64, 700 + i as u64]);
     let in_rho = |i: usize| [Val::from_u64(11 + i as u64), Val::from_u64(211 + i as u64)];
     let in_rcm = |i: usize| [Val::from_u64(100 + i as u64), Val::from_u64(300 + i as u64)];
+    let in_div = |i: usize| Val::from_u64(500 + i as u64); // per-input diversifier
     let cms: Vec<[Val; DIGEST]> = (0..N_IN)
         .map(|i| {
             commit(
-                recipient_of(Val::from_u64(nks[i][0]), Val::from_u64(nks[i][1])),
+                recipient_of(Val::from_u64(nks[i][0]), Val::from_u64(nks[i][1]), in_div(i)),
                 Val::from_u64(in_values[i]),
                 in_rho(i),
                 in_rcm(i),
@@ -817,6 +827,7 @@ pub fn demo_witness() -> Witness {
     let (_, paths) = build_paths(&cms);
     let inputs = core::array::from_fn(|i| Input {
         nk: nks[i],
+        div: in_div(i),
         value: in_values[i],
         rho: in_rho(i),
         rcm: in_rcm(i),
@@ -824,7 +835,7 @@ pub fn demo_witness() -> Witness {
         bits: paths[i].1,
     });
     let outputs = core::array::from_fn(|j| Output {
-        recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64)),
+        recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
         value: [900u64, 500][j],
         rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
         rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
@@ -934,16 +945,17 @@ mod tests {
     /// A valid 2-in/2-out witness whose two input commitments sit at positions 0 and 1 of a shared
     /// tree, balanced so Σin = Σout + fee.
     pub(crate) fn sample() -> Witness {
-        let in0 = (1000u64, [7u64, 70u64], 11u64, 100u64); // value, nk(2), rho-seed, rcm-seed
-        let in1 = (500u64, [9u64, 90u64], 13u64, 101u64);
+        let in0 = (1000u64, [7u64, 70u64], 11u64, 100u64, 501u64); // value, nk(2), rho, rcm, div
+        let in1 = (500u64, [9u64, 90u64], 13u64, 101u64, 502u64);
         let rho2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 200)];
         let rcm2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 300)];
-        let cmf = |v: &(u64, [u64; 2], u64, u64)| {
-            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1])), Val::from_u64(v.0), rho2(v.2), rcm2(v.3))
+        let cmf = |v: &(u64, [u64; 2], u64, u64, u64)| {
+            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1]), Val::from_u64(v.4)), Val::from_u64(v.0), rho2(v.2), rcm2(v.3))
         };
         let (_, paths) = build_paths(&[cmf(&in0), cmf(&in1)]);
-        let mk_in = |v: (u64, [u64; 2], u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
+        let mk_in = |v: (u64, [u64; 2], u64, u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
             nk: v.1,
+            div: Val::from_u64(v.4),
             value: v.0,
             rho: rho2(v.2),
             rcm: rcm2(v.3),
@@ -952,8 +964,8 @@ mod tests {
         };
         let inputs = [mk_in(in0, &paths[0]), mk_in(in1, &paths[1])];
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7)), value: 900, rho: rho2(21), rcm: rcm2(22) },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8)), value: 500, rho: rho2(23), rcm: rcm2(24) },
+            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), value: 900, rho: rho2(21), rcm: rcm2(22) },
+            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), value: 500, rho: rho2(23), rcm: rcm2(24) },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
         Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
@@ -998,10 +1010,11 @@ mod tests {
         let nk = |i: usize| [7 + i as u64, 700 + i as u64];
         let in_rho = |i: usize| [Val::from_u64(11 + i as u64), Val::from_u64(211 + i as u64)];
         let in_rcm = |i: usize| [Val::from_u64(100 + i as u64), Val::from_u64(300 + i as u64)];
+        let in_div = |i: usize| Val::from_u64(500 + i as u64);
         let cms: Vec<[Val; DIGEST]> = (0..N_IN)
             .map(|i| {
                 commit(
-                    recipient_of(Val::from_u64(nk(i)[0]), Val::from_u64(nk(i)[1])),
+                    recipient_of(Val::from_u64(nk(i)[0]), Val::from_u64(nk(i)[1]), in_div(i)),
                     Val::from_u64(in_values[i]),
                     in_rho(i),
                     in_rcm(i),
@@ -1011,6 +1024,7 @@ mod tests {
         let (_, paths) = build_paths(&cms);
         let inputs = core::array::from_fn(|i| Input {
             nk: nk(i),
+            div: in_div(i),
             value: in_values[i],
             rho: in_rho(i),
             rcm: in_rcm(i),
@@ -1018,7 +1032,7 @@ mod tests {
             bits: paths[i].1,
         });
         let outputs = core::array::from_fn(|j| Output {
-            recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64)),
+            recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
             value: out_values[j],
             rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
             rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],

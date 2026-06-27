@@ -139,6 +139,9 @@ fn encodeWitness(
     for (inputs) |in_| {
         try putU64(&w, a, std.mem.readInt(u64, sender.nk[0..8], .little)); // nk0
         try putU64(&w, a, std.mem.readInt(u64, sender.nk[8..16], .little)); // nk1
+        var div_le: [8]u8 = undefined;
+        std.mem.writeInt(u64, &div_le, in_.note.div, .little);
+        try putFelt(&w, a, &div_le); // diversifier (recipient = H(nk ‖ div))
         try putU64(&w, a, in_.note.value);
         try putFelt(&w, a, in_.note.rho[0..8]);
         try putFelt(&w, a, in_.note.rho[8..16]); // rho limb 1 (128-bit)
@@ -191,7 +194,7 @@ pub fn buildTransfer(
         const jb = [_]u8{@intCast(j)};
         const rho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nfs[0], &jb });
         const rcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &jb });
-        out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .rho = rho, .rcm = rcm };
+        out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .div = recipient.div, .rho = rho, .rcm = rcm };
         out_cms[j] = out_notes[j].commitment();
         tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal;
     }
@@ -287,7 +290,7 @@ pub const Chain = struct {
         std.mem.writeInt(u64, &value_le, value, .little);
         const rho = p.hashDomain("lattica:v1:mint-rho", &.{ &seed, &value_le });
         const rcm = p.expand(&seed, "mint-rcm");
-        const note = tx.Note{ .value = value, .recipient = address.recipientId(), .rho = rho, .rcm = rcm };
+        const note = tx.Note{ .value = value, .recipient = address.recipientId(), .div = address.div, .rho = rho, .rcm = rcm };
         const tn = tx.encryptNote(self.allocator, address, note) catch return TxError.Internal;
         const pos = try self.insertCommitment(tn.cm);
         self.transmitted.append(self.allocator, tn) catch return TxError.Internal;
