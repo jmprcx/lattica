@@ -7,7 +7,8 @@
 const std = @import("std");
 const p = @import("primitives.zig");
 const tx = @import("tx.zig");
-const circuit = @import("circuit.zig");
+const poseidon2 = @import("poseidon2.zig");
+const tree = @import("tree.zig");
 const node = @import("node.zig");
 
 /// First 6 bytes of `bytes` as 12 lowercase hex characters.
@@ -33,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "keygen")) {
         try keygen();
     } else if (std.mem.eql(u8, cmd, "bench")) {
-        try bench(a, init.io);
+        try bench(init.io);
     } else {
         std.debug.print("unknown command: {s}\nusage: lattica-wallet [demo|keygen|bench]\n", .{cmd});
         std.process.exit(2);
@@ -56,28 +57,54 @@ fn elapsedMs(t0: std.Io.Timestamp, t1: std.Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
-fn bench(a: std.mem.Allocator, io: std.Io) !void {
-    const iters: u32 = 10;
-    const secret = [_]u8{7} ** 32;
+fn bench(io: std.Io) !void {
+    const iters: u32 = 5000;
+    const fiters: f64 = @floatFromInt(iters);
+    var sink: u64 = 0;
 
-    const p0 = std.Io.Clock.now(.awake, io);
-    var proof = try circuit.proveAuthorization(a, &secret);
-    var i: u32 = 1;
-    while (i < iters) : (i += 1) proof = try circuit.proveAuthorization(a, &secret);
-    const prove_ms = elapsedMs(p0, std.Io.Clock.now(.awake, io)) / @as(f64, @floatFromInt(iters));
+    // The in-circuit / on-chain hash primitive.
+    var st = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const t0 = std.Io.Clock.now(.awake, io);
+    var i: u32 = 0;
+    while (i < iters) : (i += 1) poseidon2.permute(&st);
+    const permute_us = elapsedMs(t0, std.Io.Clock.now(.awake, io)) * 1000.0 / fiters;
+    sink +%= st[0];
 
-    const v0 = std.Io.Clock.now(.awake, io);
+    // On-chain note commitment.
+    const rcp = [_]u8{3} ** 32;
+    const rho = [_]u8{7} ** 32;
+    const rcm = [_]u8{9} ** 32;
+    const nk = [_]u8{5} ** 32;
+    const t1 = std.Io.Clock.now(.awake, io);
     i = 0;
-    while (i < iters) : (i += 1) std.debug.assert(circuit.verifyAuthorization(proof));
-    const verify_ms = elapsedMs(v0, std.Io.Clock.now(.awake, io)) / @as(f64, @floatFromInt(iters));
+    while (i < iters) : (i += 1) sink +%= p.noteCommitment(.{ .recipient = &rcp, .value = 1000, .rho = &rho, .rcm = &rcm })[0];
+    const commit_us = elapsedMs(t1, std.Io.Clock.now(.awake, io)) * 1000.0 / fiters;
 
-    std.debug.print("Lattica FRI-STARK authorization proof ({d} iters)\n", .{iters});
-    std.debug.print("  prove       : {d:.4} ms\n", .{prove_ms});
-    std.debug.print("  verify      : {d:.4} ms\n", .{verify_ms});
-    std.debug.print("  proof size  : {d} bytes (transparent, hash-based, no trusted setup)\n", .{proof.proof.len});
-    std.debug.print("  ML-DSA sig  : {d} bytes\n", .{p.SIG_LEN});
-    std.debug.print("  ML-DSA pk   : {d} bytes\n", .{p.PK_LEN});
-    std.debug.print("  ML-KEM ct   : {d} bytes\n", .{p.CT_LEN});
+    // On-chain nullifier.
+    const t2 = std.Io.Clock.now(.awake, io);
+    i = 0;
+    while (i < iters) : (i += 1) sink +%= p.nullifier(&nk, &rho, i)[0];
+    const nf_us = elapsedMs(t2, std.Io.Clock.now(.awake, io)) * 1000.0 / fiters;
+
+    // Merkle internal node.
+    const left = [_]u8{1} ** 32;
+    const right = [_]u8{2} ** 32;
+    const t3 = std.Io.Clock.now(.awake, io);
+    i = 0;
+    while (i < iters) : (i += 1) sink +%= tree.merkleHash(&left, &right)[0];
+    const merge_us = elapsedMs(t3, std.Io.Clock.now(.awake, io)) * 1000.0 / fiters;
+
+    std.debug.print("Lattica on-chain hashing — Poseidon2-Goldilocks ({d} iters)\n", .{iters});
+    std.debug.print("  permute      : {d:.3} µs/op\n", .{permute_us});
+    std.debug.print("  note commit  : {d:.3} µs/op\n", .{commit_us});
+    std.debug.print("  nullifier    : {d:.3} µs/op\n", .{nf_us});
+    std.debug.print("  merkle node  : {d:.3} µs/op\n", .{merge_us});
+    std.debug.print("post-quantum primitive sizes:\n", .{});
+    std.debug.print("  ML-DSA sig   : {d} bytes\n", .{p.SIG_LEN});
+    std.debug.print("  ML-DSA pk    : {d} bytes\n", .{p.PK_LEN});
+    std.debug.print("  ML-KEM ct    : {d} bytes\n", .{p.CT_LEN});
+    std.debug.print("  join-split proof: ~0.5 MB (transparent, hash-based; prove/verify timed in lattica-prover-p3)\n", .{});
+    if (sink == 0xdead_beef) std.debug.print("", .{}); // keep `sink` live
 }
 
 fn demo(a: std.mem.Allocator) !void {

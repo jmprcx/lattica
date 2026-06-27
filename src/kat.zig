@@ -14,7 +14,6 @@ const field = @import("field.zig");
 const p = @import("primitives.zig");
 const tree = @import("tree.zig");
 const tx = @import("tx.zig");
-const circuit = @import("circuit.zig");
 const Felt = field.Felt;
 
 // ---------------------------------------------------------------------------------------
@@ -162,62 +161,6 @@ test "property: note serialization round trip" {
     }
 }
 
-test "property: STARK completeness and soundness over random secrets" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var prng = std.Random.DefaultPrng.init(0x5EED);
-    const r = prng.random();
-    for (0..4) |_| {
-        var secret: [32]u8 = undefined;
-        r.bytes(&secret);
-        const auth = try circuit.proveAuthorization(a, &secret);
-        // Completeness.
-        try testing.expect(circuit.verifyAuthorization(auth));
-        // Soundness: flipping any byte of image or proof must break verification.
-        var bad_img = auth;
-        bad_img.image[r.intRangeLessThan(usize, 0, 16)] +%= 1;
-        try testing.expect(!circuit.verifyAuthorization(bad_img));
-        const mutated = try a.dupe(u8, auth.proof);
-        mutated[r.intRangeLessThan(usize, 0, mutated.len)] +%= 1;
-        try testing.expect(!circuit.verifyAuthorization(.{ .image = auth.image, .proof = mutated }));
-    }
-}
-
-// ---------------------------------------------------------------------------------------
-// Robustness / fuzz: the verifier must never crash and must reject malformed proofs.
-// ---------------------------------------------------------------------------------------
-
-test "robustness: verifier rejects random bytes without crashing" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // A genuine proof, to learn the canonical proof length.
-    const secret = [_]u8{3} ** 32;
-    const real = try circuit.proveAuthorization(a, &secret);
-    const proof_len = real.proof.len;
-
-    var prng = std.Random.DefaultPrng.init(0xF0F0);
-    const r = prng.random();
-
-    // Random bytes at a variety of lengths (including the real length and truncations).
-    const lengths = [_]usize{ 0, 1, 31, 64, proof_len / 2, proof_len - 1, proof_len, proof_len + 1 };
-    for (lengths) |len| {
-        for (0..64) |_| {
-            const buf = try a.alloc(u8, len);
-            r.bytes(buf);
-            var image: [16]u8 = undefined;
-            r.bytes(&image);
-            // Must return false (never panic / never accept garbage).
-            try testing.expect(!circuit.verifyAuthorization(.{ .image = image, .proof = buf }));
-        }
-    }
-
-    // Single-byte mutations of a valid proof must all be rejected (sampled).
-    for (0..200) |_| {
-        const mutated = try a.dupe(u8, real.proof);
-        mutated[r.intRangeLessThan(usize, 0, mutated.len)] +%= (r.int(u8) | 1); // nonzero delta
-        try testing.expect(!circuit.verifyAuthorization(.{ .image = real.image, .proof = mutated }));
-    }
-}
+// The production join-split verifier's robustness (fail-closed on null/short/non-canonical inputs,
+// rejection of tampered proofs) is covered in `lattica-prover-p3` (lib.rs fail-closed +
+// non-canonical tests) and `lattica-prover-p3/tests/ffi_integration.c` (real prove→verify→tamper).
