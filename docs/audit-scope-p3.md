@@ -200,6 +200,15 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | **Variable (N,M) via dummy notes** | ✅ (tested) |
 | ABI fuzz / adversarial tests (beyond fail-closed) | ❌ |
 | Threat model + scope + frozen params (this doc) | ✅ |
+| ZK blinding from a CSPRNG, fresh per proof | ✅ (`ChaCha20Rng`; re-randomization tested) |
+| Consolidate to ONE production circuit (drop/gate `full_spend_air` + its ABI) | ❌ pre-audit cleanup |
+| Protocol completeness: key hierarchy / addresses, multi-asset, mint/burn | ❌ design decisions |
+
+> **Self-review note (2026-06-26):** a recheck found the prover was seeding the hiding-PCS / Merkle
+> salt RNG with a *fixed* non-cryptographic `SmallRng` — so the "zero-knowledge" proofs were not
+> re-randomized (identical blinding every proof), defeating privacy. Fixed in `joinsplit_air` to a
+> ChaCha20 CSPRNG seeded from the OS per proof, with a `zk_blinding_is_fresh_per_proof` test. The
+> reference `full_spend_air` still uses the dev RNG and should be dropped or gated before audit.
 
 ## 8. Reproduce / verify
 

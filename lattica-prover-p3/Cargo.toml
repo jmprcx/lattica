@@ -33,5 +33,6 @@ p3-merkle-tree = "0.6.1"
 p3-uni-stark = "0.6.1"
 p3-baby-bear = "0.6.1"
 rand = "0.10"
+rand_chacha = "0.10"
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

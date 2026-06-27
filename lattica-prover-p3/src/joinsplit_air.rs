@@ -36,7 +36,7 @@ use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_air::symbolic::AirLayout;
 use p3_uni_stark::{prove, verify, Proof, ProvenSecurity, StarkConfig, StarkSecurityParams};
-use rand::rngs::SmallRng;
+use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 
 use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK};
@@ -483,19 +483,22 @@ type Perm = Poseidon2Goldilocks<8>;
 type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
 type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, SmallRng, 2, 4, 4>;
+    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
 type Challenge = BinomialExtensionField<Val, 2>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
 type Dft = Radix2DitParallel<Val>;
-type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, SmallRng>;
+type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
 type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
 
-fn make_config(seed: u64) -> MyConfig {
+fn make_config() -> MyConfig {
     let perm = default_goldilocks_poseidon2_8();
-    // production FRI parameters (C-04): ≈103-bit proven / ~127-bit conjectured, smallest-encoding.
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, SmallRng::seed_from_u64(seed));
+    // The hiding-PCS / Merkle-salt RNG must be a CSPRNG seeded from fresh OS entropy **per proof** —
+    // otherwise the zero-knowledge blinding is predictable/identical across proofs and the witness is
+    // not actually hidden. ChaCha20Rng is ChaCha-based; `from_os_rng` reseeds each call.
+    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    // production FRI parameters (C-04): ≈103-bit proven / ~127-bit conjectured, smallest-encoding.
     let fri = FriParameters {
         log_blowup: 4,
         log_final_poly_len: 0,
@@ -505,7 +508,7 @@ fn make_config(seed: u64) -> MyConfig {
         query_proof_of_work_bits: 16,
         mmcs: challenge_mmcs,
     };
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, SmallRng::seed_from_u64(seed));
+    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
     MyConfig::new(pcs, Challenger::new(perm))
 }
 
@@ -662,7 +665,7 @@ pub fn public_values(w: &Witness) -> Vec<Val> {
 }
 
 pub fn prove_verify_with(w: &Witness, pis: &[Val]) -> Result<(), String> {
-    let config = make_config(1);
+    let config = make_config();
     let air = JoinSplitAir;
     let trace = build_trace(w);
     let proof = prove(&config, &air, trace, pis);
@@ -678,7 +681,7 @@ pub const NUM_PUBLIC_INPUTS: usize = N_PUBLIC;
 
 /// Prove a join-split and return canonical (postcard) proof bytes.
 pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {
-    let config = make_config(1);
+    let config = make_config();
     let trace = build_trace(w);
     let proof = prove(&config, &JoinSplitAir, trace, &public_values(w));
     postcard::to_allocvec(&proof).expect("proof serialization is infallible")
@@ -693,7 +696,7 @@ pub fn verify_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    verify(&make_config(1), &JoinSplitAir, &proof, pis).is_ok()
+    verify(&make_config(), &JoinSplitAir, &proof, pis).is_ok()
 }
 
 /// A representative valid join-split witness (2 inputs at tree positions 0,1; balanced).
@@ -729,7 +732,7 @@ pub fn demo_witness() -> Witness {
 
 /// (proof bytes, prove ms, verify ms, proven security bits) for a representative join-split.
 pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
-    let config = make_config(1);
+    let config = make_config();
     let trace = build_trace(w);
     let pis = public_values(w);
     let t0 = std::time::Instant::now();
@@ -741,7 +744,7 @@ pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
     let verify_ms = t1.elapsed().as_millis();
     // proven security at this trace height
     let perm = default_goldilocks_poseidon2_8();
-    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, SmallRng::seed_from_u64(1));
+    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, ChaCha20Rng::seed_from_u64(1));
     let fri = FriParameters {
         log_blowup: 4,
         log_final_poly_len: 0,
@@ -760,7 +763,7 @@ pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
 /// Prove with the witness's real public inputs, verify against `verify_pis` (tests FS binding).
 #[allow(dead_code)]
 pub fn prove_real_verify_with(w: &Witness, verify_pis: &[Val]) -> Result<(), String> {
-    let config = make_config(1);
+    let config = make_config();
     let air = JoinSplitAir;
     let trace = build_trace(w);
     let proof = prove(&config, &air, trace, &public_values(w));
@@ -918,6 +921,19 @@ mod tests {
     #[test]
     fn joinsplit_verifies() {
         prove_verify(&witness_with([1000, 500], [900, 500], 100)).expect("valid join-split should verify");
+    }
+
+    #[test]
+    fn zk_blinding_is_fresh_per_proof() {
+        // Two proofs of the *same* witness must differ — the hiding-PCS blinding is fresh CSPRNG
+        // randomness per proof (would fail with the old fixed-seed RNG).
+        let w = witness_with([1000, 500], [900, 500], 100);
+        let a = prove_to_bytes(&w);
+        let b = prove_to_bytes(&w);
+        assert_ne!(a, b, "ZK proofs of the same statement must be re-randomized");
+        // both still verify
+        assert!(verify_bytes(&a, &public_values(&w)));
+        assert!(verify_bytes(&b, &public_values(&w)));
     }
 
     #[test]
