@@ -11,14 +11,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const p = @import("primitives.zig");
+const poseidon2 = @import("poseidon2.zig");
 const Hash32 = p.Hash32;
 
 /// Hash of an unfilled leaf (the empty-note sentinel).
 pub const EMPTY_LEAF: Hash32 = [_]u8{0} ** 32;
 
-/// Internal-node hash: `H(left, right)`.
+/// Internal-node hash: `H(left, right)` — the in-circuit Poseidon2 2-to-1 merge (C-03), so on-chain
+/// anchors equal the join-split circuit's membership root.
 pub fn merkleHash(left: *const Hash32, right: *const Hash32) Hash32 {
-    return p.hashDomain(p.domain.MERKLE_NODE, &.{ left, right });
+    return poseidon2.digestBytes(poseidon2.merge(poseidon2.digestFromBytes(left.*), poseidon2.digestFromBytes(right.*)));
 }
 
 /// An authentication path: the sibling at each level from the leaf up to (but excluding) the

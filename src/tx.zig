@@ -17,6 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const p = @import("primitives.zig");
+const poseidon2 = @import("poseidon2.zig");
 const Hash32 = p.Hash32;
 
 // ---------------------------------------------------------------------------------------
@@ -85,12 +86,13 @@ pub const Note = struct {
 
 /// A public payment address: a viewing-key tag plus an ML-KEM encapsulation key.
 pub const Address = struct {
-    ivk_tag: Hash32,
+    /// `= H(nk)` (the in-circuit ownership digest), bound into every note commitment to this address.
+    recipient_id: Hash32,
     kem_ek: [p.EK_LEN]u8,
 
     /// The recipient identifier bound into a note commitment.
     pub fn recipientId(self: Address) Hash32 {
-        return p.hashDomain(p.domain.IVK, &.{ &self.ivk_tag, &self.kem_ek });
+        return self.recipient_id;
     }
 };
 
@@ -122,8 +124,12 @@ pub const FullKey = struct {
 
     /// The public payment address derived from this key.
     pub fn address(self: FullKey) Address {
-        const ivk_tag = p.hashDomain(p.domain.IVK, &.{ &self.seed, &self.nk });
-        return .{ .ivk_tag = ivk_tag, .kem_ek = self.kem.ekBytes() };
+        // recipientId = H(nk): the circuit proves the spender knows `nk` with recipient = H(nk).
+        const rid = poseidon2.digestBytes(poseidon2.recipient(
+            poseidon2.feltLE(self.nk[0..8]),
+            poseidon2.feltLE(self.nk[8..16]),
+        ));
+        return .{ .recipient_id = rid, .kem_ek = self.kem.ekBytes() };
     }
 };
 

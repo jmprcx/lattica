@@ -18,6 +18,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const poseidon2 = @import("poseidon2.zig"); // C-03: on-chain hashing == the circuit's Poseidon2
 const Sha3_256 = std.crypto.hash.sha3.Sha3_256;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const MlKem = std.crypto.kem.ml_kem.MLKem768;
@@ -86,13 +87,22 @@ pub const NoteCommitmentInput = struct {
     rcm: *const Hash32,
 };
 
-/// `cm = H(recipient, value, rho, rcm)`. Hiding via the random trapdoor `rcm`, binding via
-/// SHA3 collision resistance. There is deliberately no homomorphic property — balance is
-/// enforced in-proof instead.
+/// `cm = H(DOM_CM, recipient, value, rho, rcm)` — **the in-circuit Poseidon2 commitment** (C-03), so
+/// the on-chain commitment equals what the join-split circuit proves. `recipient` is the 4-element
+/// recipientId digest; `value`/`rho`/`rcm` reduce to field elements (rho/rcm are 64-bit in v1).
 pub fn noteCommitment(in: NoteCommitmentInput) Hash32 {
+    var rcp: [32]u8 = [_]u8{0} ** 32;
+    const rn = @min(in.recipient.len, 32);
+    @memcpy(rcp[0..rn], in.recipient[0..rn]);
     var value_le: [8]u8 = undefined;
     std.mem.writeInt(u64, &value_le, in.value, .little);
-    return hashDomain(domain.NOTE_COMMIT, &.{ in.recipient, &value_le, in.rho, in.rcm });
+    const cm = poseidon2.commitNote(
+        poseidon2.digestFromBytes(rcp),
+        poseidon2.feltLE(&value_le),
+        poseidon2.feltLE(in.rho[0..8]),
+        poseidon2.feltLE(in.rcm[0..8]),
+    );
+    return poseidon2.digestBytes(cm);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -104,7 +114,15 @@ pub fn noteCommitment(in: NoteCommitmentInput) Hash32 {
 pub fn nullifier(nk: *const Hash32, rho: *const Hash32, position: u64) Hash32 {
     var pos_le: [8]u8 = undefined;
     std.mem.writeInt(u64, &pos_le, position, .little);
-    return hashDomain(domain.NULLIFIER, &.{ nk, rho, &pos_le });
+    // C-03: nf = H(DOM_NF, nk0, nk1, rho, pos) — the in-circuit Poseidon2 nullifier. The 128-bit
+    // nk is the first 16 bytes of the key material (two field elements).
+    const nf = poseidon2.nullifierHash(
+        poseidon2.feltLE(nk[0..8]),
+        poseidon2.feltLE(nk[8..16]),
+        poseidon2.feltLE(rho[0..8]),
+        poseidon2.feltLE(&pos_le),
+    );
+    return poseidon2.digestBytes(nf);
 }
 
 /// `PRF_expand(seed, label)` — derive a labelled 32-byte subkey from a seed.

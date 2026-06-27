@@ -121,6 +121,21 @@ pub fn merge(l: Digest, r: Digest) Digest {
     return s[0..4].*;
 }
 
+/// Reduce up to 8 little-endian bytes to a field element (mod p).
+pub fn feltLE(b: []const u8) Felt {
+    var x: u64 = 0;
+    var i: usize = 0;
+    while (i < b.len and i < 8) : (i += 1) x |= @as(u64, b[i]) << @intCast(i * 8);
+    return x % field.P;
+}
+
+/// Interpret a 32-byte hash as a 4-element digest (4 little-endian limbs, each mod p).
+pub fn digestFromBytes(bytes: [32]u8) Digest {
+    var d: Digest = undefined;
+    inline for (0..4) |i| d[i] = feltLE(bytes[i * 8 .. i * 8 + 8]);
+    return d;
+}
+
 /// Canonical little-endian bytes of a 4-element digest (the on-chain 32-byte hash).
 pub fn digestBytes(d: Digest) [32]u8 {
     var out: [32]u8 = undefined;
