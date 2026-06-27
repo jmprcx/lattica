@@ -921,6 +921,14 @@ mod tests {
     }
 
     #[test]
+    fn dummy_notes_pad_smaller_transactions() {
+        // A 1-real-in / 1-real-out transaction, padded to the fixed 2-in/2-out shape with
+        // zero-value dummy notes (Σin = 1000 = 900 + 100 = Σout + fee). This is how variable
+        // (N, M) is supported without a variable-shape circuit.
+        prove_verify(&witness_with([1000, 0], [900, 0], 100)).expect("dummy-padded tx should verify");
+    }
+
+    #[test]
     fn wrong_anchor_rejected() {
         let w = witness_with([1000, 500], [900, 500], 100);
         let mut pis = public_values(&w);

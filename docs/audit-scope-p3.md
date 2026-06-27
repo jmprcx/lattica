@@ -161,10 +161,15 @@ inputs `anchor ‖ N·nf ‖ M·out_cm ‖ fee ‖ tx_binding` with per-input/ou
 aggregate hash — that is the future batching path); per-input distinct `nk`/`rho` via the
 local-persistent columns.
 
-**Remaining for the audited artifact:** (a) variable/padded `(N, M)` if the protocol needs more than
-fixed 2-in/2-out; (b) the C-03 protocol-side hash match (§5) + shared KATs + the end-to-end FFI test;
-(c) the constraint-accounting self-audit. The join-split **C ABI + byte layout** is done
-(`lattica_joinsplit_verify`, round-trip tested; `ffi.zig::JoinSplitPublicInputs`).
+**Variable `(N, M)`** is supported by the standard **dummy-note convention**: a smaller transaction
+pads to the fixed 2-in/2-out shape with zero-value notes (a dummy input is a zero-value note the
+spender owns; balance and range are unaffected). Tested (`dummy_notes_pad_smaller_transactions`). A
+variable-shape circuit is only needed if more than 2-in/2-out is required.
+
+**Remaining for the audited artifact:** the C-03 protocol-side hash match (§5) + shared KATs + the
+end-to-end FFI test. The join-split **C ABI + byte layout** is done (`lattica_joinsplit_verify`,
+round-trip tested; `ffi.zig::JoinSplitPublicInputs`); the **constraint-accounting self-audit** is done
+(`docs/joinsplit-constraint-audit.md`).
 
 ## 7. Pre-audit readiness checklist
 
@@ -183,7 +188,8 @@ fixed 2-in/2-out; (b) the C-03 protocol-side hash match (§5) + shared KATs + th
 | **Join-split C ABI + byte layout** | ✅ (`lattica_joinsplit_verify` + `ffi.zig::JoinSplitPublicInputs`) |
 | **C-03 protocol↔circuit hash match + shared KATs** | ❌ |
 | **End-to-end FFI integration test** (Zig: mint→prove→verify→double-spend) | ❌ |
-| **Constraint-accounting self-audit** (every column/constraint, no vacuous binding) | ❌ |
+| **Constraint-accounting self-audit** (every column/constraint, no vacuous binding) | ✅ (`docs/joinsplit-constraint-audit.md`) |
+| **Variable (N,M) via dummy notes** | ✅ (tested) |
 | ABI fuzz / adversarial tests (beyond fail-closed) | ❌ |
 | Threat model + scope + frozen params (this doc) | ✅ |
 
