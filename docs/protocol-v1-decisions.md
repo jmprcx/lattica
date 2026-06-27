@@ -40,6 +40,15 @@ around `2^32` notes. **Decision:** accept 64-bit for v1 launch parameters and fl
 **future:** widen via a two-permutation (sponge) commitment or a wider permutation, which lifts `rho`
 to ≥128-bit. (An auditor should explicitly sign off on the launch `rho` width.)
 
+**Interaction with deterministic note encryption (flag for audit).** Note encryption is deterministic
+— the ML-KEM encapsulation coins are `expand(cm, "kem-encaps")` and the AEAD key+nonce are
+`H(ss ‖ kem_ct ‖ cm ‖ …)` (`primitives.deriveNoteKey`), all derived from the commitment `cm` (chosen
+for seed-restorability, no stored `esk`). Because v1's `cm` binds only `rho[0..8]`/`rcm[0..8]` (§3),
+the AEAD `(key,nonce)` is unique up to a **128-bit** commitment collision (≈2⁶⁴ notes to one recipient)
+rather than the 256-bit margin before C-03. That is safe at any realistic note count, but it is tighter
+than a randomized scheme (Zcash uses a fresh `esk` per note); widening `rho`/`rcm` restores the margin.
+An auditor should weigh the determinism + this bound together.
+
 ## 4. Issuance — **mint (v1); burn deferred**
 Shielded issuance via a **public `mint` amount** in the join-split balance:
 `Σ in_value + mint = Σ out_value + fee`. `mint` is a public input, range-checked like any value, and
