@@ -206,8 +206,8 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | Mint (shielded issuance) in the circuit | ✅ (`Σin + mint = Σout + fee`, range-checked, ABI+ffi) |
 | 128-bit spend authority (`nk` = 2 field elements) | ✅ (M6 §2a; found+fixed during cutover) |
 | C-03 live: on-chain hashing → Poseidon2 (== circuit) | ✅ (`tx`/`tree`/`primitives` → `poseidon2.zig`) |
-| Node verifies the join-split proof via the backend seam | ✅ (`node.zig`; production installs the Rust verifier) |
-| `lattica_joinsplit_prove` wallet-side prover ABI | ✅ (Rust + tested; Zig wallet glue blocked by host linker) |
+| Hidden-value join-split node tx model (revealed values + ML-DSA binding removed) | ✅ (`node.zig`; `verifyAndApply` = proof + anchor + nullifier; `tx_binding` binds the body) |
+| `lattica_joinsplit_prove` wallet-side prover ABI + wallet witness glue | ✅ (Rust + Zig `buildTransfer`; real prove/verify via the C harness, mock backends in-tree) |
 
 > **Self-review note (2026-06-26):** a recheck found the prover was seeding the hiding-PCS / Merkle
 > salt RNG with a *fixed* non-cryptographic `SmallRng` — so the "zero-knowledge" proofs were not

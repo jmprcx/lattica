@@ -54,18 +54,27 @@ transaction sets `mint > 0` with all-dummy inputs; a normal transaction sets `mi
 Already decided/built: fixed `(N_IN, M_OUT) = (2, 2)`; smaller transactions pad with zero-value dummy
 notes. A variable-shape circuit is only needed beyond 2-in/2-out.
 
-## M6 live cutover — sequence (status: staged)
-The decisions above fix the target shape. The live cutover (`node.zig` still runs the old
-`circuit.zig` generic-preimage proof) is sequenced as:
-1. **Mint** in the circuit (per §4) — *done* (contained; ABI/public-inputs updated).
-2. **On-chain hashing → Poseidon2 (C-03):** `Address.recipientId`, `Note.commitment`,
-   `Note.nullifier`, and the Merkle node hash (`tree.zig`) switch from SHA3 to `poseidon2.zig`, so the
-   node-reconstructed public inputs equal the proof's. Keep the note wire format; reduce note fields
-   to field elements canonically.
-3. **`lattica_joinsplit_prove`** (wallet-side prover ABI) so the wallet produces real proofs.
-4. **Node verify swap:** `ShieldedTx` carries a join-split proof; `verifyAndApply` calls
-   `ffi.verifyJoinSplit` (backend = `lattica_joinsplit_verify`) and reconstructs `JoinSplitPublicInputs`
-   from the tx; demote the native membership/nullifier/balance checks to consistency.
-5. **Consolidate:** drop `circuit.zig` (old proof) and the reference `full_spend_air` + its ABI.
-This is a broad refactor of the live path + the test suite; it lands incrementally, each step
-keeping the suite green.
+## M6 live cutover — sequence (status: COMPLETE)
+The decisions above fixed the target shape; the live cutover landed incrementally, suite green at
+each step:
+1. ✅ **Mint** in the circuit (per §4) — public issuance in the balance.
+2a. ✅ **128-bit spend authority** (`nk` → 2 field elements) — found + fixed during the cutover.
+2. ✅ **On-chain hashing → Poseidon2 (C-03):** `Address.recipientId = H(nk)`, `Note.commitment`,
+   `Note.nullifier`, and the Merkle node hash use `poseidon2.zig` (KAT-equal to the circuit), so the
+   node-reconstructed public inputs equal the proof's. Note wire format kept; fields reduce to field
+   elements canonically.
+3. ✅ **`lattica_joinsplit_prove`** wallet-side prover ABI (canonical witness layout, fail-closed).
+4. ✅ **Hidden-value node tx model:** `ShieldedTx` is now the join-split statement (anchor, N
+   nullifiers, M output commitments, fee, mint, proof, output ciphertexts) — revealed values, native
+   membership/balance, and the ML-DSA binding signature are **removed**. `verifyAndApply` authorizes
+   via `ffi.verifyJoinSplit` alone (fail-closed); a canonical `tx_binding` digest of the body binds
+   the proof to the tx (replacing the binding signature). `buildTransfer` builds the witness
+   (siblings + position bits + reduced felts) and proves via the prover backend.
+5. ✅ **Consolidate:** the single production circuit is `joinsplit_air` (`full_spend_air` + spend ABI
+   removed); `node.zig` no longer uses `circuit.zig` (it remains only for `wallet bench` / `kat`).
+
+**Backend seam.** The node calls the Rust `lattica_joinsplit_verify` (and the wallet
+`lattica_joinsplit_prove`) via `ffi.set*Backend`, installed at startup. On hosts whose linker can't
+link the Rust staticlib (this one — see `ffi_integration.zig`), tests + the `wallet demo` install
+mock backends that model the proof's tx-binding; the real prove→verify is covered by the Rust tests +
+`lattica-prover-p3/tests/ffi_integration.c`.

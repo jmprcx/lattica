@@ -135,6 +135,45 @@ pub fn verifyJoinSplit(proof: []const u8, pi: JoinSplitPublicInputs) bool {
     return f(proof.ptr, proof.len, &enc, enc.len) == 0;
 }
 
+/// The C ABI the production prover implements (`lattica_joinsplit_prove`): consume a serialized
+/// witness, write the proof + the `JoinSplitPublicInputs` bytes. Returns 0 ok, nonzero on failure.
+pub const ProveFn = *const fn (
+    witness_ptr: [*]const u8,
+    witness_len: usize,
+    proof_out: [*]u8,
+    proof_cap: usize,
+    proof_len: *usize,
+    pi_out: [*]u8,
+    pi_cap: usize,
+    pi_len: *usize,
+) callconv(.c) i32;
+
+var joinsplit_prove_backend: ?ProveFn = null;
+
+pub fn setJoinSplitProveBackend(f: ProveFn) void {
+    joinsplit_prove_backend = f;
+}
+pub fn clearJoinSplitProveBackend() void {
+    joinsplit_prove_backend = null;
+}
+
+/// Maximum join-split proof size the wallet buffers for (the real proof is ~0.5 MB).
+pub const MAX_PROOF_LEN: usize = 1 << 21;
+
+/// Prove a join-split from a serialized witness via the installed prover backend (the Rust
+/// `lattica_joinsplit_prove` in production). Returns the proof bytes (allocator-owned).
+pub fn proveJoinSplit(allocator: std.mem.Allocator, witness: []const u8) ![]u8 {
+    const f = joinsplit_prove_backend orelse return error.NoProveBackend;
+    const buf = try allocator.alloc(u8, MAX_PROOF_LEN);
+    errdefer allocator.free(buf);
+    var pi: [JoinSplitPublicInputs.ENCODED_LEN]u8 = undefined;
+    var proof_len: usize = 0;
+    var pi_len: usize = 0;
+    const rc = f(witness.ptr, witness.len, buf.ptr, buf.len, &proof_len, &pi, pi.len, &pi_len);
+    if (rc != 0) return error.ProveFailed;
+    return allocator.realloc(buf, proof_len) catch buf[0..proof_len];
+}
+
 // ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------

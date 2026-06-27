@@ -1,26 +1,37 @@
 //! # node
 //!
-//! Minimal in-memory chain state and shielded-transaction validation — enough to demonstrate
-//! a complete post-quantum shielded transfer end to end, without networking, mempool, or
+//! Minimal in-memory chain state and shielded-transaction validation — enough to demonstrate a
+//! complete post-quantum shielded transfer end to end, without networking, mempool, or
 //! proof-of-work. It models exactly the consensus-critical shielded state (commitment tree,
 //! historical anchors, nullifier set) and the rules that validate a transaction against them.
+//!
+//! Transactions are **hidden-value join-splits**: a single zero-knowledge proof
+//! (`lattica-prover-p3::joinsplit_air`, installed via `ffi.setJoinSplitBackend`) proves ownership,
+//! membership under a known anchor, nullifier correctness, value balance, and range — over inputs
+//! and outputs whose values/commitments are never revealed. The node sees only the public statement:
+//! the anchor, the N nullifiers, the M output commitments, the fee, the mint, and a `tx_binding`
+//! digest of the whole body (so outputs can't be swapped — it replaces a binding signature).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const p = @import("primitives.zig");
 const tree = @import("tree.zig");
 const tx = @import("tx.zig");
-const circuit = @import("circuit.zig");
 const ffi = @import("ffi.zig");
+const poseidon2 = @import("poseidon2.zig");
 const Hash32 = p.Hash32;
 
-const TX_DOMAIN: []const u8 = "lattica:v1:tx-digest";
+const TX_DOMAIN: []const u8 = "lattica:v1:tx-binding";
+const OUT_RHO_DOMAIN: []const u8 = "lattica:v1:out-rho";
+const OUT_RCM_DOMAIN: []const u8 = "lattica:v1:out-rcm";
+
+/// Fixed join-split shape (must match the circuit `N_IN`/`M_OUT`).
+pub const N_IN: usize = ffi.JOINSPLIT_N_IN;
+pub const M_OUT: usize = ffi.JOINSPLIT_M_OUT;
 
 /// Reasons a shielded transaction can be rejected by the chain.
 pub const TxError = error{
-    BadBindingSignature,
     UnknownAnchor,
-    BadMembership,
     DoubleSpend,
     BadAuthProof,
     Unbalanced,
@@ -29,84 +40,64 @@ pub const TxError = error{
     Internal,
 };
 
-/// A spend of one shielded note. In a production build `cm`/`value` would be hidden in the
-/// AIR; this PoC reveals them so the node can check membership and balance natively while the
-/// proof does authorization.
-pub const Spend = struct {
-    anchor: Hash32,
-    cm: Hash32,
-    value: u64,
-    nullifier: Hash32,
-    merkle: tree.MerklePath,
-    auth: circuit.AuthProof,
+/// A note the wallet owns and is about to spend: the note, its tree position, and its membership
+/// path under the anchor being spent against.
+pub const InputSpend = struct {
+    note: tx.Note,
+    position: u64,
+    path: tree.MerklePath,
 };
 
-/// A new shielded output.
-pub const Output = struct {
+/// A requested output: pay `value` to `recipient`.
+pub const OutputReq = struct {
+    recipient: tx.Address,
     value: u64,
-    note: tx.TransmittedNote,
 };
 
-/// A shielded transaction: spends, outputs, a fee, and an ML-DSA binding signature over the
-/// whole body.
+/// A shielded join-split transaction. The only public data is the join-split statement plus the
+/// encrypted output notes; values and input commitments stay hidden in the proof.
 pub const ShieldedTx = struct {
-    spends: []Spend,
-    outputs: []Output,
+    anchor: Hash32,
+    nullifiers: [N_IN]Hash32,
+    out_cms: [M_OUT]Hash32,
     fee: u64,
-    /// Public issuance amount (0 for a normal transfer; > 0 only for a coinbase). Bound into the
-    /// join-split balance `Σin + mint = Σout + fee`.
-    mint: u64 = 0,
-    /// The join-split zero-knowledge proof (the production authorization). Empty pre-cutover.
-    proof: []const u8 = &.{},
-    binding_pk: [p.PK_LEN]u8,
-    binding_sig: [p.SIG_LEN]u8,
+    mint: u64,
+    proof: []const u8,
+    /// Encrypted output notes (recipients trial-decrypt to find theirs).
+    outputs: [M_OUT]tx.TransmittedNote,
 
-    /// Reconstruct the join-split public statement from the transaction body, padded to the
-    /// circuit's fixed `(N_IN, M_OUT)` shape. The verifier can never disagree with the body because
-    /// the node derives these — not the prover.
-    pub fn joinSplitPublicInputs(self: ShieldedTx) ffi.JoinSplitPublicInputs {
-        var pi = std.mem.zeroes(ffi.JoinSplitPublicInputs);
-        if (self.spends.len > 0) pi.anchor = self.spends[0].anchor;
-        var i: usize = 0;
-        while (i < self.spends.len and i < ffi.JOINSPLIT_N_IN) : (i += 1) pi.nullifiers[i] = self.spends[i].nullifier;
-        var j: usize = 0;
-        while (j < self.outputs.len and j < ffi.JOINSPLIT_M_OUT) : (j += 1) pi.out_cms[j] = self.outputs[j].note.cm;
-        pi.fee = self.fee;
-        pi.mint = self.mint;
-        pi.tx_binding = self.digest();
-        return pi;
-    }
-
-    /// Canonical 32-byte digest of everything except the binding signature.
-    pub fn digest(self: ShieldedTx) Hash32 {
+    /// Canonical 4-element digest of the public body — the sighash the proof binds via its
+    /// `tx_binding` public input. Recomputed by the node so the prover can never disagree with the
+    /// body it submitted. Canonicalized (each limb < p) so it round-trips through the field.
+    pub fn txBinding(self: ShieldedTx) Hash32 {
         var dh = p.DomainHasher.init(TX_DOMAIN);
         var le: [8]u8 = undefined;
-
-        std.mem.writeInt(u64, &le, @intCast(self.spends.len), .little);
-        dh.field(&le);
-        for (self.spends) |s| {
-            dh.field(&s.anchor);
-            dh.field(&s.cm);
-            std.mem.writeInt(u64, &le, s.value, .little);
-            dh.field(&le);
-            dh.field(&s.nullifier);
-            dh.field(&s.auth.image);
-            dh.field(s.auth.proof);
-        }
-
-        std.mem.writeInt(u64, &le, @intCast(self.outputs.len), .little);
-        dh.field(&le);
-        for (self.outputs) |o| {
-            std.mem.writeInt(u64, &le, o.value, .little);
-            dh.field(&le);
-            dh.field(&o.note.cm);
-            dh.field(&o.note.kem_ct);
-            dh.field(o.note.ciphertext);
-        }
-
+        dh.field(&self.anchor);
+        for (self.nullifiers) |nf| dh.field(&nf);
+        for (self.out_cms) |cm| dh.field(&cm);
         std.mem.writeInt(u64, &le, self.fee, .little);
         dh.field(&le);
-        return dh.final();
+        std.mem.writeInt(u64, &le, self.mint, .little);
+        dh.field(&le);
+        for (self.outputs) |tn| {
+            dh.field(&tn.kem_ct);
+            dh.field(tn.ciphertext);
+        }
+        const raw = dh.final();
+        // reduce each 8-byte limb mod p so the digest is a canonical 4-element field value.
+        return poseidon2.digestBytes(poseidon2.digestFromBytes(raw));
+    }
+
+    /// The join-split public statement the verifier checks against.
+    pub fn publicInputs(self: ShieldedTx) ffi.JoinSplitPublicInputs {
+        return .{
+            .anchor = self.anchor,
+            .nullifiers = self.nullifiers,
+            .out_cms = self.out_cms,
+            .tx_binding = self.txBinding(),
+            .fee = self.fee,
+            .mint = self.mint,
+        };
     }
 };
 
@@ -114,61 +105,111 @@ pub const ShieldedTx = struct {
 // Wallet-side transfer construction
 // ---------------------------------------------------------------------------------------
 
-/// Build a one-input, one-output shielded transfer that spends `spend_note` and pays
-/// `send_value` to `recipient`, leaving `fee` for the miner. Allocations (the spends/outputs
-/// arrays, the proof, the output ciphertext) are owned by `allocator`.
+const DEPTH = TREE_DEPTH;
+
+fn putU64(w: *std.ArrayList(u8), a: Allocator, v: u64) !void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, v, .little);
+    try w.appendSlice(a, &b);
+}
+/// Append the canonical field element implied by up to 8 little-endian bytes.
+fn putFelt(w: *std.ArrayList(u8), a: Allocator, bytes: []const u8) !void {
+    try putU64(w, a, poseidon2.feltLE(bytes));
+}
+/// Append a 32-byte hash as 4 canonical field elements.
+fn putDigest(w: *std.ArrayList(u8), a: Allocator, h: Hash32) !void {
+    var k: usize = 0;
+    while (k < 4) : (k += 1) try putFelt(w, a, h[k * 8 .. k * 8 + 8]);
+}
+
+/// Serialize a witness into the canonical wallet→prover layout (matching
+/// `lattica-prover-p3::parse_joinsplit_witness`).
+fn encodeWitness(
+    a: Allocator,
+    sender: tx.FullKey,
+    inputs: []const InputSpend,
+    out_notes: [M_OUT]tx.Note,
+    fee: u64,
+    mint: u64,
+    tx_binding: Hash32,
+) ![]u8 {
+    var w: std.ArrayList(u8) = .empty;
+    errdefer w.deinit(a);
+    for (inputs) |in_| {
+        try putU64(&w, a, std.mem.readInt(u64, sender.nk[0..8], .little)); // nk0
+        try putU64(&w, a, std.mem.readInt(u64, sender.nk[8..16], .little)); // nk1
+        try putU64(&w, a, in_.note.value);
+        try putFelt(&w, a, in_.note.rho[0..8]);
+        try putFelt(&w, a, in_.note.rcm[0..8]);
+        for (in_.path.siblings) |sib| try putDigest(&w, a, sib);
+        var d: usize = 0;
+        while (d < DEPTH) : (d += 1) try w.append(a, @intCast((in_.position >> @intCast(d)) & 1));
+    }
+    for (out_notes) |o| {
+        try putDigest(&w, a, o.recipient);
+        try putU64(&w, a, o.value);
+        try putFelt(&w, a, o.rho[0..8]);
+        try putFelt(&w, a, o.rcm[0..8]);
+    }
+    try putU64(&w, a, fee);
+    try putU64(&w, a, mint);
+    try putDigest(&w, a, tx_binding);
+    return w.toOwnedSlice(a);
+}
+
+/// Build a shielded join-split: spend the `N_IN` `inputs` (all real tree members under `anchor`;
+/// pad with owned zero-value notes), pay the `outputs` (padded to `M_OUT` with zero-value notes back
+/// to the sender), leaving `fee`, with public issuance `mint`. The proof is produced via the
+/// installed prover backend. Allocations are owned by `allocator`.
 pub fn buildTransfer(
     allocator: Allocator,
     sender: tx.FullKey,
-    spend_note: tx.Note,
-    spend_position: u64,
-    spend_path: tree.MerklePath,
-    anchor: Hash32,
-    recipient: tx.Address,
-    send_value: u64,
+    inputs: []const InputSpend,
+    outputs: []const OutputReq,
     fee: u64,
+    mint: u64,
+    anchor: Hash32,
 ) !ShieldedTx {
-    const total_out = std.math.add(u64, send_value, fee) catch return TxError.ValueOverflow;
-    if (total_out != spend_note.value) return TxError.Unbalanced;
+    if (inputs.len != N_IN or outputs.len > M_OUT) return TxError.Internal;
 
-    const nullifier = spend_note.nullifier(&sender.nk, spend_position);
+    // Nullifiers for every input.
+    var nfs: [N_IN]Hash32 = undefined;
+    for (inputs, 0..) |in_, i| nfs[i] = in_.note.nullifier(&sender.nk, in_.position);
 
-    // Post-quantum proof of spend authorization (knowledge of the spend secret).
-    const auth_secret = p.expand(&sender.seed, "spend-auth");
-    const auth = circuit.proveAuthorization(allocator, &auth_secret) catch return TxError.Internal;
+    // Output notes (pad to M_OUT with zero-value notes back to the sender), commitments, ciphertexts.
+    var out_notes: [M_OUT]tx.Note = undefined;
+    var tns: [M_OUT]tx.TransmittedNote = undefined;
+    var out_cms: [M_OUT]Hash32 = undefined;
+    for (0..M_OUT) |j| {
+        const recipient: tx.Address = if (j < outputs.len) outputs[j].recipient else sender.address();
+        const value: u64 = if (j < outputs.len) outputs[j].value else 0;
+        const jb = [_]u8{@intCast(j)};
+        const rho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nfs[0], &jb });
+        const rcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &jb });
+        out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .rho = rho, .rcm = rcm };
+        out_cms[j] = out_notes[j].commitment();
+        tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal;
+    }
 
-    // Output note to the recipient; its rho is the spend nullifier, tying uniqueness to the
-    // consumed note exactly as Orchard does.
-    const out_rcm = p.expand(&nullifier, "out-rcm");
-    const out_note = tx.Note{
-        .value = send_value,
-        .recipient = recipient.recipientId(),
-        .rho = nullifier,
-        .rcm = out_rcm,
-    };
-    const out_tn = tx.encryptNote(allocator, recipient, out_note) catch return TxError.Internal;
-
-    const spends = allocator.alloc(Spend, 1) catch return TxError.Internal;
-    spends[0] = .{
-        .anchor = anchor,
-        .cm = spend_note.commitment(),
-        .value = spend_note.value,
-        .nullifier = nullifier,
-        .merkle = spend_path,
-        .auth = auth,
-    };
-    const outputs = allocator.alloc(Output, 1) catch return TxError.Internal;
-    outputs[0] = .{ .value = send_value, .note = out_tn };
+    // Value balance (wallet-side, before proving): Σin + mint = Σout + fee.
+    var in_sum: u64 = mint;
+    for (inputs) |in_| in_sum = std.math.add(u64, in_sum, in_.note.value) catch return TxError.ValueOverflow;
+    var out_sum: u64 = fee;
+    for (out_notes) |o| out_sum = std.math.add(u64, out_sum, o.value) catch return TxError.ValueOverflow;
+    if (in_sum != out_sum) return TxError.Unbalanced;
 
     var t = ShieldedTx{
-        .spends = spends,
-        .outputs = outputs,
+        .anchor = anchor,
+        .nullifiers = nfs,
+        .out_cms = out_cms,
         .fee = fee,
-        .binding_pk = sender.sig.pkBytes(),
-        .binding_sig = [_]u8{0} ** p.SIG_LEN,
+        .mint = mint,
+        .proof = &.{},
+        .outputs = tns,
     };
-    const dg = t.digest();
-    t.binding_sig = sender.sig.sign(&dg) catch return TxError.Internal;
+    const binding = t.txBinding();
+    const witness = encodeWitness(allocator, sender, inputs, out_notes, fee, mint, binding) catch return TxError.Internal;
+    t.proof = ffi.proveJoinSplit(allocator, witness) catch return TxError.Internal;
     return t;
 }
 
@@ -235,7 +276,7 @@ pub const Chain = struct {
         return pos;
     }
 
-    /// Mint funds directly into a shielded note (coinbase-style, to bootstrap the demo).
+    /// Mint funds directly into a shielded note (coinbase-style, to bootstrap the demo / pad inputs).
     pub fn mint(self: *Chain, address: tx.Address, value: u64, seed: Hash32) !Minted {
         var value_le: [8]u8 = undefined;
         std.mem.writeInt(u64, &value_le, value, .little);
@@ -248,50 +289,86 @@ pub const Chain = struct {
         return .{ .note = note, .pos = pos };
     }
 
-    /// Validate and apply a shielded transaction. On success, nullifiers are recorded and the
-    /// output commitments are appended to the tree.
+    /// Validate and apply a shielded join-split. On success, nullifiers are recorded and the output
+    /// commitments are appended to the tree.
     pub fn verifyAndApply(self: *Chain, t: ShieldedTx) TxError!void {
-        // 1. Binding signature over the whole transaction body.
-        const dg = t.digest();
-        if (!p.verify(&t.binding_pk, &dg, &t.binding_sig)) return TxError.BadBindingSignature;
+        // 1. The join-split proof is the sole authorization — fail-closed (no backend ⇒ reject). It
+        //    binds ownership, membership under the anchor, nullifier correctness, balance, and range;
+        //    its tx_binding == the public body (recomputed here) so nothing can be swapped.
+        if (!ffi.verifyJoinSplit(t.proof, t.publicInputs())) return TxError.BadAuthProof;
 
-        // 2. Per-spend checks. Track in-transaction nullifiers to also reject duplicates.
+        // 2. The anchor must be one the chain published.
+        if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
+
+        // 3. Nullifiers: reject any already spent, or duplicated within this transaction.
         var seen = HashSet.init(self.allocator);
         defer seen.deinit();
-        for (t.spends) |s| {
-            if (!self.isKnownAnchor(&s.anchor)) return TxError.UnknownAnchor;
-            if (!tree.verifyPath(&s.anchor, &s.cm, s.merkle)) return TxError.BadMembership;
-            if (self.nullifiers.contains(s.nullifier)) return TxError.DoubleSpend;
-            const gop = seen.getOrPut(s.nullifier) catch return TxError.Internal;
+        for (t.nullifiers) |nf| {
+            if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
+            const gop = seen.getOrPut(nf) catch return TxError.Internal;
             if (gop.found_existing) return TxError.DoubleSpend;
         }
 
-        // 2b. Authorization. Production wires the Rust `lattica_joinsplit_verify` via
-        //     `ffi.setJoinSplitBackend`: the join-split proof must verify against the public
-        //     statement the node reconstructs from the tx body — binding ownership, membership under
-        //     a known anchor, nullifier correctness, and the value balance in zero-knowledge (its
-        //     tx_binding == the tx digest, so outputs can't be swapped). With no backend installed
-        //     the node is pre-cutover and falls back to the old per-spend generic-preimage proof.
-        if (ffi.hasJoinSplitBackend()) {
-            if (!ffi.verifyJoinSplit(t.proof, t.joinSplitPublicInputs())) return TxError.BadAuthProof;
-        } else {
-            for (t.spends) |s| if (!circuit.verifyAuthorization(s.auth)) return TxError.BadAuthProof;
-        }
-
-        // 3. Value balance: inputs == outputs + fee. Checked sums — a malicious tx must not be
-        //    able to wrap a u64 total (panic in safe builds; ambiguity in optimized builds).
-        var inputs: u64 = 0;
-        for (t.spends) |s| inputs = std.math.add(u64, inputs, s.value) catch return TxError.ValueOverflow;
-        var outputs_plus_fee: u64 = t.fee;
-        for (t.outputs) |o| outputs_plus_fee = std.math.add(u64, outputs_plus_fee, o.value) catch return TxError.ValueOverflow;
-        if (inputs != outputs_plus_fee) return TxError.Unbalanced;
+        // (Issuance policy on `mint` — block-reward / supply schedule — is a consensus-layer check,
+        //  out of scope for this state machine; the proof guarantees the balance holds given `mint`.)
 
         // 4. Apply (only after all checks pass).
-        for (t.spends) |s| self.nullifiers.put(s.nullifier, {}) catch return TxError.Internal;
+        for (t.nullifiers) |nf| self.nullifiers.put(nf, {}) catch return TxError.Internal;
         for (t.outputs) |o| {
-            _ = self.insertCommitment(o.note.cm) catch return TxError.Internal;
-            self.transmitted.append(self.allocator, o.note) catch return TxError.Internal;
+            _ = self.insertCommitment(o.cm) catch return TxError.Internal;
+            self.transmitted.append(self.allocator, o) catch return TxError.Internal;
         }
+    }
+};
+
+// ---------------------------------------------------------------------------------------
+// Mock backends — model the proof's tx-binding so node-level tests (and the wallet demo) exercise
+// the real verify/prove seam without linking the Rust staticlib. Production installs the Rust
+// `lattica_joinsplit_prove`/`lattica_joinsplit_verify` instead; the real prove→verify path is
+// covered by `lattica-prover-p3/tests/ffi_integration.c` and `src/ffi_integration.zig`.
+// ---------------------------------------------------------------------------------------
+
+pub const mock = struct {
+    const TXB_OFFSET: usize = 32 * (1 + N_IN + M_OUT); // anchor ‖ N·nf ‖ M·out_cm, then tx_binding
+
+    /// "Proof" = the witness's tx_binding (its last 32 bytes), modeling that the proof commits to it.
+    pub fn prove(
+        witness_ptr: [*]const u8,
+        witness_len: usize,
+        proof_out: [*]u8,
+        proof_cap: usize,
+        proof_len: *usize,
+        pi_out: [*]u8,
+        pi_cap: usize,
+        pi_len: *usize,
+    ) callconv(.c) i32 {
+        _ = pi_out;
+        _ = pi_cap;
+        if (witness_len < 32 or proof_cap < 32) return 1;
+        @memcpy(proof_out[0..32], witness_ptr[witness_len - 32 .. witness_len]);
+        proof_len.* = 32;
+        pi_len.* = 0;
+        return 0;
+    }
+
+    /// Accept iff the proof's tx_binding equals the public statement's tx_binding (so any tampering
+    /// of the body — which changes tx_binding — is rejected, exactly like the real binding does).
+    pub fn verify(proof_ptr: [*]const u8, proof_len: usize, pi_ptr: [*]const u8, pi_len: usize) callconv(.c) i32 {
+        if (proof_len != 32 or pi_len != ffi.JoinSplitPublicInputs.ENCODED_LEN) return 1;
+        const proof = proof_ptr[0..32];
+        const pi = pi_ptr[0..pi_len];
+        if (std.mem.eql(u8, proof, pi[TXB_OFFSET .. TXB_OFFSET + 32])) return 0;
+        return 1;
+    }
+
+    /// Install both mock backends (test / demo only).
+    pub fn install() void {
+        ffi.setJoinSplitProveBackend(&prove);
+        ffi.setJoinSplitBackend(&verify);
+    }
+    pub fn uninstall() void {
+        ffi.clearJoinSplitProveBackend();
+        ffi.clearJoinSplitBackend();
     }
 };
 
@@ -305,29 +382,39 @@ fn account(seed: u8) !tx.FullKey {
     return tx.FullKey.fromSeed([_]u8{seed} ** 32);
 }
 
-test "end to end shielded transfer" {
+/// Mint a real note + a zero-value padding note to `key`, returning both as `InputSpend`s under the
+/// current anchor (the join-split needs `N_IN` real tree members).
+fn fundTwoInputs(a: Allocator, chain: *Chain, key: tx.FullKey, value: u64, salt: u8) ![N_IN]InputSpend {
+    const m0 = try chain.mint(key.address(), value, [_]u8{salt} ** 32);
+    const m1 = try chain.mint(key.address(), 0, [_]u8{salt +% 1} ** 32);
+    return .{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+}
+
+test "end to end shielded join-split transfer" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
 
     var chain = try Chain.init(a);
     const alice = try account(1);
     const bob = try account(2);
 
-    // Alice receives 1000 via a mint.
-    const minted = try chain.mint(alice.address(), 1000, [_]u8{11} ** 32);
-    const decrypted = tx.tryDecrypt(a, alice, chain.transmitted.items[0]) orelse return error.TestUnexpectedNull;
-    try testing.expect(decrypted.eql(minted.note));
-
-    // Alice pays Bob 900, fee 100.
+    // Alice holds 1000 (+ a zero-value padding note).
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 11);
     const anchor = chain.anchor();
-    const path = try chain.merklePath(a, minted.pos);
-    const t = try buildTransfer(a, alice, minted.note, minted.pos, path, anchor, bob.address(), 900, 100);
 
-    // Node accepts it.
+    // Alice pays Bob 900, fee 100 (output 1 is a zero-value dummy back to Alice).
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    const t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, anchor);
+
     try chain.verifyAndApply(t);
 
-    // Bob can find and decrypt his note; Alice cannot (it's not hers).
+    // Bob finds and decrypts exactly his 900 note; Alice's dummy decrypts to her at 0.
     var bob_total: u64 = 0;
     var bob_count: usize = 0;
     for (chain.transmitted.items) |tn| {
@@ -339,102 +426,91 @@ test "end to end shielded transfer" {
     try testing.expectEqual(@as(usize, 1), bob_count);
     try testing.expectEqual(@as(u64, 900), bob_total);
 
-    // Replaying the exact same transaction is a double-spend and is rejected.
+    // Replaying the same transaction is a double-spend.
     try testing.expectError(TxError.DoubleSpend, chain.verifyAndApply(t));
+}
+
+test "join-split requires a verifier backend (fail-closed)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+
+    // Build with the mock prover installed, then verify with NO backend ⇒ rejected.
+    mock.install();
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 7);
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    const t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    mock.uninstall(); // no verifier installed
+    try testing.expectError(TxError.BadAuthProof, chain.verifyAndApply(t));
 }
 
 test "unbalanced transfer rejected at build" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
     var chain = try Chain.init(a);
     const alice = try account(1);
     const bob = try account(2);
-    const minted = try chain.mint(alice.address(), 1000, [_]u8{5} ** 32);
-    const path = try chain.merklePath(a, minted.pos);
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 5);
     // 900 + 99 != 1000
-    try testing.expectError(TxError.Unbalanced, buildTransfer(a, alice, minted.note, minted.pos, path, chain.anchor(), bob.address(), 900, 99));
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    try testing.expectError(TxError.Unbalanced, buildTransfer(a, alice, &inputs, &outs, 99, 0, chain.anchor()));
 }
 
-test "tampered value breaks binding signature" {
+test "tampered output is rejected (tx-binding)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
     var chain = try Chain.init(a);
     const alice = try account(1);
     const bob = try account(2);
-    const minted = try chain.mint(alice.address(), 1000, [_]u8{5} ** 32);
-    const path = try chain.merklePath(a, minted.pos);
-    var t = try buildTransfer(a, alice, minted.note, minted.pos, path, chain.anchor(), bob.address(), 900, 100);
-    // Tamper with the output value after signing: the binding signature must now fail.
-    t.outputs[0].value = 950;
-    try testing.expectError(TxError.BadBindingSignature, chain.verifyAndApply(t));
-}
-
-test "value overflow rejected (checked arithmetic)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var chain = try Chain.init(a);
-    const alice = try account(1);
-    const bob = try account(2);
-    const minted = try chain.mint(alice.address(), 1000, [_]u8{7} ** 32);
-    const path = try chain.merklePath(a, minted.pos);
-    var t = try buildTransfer(a, alice, minted.note, minted.pos, path, chain.anchor(), bob.address(), 900, 100);
-    // Force the output+fee sum to wrap u64, then re-sign so the binding signature passes and the
-    // checked value sum is what rejects (rather than a panic in safe builds).
-    t.outputs[0].value = std.math.maxInt(u64);
-    t.fee = 1;
-    const dg = t.digest();
-    t.binding_sig = try alice.sig.sign(&dg);
-    try testing.expectError(TxError.ValueOverflow, chain.verifyAndApply(t));
-}
-
-fn acceptJoinSplit(_: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) i32 {
-    return 0;
-}
-fn rejectJoinSplit(_: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) i32 {
-    return 1;
-}
-
-test "node enforces the join-split proof when a backend is installed" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var chain = try Chain.init(a);
-    const alice = try account(1);
-    const bob = try account(2);
-    const minted = try chain.mint(alice.address(), 1000, [_]u8{11} ** 32);
-    const path = try chain.merklePath(a, minted.pos);
-    const t = try buildTransfer(a, alice, minted.note, minted.pos, path, chain.anchor(), bob.address(), 900, 100);
-
-    // A rejecting verifier backend ⇒ the join-split proof check fails (no state mutated, so we can
-    // retry the same tx afterwards).
-    ffi.setJoinSplitBackend(&rejectJoinSplit);
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 5);
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    var t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    // Swap an output commitment after proving: tx_binding no longer matches the proof ⇒ rejected.
+    t.out_cms[0][0] +%= 1;
     try testing.expectError(TxError.BadAuthProof, chain.verifyAndApply(t));
-    ffi.clearJoinSplitBackend();
-
-    // An accepting backend ⇒ the tx applies; the replay is still a double-spend.
-    ffi.setJoinSplitBackend(&acceptJoinSplit);
-    defer ffi.clearJoinSplitBackend();
-    try chain.verifyAndApply(t);
-    try testing.expectError(TxError.DoubleSpend, chain.verifyAndApply(t));
 }
 
 test "unknown anchor rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
     var chain = try Chain.init(a);
     const alice = try account(1);
     const bob = try account(2);
-    const minted = try chain.mint(alice.address(), 1000, [_]u8{5} ** 32);
-    const path = try chain.merklePath(a, minted.pos);
-    var t = try buildTransfer(a, alice, minted.note, minted.pos, path, chain.anchor(), bob.address(), 900, 100);
-    // Point the spend at an anchor the chain never published, then re-sign so the binding
-    // signature is valid and the anchor check is what fails.
-    t.spends[0].anchor = [_]u8{0xaa} ** 32;
-    const dg = t.digest();
-    t.binding_sig = try alice.sig.sign(&dg);
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 5);
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    var t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    // Point at an anchor the chain never published, re-binding the proof to it so the proof check
+    // passes (the mock binds tx_binding) and the anchor check is what fails.
+    t.anchor = [_]u8{0xaa} ** 32;
+    var rebind = t.txBinding();
+    t.proof = rebind[0..]; // proof = the new tx_binding ⇒ mock verify accepts
     try testing.expectError(TxError.UnknownAnchor, chain.verifyAndApply(t));
+}
+
+test "coinbase mint funds an output with no input value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const miner = try account(3);
+    // Two zero-value inputs; issuance (mint=500) funds a 500 output, no fee.
+    const inputs = try fundTwoInputs(a, &chain, miner, 0, 20);
+    const outs = [_]OutputReq{.{ .recipient = miner.address(), .value = 500 }};
+    const t = try buildTransfer(a, miner, &inputs, &outs, 0, 500, chain.anchor());
+    try chain.verifyAndApply(t);
 }

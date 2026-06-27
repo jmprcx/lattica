@@ -81,37 +81,42 @@ fn bench(a: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn demo(a: std.mem.Allocator) !void {
-    std.debug.print("=== Lattica: post-quantum shielded transfer demo ===\n\n", .{});
+    std.debug.print("=== Lattica: post-quantum shielded join-split demo ===\n\n", .{});
+
+    // Install the mock prover/verifier backends. In production these are the Rust
+    // lattica_joinsplit_prove / lattica_joinsplit_verify (joinsplit_air); the mocks model the
+    // proof's tx-binding so the flow runs without linking the staticlib.
+    node.mock.install();
+    defer node.mock.uninstall();
 
     var chain = try node.Chain.init(a);
     const alice = try tx.FullKey.fromSeed([_]u8{1} ** 32);
     const bob = try tx.FullKey.fromSeed([_]u8{2} ** 32);
     std.debug.print("Alice and Bob each hold a post-quantum account (ML-KEM + ML-DSA keys).\n\n", .{});
 
-    // 1. Mint funds to Alice.
-    const minted = try chain.mint(alice.address(), 1000, [_]u8{11} ** 32);
-    std.debug.print("[mint]   1000 minted to Alice as a shielded note at tree position {d}.\n", .{minted.pos});
-    std.debug.print("         note commitment {s}… inserted; anchor now {s}…\n", .{ hex6(&minted.note.commitment()), hex6(&chain.anchor()) });
+    // 1. Mint funds to Alice: a 1000 note plus a zero-value note to pad the fixed 2-in shape.
+    const m0 = try chain.mint(alice.address(), 1000, [_]u8{11} ** 32);
+    const m1 = try chain.mint(alice.address(), 0, [_]u8{12} ** 32);
+    std.debug.print("[mint]   1000 minted to Alice (+ a 0-value padding note); anchor now {s}…\n", .{hex6(&chain.anchor())});
     if (tx.tryDecrypt(a, alice, chain.transmitted.items[0])) |n| {
         std.debug.print("         Alice trial-decrypts her note: value = {d}.\n\n", .{n.value});
-    } else {
-        std.debug.print("         (decryption failed!)\n\n", .{});
     }
 
-    // 2. Alice builds a shielded transfer to Bob: 900 to Bob, 100 fee.
+    // 2. Alice builds a hidden-value join-split to Bob: 900 to Bob, 100 fee.
     const anchor = chain.anchor();
-    const path = try chain.merklePath(a, minted.pos);
-    const t = try node.buildTransfer(a, alice, minted.note, minted.pos, path, anchor, bob.address(), 900, 100);
-    std.debug.print("[build]  Alice spends her note: 900 to Bob, 100 fee.\n", .{});
-    std.debug.print("         nullifier    {s}… (revealed; unlinkable to the note)\n", .{hex6(&t.spends[0].nullifier)});
-    std.debug.print("         FRI proof    {d} bytes (transparent, hash-based, no trusted setup)\n", .{t.spends[0].auth.proof.len});
-    std.debug.print("         binding sig  {d} bytes (ML-DSA)\n", .{p.SIG_LEN});
-    const total = t.spends[0].auth.proof.len + p.SIG_LEN + t.outputs[0].note.ciphertext.len + t.outputs[0].note.kem_ct.len;
-    std.debug.print("         tx size     ~{d} bytes\n\n", .{total});
+    const inputs = [_]node.InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+    const outs = [_]node.OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    const t = try node.buildTransfer(a, alice, &inputs, &outs, 100, 0, anchor);
+    std.debug.print("[build]  Alice spends 2 notes → 900 to Bob + 0 dummy, 100 fee (values hidden).\n", .{});
+    std.debug.print("         nullifiers   {s}…, {s}… (revealed; unlinkable to the notes)\n", .{ hex6(&t.nullifiers[0]), hex6(&t.nullifiers[1]) });
+    std.debug.print("         join-split proof {d} bytes (mock backend; the real proof is ~0.5 MB)\n\n", .{t.proof.len});
 
-    // 3. The node validates and applies it.
+    // 3. The node validates and applies it (proof verify + anchor + nullifier-unseen).
     if (chain.verifyAndApply(t)) |_| {
-        std.debug.print("[node]   transaction ACCEPTED: binding sig ✓  membership ✓  nullifier-unseen ✓  auth ✓  balance ✓\n\n", .{});
+        std.debug.print("[node]   transaction ACCEPTED: proof ✓  anchor-known ✓  nullifiers-unseen ✓\n\n", .{});
     } else |err| {
         std.debug.print("[node]   transaction REJECTED: {s}\n", .{@errorName(err)});
         std.process.exit(1);
