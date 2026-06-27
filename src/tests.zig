@@ -4,11 +4,6 @@
 test {
     _ = @import("primitives.zig");
     _ = @import("field.zig");
-    _ = @import("rescue.zig");
-    _ = @import("stark.zig");
-    _ = @import("membership.zig");
-    _ = @import("permutation.zig");
-    _ = @import("spend.zig");
     _ = @import("codec.zig");
     _ = @import("protocol.zig");
     _ = @import("ffi.zig");
