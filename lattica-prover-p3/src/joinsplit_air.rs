@@ -428,8 +428,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         }
 
         // ---- local-persistent columns: constant within a region, free at region boundaries ----
+        // RHO1 MUST be here: it is read at both commit_a (lane 7) and the nullifier (lane 4); without
+        // persistence a prover could use one rho1 in the commitment and another in the nullifier,
+        // minting a fresh nullifier for a real note ⇒ double-spend.
         let not_last = one.clone() - p[P_REGION_LAST].clone();
-        for &c in &[NK, NK1, RHO, VAL] {
+        for &c in &[NK, NK1, RHO, RHO1, VAL] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
         // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
@@ -1123,5 +1126,37 @@ mod tests {
         let mut b1 = [false; DEPTH];
         b1[0] = true;
         assert_ne!(nullifier(nk0, nk1, rho, pos_of(&b0)), nullifier(nk0, nk1, rho, pos_of(&b1)));
+    }
+
+    #[test]
+    fn rho1_persistence_blocks_forged_nullifier() {
+        // Adversarial trace: keep rho1 = R in the commitment (so cm still matches the tree note) but
+        // bind rho1' = R+1 in the nullifier — a fresh, forged nullifier for the SAME note (the
+        // double-spend the rho-widening could have enabled). Only the RHO1-persistence link is
+        // violated, so this fails iff that constraint exists.
+        let w = sample();
+        let mut trace = build_trace(&w);
+        let (nk0, nk1) = (Val::from_u64(w.inputs[0].nk[0]), Val::from_u64(w.inputs[0].nk[1]));
+        let rho0 = w.inputs[0].rho[0];
+        let rho1p = w.inputs[0].rho[1] + Val::ONE;
+        let pos = pos_of(&w.inputs[0].bits);
+        // rewrite input 0's nullifier block to bind rho1' (recomputes the perm ⇒ a forged nf)
+        let nin = [Val::from_u64(DOM_NF), nk0, nk1, rho0, rho1p, pos, Val::ZERO, Val::ZERO];
+        set_block(&mut trace.values, null_block(0), nin);
+        // make the LOCAL nullifier binding (lane 4 == RHO1) hold at the null block, so the only broken
+        // constraint is RHO1's persistence across the span.
+        for r in null_in_row(0)..=null_out_row(0) {
+            trace.values[r * WIDTH + RHO1] = rho1p;
+        }
+        // publish the forged nullifier so the nf-output binding also holds.
+        let mut pis = public_values(&w);
+        let nfp = nullifier(nk0, nk1, [rho0, rho1p], pos);
+        pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&nfp);
+        // Robust to debug (prove's constraint check panics) and release (verify rejects).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let proof = prove(&make_config(), &JoinSplitAir, trace, &pis);
+            verify_bytes(&postcard::to_allocvec(&proof).unwrap(), &pis)
+        }));
+        assert!(matches!(outcome, Ok(false) | Err(_)), "a forged rho1 in the nullifier must not verify");
     }
 }

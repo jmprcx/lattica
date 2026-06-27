@@ -32,22 +32,23 @@ Goldilocks elements (128-bit)**; ownership `recipient = H(DOM_OWN ‖ nk0 ‖ nk
 nk0 ‖ nk1 ‖ rho ‖ pos)` (both fit the width-8 hash without touching the commitment's lane budget).
 Implemented in `joinsplit_air` + `poseidon2.zig` (KAT-matched); 37 Rust + full Zig suite pass.
 
-## 3. Note randomness `rho`, `rcm` — **one field element each (~64-bit) in v1**
-The width-8 Poseidon2 commitment input is `[DOM_CM, recipient(4), value, rho, rcm]` — 8 lanes, full —
-so `rho` and `rcm` are single Goldilocks elements (~64-bit). `rho` uniqueness gives nullifier
-uniqueness. **Limitation:** 64-bit per-note randomness; the birthday bound on `rho` becomes a concern
-around `2^32` notes. **Decision:** accept 64-bit for v1 launch parameters and flag for the audit;
-**future:** widen via a two-permutation (sponge) commitment or a wider permutation, which lifts `rho`
-to ≥128-bit. (An auditor should explicitly sign off on the launch `rho` width.)
+## 3. Note randomness `rho`, `rcm` — **128-bit (two field elements each)** *(done)*
+Originally 1 field element each (~64-bit, forced by the 8-lane single-permutation commitment). **Now
+widened to 128-bit**: the commitment is a two-permutation Merkle-Damgård chain
+`cm = H₂(H₁(DOM_CM ‖ recipient(4) ‖ value ‖ rho0 ‖ rho1) ‖ rcm0 ‖ rcm1)`, so `rho`/`rcm` are each two
+Goldilocks elements while `recipient` stays a 256-bit digest. The 256-bit chaining value gives 128-bit
+collision resistance. `rho` uniqueness (now 128-bit) gives nullifier uniqueness; the birthday bound
+moves from ~2³² to ~2⁶⁴ notes. Implemented in `joinsplit_air` + `poseidon2.zig` (KAT-matched);
+validated by the full suite + the real in-node prove→verify.
 
-**Interaction with deterministic note encryption (flag for audit).** Note encryption is deterministic
-— the ML-KEM encapsulation coins are `expand(cm, "kem-encaps")` and the AEAD key+nonce are
-`H(ss ‖ kem_ct ‖ cm ‖ …)` (`primitives.deriveNoteKey`), all derived from the commitment `cm` (chosen
-for seed-restorability, no stored `esk`). Because v1's `cm` binds only `rho[0..8]`/`rcm[0..8]` (§3),
-the AEAD `(key,nonce)` is unique up to a **128-bit** commitment collision (≈2⁶⁴ notes to one recipient)
-rather than the 256-bit margin before C-03. That is safe at any realistic note count, but it is tighter
-than a randomized scheme (Zcash uses a fresh `esk` per note); widening `rho`/`rcm` restores the margin.
-An auditor should weigh the determinism + this bound together.
+**Interaction with deterministic note encryption.** Note encryption is deterministic — the ML-KEM
+encapsulation coins are `expand(cm, "kem-encaps")` and the AEAD key+nonce are `H(ss ‖ kem_ct ‖ cm ‖ …)`
+(`primitives.deriveNoteKey`), all derived from `cm` (chosen for seed-restorability, no stored `esk`).
+The AEAD `(key,nonce)` is therefore unique up to a `cm` collision; with the 128-bit `rho`/`rcm` the
+commitment binds the full note randomness and the margin is the commitment's 128-bit collision
+resistance (was ~2⁶⁴ when `cm` bound only 64-bit `rho`/`rcm`). This differs from a randomized scheme
+(Zcash uses a fresh `esk` per note); an auditor should still note the determinism, but the
+randomness-width concern is resolved.
 
 ## 4. Issuance — **mint (v1); burn deferred**
 Shielded issuance via a **public `mint` amount** in the join-split balance:
