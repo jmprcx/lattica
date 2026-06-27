@@ -112,10 +112,15 @@ Tracked in detail in `docs/remediation-status.md`. The soundness-relevant ones:
   `Σin − Σout − fee = 0`; all addends bounded ⇒ no field wraparound. Validated (out-of-range and
   wrong-fee rejected).
 - **A4 — nullifier-derivation argument. ✅ Written** (see "A4 — nullifier-derivation" below).
-- **C-03 — protocol/circuit hash match. ❌ Open.** `src/{tx,primitives}.zig` still hash with SHA3;
-  the on-chain `noteCommitment`/`nullifier`/Merkle **must** switch to the exact in-circuit
-  Poseidon2-Goldilocks layouts (incl. the A2 domain tags), guarded by shared known-answer vectors.
-  The seam is unaudited until matched.
+- **C-03 — protocol/circuit hash match. 🟡 Hash matched; protocol swap = M6.** `src/poseidon2.zig`
+  is a Zig Poseidon2-Goldilocks that reproduces the circuit's permutation **and** the domain-tagged
+  `recipient`/`commit`/`nullifier`/`merge` hashes **byte-for-byte** — pinned by known-answer vectors
+  generated from the circuit (`dump_p2`) and asserted in `poseidon2.zig`'s KAT tests. The remaining
+  step is the **coordinated protocol swap**: migrate the `Note` model (`tx.zig`) + Merkle tree
+  (`tree.zig`) off SHA3 onto these functions (note fields become Goldilocks elements). Because that
+  swap is protocol-wide (touches note encryption/wallet) it lands with the **M6 node cutover**; the
+  end-to-end FFI test (below) demonstrates the protocol-side `poseidon2.zig` hashes equal the
+  circuit's via a real proof verifying.
 - Single-asset; no memo field; coinbase/mint/burn not yet modeled.
 
 ### A4 — nullifier-derivation argument
@@ -186,7 +191,8 @@ round-trip tested; `ffi.zig::JoinSplitPublicInputs`); the **constraint-accountin
 | **A4 nullifier-derivation argument** | ✅ (§5) |
 | **B — join-split (N-in/M-out) circuit** | ✅ (`joinsplit_air`, fixed 2-in/2-out, 12/12) |
 | **Join-split C ABI + byte layout** | ✅ (`lattica_joinsplit_verify` + `ffi.zig::JoinSplitPublicInputs`) |
-| **C-03 protocol↔circuit hash match + shared KATs** | ❌ |
+| **C-03 hash match: Zig Poseidon2 == circuit + KATs** | ✅ (`src/poseidon2.zig`) |
+| **C-03 protocol note-model swap (tx/tree off SHA3)** | ⏳ M6 cutover (protocol-wide) |
 | **End-to-end FFI integration test** (Zig: mint→prove→verify→double-spend) | ❌ |
 | **Constraint-accounting self-audit** (every column/constraint, no vacuous binding) | ✅ (`docs/joinsplit-constraint-audit.md`) |
 | **Variable (N,M) via dummy notes** | ✅ (tested) |
