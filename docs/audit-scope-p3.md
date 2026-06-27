@@ -6,27 +6,36 @@ checklist. Companion docs: `docs/soundness-budget.md` (C-04), `docs/plonky3-port
 circuit was built), `docs/remediation-status.md` (audit-finding tracker), `docs/audit-scope.md` (the
 older *Winterfell* reviewer guide — reference only; superseded by this for production).
 
-> **Status: circuit + integration ready for external review; two pre-audit caveats remain.** The
-> production circuit is the **join-split N-in/M-out** (§6), with the soundness fixes applied (A1–A4,
-> 128-bit `nk`) and the live protocol cut over to it (Poseidon2 on-chain hashing == circuit;
-> hidden-value node tx model; fail-closed, panic-isolated verifier). Two adversarial recheck passes
-> found + fixed real bugs (the ZK-blinding RNG; a node-layer `mint` inflation hole). **Before the
-> audit / any value-bearing use:** (1) the Zig node ↔ Rust prover/verifier integration is verified by
-> code review + the C harness, but the *in-node* real prove→verify path has not been executed on this
-> host (its linker can't link the Rust staticlib — see `ffi_integration.zig`); run it on a linking
-> host. (2) The documented launch limitations in §5 / `docs/protocol-v1-decisions.md` need explicit
-> auditor sign-off: `rho`/`rcm` are 64-bit in v1, and the proven soundness is ~103-bit (≈127-bit
-> conjectured). This PoC chain has no coinbase/issuance consensus, so `mint > 0` is rejected at the tx
-> layer.
+> **Status: ready for external review; two deliberate-parameter sign-offs remain (not bugs).** The
+> production circuit is the **join-split N-in/M-out** (`joinsplit_air`, §6), with the soundness fixes
+> applied (A1–A4, 128-bit `nk`) and the live protocol fully cut over to it: Poseidon2 on-chain hashing
+> == circuit; hidden-value node tx model; fail-closed, panic-isolated verifier; validated coinbase
+> issuance (`mint` is impossible except via the consensus-authorized path). Three adversarial recheck
+> passes hardened it: passes 1–2 found + fixed real bugs (the ZK-blinding RNG; a node-layer `mint`
+> inflation hole) + added verifier panic isolation; pass 3 found no new exploitable issue.
+>
+> **The in-node real prove→verify path now executes green** (`scripts/run-real-integration.sh`:
+> the Zig node builds the witness → real Rust prover → Zig reconstructs the public inputs → real Rust
+> verifier → accept; replay + tamper rejected). It is built as an object linked with the system
+> toolchain because this host's Zig linker can't link the Rust staticlib.
+>
+> **Remaining before value-bearing use** — two *deliberate v1 parameters* needing explicit auditor
+> sign-off (see §5 / `docs/protocol-v1-decisions.md`), not defects: (1) `rho`/`rcm` are 64-bit (a
+> wider, randomness restores ≥128-bit via a 2-permutation sponge commitment — a v2 change); (2)
+> proven soundness is ~103-bit (≈127-bit conjectured), which is the ceiling for Goldilocks F_p² —
+> raising it further requires a larger field. Out of lattica's scope by design: block
+> consensus / PoW / mempool / networking / the emission schedule belong to the host chain
+> (`rubble-node-zig`); lattica provides the shielded-tx + issuance *mechanisms* it drives.
 
 ## 1. Scope
 
 **In scope (to be audited):**
-- The circuit: `lattica-prover-p3/src/{poseidon2_air,spend_air,full_spend_air}.rs` — the AIR
-  constraints, trace generation, periodic columns, and the cross-region binding.
-- The verifier boundary: `lattica-prover-p3/src/lib.rs` — `lattica_spend_verify` C ABI, the
-  `SpendPublicInputs` parsing, canonical field-element checks, fail-closed behavior, proof
-  (de)serialization.
+- The circuit: `lattica-prover-p3/src/{joinsplit_air,poseidon2_air,spend_air}.rs` — the AIR
+  constraints, trace generation, periodic columns, and the cross-region binding (`joinsplit_air` is
+  the production circuit; `poseidon2_air`/`spend_air` are its building blocks).
+- The verifier/prover boundary: `lattica-prover-p3/src/lib.rs` — `lattica_joinsplit_verify` /
+  `lattica_joinsplit_prove` C ABI, the `JoinSplitPublicInputs` + witness parsing, canonical
+  field-element checks, fail-closed + panic-isolated behavior, proof (de)serialization.
 - The Zig protocol seam: `src/ffi.zig` (ABI shape), `src/protocol.zig` (tx encoding, supply model,
   tx-binding digest), `src/codec.zig` (canonical encoding) — **specifically the requirement that the
   on-chain hashes equal the in-circuit hashes** (see §5 / C-03).
@@ -215,7 +224,13 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | 128-bit spend authority (`nk` = 2 field elements) | ✅ (M6 §2a; found+fixed during cutover) |
 | C-03 live: on-chain hashing → Poseidon2 (== circuit) | ✅ (`tx`/`tree`/`primitives` → `poseidon2.zig`) |
 | Hidden-value join-split node tx model (revealed values + ML-DSA binding removed) | ✅ (`node.zig`; `verifyAndApply` = proof + anchor + nullifier; `tx_binding` binds the body) |
-| `lattica_joinsplit_prove` wallet-side prover ABI + wallet witness glue | ✅ (Rust + Zig `buildTransfer`; real prove/verify via the C harness, mock backends in-tree) |
+| `lattica_joinsplit_prove` wallet-side prover ABI + wallet witness glue | ✅ (Rust + Zig `buildTransfer`) |
+| Real **in-node** prove→verify executed (not mocks) | ✅ (`scripts/run-real-integration.sh` / `src/integration_node.zig`: Zig witness→Rust prove→Zig pi→Rust verify→accept; replay+tamper reject) |
+| Verifier ABI panic-isolated against malformed proofs | ✅ (`catch_unwind`; tampered+garbage-proof tests) |
+| Validated coinbase issuance (`mint` only via consensus-authorized reward) | ✅ (`Chain.applyCoinbase`; normal path requires `mint == 0`) |
+| Constraint self-audit current (covers `mint`, 128-bit `nk`) | ✅ (`docs/joinsplit-constraint-audit.md`; re-audited pass 3, no gaps) |
+| ≥128-bit note randomness (`rho`/`rcm`) | ⏳ v1 = 64-bit (deliberate; v2 = 2-permutation sponge) — auditor sign-off |
+| ≥128-bit *proven* soundness | ⏳ ~103 proven / ~127 conjectured = Goldilocks ceiling (larger field needed) — auditor sign-off |
 
 > **Self-review note (2026-06-26):** a recheck found the prover was seeding the hiding-PCS / Merkle
 > salt RNG with a *fixed* non-cryptographic `SmallRng` — so the "zero-knowledge" proofs were not
