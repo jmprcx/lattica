@@ -25,6 +25,13 @@ commitment and make the balance per-asset.
 - **Cutover requirement:** `Address.recipientId` must equal `poseidon2.recipient(nk)` so the on-chain
   commitment equals the circuit's.
 
+## 2a. Spend authority `nk` — **128-bit (two field elements)** *(fixed during M6)*
+Starting the M6 cutover surfaced that a single-element `nk` gives only **~64-bit spend authority**
+(`recipient = H(nk)` is brute-forceable in ~2⁶⁴ hashes ⇒ note theft). **Fixed:** `nk` is now **two
+Goldilocks elements (128-bit)**; ownership `recipient = H(DOM_OWN ‖ nk0 ‖ nk1)` and `nf = H(DOM_NF ‖
+nk0 ‖ nk1 ‖ rho ‖ pos)` (both fit the width-8 hash without touching the commitment's lane budget).
+Implemented in `joinsplit_air` + `poseidon2.zig` (KAT-matched); 37 Rust + full Zig suite pass.
+
 ## 3. Note randomness `rho`, `rcm` — **one field element each (~64-bit) in v1**
 The width-8 Poseidon2 commitment input is `[DOM_CM, recipient(4), value, rho, rcm]` — 8 lanes, full —
 so `rho` and `rcm` are single Goldilocks elements (~64-bit). `rho` uniqueness gives nullifier

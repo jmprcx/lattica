@@ -65,8 +65,8 @@ fn h(domain: u64, elems: &[Val]) -> [Val; DIGEST] {
     native_permute(s)[..DIGEST].try_into().unwrap()
 }
 
-pub fn recipient_of(nk: Val) -> [Val; DIGEST] {
-    h(DOM_OWN, &[nk])
+pub fn recipient_of(nk0: Val, nk1: Val) -> [Val; DIGEST] {
+    h(DOM_OWN, &[nk0, nk1]) // 128-bit nullifier key ⇒ 128-bit spend authority
 }
 
 pub fn commit(recipient: [Val; DIGEST], value: Val, rho: Val, rcm: Val) -> [Val; DIGEST] {
@@ -78,8 +78,8 @@ pub fn commit(recipient: [Val; DIGEST], value: Val, rho: Val, rcm: Val) -> [Val;
     h(DOM_CM, &e)
 }
 
-pub fn nullifier(nk: Val, rho: Val, pos: Val) -> [Val; DIGEST] {
-    h(DOM_NF, &[nk, rho, pos])
+pub fn nullifier(nk0: Val, nk1: Val, rho: Val, pos: Val) -> [Val; DIGEST] {
+    h(DOM_NF, &[nk0, nk1, rho, pos])
 }
 
 /// Untagged 2-to-1 Merkle compression `H(l ‖ r)` (fills all 8 lanes).
@@ -110,7 +110,7 @@ pub fn fold(leaf: [Val; DIGEST], sib: &[[Val; DIGEST]; DEPTH], bits: &[bool; DEP
 
 #[derive(Clone)]
 pub struct Input {
-    pub nk: u64,
+    pub nk: [u64; 2], // 128-bit nullifier key / spend authority
     pub value: u64,
     pub rho: Val,
     pub rcm: Val,
@@ -149,15 +149,15 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let mut nullifiers = [[Val::ZERO; DIGEST]; N_IN];
     let mut in_sum: u128 = 0;
     for (i, inp) in w.inputs.iter().enumerate() {
-        let nk = Val::from_u64(inp.nk);
-        let recipient = recipient_of(nk);
+        let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
+        let recipient = recipient_of(nk0, nk1);
         let cm = commit(recipient, Val::from_u64(inp.value), inp.rho, inp.rcm);
         let root = fold(cm, &inp.sib, &inp.bits);
         match anchor {
             None => anchor = Some(root),
             Some(a) => assert_eq!(a, root, "input {i} folds to a different anchor"),
         }
-        nullifiers[i] = nullifier(nk, inp.rho, pos_of(&inp.bits));
+        nullifiers[i] = nullifier(nk0, nk1, inp.rho, pos_of(&inp.bits));
         in_sum += inp.value as u128;
     }
     // per-output commitment
@@ -195,7 +195,8 @@ const POSACC: usize = 12; // Σ bit_d·2^d within an input's membership (A1)
 const VALACC: usize = 13; // global balance accumulator: +in +mint −out −fee ⇒ 0
 const REM: usize = 14; // range running remainder
 const RBIT: usize = 15;
-const WIDTH: usize = 16;
+const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
+const WIDTH: usize = 17;
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors
 const P_OWN_IN: usize = 11;
@@ -393,7 +394,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
 
         // ---- local-persistent columns: constant within a region, free at region boundaries ----
         let not_last = one.clone() - p[P_REGION_LAST].clone();
-        for &c in &[NK, RHO, VAL] {
+        for &c in &[NK, NK1, RHO, VAL] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
         // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
@@ -420,11 +421,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         builder.when_transition().assert_zero(ra.clone() * (cur[RBIT].clone() * (one.clone() - cur[RBIT].clone())));
         builder.assert_zero(p[P_RANGE_CLOSE].clone() * cur[REM].clone());
 
-        // ---- ownership input: [DOM_OWN, nk, 0,..] ----
+        // ---- ownership input: [DOM_OWN, nk0, nk1, 0,..] ----
         let own = p[P_OWN_IN].clone();
         builder.assert_zero(own.clone() * (cur[0].clone() - dom_own.clone()));
         builder.assert_zero(own.clone() * (cur[1].clone() - cur[NK].clone()));
-        for i in 2..8 {
+        builder.assert_zero(own.clone() * (cur[2].clone() - cur[NK1].clone()));
+        for i in 3..8 {
             builder.assert_zero(own.clone() * cur[i].clone());
         }
 
@@ -455,13 +457,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
             builder.assert_zero(pr.clone() * (cur[k].clone() - pis[PI_ANCHOR + k].clone()));
         }
 
-        // ---- nullifier input: [DOM_NF, nk, rho, pos_acc, 0,0,0,0] (A1: pos = pos_acc) ----
+        // ---- nullifier input: [DOM_NF, nk0, nk1, rho, pos_acc, 0,0,0] (A1: pos = pos_acc) ----
         let ni = p[P_NULL_IN].clone();
         builder.assert_zero(ni.clone() * (cur[0].clone() - dom_nf.clone()));
         builder.assert_zero(ni.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(ni.clone() * (cur[2].clone() - cur[RHO].clone()));
-        builder.assert_zero(ni.clone() * (cur[3].clone() - cur[POSACC].clone()));
-        for i in 4..8 {
+        builder.assert_zero(ni.clone() * (cur[2].clone() - cur[NK1].clone()));
+        builder.assert_zero(ni.clone() * (cur[3].clone() - cur[RHO].clone()));
+        builder.assert_zero(ni.clone() * (cur[4].clone() - cur[POSACC].clone()));
+        for i in 5..8 {
             builder.assert_zero(ni.clone() * cur[i].clone());
         }
         // ---- nullifier output: per-input public nf_i ----
@@ -561,14 +564,15 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
 
     // --- inputs: ownership, commitment, membership, nullifier (+ local-persistent + pos_acc) ---
     for (i, inp) in w.inputs.iter().enumerate() {
-        let nk = Val::from_u64(inp.nk);
+        let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
         let value = Val::from_u64(inp.value);
         let base = input_base(i);
         let mut own = [Val::ZERO; 8];
         own[0] = Val::from_u64(DOM_OWN);
-        own[1] = nk;
+        own[1] = nk0;
+        own[2] = nk1;
         set_block(&mut t, base, own);
-        let recipient = recipient_of(nk);
+        let recipient = recipient_of(nk0, nk1);
         let mut cin = [Val::ZERO; 8];
         cin[0] = Val::from_u64(DOM_CM);
         cin[1..1 + DIGEST].copy_from_slice(&recipient);
@@ -586,17 +590,19 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
             t[((base + 2 + d) * BLOCK) * WIDTH + BIT] = if inp.bits[d] { Val::ONE } else { Val::ZERO };
             node = merge(l, r);
         }
-        // nullifier block: [DOM_NF, nk, rho, pos, 0,0,0,0]
+        // nullifier block: [DOM_NF, nk0, nk1, rho, pos, 0,0,0]
         let pos = pos_of(&inp.bits);
         let mut nin = [Val::ZERO; 8];
         nin[0] = Val::from_u64(DOM_NF);
-        nin[1] = nk;
-        nin[2] = inp.rho;
-        nin[3] = pos;
+        nin[1] = nk0;
+        nin[2] = nk1;
+        nin[3] = inp.rho;
+        nin[4] = pos;
         set_block(&mut t, null_block(i), nin);
         // local-persistent nk/rho/value across the span
         let (lo, hi) = (own_in_row(i), null_out_row(i));
-        fill_col(&mut t, lo, hi, NK, nk);
+        fill_col(&mut t, lo, hi, NK, nk0);
+        fill_col(&mut t, lo, hi, NK1, nk1);
         fill_col(&mut t, lo, hi, RHO, inp.rho);
         fill_col(&mut t, lo, hi, VAL, value);
         // pos_acc: cumulative Σ bit_d·2^d (jumps after each link row)
@@ -728,10 +734,11 @@ pub fn verify_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
 /// A representative valid join-split witness (2 inputs at tree positions 0,1; balanced).
 pub fn demo_witness() -> Witness {
     let in_values = [1000u64, 500];
+    let nks: [[u64; 2]; N_IN] = core::array::from_fn(|i| [7 + i as u64, 700 + i as u64]);
     let cms: Vec<[Val; DIGEST]> = (0..N_IN)
         .map(|i| {
             commit(
-                recipient_of(Val::from_u64(7 + i as u64)),
+                recipient_of(Val::from_u64(nks[i][0]), Val::from_u64(nks[i][1])),
                 Val::from_u64(in_values[i]),
                 Val::from_u64(11 + i as u64),
                 Val::from_u64(100 + i as u64),
@@ -740,7 +747,7 @@ pub fn demo_witness() -> Witness {
         .collect();
     let (_, paths) = build_paths(&cms);
     let inputs = core::array::from_fn(|i| Input {
-        nk: 7 + i as u64,
+        nk: nks[i],
         value: in_values[i],
         rho: Val::from_u64(11 + i as u64),
         rcm: Val::from_u64(100 + i as u64),
@@ -748,7 +755,7 @@ pub fn demo_witness() -> Witness {
         bits: paths[i].1,
     });
     let outputs = core::array::from_fn(|j| Output {
-        recipient: recipient_of(Val::from_u64(77 + j as u64)),
+        recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64)),
         value: [900u64, 500][j],
         rho: Val::from_u64(21 + j as u64),
         rcm: Val::from_u64(22 + j as u64),
@@ -858,12 +865,13 @@ mod tests {
     /// A valid 2-in/2-out witness whose two input commitments sit at positions 0 and 1 of a shared
     /// tree, balanced so Σin = Σout + fee.
     pub(crate) fn sample() -> Witness {
-        let in0 = (1000u64, 7u64, 11u64, 100u64); // value, nk, rho, rcm
-        let in1 = (500u64, 9u64, 13u64, 101u64);
-        let cm0 = commit(recipient_of(Val::from_u64(in0.1)), Val::from_u64(in0.0), Val::from_u64(in0.2), Val::from_u64(in0.3));
-        let cm1 = commit(recipient_of(Val::from_u64(in1.1)), Val::from_u64(in1.0), Val::from_u64(in1.2), Val::from_u64(in1.3));
-        let (_, paths) = build_paths(&[cm0, cm1]);
-        let mk_in = |v: (u64, u64, u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
+        let in0 = (1000u64, [7u64, 70u64], 11u64, 100u64); // value, nk(2), rho, rcm
+        let in1 = (500u64, [9u64, 90u64], 13u64, 101u64);
+        let cmf = |v: &(u64, [u64; 2], u64, u64)| {
+            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1])), Val::from_u64(v.0), Val::from_u64(v.2), Val::from_u64(v.3))
+        };
+        let (_, paths) = build_paths(&[cmf(&in0), cmf(&in1)]);
+        let mk_in = |v: (u64, [u64; 2], u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
             nk: v.1,
             value: v.0,
             rho: Val::from_u64(v.2),
@@ -873,8 +881,8 @@ mod tests {
         };
         let inputs = [mk_in(in0, &paths[0]), mk_in(in1, &paths[1])];
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77)), value: 900, rho: Val::from_u64(21), rcm: Val::from_u64(22) },
-            Output { recipient: recipient_of(Val::from_u64(88)), value: 500, rho: Val::from_u64(23), rcm: Val::from_u64(24) },
+            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7)), value: 900, rho: Val::from_u64(21), rcm: Val::from_u64(22) },
+            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8)), value: 500, rho: Val::from_u64(23), rcm: Val::from_u64(24) },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
         Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
@@ -916,10 +924,11 @@ mod tests {
 
     /// Build a balanced witness with the given input/output values + fee (computes Merkle paths).
     fn witness_with(in_values: [u64; N_IN], out_values: [u64; M_OUT], fee: u64) -> Witness {
+        let nk = |i: usize| [7 + i as u64, 700 + i as u64];
         let cms: Vec<[Val; DIGEST]> = (0..N_IN)
             .map(|i| {
                 commit(
-                    recipient_of(Val::from_u64(7 + i as u64)),
+                    recipient_of(Val::from_u64(nk(i)[0]), Val::from_u64(nk(i)[1])),
                     Val::from_u64(in_values[i]),
                     Val::from_u64(11 + i as u64),
                     Val::from_u64(100 + i as u64),
@@ -928,7 +937,7 @@ mod tests {
             .collect();
         let (_, paths) = build_paths(&cms);
         let inputs = core::array::from_fn(|i| Input {
-            nk: 7 + i as u64,
+            nk: nk(i),
             value: in_values[i],
             rho: Val::from_u64(11 + i as u64),
             rcm: Val::from_u64(100 + i as u64),
@@ -936,7 +945,7 @@ mod tests {
             bits: paths[i].1,
         });
         let outputs = core::array::from_fn(|j| Output {
-            recipient: recipient_of(Val::from_u64(77 + j as u64)),
+            recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64)),
             value: out_values[j],
             rho: Val::from_u64(21 + j as u64),
             rcm: Val::from_u64(22 + j as u64),
@@ -1038,12 +1047,11 @@ mod tests {
     #[test]
     fn distinct_positions_give_distinct_nullifiers() {
         // same note key/rho at different positions ⇒ different nullifiers (A1 prevents replay)
-        let nk = Val::from_u64(5);
+        let (nk0, nk1) = (Val::from_u64(5), Val::from_u64(50));
         let rho = Val::from_u64(6);
-        let mut b0 = [false; DEPTH];
+        let b0 = [false; DEPTH];
         let mut b1 = [false; DEPTH];
         b1[0] = true;
-        assert_ne!(nullifier(nk, rho, pos_of(&b0)), nullifier(nk, rho, pos_of(&b1)));
-        let _ = &mut b0;
+        assert_ne!(nullifier(nk0, nk1, rho, pos_of(&b0)), nullifier(nk0, nk1, rho, pos_of(&b1)));
     }
 }

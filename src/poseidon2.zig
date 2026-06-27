@@ -102,16 +102,16 @@ fn h(domain: u64, elems: []const Felt) Digest {
     return s[0..4].*;
 }
 
-pub fn recipient(nk: Felt) Digest {
-    return h(DOM_OWN, &.{nk});
+pub fn recipient(nk0: Felt, nk1: Felt) Digest {
+    return h(DOM_OWN, &.{ nk0, nk1 }); // 128-bit nullifier key
 }
 
 pub fn commitNote(rcp: Digest, value: Felt, rho: Felt, rcm: Felt) Digest {
     return h(DOM_CM, &.{ rcp[0], rcp[1], rcp[2], rcp[3], value, rho, rcm });
 }
 
-pub fn nullifierHash(nk: Felt, rho: Felt, pos: Felt) Digest {
-    return h(DOM_NF, &.{ nk, rho, pos });
+pub fn nullifierHash(nk0: Felt, nk1: Felt, rho: Felt, pos: Felt) Digest {
+    return h(DOM_NF, &.{ nk0, nk1, rho, pos });
 }
 
 /// 2-to-1 Merkle compression `H(l ‖ r)` (untagged, fills all 8 lanes).
@@ -140,9 +140,9 @@ test "poseidon2: permute matches the circuit (KAT)" {
 }
 
 test "poseidon2: domain-tagged hashes match the circuit (KAT)" {
-    const rcp = recipient(7);
-    try testing.expectEqual(Digest{ 8589660077463699964, 11582635494537579975, 10190216301124296143, 9714163045517615623 }, rcp);
-    try testing.expectEqual(Digest{ 6730853517235228475, 1266684377645747659, 4479287571394072201, 6692673690341164055 }, commitNote(rcp, 1000, 11, 100));
-    try testing.expectEqual(Digest{ 15628492033080938473, 14759299879303918046, 2950129383873080312, 7624848991607730880 }, nullifierHash(7, 11, 9));
+    const rcp = recipient(7, 70);
+    try testing.expectEqual(Digest{ 6469389008428325857, 2098789990759076109, 3483504872978708866, 10944715271802619590 }, rcp);
+    try testing.expectEqual(Digest{ 12586464260278947373, 4054173028709421847, 2337667059236436295, 12821985444102875151 }, commitNote(rcp, 1000, 11, 100));
+    try testing.expectEqual(Digest{ 898948081653809234, 11357996259474670558, 15311675036087494067, 11447551169066571571 }, nullifierHash(7, 70, 11, 9));
     try testing.expectEqual(Digest{ 15506260347376358782, 2994144798473533345, 1833939590059144543, 15204941819943812974 }, merge(.{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 }));
 }

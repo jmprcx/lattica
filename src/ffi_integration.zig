@@ -62,8 +62,8 @@ test "ffi integration: prove(rust) -> verify -> double-spend rejected" {
     try testing.expectEqual(@as(i32, 0), lattica_joinsplit_verify(proof_bytes.ptr, proof_bytes.len, pi_bytes.ptr, pi_bytes.len));
 
     // 3. C-03: the protocol's poseidon2 hashes equal the circuit's public inputs.
-    //    Demo input 0 is nk=7, rho=11 at tree position 0 ⇒ nf_0 = H(DOM_NF, 7, 11, 0), at pi[32..64].
-    const nf0 = poseidon2.digestBytes(poseidon2.nullifierHash(7, 11, 0));
+    //    Demo input 0 is nk=(7,700), rho=11 at position 0 ⇒ nf_0 = H(DOM_NF, 7, 700, 11, 0).
+    const nf0 = poseidon2.digestBytes(poseidon2.nullifierHash(7, 700, 11, 0));
     try testing.expectEqualSlices(u8, nf0[0..], pi_bytes[32..64]);
 
     // 4. Tampered public inputs are rejected.
