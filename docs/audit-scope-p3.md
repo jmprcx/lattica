@@ -6,10 +6,18 @@ checklist. Companion docs: `docs/soundness-budget.md` (C-04), `docs/plonky3-port
 circuit was built), `docs/remediation-status.md` (audit-finding tracker), `docs/audit-scope.md` (the
 older *Winterfell* reviewer guide — reference only; superseded by this for production).
 
-> **Status: NOT YET READY FOR AUDIT.** This document is the scope/threat artifact only. The circuit
-> still has open soundness items (§5) and is **1-in/1-out**, whereas the audited target is
-> **join-split N-in/M-out** (§6). The audit should run against the artifact described in §3/§6 once
-> §5 and §7 are complete.
+> **Status: circuit + integration ready for external review; two pre-audit caveats remain.** The
+> production circuit is the **join-split N-in/M-out** (§6), with the soundness fixes applied (A1–A4,
+> 128-bit `nk`) and the live protocol cut over to it (Poseidon2 on-chain hashing == circuit;
+> hidden-value node tx model; fail-closed, panic-isolated verifier). Two adversarial recheck passes
+> found + fixed real bugs (the ZK-blinding RNG; a node-layer `mint` inflation hole). **Before the
+> audit / any value-bearing use:** (1) the Zig node ↔ Rust prover/verifier integration is verified by
+> code review + the C harness, but the *in-node* real prove→verify path has not been executed on this
+> host (its linker can't link the Rust staticlib — see `ffi_integration.zig`); run it on a linking
+> host. (2) The documented launch limitations in §5 / `docs/protocol-v1-decisions.md` need explicit
+> auditor sign-off: `rho`/`rcm` are 64-bit in v1, and the proven soundness is ~103-bit (≈127-bit
+> conjectured). This PoC chain has no coinbase/issuance consensus, so `mint > 0` is rejected at the tx
+> layer.
 
 ## 1. Scope
 
