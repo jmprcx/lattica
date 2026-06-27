@@ -14,7 +14,7 @@
 //! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip via a
 //! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
-use lattica_prover_p3::{full_spend_air, joinsplit_air, poseidon2_air, spend_air};
+use lattica_prover_p3::{joinsplit_air, poseidon2_air, spend_air};
 
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
@@ -182,48 +182,7 @@ fn main() {
         }
     }
 
-    // M4c: the full spend statement (ownership, commitment, membership, nullifier, output,
-    // value-balance, range, tx-binding) in zero-knowledge.
-    let w = full_spend_air::Witness {
-        nk: 12345,
-        value: 1000,
-        rho: Val::new(7),
-        rcm: Val::new(9),
-        pos: Val::new(3),
-        sib: core::array::from_fn(|d| core::array::from_fn(|k| Val::new((d * 4 + k + 50) as u64))),
-        bits: core::array::from_fn(|d| d % 3 == 0),
-        out_recipient: core::array::from_fn(|i| Val::new(77 + i as u64)),
-        out_value: 600,
-        out_rho: Val::new(11),
-        out_rcm: Val::new(13),
-        fee: 400,
-        tx_binding: core::array::from_fn(|i| Val::new(0xABCDEF + i as u64)),
-    };
-    let t0 = std::time::Instant::now();
-    let proof = full_spend_air::prove_to_bytes(&w);
-    let prove_ms = t0.elapsed().as_millis();
-    let pis = full_spend_air::public_values(&w);
-    let t1 = std::time::Instant::now();
-    let ok = full_spend_air::verify_bytes(&proof, &pis);
-    let verify_ms = t1.elapsed().as_millis();
-    if !ok {
-        println!("  M4c full spend statement: FAILED");
-        std::process::exit(1);
-    }
-    println!(
-        "  M4c full spend (DEPTH={}, ZK): ACCEPTED | proof {} bytes, prove {} ms, verify {} ms",
-        full_spend_air::DEPTH,
-        proof.len(),
-        prove_ms,
-        verify_ms
-    );
-    let s = full_spend_air::security_report();
-    println!(
-        "  C-04 soundness: proven {} bits (UDR {}, LDR {}), conjectured FRI {} bits (capped ~127 by F_p2 / 128 collision)",
-        s.proven_bits, s.proven_udr_bits, s.proven_ldr_bits, s.conjectured_fri_bits
-    );
-
-    // Join-split (N-in/M-out) — the audit-target shape, with soundness fixes A1/A2/A3.
+    // Join-split (N-in/M-out) — the single production circuit, with soundness fixes A1/A2/A3.
     let (jbytes, jprove, jverify, jproven) = joinsplit_air::measure(&joinsplit_air::demo_witness());
     println!(
         "  join-split {}-in/{}-out (DEPTH={}, ZK): proof {} bytes, prove {} ms, verify {} ms, proven {} bits",

@@ -1,6 +1,6 @@
-//! Join-split (N-in / M-out) spend circuit — the audit-target shape, with the soundness fixes baked
-//! in (A1 position-consistency, A2 domain separation, A3 fee range-check). Built fresh; the 1-in/1-out
-//! `full_spend_air` is kept intact as the simpler reference.
+//! Join-split (N-in / M-out) spend circuit — the single production circuit (the audit target), with
+//! the soundness fixes baked in (A1 position-consistency, A2 domain separation, A3 value/fee/mint
+//! range-checks; 128-bit spend authority).
 //!
 //! This file (so far) is the **native oracle** + design — the statement computed in plain Rust, which
 //! pins the hash layouts, the nullifier/position binding, the multi-input membership to a shared

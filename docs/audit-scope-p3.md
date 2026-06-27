@@ -201,10 +201,13 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | ABI fuzz / adversarial tests (beyond fail-closed) | ❌ |
 | Threat model + scope + frozen params (this doc) | ✅ |
 | ZK blinding from a CSPRNG, fresh per proof | ✅ (`ChaCha20Rng`; re-randomization tested) |
-| Consolidate to ONE production circuit (drop/gate `full_spend_air` + its ABI) | ⏳ M6 cutover |
+| Consolidate to ONE production circuit (`full_spend_air` + spend ABI + bins removed) | ✅ joinsplit_air only |
 | Protocol completeness decisions (asset/keys/randomness/issuance) | ✅ (`docs/protocol-v1-decisions.md`) |
 | Mint (shielded issuance) in the circuit | ✅ (`Σin + mint = Σout + fee`, range-checked, ABI+ffi) |
-| C-03 live: on-chain hashing → Poseidon2 + node proof swap (M6) | ⏳ staged (see protocol-v1-decisions §M6) |
+| 128-bit spend authority (`nk` = 2 field elements) | ✅ (M6 §2a; found+fixed during cutover) |
+| C-03 live: on-chain hashing → Poseidon2 (== circuit) | ✅ (`tx`/`tree`/`primitives` → `poseidon2.zig`) |
+| Node verifies the join-split proof via the backend seam | ✅ (`node.zig`; production installs the Rust verifier) |
+| `lattica_joinsplit_prove` wallet-side prover ABI | ⏳ remaining (wallet currently uses the demo prover) |
 
 > **Self-review note (2026-06-26):** a recheck found the prover was seeding the hiding-PCS / Merkle
 > salt RNG with a *fixed* non-cryptographic `SmallRng` — so the "zero-knowledge" proofs were not
