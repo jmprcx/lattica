@@ -67,7 +67,10 @@ fn parse_joinsplit_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
 }
 
 /// C ABI: verify a serialized **join-split** proof against `JoinSplitPublicInputs` bytes.
-/// `0` accept / nonzero reject; fail-closed. See `lattica_spend_verify` for the conventions.
+/// `0` accept / nonzero reject; **fail-closed**: returns nonzero on null pointers, wrong public-input
+/// length, non-canonical limbs, malformed proof bytes, or any panic inside the proof system (a node
+/// accepts proofs from untrusted peers, so a panic must become a clean reject, never UB across the
+/// C boundary).
 ///
 /// # Safety
 /// `proof_ptr`/`pi_ptr` must point to `proof_len`/`pi_len` readable bytes (or be null).
@@ -87,7 +90,10 @@ pub unsafe extern "C" fn lattica_joinsplit_verify(
         Some(p) => p,
         None => return 1,
     };
-    if joinsplit_air::verify_bytes(proof, &pis) {
+    // Isolate any panic in deserialization / the STARK verifier (malformed-but-deserializable proofs
+    // from the network must not unwind across `extern "C"`).
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| joinsplit_air::verify_bytes(proof, &pis)));
+    if matches!(ok, Ok(true)) {
         0
     } else {
         1
@@ -362,6 +368,21 @@ mod tests {
             unsafe { lattica_joinsplit_verify(core::ptr::null(), 0, pib.as_ptr(), pib.len()) },
             0
         );
+        // tampered proof bytes (still postcard-shaped) → reject, and must not unwind across the ABI
+        let mut bad_proof = proof.clone();
+        bad_proof[proof.len() / 2] ^= 0xFF;
+        assert_ne!(
+            unsafe { lattica_joinsplit_verify(bad_proof.as_ptr(), bad_proof.len(), pib.as_ptr(), pib.len()) },
+            0
+        );
+        // garbage proof buffers of various lengths → reject, never panic (catch_unwind isolation)
+        for len in [0usize, 1, 31, 5000] {
+            const G: [u8; 5000] = [0xAB; 5000];
+            assert_ne!(
+                unsafe { lattica_joinsplit_verify(G.as_ptr(), len, pib.as_ptr(), pib.len()) },
+                0
+            );
+        }
     }
 
     #[test]
