@@ -34,7 +34,7 @@ fn push_digest(b: &[u8], out: &mut Vec<Goldilocks>) -> Option<()> {
 // --- join-split (N-in/M-out) C ABI -------------------------------------------------------------
 
 /// `JoinSplitPublicInputs` byte layout: anchor(32) ‖ N·nullifier(32) ‖ M·out_cm(32) ‖
-/// tx_binding(32) ‖ fee(8 LE). Each 32-byte field is a 4-element Goldilocks digest.
+/// tx_binding(32) ‖ fee(8 LE) ‖ mint(8 LE). Each 32-byte field is a 4-element Goldilocks digest.
 const JS_PUBLIC_INPUTS_LEN: usize =
     DIGEST_BYTES * (2 + joinsplit_air::N_IN + joinsplit_air::M_OUT) + 8 + 8; // … ‖ fee(8) ‖ mint(8)
 
