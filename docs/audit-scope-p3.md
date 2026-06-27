@@ -171,10 +171,12 @@ pads to the fixed 2-in/2-out shape with zero-value notes (a dummy input is a zer
 spender owns; balance and range are unaffected). Tested (`dummy_notes_pad_smaller_transactions`). A
 variable-shape circuit is only needed if more than 2-in/2-out is required.
 
-**Remaining for the audited artifact:** the C-03 protocol-side hash match (§5) + shared KATs + the
-end-to-end FFI test. The join-split **C ABI + byte layout** is done (`lattica_joinsplit_verify`,
-round-trip tested; `ffi.zig::JoinSplitPublicInputs`); the **constraint-accounting self-audit** is done
-(`docs/joinsplit-constraint-audit.md`).
+**Remaining for the audited artifact:** only the **C-03 protocol note-model swap** (migrate the
+`Note` model + Merkle tree off SHA3 onto `poseidon2.zig` — protocol-wide, lands with the M6 node
+cutover; §5). Everything else is done: join-split **C ABI + byte layout**
+(`lattica_joinsplit_verify`, round-trip tested), the **shared KATs** + Zig hash match
+(`poseidon2.zig`), the **end-to-end FFI test** (`tests/ffi_integration.c`: prove→verify→tamper→
+double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-constraint-audit.md`).
 
 ## 7. Pre-audit readiness checklist
 
@@ -193,7 +195,7 @@ round-trip tested; `ffi.zig::JoinSplitPublicInputs`); the **constraint-accountin
 | **Join-split C ABI + byte layout** | ✅ (`lattica_joinsplit_verify` + `ffi.zig::JoinSplitPublicInputs`) |
 | **C-03 hash match: Zig Poseidon2 == circuit + KATs** | ✅ (`src/poseidon2.zig`) |
 | **C-03 protocol note-model swap (tx/tree off SHA3)** | ⏳ M6 cutover (protocol-wide) |
-| **End-to-end FFI integration test** (Zig: mint→prove→verify→double-spend) | ❌ |
+| **End-to-end FFI integration test** (prove→verify→tamper→double-spend) | ✅ (`tests/ffi_integration.c`, verified; Zig `test-ffi` ready) |
 | **Constraint-accounting self-audit** (every column/constraint, no vacuous binding) | ✅ (`docs/joinsplit-constraint-audit.md`) |
 | **Variable (N,M) via dummy notes** | ✅ (tested) |
 | ABI fuzz / adversarial tests (beyond fail-closed) | ❌ |

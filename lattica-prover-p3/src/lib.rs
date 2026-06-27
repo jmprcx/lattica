@@ -166,6 +166,38 @@ pub unsafe extern "C" fn lattica_joinsplit_verify(
     }
 }
 
+/// C ABI: prove the fixed demo join-split witness and write the proof + the `JoinSplitPublicInputs`
+/// bytes into the caller's buffers. For the end-to-end FFI integration test (prove in Rust, verify
+/// across the ABI). Returns 0 on success, 1 on encode failure, 2 if a buffer is too small.
+///
+/// # Safety
+/// The four pointers must be valid; `*_out` must point to `*_cap` writable bytes; the `len` pointers
+/// must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn lattica_joinsplit_prove_demo(
+    proof_out: *mut u8,
+    proof_cap: usize,
+    proof_len: *mut usize,
+    pi_out: *mut u8,
+    pi_cap: usize,
+    pi_len: *mut usize,
+) -> i32 {
+    let w = joinsplit_air::demo_witness();
+    let proof = joinsplit_air::prove_to_bytes(&w);
+    let pib = match encode_joinsplit_public_inputs(&joinsplit_air::public_values(&w)) {
+        Some(b) => b,
+        None => return 1,
+    };
+    if proof.len() > proof_cap || pib.len() > pi_cap {
+        return 2;
+    }
+    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
+    *proof_len = proof.len();
+    core::ptr::copy_nonoverlapping(pib.as_ptr(), pi_out, pib.len());
+    *pi_len = pib.len();
+    0
+}
+
 /// Encode the circuit's join-split public-input vector into the `JoinSplitPublicInputs` byte layout
 /// (inverse of `parse_joinsplit_public_inputs`). Used by tests and the node/wallet glue.
 pub fn encode_joinsplit_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {

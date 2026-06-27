@@ -36,4 +36,20 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run all unit + integration tests");
     test_step.dependOn(&run_tests.step);
+
+    // End-to-end FFI integration test: links the prebuilt Rust prover staticlib.
+    // Build it first: `cd lattica-prover-p3 && cargo build --release`.
+    const ffi_it_mod = b.createModule(.{
+        .root_source_file = b.path("src/ffi_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ffi_it_mod.addObjectFile(b.path("lattica-prover-p3/target/release/liblattica_prover_p3.a"));
+    ffi_it_mod.linkSystemLibrary("unwind", .{});
+    const ffi_it = b.addTest(.{ .root_module = ffi_it_mod });
+    ffi_it.use_lld = true; // self-hosted ELF linker can't handle crt1.o's .sframe (gcc 16); use LLD
+    const run_ffi_it = b.addRunArtifact(ffi_it);
+    const ffi_step = b.step("test-ffi", "FFI integration test (run cargo build --release in lattica-prover-p3 first)");
+    ffi_step.dependOn(&run_ffi_it.step);
 }

@@ -136,8 +136,12 @@ counts below are historical, from the iteration that added each piece.)
   nullifier-derivation argument written.
 - ✅ **Join-split (N-in/M-out) landed** (decided 2026-06-26): `joinsplit_air`, fixed 2-in/2-out,
   `DEPTH=32`, proof ~444 KB, prove ~8.3 s, verify ~24 ms, proven 103-bit, 12/12 tests (34 crate-wide).
-- ❌ **Remaining:** join-split C ABI + byte layout; C-03 protocol↔circuit hash match + shared KATs;
-  end-to-end FFI test; constraint-accounting self-audit; (variable `(N,M)` if needed).
+- ✅ **C ABI + byte layout** (`lattica_joinsplit_verify`), **constraint self-audit**
+  (`docs/joinsplit-constraint-audit.md`), **variable (N,M)** via dummy notes, **C-03 hash match in
+  Zig** (`src/poseidon2.zig`, KAT-equal to the circuit), and the **end-to-end FFI test**
+  (`lattica-prover-p3/tests/ffi_integration.c`: prove→verify→tamper→double-spend, verified).
+- ⏳ **Remaining: C-03 protocol note-model swap** (migrate `tx.zig`/`tree.zig` off SHA3 onto
+  `poseidon2.zig`) — protocol-wide, lands with the **M6 node cutover**. Then the Phase-3 audit.
 
 Then **Phase 3** (external audit of the circuit + protocol + FFI glue) gates value-bearing use; none
 of the audit's 8 release gates are met yet.
