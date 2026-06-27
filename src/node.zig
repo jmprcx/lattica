@@ -11,6 +11,7 @@ const p = @import("primitives.zig");
 const tree = @import("tree.zig");
 const tx = @import("tx.zig");
 const circuit = @import("circuit.zig");
+const ffi = @import("ffi.zig");
 const Hash32 = p.Hash32;
 
 const TX_DOMAIN: []const u8 = "lattica:v1:tx-digest";
@@ -52,8 +53,29 @@ pub const ShieldedTx = struct {
     spends: []Spend,
     outputs: []Output,
     fee: u64,
+    /// Public issuance amount (0 for a normal transfer; > 0 only for a coinbase). Bound into the
+    /// join-split balance `Σin + mint = Σout + fee`.
+    mint: u64 = 0,
+    /// The join-split zero-knowledge proof (the production authorization). Empty pre-cutover.
+    proof: []const u8 = &.{},
     binding_pk: [p.PK_LEN]u8,
     binding_sig: [p.SIG_LEN]u8,
+
+    /// Reconstruct the join-split public statement from the transaction body, padded to the
+    /// circuit's fixed `(N_IN, M_OUT)` shape. The verifier can never disagree with the body because
+    /// the node derives these — not the prover.
+    pub fn joinSplitPublicInputs(self: ShieldedTx) ffi.JoinSplitPublicInputs {
+        var pi = std.mem.zeroes(ffi.JoinSplitPublicInputs);
+        if (self.spends.len > 0) pi.anchor = self.spends[0].anchor;
+        var i: usize = 0;
+        while (i < self.spends.len and i < ffi.JOINSPLIT_N_IN) : (i += 1) pi.nullifiers[i] = self.spends[i].nullifier;
+        var j: usize = 0;
+        while (j < self.outputs.len and j < ffi.JOINSPLIT_M_OUT) : (j += 1) pi.out_cms[j] = self.outputs[j].note.cm;
+        pi.fee = self.fee;
+        pi.mint = self.mint;
+        pi.tx_binding = self.digest();
+        return pi;
+    }
 
     /// Canonical 32-byte digest of everything except the binding signature.
     pub fn digest(self: ShieldedTx) Hash32 {
@@ -242,7 +264,18 @@ pub const Chain = struct {
             if (self.nullifiers.contains(s.nullifier)) return TxError.DoubleSpend;
             const gop = seen.getOrPut(s.nullifier) catch return TxError.Internal;
             if (gop.found_existing) return TxError.DoubleSpend;
-            if (!circuit.verifyAuthorization(s.auth)) return TxError.BadAuthProof;
+        }
+
+        // 2b. Authorization. Production wires the Rust `lattica_joinsplit_verify` via
+        //     `ffi.setJoinSplitBackend`: the join-split proof must verify against the public
+        //     statement the node reconstructs from the tx body — binding ownership, membership under
+        //     a known anchor, nullifier correctness, and the value balance in zero-knowledge (its
+        //     tx_binding == the tx digest, so outputs can't be swapped). With no backend installed
+        //     the node is pre-cutover and falls back to the old per-spend generic-preimage proof.
+        if (ffi.hasJoinSplitBackend()) {
+            if (!ffi.verifyJoinSplit(t.proof, t.joinSplitPublicInputs())) return TxError.BadAuthProof;
+        } else {
+            for (t.spends) |s| if (!circuit.verifyAuthorization(s.auth)) return TxError.BadAuthProof;
         }
 
         // 3. Value balance: inputs == outputs + fee. Checked sums — a malicious tx must not be
@@ -355,6 +388,37 @@ test "value overflow rejected (checked arithmetic)" {
     const dg = t.digest();
     t.binding_sig = try alice.sig.sign(&dg);
     try testing.expectError(TxError.ValueOverflow, chain.verifyAndApply(t));
+}
+
+fn acceptJoinSplit(_: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) i32 {
+    return 0;
+}
+fn rejectJoinSplit(_: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) i32 {
+    return 1;
+}
+
+test "node enforces the join-split proof when a backend is installed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    const minted = try chain.mint(alice.address(), 1000, [_]u8{11} ** 32);
+    const path = try chain.merklePath(a, minted.pos);
+    const t = try buildTransfer(a, alice, minted.note, minted.pos, path, chain.anchor(), bob.address(), 900, 100);
+
+    // A rejecting verifier backend ⇒ the join-split proof check fails (no state mutated, so we can
+    // retry the same tx afterwards).
+    ffi.setJoinSplitBackend(&rejectJoinSplit);
+    try testing.expectError(TxError.BadAuthProof, chain.verifyAndApply(t));
+    ffi.clearJoinSplitBackend();
+
+    // An accepting backend ⇒ the tx applies; the replay is still a double-spend.
+    ffi.setJoinSplitBackend(&acceptJoinSplit);
+    defer ffi.clearJoinSplitBackend();
+    try chain.verifyAndApply(t);
+    try testing.expectError(TxError.DoubleSpend, chain.verifyAndApply(t));
 }
 
 test "unknown anchor rejected" {

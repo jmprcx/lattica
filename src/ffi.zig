@@ -118,6 +118,16 @@ pub fn setJoinSplitBackend(f: VerifyFn) void {
     joinsplit_backend = f;
 }
 
+/// Whether a join-split verifier backend is installed (production installs the Rust verifier at
+/// startup; without one the node is in pre-cutover mode and relies on its native checks).
+pub fn hasJoinSplitBackend() bool {
+    return joinsplit_backend != null;
+}
+
+pub fn clearJoinSplitBackend() void {
+    joinsplit_backend = null;
+}
+
 /// Verify a join-split proof against its public inputs. Fail-closed (no backend ⇒ reject).
 pub fn verifyJoinSplit(proof: []const u8, pi: JoinSplitPublicInputs) bool {
     const f = joinsplit_backend orelse return false;
