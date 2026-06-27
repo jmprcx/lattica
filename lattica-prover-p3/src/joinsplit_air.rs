@@ -69,17 +69,28 @@ pub fn recipient_of(nk0: Val, nk1: Val) -> [Val; DIGEST] {
     h(DOM_OWN, &[nk0, nk1]) // 128-bit nullifier key ⇒ 128-bit spend authority
 }
 
-pub fn commit(recipient: [Val; DIGEST], value: Val, rho: Val, rcm: Val) -> [Val; DIGEST] {
-    let mut e = [Val::ZERO; 7];
-    e[..DIGEST].copy_from_slice(&recipient);
-    e[DIGEST] = value;
-    e[DIGEST + 1] = rho;
-    e[DIGEST + 2] = rcm;
-    h(DOM_CM, &e)
+/// Two-permutation (128-bit-randomness) commitment:
+///   H1 = perm([DOM_CM, recipient(4), value, rho0, rho1])     (8 lanes, full)
+///   cm = perm([H1(4), rcm0, rcm1, 0, 0])                      (Merkle-Damgård chain)
+/// rho/rcm are each two field elements ⇒ 128-bit note randomness + hiding (vs 64-bit before). The
+/// second block is merge-shaped; the chaining value (256-bit) gives 128-bit collision resistance.
+pub fn commit(recipient: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2]) -> [Val; DIGEST] {
+    let mut a = [Val::ZERO; W];
+    a[0] = Val::from_u64(DOM_CM);
+    a[1..1 + DIGEST].copy_from_slice(&recipient);
+    a[1 + DIGEST] = value;
+    a[1 + DIGEST + 1] = rho[0];
+    a[1 + DIGEST + 2] = rho[1];
+    let chain = native_permute(a);
+    let mut b = [Val::ZERO; W];
+    b[..DIGEST].copy_from_slice(&chain[..DIGEST]);
+    b[DIGEST] = rcm[0];
+    b[DIGEST + 1] = rcm[1];
+    native_permute(b)[..DIGEST].try_into().unwrap()
 }
 
-pub fn nullifier(nk0: Val, nk1: Val, rho: Val, pos: Val) -> [Val; DIGEST] {
-    h(DOM_NF, &[nk0, nk1, rho, pos])
+pub fn nullifier(nk0: Val, nk1: Val, rho: [Val; 2], pos: Val) -> [Val; DIGEST] {
+    h(DOM_NF, &[nk0, nk1, rho[0], rho[1], pos])
 }
 
 /// Untagged 2-to-1 Merkle compression `H(l ‖ r)` (fills all 8 lanes).
@@ -112,8 +123,8 @@ pub fn fold(leaf: [Val; DIGEST], sib: &[[Val; DIGEST]; DEPTH], bits: &[bool; DEP
 pub struct Input {
     pub nk: [u64; 2], // 128-bit nullifier key / spend authority
     pub value: u64,
-    pub rho: Val,
-    pub rcm: Val,
+    pub rho: [Val; 2], // 128-bit note randomness
+    pub rcm: [Val; 2], // 128-bit commitment trapdoor
     pub sib: [[Val; DIGEST]; DEPTH],
     pub bits: [bool; DEPTH],
 }
@@ -122,8 +133,8 @@ pub struct Input {
 pub struct Output {
     pub recipient: [Val; DIGEST],
     pub value: u64,
-    pub rho: Val,
-    pub rcm: Val,
+    pub rho: [Val; 2],
+    pub rcm: [Val; 2],
 }
 
 #[derive(Clone)]
@@ -178,8 +189,8 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
 // per-instance public bindings. Built incrementally; each stage differential-tested vs the oracle.
 // ==============================================================================================
 
-const SPAN_BLOCKS: usize = 3 + DEPTH; // ownership, commitment, DEPTH merges, nullifier
-const OUT_BLOCKS: usize = 2; // out_cm perm + range overflow (BITS > 32 ⇒ 2 blocks)
+const SPAN_BLOCKS: usize = 4 + DEPTH; // ownership, commit_a, commit_b, DEPTH merges, nullifier
+const OUT_BLOCKS: usize = 2; // out_cm perm_a + perm_b (2-permutation commitment; also 64 rows for the value range)
 const FEE_BLOCKS: usize = 2; // fee binding + range
 const MINT_BLOCKS: usize = 2; // mint (issuance) binding + range
 const USED_BLOCKS: usize = N_IN * SPAN_BLOCKS + M_OUT * OUT_BLOCKS + FEE_BLOCKS + MINT_BLOCKS;
@@ -189,35 +200,39 @@ const HEIGHT: usize = NUM_BLOCKS * BLOCK;
 // columns
 const BIT: usize = 8; // membership position bit
 const NK: usize = 9; // local-persistent within an input span
-const RHO: usize = 10;
+const RHO: usize = 10; // rho limb 0 (local-persistent)
 const VAL: usize = 11; // value within input / output / fee / mint region
 const POSACC: usize = 12; // Σ bit_d·2^d within an input's membership (A1)
 const VALACC: usize = 13; // global balance accumulator: +in +mint −out −fee ⇒ 0
 const REM: usize = 14; // range running remainder
 const RBIT: usize = 15;
 const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
-const WIDTH: usize = 17;
+const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
+const WIDTH: usize = 18;
 
-// periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors
+// periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
+// The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
 const P_OWN_IN: usize = 11;
-const P_RECIP_LINK: usize = 12;
-const P_COMMIT_IN: usize = 13;
-const P_MEM_LINK: usize = 14;
-const P_POS_COEFF: usize = 15; // 2^d at each membership link
-const P_ROOT: usize = 16;
-const P_NULL_IN: usize = 17;
-const P_OUT_IN: usize = 18;
-const P_FEE_IN: usize = 19;
-const P_MINT_IN: usize = 20; // issuance amount binding row
-const P_REGION_LAST: usize = 21; // last row of each region (gates local-persistent columns)
-const P_RANGE_SEED: usize = 22; // rem = VAL (each value's first range row)
-const P_RANGE_ACTIVE: usize = 23; // decomposition rows
-const P_RANGE_CLOSE: usize = 24; // rem = 0 (value < 2^BITS)
-const P_ROW0: usize = 25; // VALACC = 0
-const P_FINAL: usize = 26; // VALACC = 0 (balance)
-const P_NULLOUT: usize = 27; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 27 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 27 + N_IN + M_OUT;
+const P_RECIP_LINK: usize = 12; // own.out -> commit_a.in recipient lanes
+const P_COMMIT_A_IN: usize = 13; // input commit_a: DOM_CM, value, rho0, rho1
+const P_CHAIN_LINK: usize = 14; // commit_a.out -> commit_b.in[0..4] (input & output commitments)
+const P_COMMIT_B: usize = 15; // commit_b.in pad lanes = 0 (input & output commitments)
+const P_MEM_LINK: usize = 16;
+const P_POS_COEFF: usize = 17; // 2^d at each membership link
+const P_ROOT: usize = 18;
+const P_NULL_IN: usize = 19;
+const P_OUT_A_IN: usize = 20; // output out_a: DOM_CM, out_value
+const P_FEE_IN: usize = 21;
+const P_MINT_IN: usize = 22; // issuance amount binding row
+const P_REGION_LAST: usize = 23; // last row of each region (gates local-persistent columns)
+const P_RANGE_SEED: usize = 24; // rem = VAL (each value's first range row)
+const P_RANGE_ACTIVE: usize = 25; // decomposition rows
+const P_RANGE_CLOSE: usize = 26; // rem = 0 (value < 2^BITS)
+const P_ROW0: usize = 27; // VALACC = 0
+const P_FINAL: usize = 28; // VALACC = 0 (balance)
+const P_NULLOUT: usize = 29; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 29 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 29 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
 const PI_ANCHOR: usize = 0;
@@ -237,14 +252,20 @@ const fn own_in_row(i: usize) -> usize {
 const fn own_out_row(i: usize) -> usize {
     input_base(i) * BLOCK + BLOCK - 1
 }
-const fn commit_in_row(i: usize) -> usize {
+const fn commit_a_in_row(i: usize) -> usize {
     (input_base(i) + 1) * BLOCK
 }
+const fn commit_a_out_row(i: usize) -> usize {
+    (input_base(i) + 1) * BLOCK + BLOCK - 1
+}
+const fn commit_b_in_row(i: usize) -> usize {
+    (input_base(i) + 2) * BLOCK
+}
 const fn root_row(i: usize) -> usize {
-    (input_base(i) + 1 + DEPTH) * BLOCK + BLOCK - 1
+    (input_base(i) + 2 + DEPTH) * BLOCK + BLOCK - 1
 }
 const fn null_block(i: usize) -> usize {
-    input_base(i) + 2 + DEPTH
+    input_base(i) + 3 + DEPTH
 }
 const fn null_in_row(i: usize) -> usize {
     null_block(i) * BLOCK
@@ -256,10 +277,16 @@ const fn out_base(j: usize) -> usize {
     N_IN * SPAN_BLOCKS + j * OUT_BLOCKS
 }
 const fn out_in_row(j: usize) -> usize {
-    out_base(j) * BLOCK
+    out_base(j) * BLOCK // out_a input (DOM_CM, recipient, value, rho0, rho1); value-range seed
+}
+const fn out_a_out_row(j: usize) -> usize {
+    out_base(j) * BLOCK + BLOCK - 1
+}
+const fn out_b_in_row(j: usize) -> usize {
+    (out_base(j) + 1) * BLOCK
 }
 const fn out_out_row(j: usize) -> usize {
-    out_base(j) * BLOCK + BLOCK - 1
+    (out_base(j) + 1) * BLOCK + BLOCK - 1 // out_b output = public out_cm_j
 }
 const fn fee_base() -> usize {
     N_IN * SPAN_BLOCKS + M_OUT * OUT_BLOCKS
@@ -285,28 +312,34 @@ fn one_hot(rows: &[usize]) -> Vec<Val> {
 fn periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic_table(); // 11 round-schedule columns, period 32
     let own_in: Vec<usize> = (0..N_IN).map(own_in_row).collect();
-    let recip: Vec<usize> = (0..N_IN).map(own_out_row).collect(); // own output → commit input
-    let commit_in: Vec<usize> = (0..N_IN).map(commit_in_row).collect();
-    // membership links + the 2^d position coefficient at each link (A1).
+    let recip: Vec<usize> = (0..N_IN).map(own_out_row).collect(); // own output → commit_a recipient
+    let commit_a_in: Vec<usize> = (0..N_IN).map(commit_a_in_row).collect();
+    // chain links: commit_a.out → commit_b.in (inputs) and out_a.out → out_b.in (outputs)
+    let mut chain_link: Vec<usize> = (0..N_IN).map(commit_a_out_row).collect();
+    chain_link.extend((0..M_OUT).map(out_a_out_row));
+    // commit_b input rows (inputs & outputs): the pad lanes (6,7) are constrained to 0
+    let mut commit_b: Vec<usize> = (0..N_IN).map(commit_b_in_row).collect();
+    commit_b.extend((0..M_OUT).map(out_b_in_row));
+    // membership links + the 2^d position coefficient at each link (A1). Leaf = commit_b output.
     let mut mem: Vec<usize> = Vec::new();
     let mut pos_coeff = vec![Val::ZERO; HEIGHT];
     for i in 0..N_IN {
         for d in 0..DEPTH {
-            let row = (input_base(i) + 1 + d) * BLOCK + BLOCK - 1;
+            let row = (input_base(i) + 2 + d) * BLOCK + BLOCK - 1;
             mem.push(row);
             pos_coeff[row] = Val::from_u64(1u64 << d);
         }
     }
     let root: Vec<usize> = (0..N_IN).map(root_row).collect();
     let null_in: Vec<usize> = (0..N_IN).map(null_in_row).collect();
-    let out_in: Vec<usize> = (0..M_OUT).map(out_in_row).collect();
+    let out_a_in: Vec<usize> = (0..M_OUT).map(out_in_row).collect();
     // region-last rows (gate local-persistent columns at region boundaries)
     let mut region_last: Vec<usize> = (0..N_IN).map(null_out_row).collect();
     region_last.extend((0..M_OUT).map(|j| out_in_row(j) + OUT_BLOCKS * BLOCK - 1));
     region_last.push(fee_in_row() + FEE_BLOCKS * BLOCK - 1);
     region_last.push(mint_in_row() + MINT_BLOCKS * BLOCK - 1);
-    // range windows: one per value (each input value, output value, the fee, and the mint)
-    let mut seeds: Vec<usize> = (0..N_IN).map(commit_in_row).collect();
+    // range windows: one per value (each input value at commit_a, output value at out_a, fee, mint)
+    let mut seeds: Vec<usize> = (0..N_IN).map(commit_a_in_row).collect();
     seeds.extend((0..M_OUT).map(out_in_row));
     seeds.push(fee_in_row());
     seeds.push(mint_in_row());
@@ -319,12 +352,14 @@ fn periodic() -> Vec<Vec<Val>> {
 
     cols.push(one_hot(&own_in)); // P_OWN_IN
     cols.push(one_hot(&recip)); // P_RECIP_LINK
-    cols.push(one_hot(&commit_in)); // P_COMMIT_IN
+    cols.push(one_hot(&commit_a_in)); // P_COMMIT_A_IN
+    cols.push(one_hot(&chain_link)); // P_CHAIN_LINK
+    cols.push(one_hot(&commit_b)); // P_COMMIT_B
     cols.push(one_hot(&mem)); // P_MEM_LINK
     cols.push(pos_coeff); // P_POS_COEFF
     cols.push(one_hot(&root)); // P_ROOT
     cols.push(one_hot(&null_in)); // P_NULL_IN
-    cols.push(one_hot(&out_in)); // P_OUT_IN
+    cols.push(one_hot(&out_a_in)); // P_OUT_A_IN
     cols.push(one_hot(&[fee_in_row()])); // P_FEE_IN
     cols.push(one_hot(&[mint_in_row()])); // P_MINT_IN
     cols.push(one_hot(&region_last)); // P_REGION_LAST
@@ -407,7 +442,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
 
         // ---- global value accumulator: +in (commit), −out, −fee ⇒ 0 ----
         builder.assert_zero(p[P_ROW0].clone() * cur[VALACC].clone());
-        let acc_delta = (p[P_COMMIT_IN].clone() + p[P_MINT_IN].clone() - p[P_OUT_IN].clone() - p[P_FEE_IN].clone())
+        let acc_delta = (p[P_COMMIT_A_IN].clone() + p[P_MINT_IN].clone() - p[P_OUT_A_IN].clone() - p[P_FEE_IN].clone())
             * cur[VAL].clone();
         builder.when_transition().assert_zero(nxt[VALACC].clone() - cur[VALACC].clone() - acc_delta);
         builder.assert_zero(p[P_FINAL].clone() * cur[VALACC].clone()); // balance: Σin = Σout + fee
@@ -436,13 +471,25 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
             builder.when_transition().assert_zero(rl.clone() * (nxt[1 + k].clone() - cur[k].clone()));
         }
 
-        // ---- commitment input: [DOM_CM, recipient(link), value, rho, rcm(free)] ----
-        let ci = p[P_COMMIT_IN].clone();
-        builder.assert_zero(ci.clone() * (cur[0].clone() - dom_cm.clone()));
-        builder.assert_zero(ci.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // value (lane 5)
-        builder.assert_zero(ci.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone())); // rho   (lane 6)
+        // ---- commit_a input: [DOM_CM, recipient(link), value, rho0, rho1] ----
+        let ca = p[P_COMMIT_A_IN].clone();
+        builder.assert_zero(ca.clone() * (cur[0].clone() - dom_cm.clone()));
+        builder.assert_zero(ca.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // value (lane 5)
+        builder.assert_zero(ca.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone())); // rho0  (lane 6)
+        builder.assert_zero(ca.clone() * (cur[3 + DIGEST].clone() - cur[RHO1].clone())); // rho1 (lane 7)
 
-        // ---- membership links: place running digest by the bit (general position) ----
+        // ---- chain link: commit_b.in[0..4] = commit_a.out[0..4] (also out_b ← out_a) ----
+        let cl = p[P_CHAIN_LINK].clone();
+        for k in 0..DIGEST {
+            builder.when_transition().assert_zero(cl.clone() * (nxt[k].clone() - cur[k].clone()));
+        }
+
+        // ---- commit_b input: [chain(4), rcm0, rcm1, 0, 0] — pad lanes 6,7 pinned to 0 (rcm free) ----
+        let cb = p[P_COMMIT_B].clone();
+        builder.assert_zero(cb.clone() * cur[DIGEST + 2].clone()); // lane 6
+        builder.assert_zero(cb.clone() * cur[DIGEST + 3].clone()); // lane 7
+
+        // ---- membership links: place running digest (= commit_b output) by the bit ----
         let ml = p[P_MEM_LINK].clone();
         for k in 0..DIGEST {
             let placed = (one.clone() - bit.clone()) * (nxt[k].clone() - cur[k].clone())
@@ -457,14 +504,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
             builder.assert_zero(pr.clone() * (cur[k].clone() - pis[PI_ANCHOR + k].clone()));
         }
 
-        // ---- nullifier input: [DOM_NF, nk0, nk1, rho, pos_acc, 0,0,0] (A1: pos = pos_acc) ----
+        // ---- nullifier input: [DOM_NF, nk0, nk1, rho0, rho1, pos_acc, 0, 0] (A1: pos = pos_acc) ----
         let ni = p[P_NULL_IN].clone();
         builder.assert_zero(ni.clone() * (cur[0].clone() - dom_nf.clone()));
         builder.assert_zero(ni.clone() * (cur[1].clone() - cur[NK].clone()));
         builder.assert_zero(ni.clone() * (cur[2].clone() - cur[NK1].clone()));
         builder.assert_zero(ni.clone() * (cur[3].clone() - cur[RHO].clone()));
-        builder.assert_zero(ni.clone() * (cur[4].clone() - cur[POSACC].clone()));
-        for i in 5..8 {
+        builder.assert_zero(ni.clone() * (cur[4].clone() - cur[RHO1].clone()));
+        builder.assert_zero(ni.clone() * (cur[5].clone() - cur[POSACC].clone()));
+        for i in 6..8 {
             builder.assert_zero(ni.clone() * cur[i].clone());
         }
         // ---- nullifier output: per-input public nf_i ----
@@ -475,11 +523,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
             }
         }
 
-        // ---- output-commitment input: [DOM_CM, out_recipient(free), out_value, out_rho/rcm(free)] ----
-        let oi = p[P_OUT_IN].clone();
-        builder.assert_zero(oi.clone() * (cur[0].clone() - dom_cm.clone()));
-        builder.assert_zero(oi.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // out_value (lane 5)
-        // ---- output-commitment output: per-output public out_cm_j ----
+        // ---- output commit_a: [DOM_CM, out_recipient(free), out_value, out_rho0/1(free)] ----
+        // (out_b chain-link + pad lanes are covered by P_CHAIN_LINK / P_COMMIT_B above.)
+        let oa = p[P_OUT_A_IN].clone();
+        builder.assert_zero(oa.clone() * (cur[0].clone() - dom_cm.clone()));
+        builder.assert_zero(oa.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // out_value (lane 5)
+        // ---- output-commitment output (out_b): per-output public out_cm_j ----
         for j in 0..M_OUT {
             let sel = p[P_OUTOUT + j].clone();
             for k in 0..DIGEST {
@@ -573,43 +622,53 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         own[2] = nk1;
         set_block(&mut t, base, own);
         let recipient = recipient_of(nk0, nk1);
-        let mut cin = [Val::ZERO; 8];
-        cin[0] = Val::from_u64(DOM_CM);
-        cin[1..1 + DIGEST].copy_from_slice(&recipient);
-        cin[1 + DIGEST] = value;
-        cin[1 + DIGEST + 1] = inp.rho;
-        cin[1 + DIGEST + 2] = inp.rcm;
-        set_block(&mut t, base + 1, cin);
-        let mut node = commit(recipient, value, inp.rho, inp.rcm);
+        // commit_a: H1 = perm([DOM_CM, recipient(4), value, rho0, rho1]); its digest is the chain.
+        let mut a = [Val::ZERO; 8];
+        a[0] = Val::from_u64(DOM_CM);
+        a[1..1 + DIGEST].copy_from_slice(&recipient);
+        a[1 + DIGEST] = value;
+        a[1 + DIGEST + 1] = inp.rho[0];
+        a[1 + DIGEST + 2] = inp.rho[1];
+        set_block(&mut t, base + 1, a);
+        let chain = native_permute(a);
+        // commit_b: cm = perm([chain(4), rcm0, rcm1, 0, 0]).
+        let mut b = [Val::ZERO; 8];
+        b[..DIGEST].copy_from_slice(&chain[..DIGEST]);
+        b[DIGEST] = inp.rcm[0];
+        b[DIGEST + 1] = inp.rcm[1];
+        set_block(&mut t, base + 2, b);
+        let mut node = commit(recipient, value, inp.rho, inp.rcm); // = perm(b)[..DIGEST]
         for d in 0..DEPTH {
             let (l, r) = if inp.bits[d] { (inp.sib[d], node) } else { (node, inp.sib[d]) };
             let mut min = [Val::ZERO; 8];
             min[..DIGEST].copy_from_slice(&l);
             min[DIGEST..].copy_from_slice(&r);
-            set_block(&mut t, base + 2 + d, min);
-            t[((base + 2 + d) * BLOCK) * WIDTH + BIT] = if inp.bits[d] { Val::ONE } else { Val::ZERO };
+            set_block(&mut t, base + 3 + d, min);
+            t[((base + 3 + d) * BLOCK) * WIDTH + BIT] = if inp.bits[d] { Val::ONE } else { Val::ZERO };
             node = merge(l, r);
         }
-        // nullifier block: [DOM_NF, nk0, nk1, rho, pos, 0,0,0]
+        // nullifier block: [DOM_NF, nk0, nk1, rho0, rho1, pos, 0, 0]
         let pos = pos_of(&inp.bits);
         let mut nin = [Val::ZERO; 8];
         nin[0] = Val::from_u64(DOM_NF);
         nin[1] = nk0;
         nin[2] = nk1;
-        nin[3] = inp.rho;
-        nin[4] = pos;
+        nin[3] = inp.rho[0];
+        nin[4] = inp.rho[1];
+        nin[5] = pos;
         set_block(&mut t, null_block(i), nin);
         // local-persistent nk/rho/value across the span
         let (lo, hi) = (own_in_row(i), null_out_row(i));
         fill_col(&mut t, lo, hi, NK, nk0);
         fill_col(&mut t, lo, hi, NK1, nk1);
-        fill_col(&mut t, lo, hi, RHO, inp.rho);
+        fill_col(&mut t, lo, hi, RHO, inp.rho[0]);
+        fill_col(&mut t, lo, hi, RHO1, inp.rho[1]);
         fill_col(&mut t, lo, hi, VAL, value);
-        // pos_acc: cumulative Σ bit_d·2^d (jumps after each link row)
+        // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
         let mut acc = 0u64;
         let mut links: Vec<(usize, u64)> = Vec::new();
         for d in 0..DEPTH {
-            links.push(((base + 1 + d) * BLOCK + BLOCK - 1, if inp.bits[d] { 1u64 << d } else { 0 }));
+            links.push(((base + 2 + d) * BLOCK + BLOCK - 1, if inp.bits[d] { 1u64 << d } else { 0 }));
         }
         for r in lo..=hi {
             t[r * WIDTH + POSACC] = Val::from_u64(acc);
@@ -619,20 +678,25 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
                 }
             }
         }
-        // range-check the input value (window starts at the commit input row)
-        fill_range(&mut t, commit_in_row(i), inp.value);
+        // range-check the input value (window starts at commit_a; spans commit_a+commit_b = 64 rows)
+        fill_range(&mut t, commit_a_in_row(i), inp.value);
     }
 
-    // --- outputs: commitment block + value range ---
+    // --- outputs: 2-permutation commitment (out_a, out_b) + value range ---
     for (j, out) in w.outputs.iter().enumerate() {
-        let mut oin = [Val::ZERO; 8];
-        oin[0] = Val::from_u64(DOM_CM);
-        oin[1..1 + DIGEST].copy_from_slice(&out.recipient);
-        oin[1 + DIGEST] = Val::from_u64(out.value);
-        oin[1 + DIGEST + 1] = out.rho;
-        oin[1 + DIGEST + 2] = out.rcm;
-        set_block(&mut t, out_base(j), oin);
-        set_block(&mut t, out_base(j) + 1, [Val::ZERO; 8]); // range-overflow block (dummy perm)
+        let mut oa = [Val::ZERO; 8];
+        oa[0] = Val::from_u64(DOM_CM);
+        oa[1..1 + DIGEST].copy_from_slice(&out.recipient);
+        oa[1 + DIGEST] = Val::from_u64(out.value);
+        oa[1 + DIGEST + 1] = out.rho[0];
+        oa[1 + DIGEST + 2] = out.rho[1];
+        set_block(&mut t, out_base(j), oa);
+        let chain = native_permute(oa);
+        let mut ob = [Val::ZERO; 8];
+        ob[..DIGEST].copy_from_slice(&chain[..DIGEST]);
+        ob[DIGEST] = out.rcm[0];
+        ob[DIGEST + 1] = out.rcm[1];
+        set_block(&mut t, out_base(j) + 1, ob); // out_b: cm = perm(ob)[..DIGEST]
         let (lo, hi) = (out_in_row(j), out_in_row(j) + OUT_BLOCKS * BLOCK - 1);
         fill_col(&mut t, lo, hi, VAL, Val::from_u64(out.value));
         fill_range(&mut t, out_in_row(j), out.value);
@@ -660,7 +724,7 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
     // --- global value accumulator: +in (commit) +mint −out −fee ⇒ 0 ---
     let mut delta = vec![0i128; HEIGHT];
     for (i, inp) in w.inputs.iter().enumerate() {
-        delta[commit_in_row(i)] += inp.value as i128;
+        delta[commit_a_in_row(i)] += inp.value as i128;
     }
     for (j, out) in w.outputs.iter().enumerate() {
         delta[out_in_row(j)] -= out.value as i128;
@@ -735,13 +799,15 @@ pub fn verify_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
 pub fn demo_witness() -> Witness {
     let in_values = [1000u64, 500];
     let nks: [[u64; 2]; N_IN] = core::array::from_fn(|i| [7 + i as u64, 700 + i as u64]);
+    let in_rho = |i: usize| [Val::from_u64(11 + i as u64), Val::from_u64(211 + i as u64)];
+    let in_rcm = |i: usize| [Val::from_u64(100 + i as u64), Val::from_u64(300 + i as u64)];
     let cms: Vec<[Val; DIGEST]> = (0..N_IN)
         .map(|i| {
             commit(
                 recipient_of(Val::from_u64(nks[i][0]), Val::from_u64(nks[i][1])),
                 Val::from_u64(in_values[i]),
-                Val::from_u64(11 + i as u64),
-                Val::from_u64(100 + i as u64),
+                in_rho(i),
+                in_rcm(i),
             )
         })
         .collect();
@@ -749,16 +815,16 @@ pub fn demo_witness() -> Witness {
     let inputs = core::array::from_fn(|i| Input {
         nk: nks[i],
         value: in_values[i],
-        rho: Val::from_u64(11 + i as u64),
-        rcm: Val::from_u64(100 + i as u64),
+        rho: in_rho(i),
+        rcm: in_rcm(i),
         sib: paths[i].0,
         bits: paths[i].1,
     });
     let outputs = core::array::from_fn(|j| Output {
         recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64)),
         value: [900u64, 500][j],
-        rho: Val::from_u64(21 + j as u64),
-        rcm: Val::from_u64(22 + j as u64),
+        rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
+        rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
     });
     Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
 }
@@ -865,24 +931,26 @@ mod tests {
     /// A valid 2-in/2-out witness whose two input commitments sit at positions 0 and 1 of a shared
     /// tree, balanced so Σin = Σout + fee.
     pub(crate) fn sample() -> Witness {
-        let in0 = (1000u64, [7u64, 70u64], 11u64, 100u64); // value, nk(2), rho, rcm
+        let in0 = (1000u64, [7u64, 70u64], 11u64, 100u64); // value, nk(2), rho-seed, rcm-seed
         let in1 = (500u64, [9u64, 90u64], 13u64, 101u64);
+        let rho2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 200)];
+        let rcm2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 300)];
         let cmf = |v: &(u64, [u64; 2], u64, u64)| {
-            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1])), Val::from_u64(v.0), Val::from_u64(v.2), Val::from_u64(v.3))
+            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1])), Val::from_u64(v.0), rho2(v.2), rcm2(v.3))
         };
         let (_, paths) = build_paths(&[cmf(&in0), cmf(&in1)]);
         let mk_in = |v: (u64, [u64; 2], u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
             nk: v.1,
             value: v.0,
-            rho: Val::from_u64(v.2),
-            rcm: Val::from_u64(v.3),
+            rho: rho2(v.2),
+            rcm: rcm2(v.3),
             sib: pth.0,
             bits: pth.1,
         };
         let inputs = [mk_in(in0, &paths[0]), mk_in(in1, &paths[1])];
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7)), value: 900, rho: Val::from_u64(21), rcm: Val::from_u64(22) },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8)), value: 500, rho: Val::from_u64(23), rcm: Val::from_u64(24) },
+            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7)), value: 900, rho: rho2(21), rcm: rcm2(22) },
+            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8)), value: 500, rho: rho2(23), rcm: rcm2(24) },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
         Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
@@ -925,13 +993,15 @@ mod tests {
     /// Build a balanced witness with the given input/output values + fee (computes Merkle paths).
     fn witness_with(in_values: [u64; N_IN], out_values: [u64; M_OUT], fee: u64) -> Witness {
         let nk = |i: usize| [7 + i as u64, 700 + i as u64];
+        let in_rho = |i: usize| [Val::from_u64(11 + i as u64), Val::from_u64(211 + i as u64)];
+        let in_rcm = |i: usize| [Val::from_u64(100 + i as u64), Val::from_u64(300 + i as u64)];
         let cms: Vec<[Val; DIGEST]> = (0..N_IN)
             .map(|i| {
                 commit(
                     recipient_of(Val::from_u64(nk(i)[0]), Val::from_u64(nk(i)[1])),
                     Val::from_u64(in_values[i]),
-                    Val::from_u64(11 + i as u64),
-                    Val::from_u64(100 + i as u64),
+                    in_rho(i),
+                    in_rcm(i),
                 )
             })
             .collect();
@@ -939,16 +1009,16 @@ mod tests {
         let inputs = core::array::from_fn(|i| Input {
             nk: nk(i),
             value: in_values[i],
-            rho: Val::from_u64(11 + i as u64),
-            rcm: Val::from_u64(100 + i as u64),
+            rho: in_rho(i),
+            rcm: in_rcm(i),
             sib: paths[i].0,
             bits: paths[i].1,
         });
         let outputs = core::array::from_fn(|j| Output {
             recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64)),
             value: out_values[j],
-            rho: Val::from_u64(21 + j as u64),
-            rcm: Val::from_u64(22 + j as u64),
+            rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
+            rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
         });
         Witness { inputs, outputs, fee, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
     }
@@ -1048,7 +1118,7 @@ mod tests {
     fn distinct_positions_give_distinct_nullifiers() {
         // same note key/rho at different positions ⇒ different nullifiers (A1 prevents replay)
         let (nk0, nk1) = (Val::from_u64(5), Val::from_u64(50));
-        let rho = Val::from_u64(6);
+        let rho = [Val::from_u64(6), Val::from_u64(66)];
         let b0 = [false; DEPTH];
         let mut b1 = [false; DEPTH];
         b1[0] = true;

@@ -170,12 +170,13 @@ pub fn encode_joinsplit_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
 
 // --- wallet-side prover ABI -------------------------------------------------------------------
 
-/// Canonical wallet→prover witness byte layout. Per input: nk0,nk1,value (u64 LE) ‖ rho,rcm (felt) ‖
-/// sib[DEPTH]·digest(32) ‖ bits[DEPTH] (1 byte each). Per output: recipient(32) ‖ value (u64) ‖
-/// rho,rcm (felt). Tail: fee,mint (u64) ‖ tx_binding(32). Felts are canonical 8-byte LE.
+/// Canonical wallet→prover witness byte layout. Per input: nk0,nk1,value (u64 LE) ‖ rho0,rho1 (felt)
+/// ‖ rcm0,rcm1 (felt) ‖ sib[DEPTH]·digest(32) ‖ bits[DEPTH] (1 byte each). Per output: recipient(32)
+/// ‖ value (u64) ‖ rho0,rho1 (felt) ‖ rcm0,rcm1 (felt). Tail: fee,mint (u64) ‖ tx_binding(32). rho/rcm
+/// are 128-bit (two field elements); felts are canonical 8-byte LE.
 const fn js_witness_len() -> usize {
-    let per_in = 8 + 8 + 8 + 8 + 8 + joinsplit_air::DEPTH * 32 + joinsplit_air::DEPTH;
-    let per_out = 32 + 8 + 8 + 8;
+    let per_in = 8 + 8 + 8 + 16 + 16 + joinsplit_air::DEPTH * 32 + joinsplit_air::DEPTH;
+    let per_out = 32 + 8 + 16 + 16;
     joinsplit_air::N_IN * per_in + joinsplit_air::M_OUT * per_out + 8 + 8 + 32
 }
 const JS_WITNESS_LEN: usize = js_witness_len();
@@ -197,6 +198,9 @@ fn rd_digest(b: &[u8], off: &mut usize) -> Option<[Goldilocks; 4]> {
     }
     d.try_into().ok()
 }
+fn rd_felt2(b: &[u8], off: &mut usize) -> Option<[Goldilocks; 2]> {
+    Some([rd_felt(b, off)?, rd_felt(b, off)?])
+}
 
 /// Parse the witness byte layout into a circuit witness. Fail-closed on wrong length / non-canonical.
 fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
@@ -209,8 +213,8 @@ fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
     for _ in 0..N_IN {
         let nk = [rd_u64(b, &mut off), rd_u64(b, &mut off)];
         let value = rd_u64(b, &mut off);
-        let rho = rd_felt(b, &mut off)?;
-        let rcm = rd_felt(b, &mut off)?;
+        let rho = rd_felt2(b, &mut off)?;
+        let rcm = rd_felt2(b, &mut off)?;
         let mut sib = Vec::with_capacity(DEPTH);
         for _ in 0..DEPTH {
             sib.push(rd_digest(b, &mut off)?);
@@ -228,8 +232,8 @@ fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
     for _ in 0..M_OUT {
         let recipient = rd_digest(b, &mut off)?;
         let value = rd_u64(b, &mut off);
-        let rho = rd_felt(b, &mut off)?;
-        let rcm = rd_felt(b, &mut off)?;
+        let rho = rd_felt2(b, &mut off)?;
+        let rcm = rd_felt2(b, &mut off)?;
         outputs.push(Output { recipient, value, rho, rcm });
     }
     let outputs: [Output; M_OUT] = outputs.try_into().ok()?;
@@ -249,8 +253,10 @@ pub fn encode_joinsplit_witness(w: &joinsplit_air::Witness) -> Vec<u8> {
         put_u64(&mut out, inp.nk[0]);
         put_u64(&mut out, inp.nk[1]);
         put_u64(&mut out, inp.value);
-        put_felt(&mut out, inp.rho);
-        put_felt(&mut out, inp.rcm);
+        put_felt(&mut out, inp.rho[0]);
+        put_felt(&mut out, inp.rho[1]);
+        put_felt(&mut out, inp.rcm[0]);
+        put_felt(&mut out, inp.rcm[1]);
         for row in &inp.sib {
             for &f in row {
                 put_felt(&mut out, f);
@@ -265,8 +271,10 @@ pub fn encode_joinsplit_witness(w: &joinsplit_air::Witness) -> Vec<u8> {
             put_felt(&mut out, f);
         }
         put_u64(&mut out, o.value);
-        put_felt(&mut out, o.rho);
-        put_felt(&mut out, o.rcm);
+        put_felt(&mut out, o.rho[0]);
+        put_felt(&mut out, o.rho[1]);
+        put_felt(&mut out, o.rcm[0]);
+        put_felt(&mut out, o.rcm[1]);
     }
     put_u64(&mut out, w.fee);
     put_u64(&mut out, w.mint);

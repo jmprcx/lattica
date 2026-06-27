@@ -141,7 +141,9 @@ fn encodeWitness(
         try putU64(&w, a, std.mem.readInt(u64, sender.nk[8..16], .little)); // nk1
         try putU64(&w, a, in_.note.value);
         try putFelt(&w, a, in_.note.rho[0..8]);
+        try putFelt(&w, a, in_.note.rho[8..16]); // rho limb 1 (128-bit)
         try putFelt(&w, a, in_.note.rcm[0..8]);
+        try putFelt(&w, a, in_.note.rcm[8..16]); // rcm limb 1 (128-bit)
         for (in_.path.siblings) |sib| try putDigest(&w, a, sib);
         var d: usize = 0;
         while (d < DEPTH) : (d += 1) try w.append(a, @intCast((in_.position >> @intCast(d)) & 1));
@@ -150,7 +152,9 @@ fn encodeWitness(
         try putDigest(&w, a, o.recipient);
         try putU64(&w, a, o.value);
         try putFelt(&w, a, o.rho[0..8]);
+        try putFelt(&w, a, o.rho[8..16]);
         try putFelt(&w, a, o.rcm[0..8]);
+        try putFelt(&w, a, o.rcm[8..16]);
     }
     try putU64(&w, a, fee);
     try putU64(&w, a, mint);

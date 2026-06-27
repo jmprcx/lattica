@@ -106,12 +106,18 @@ pub fn recipient(nk0: Felt, nk1: Felt) Digest {
     return h(DOM_OWN, &.{ nk0, nk1 }); // 128-bit nullifier key
 }
 
-pub fn commitNote(rcp: Digest, value: Felt, rho: Felt, rcm: Felt) Digest {
-    return h(DOM_CM, &.{ rcp[0], rcp[1], rcp[2], rcp[3], value, rho, rcm });
+/// Two-permutation commitment (128-bit note randomness; must match joinsplit_air::commit):
+///   H1 = perm([DOM_CM, rcp(4), value, rho0, rho1]); cm = perm([H1(4), rcm0, rcm1, 0, 0]).
+pub fn commitNote(rcp: Digest, value: Felt, rho: [2]Felt, rcm: [2]Felt) Digest {
+    var a = [_]Felt{ DOM_CM, rcp[0], rcp[1], rcp[2], rcp[3], value, rho[0], rho[1] };
+    permute(&a);
+    var b = [_]Felt{ a[0], a[1], a[2], a[3], rcm[0], rcm[1], 0, 0 };
+    permute(&b);
+    return b[0..4].*;
 }
 
-pub fn nullifierHash(nk0: Felt, nk1: Felt, rho: Felt, pos: Felt) Digest {
-    return h(DOM_NF, &.{ nk0, nk1, rho, pos });
+pub fn nullifierHash(nk0: Felt, nk1: Felt, rho: [2]Felt, pos: Felt) Digest {
+    return h(DOM_NF, &.{ nk0, nk1, rho[0], rho[1], pos });
 }
 
 /// 2-to-1 Merkle compression `H(l ‖ r)` (untagged, fills all 8 lanes).
@@ -157,7 +163,7 @@ test "poseidon2: permute matches the circuit (KAT)" {
 test "poseidon2: domain-tagged hashes match the circuit (KAT)" {
     const rcp = recipient(7, 70);
     try testing.expectEqual(Digest{ 6469389008428325857, 2098789990759076109, 3483504872978708866, 10944715271802619590 }, rcp);
-    try testing.expectEqual(Digest{ 12586464260278947373, 4054173028709421847, 2337667059236436295, 12821985444102875151 }, commitNote(rcp, 1000, 11, 100));
-    try testing.expectEqual(Digest{ 898948081653809234, 11357996259474670558, 15311675036087494067, 11447551169066571571 }, nullifierHash(7, 70, 11, 9));
+    try testing.expectEqual(Digest{ 13531505093193624395, 17945392665132654789, 3289291828361804556, 14986895994367102023 }, commitNote(rcp, 1000, .{ 11, 211 }, .{ 100, 300 }));
+    try testing.expectEqual(Digest{ 2354178473207051117, 1485123762175440172, 16578445368892662424, 12056995742034228502 }, nullifierHash(7, 70, .{ 11, 211 }, 9));
     try testing.expectEqual(Digest{ 15506260347376358782, 2994144798473533345, 1833939590059144543, 15204941819943812974 }, merge(.{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 }));
 }

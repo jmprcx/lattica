@@ -89,7 +89,8 @@ pub const NoteCommitmentInput = struct {
 
 /// `cm = H(DOM_CM, recipient, value, rho, rcm)` — **the in-circuit Poseidon2 commitment** (C-03), so
 /// the on-chain commitment equals what the join-split circuit proves. `recipient` is the 4-element
-/// recipientId digest; `value`/`rho`/`rcm` reduce to field elements (rho/rcm are 64-bit in v1).
+/// recipientId digest; `value` reduces to a field element; `rho`/`rcm` are each 128-bit (the first
+/// 16 bytes → two field elements), matching the circuit's two-permutation commitment.
 pub fn noteCommitment(in: NoteCommitmentInput) Hash32 {
     var rcp: [32]u8 = [_]u8{0} ** 32;
     const rn = @min(in.recipient.len, 32);
@@ -99,8 +100,8 @@ pub fn noteCommitment(in: NoteCommitmentInput) Hash32 {
     const cm = poseidon2.commitNote(
         poseidon2.digestFromBytes(rcp),
         poseidon2.feltLE(&value_le),
-        poseidon2.feltLE(in.rho[0..8]),
-        poseidon2.feltLE(in.rcm[0..8]),
+        .{ poseidon2.feltLE(in.rho[0..8]), poseidon2.feltLE(in.rho[8..16]) }, // 128-bit rho
+        .{ poseidon2.feltLE(in.rcm[0..8]), poseidon2.feltLE(in.rcm[8..16]) }, // 128-bit rcm
     );
     return poseidon2.digestBytes(cm);
 }
@@ -119,7 +120,7 @@ pub fn nullifier(nk: *const Hash32, rho: *const Hash32, position: u64) Hash32 {
     const nf = poseidon2.nullifierHash(
         poseidon2.feltLE(nk[0..8]),
         poseidon2.feltLE(nk[8..16]),
-        poseidon2.feltLE(rho[0..8]),
+        .{ poseidon2.feltLE(rho[0..8]), poseidon2.feltLE(rho[8..16]) }, // 128-bit rho
         poseidon2.feltLE(&pos_le),
     );
     return poseidon2.digestBytes(nf);

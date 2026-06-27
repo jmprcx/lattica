@@ -55,8 +55,8 @@ fn main() {
     println!("// KAT permute([0..8]) = {:?}", perm.map(u));
     let rcp = recipient_of(g(7), g(70));
     println!("// KAT recipient_of(7,70) = {:?}", rcp.map(u));
-    println!("// KAT commit(rcp,1000,11,100) = {:?}", commit(rcp, g(1000), g(11), g(100)).map(u));
-    println!("// KAT nullifier(7,70,11,9) = {:?}", nullifier(g(7), g(70), g(11), g(9)).map(u));
+    println!("// KAT commit(rcp,1000,[11,211],[100,300]) = {:?}", commit(rcp, g(1000), [g(11), g(211)], [g(100), g(300)]).map(u));
+    println!("// KAT nullifier(7,70,[11,211],9) = {:?}", nullifier(g(7), g(70), [g(11), g(211)], g(9)).map(u));
     let l = [g(1), g(2), g(3), g(4)];
     let r = [g(5), g(6), g(7), g(8)];
     println!("// KAT merge([1..4],[5..8]) = {:?}", merge(l, r).map(u));
