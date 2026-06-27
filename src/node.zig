@@ -290,20 +290,35 @@ pub const Chain = struct {
         return .{ .note = note, .pos = pos };
     }
 
-    /// Validate and apply a shielded join-split. On success, nullifiers are recorded and the output
-    /// commitments are appended to the tree.
+    /// Validate and apply a normal (value-conserving) shielded join-split: issuance is forbidden
+    /// (`mint` must be 0). On success, nullifiers are recorded and the output commitments appended.
     pub fn verifyAndApply(self: *Chain, t: ShieldedTx) TxError!void {
+        return self.applyChecked(t, 0);
+    }
+
+    /// Validate and apply a **coinbase** (issuance) join-split: `t.mint` must equal `reward`, the
+    /// issuance the consensus layer permits for this block (the block subsidy + the fees being
+    /// claimed). All other checks are identical to a normal transaction. The reward *policy* (the
+    /// emission schedule, and that exactly one coinbase exists per block) lives in the host
+    /// consensus; lattica only enforces that the proven, range-checked `mint` matches what consensus
+    /// authorized — so issuance is impossible except through this gated, value-accounted path.
+    pub fn applyCoinbase(self: *Chain, t: ShieldedTx, reward: u64) TxError!void {
+        return self.applyChecked(t, reward);
+    }
+
+    /// Shared validation + application. `allowed_mint` is the only permitted issuance (0 for a normal
+    /// tx; the block reward for a coinbase).
+    fn applyChecked(self: *Chain, t: ShieldedTx, allowed_mint: u64) TxError!void {
         // 1. The join-split proof is the sole authorization — fail-closed (no backend ⇒ reject). It
         //    binds ownership, membership under the anchor, nullifier correctness, balance, and range;
         //    its tx_binding == the public body (recomputed here) so nothing can be swapped.
         if (!ffi.verifyJoinSplit(t.proof, t.publicInputs())) return TxError.BadAuthProof;
 
-        // 2. Issuance gate. A normal transaction must conserve value (mint == 0). The circuit only
-        //    proves balance *given* mint, so without this gate anyone could submit dummy inputs +
-        //    mint > 0 + a matching output and inflate the supply. Real issuance (coinbase) must go
-        //    through a dedicated, block-reward-validated path — which this PoC chain does not yet
-        //    model — so it is rejected here.
-        if (t.mint != 0) return TxError.IllegalIssuance;
+        // 2. Issuance gate. The circuit only proves balance *given* `mint`, so the node must pin
+        //    `mint` to the consensus-authorized amount — otherwise anyone could submit dummy inputs +
+        //    mint > 0 + a matching output and inflate the supply. Normal txs require mint == 0;
+        //    coinbase requires mint == reward.
+        if (t.mint != allowed_mint) return TxError.IllegalIssuance;
 
         // 3. The anchor must be one the chain published.
         if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
@@ -505,7 +520,7 @@ test "unknown anchor rejected" {
     try testing.expectError(TxError.UnknownAnchor, chain.verifyAndApply(t));
 }
 
-test "arbitrary issuance (mint > 0) is rejected — no inflation" {
+test "arbitrary issuance (mint > 0) is rejected on the normal path — no inflation" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -519,4 +534,32 @@ test "arbitrary issuance (mint > 0) is rejected — no inflation" {
     const outs = [_]OutputReq{.{ .recipient = attacker.address(), .value = 500 }};
     const t = try buildTransfer(a, attacker, &inputs, &outs, 0, 500, chain.anchor());
     try testing.expectError(TxError.IllegalIssuance, chain.verifyAndApply(t));
+}
+
+test "coinbase issuance: mint accepted iff it matches the consensus reward" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const miner = try account(4);
+
+    // A coinbase issuing the wrong amount (reward=400 but mint=500) is rejected.
+    const in_bad = try fundTwoInputs(a, &chain, miner, 0, 30);
+    const out_bad = [_]OutputReq{.{ .recipient = miner.address(), .value = 500 }};
+    const bad = try buildTransfer(a, miner, &in_bad, &out_bad, 0, 500, chain.anchor());
+    try testing.expectError(TxError.IllegalIssuance, chain.applyCoinbase(bad, 400));
+
+    // A coinbase whose mint == the authorized reward (500) is accepted; the miner gets a 500 note.
+    const in_ok = try fundTwoInputs(a, &chain, miner, 0, 32);
+    const out_ok = [_]OutputReq{.{ .recipient = miner.address(), .value = 500 }};
+    const cb = try buildTransfer(a, miner, &in_ok, &out_ok, 0, 500, chain.anchor());
+    try chain.applyCoinbase(cb, 500);
+
+    var minted: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (tx.tryDecrypt(a, miner, tn)) |n| minted += n.value;
+    }
+    try testing.expectEqual(@as(u64, 500), minted);
 }
