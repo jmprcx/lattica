@@ -6,24 +6,26 @@ checklist. Companion docs: `docs/soundness-budget.md` (C-04), `docs/plonky3-port
 circuit was built), `docs/remediation-status.md` (audit-finding tracker), `docs/audit-scope.md` (the
 older *Winterfell* reviewer guide — reference only; superseded by this for production).
 
-> **Status: ready for external review; two deliberate-parameter sign-offs remain (not bugs).** The
+> **Status: ready for external review; one deliberate-parameter sign-off remains (not a bug).** The
 > production circuit is the **join-split N-in/M-out** (`joinsplit_air`, §6), with the soundness fixes
-> applied (A1–A4, 128-bit `nk`) and the live protocol fully cut over to it: Poseidon2 on-chain hashing
-> == circuit; hidden-value node tx model; fail-closed, panic-isolated verifier; validated coinbase
-> issuance (`mint` is impossible except via the consensus-authorized path). Three adversarial recheck
-> passes hardened it: passes 1–2 found + fixed real bugs (the ZK-blinding RNG; a node-layer `mint`
-> inflation hole) + added verifier panic isolation; pass 3 found no new exploitable issue.
+> applied (A1–A4, 128-bit `nk`, **128-bit `rho`/`rcm`**) and the live protocol fully cut over to it:
+> Poseidon2 on-chain hashing == circuit; hidden-value node tx model; fail-closed, panic-isolated
+> verifier; validated coinbase issuance (`mint` is impossible except via the consensus-authorized
+> path). Four adversarial recheck passes hardened it: they found + fixed real bugs — the ZK-blinding
+> RNG, a node-layer `mint` inflation hole, and (after the `rho`/`rcm` widening) a missing `rho1`
+> persistence constraint that would have allowed a forged second nullifier per note — plus added
+> verifier panic isolation.
 >
-> **The in-node real prove→verify path now executes green** (`scripts/run-real-integration.sh`:
+> **The in-node real prove→verify path executes green** (`scripts/run-real-integration.sh`:
 > the Zig node builds the witness → real Rust prover → Zig reconstructs the public inputs → real Rust
 > verifier → accept; replay + tamper rejected). It is built as an object linked with the system
 > toolchain because this host's Zig linker can't link the Rust staticlib.
 >
-> **Remaining before value-bearing use** — two *deliberate v1 parameters* needing explicit auditor
-> sign-off (see §5 / `docs/protocol-v1-decisions.md`), not defects: (1) `rho`/`rcm` are 64-bit (a
-> wider, randomness restores ≥128-bit via a 2-permutation sponge commitment — a v2 change); (2)
-> proven soundness is ~103-bit (≈127-bit conjectured), which is the ceiling for Goldilocks F_p² —
-> raising it further requires a larger field. Out of lattica's scope by design: block
+> **Remaining before value-bearing use** — one *deliberate parameter* needing explicit auditor
+> sign-off (see §5 / `docs/protocol-v1-decisions.md`), not a defect: proven soundness is ~103-bit
+> (≈127-bit conjectured), which is the ceiling for Goldilocks F_p² — raising it further requires a
+> larger field. (`rho`/`rcm` are now 128-bit — the two-permutation commitment — so the note-randomness
+> sign-off is resolved.) Out of lattica's scope by design: block
 > consensus / PoW / mempool / networking / the emission schedule belong to the host chain
 > (`rubble-node-zig`); lattica provides the shielded-tx + issuance *mechanisms* it drives.
 
@@ -229,7 +231,7 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | Verifier ABI panic-isolated against malformed proofs | ✅ (`catch_unwind`; tampered+garbage-proof tests) |
 | Validated coinbase issuance (`mint` only via consensus-authorized reward) | ✅ (`Chain.applyCoinbase`; normal path requires `mint == 0`) |
 | Constraint self-audit current (covers `mint`, 128-bit `nk`) | ✅ (`docs/joinsplit-constraint-audit.md`; re-audited pass 3, no gaps) |
-| ≥128-bit note randomness (`rho`/`rcm`) | ⏳ v1 = 64-bit (deliberate; v2 = 2-permutation sponge) — auditor sign-off |
+| ≥128-bit note randomness (`rho`/`rcm`) | ✅ two-permutation commitment (128-bit; rho1-persistence soundness fix + regression test) |
 | ≥128-bit *proven* soundness | ⏳ ~103 proven / ~127 conjectured = Goldilocks ceiling (larger field needed) — auditor sign-off |
 
 > **Self-review note (2026-06-26):** a recheck found the prover was seeding the hiding-PCS / Merkle
