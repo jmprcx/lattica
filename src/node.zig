@@ -35,6 +35,7 @@ pub const TxError = error{
     DoubleSpend,
     BadAuthProof,
     Unbalanced,
+    IllegalIssuance,
     ValueOverflow,
     TreeFull,
     Internal,
@@ -297,10 +298,17 @@ pub const Chain = struct {
         //    its tx_binding == the public body (recomputed here) so nothing can be swapped.
         if (!ffi.verifyJoinSplit(t.proof, t.publicInputs())) return TxError.BadAuthProof;
 
-        // 2. The anchor must be one the chain published.
+        // 2. Issuance gate. A normal transaction must conserve value (mint == 0). The circuit only
+        //    proves balance *given* mint, so without this gate anyone could submit dummy inputs +
+        //    mint > 0 + a matching output and inflate the supply. Real issuance (coinbase) must go
+        //    through a dedicated, block-reward-validated path — which this PoC chain does not yet
+        //    model — so it is rejected here.
+        if (t.mint != 0) return TxError.IllegalIssuance;
+
+        // 3. The anchor must be one the chain published.
         if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
 
-        // 3. Nullifiers: reject any already spent, or duplicated within this transaction.
+        // 4. Nullifiers: reject any already spent, or duplicated within this transaction.
         var seen = HashSet.init(self.allocator);
         defer seen.deinit();
         for (t.nullifiers) |nf| {
@@ -309,10 +317,7 @@ pub const Chain = struct {
             if (gop.found_existing) return TxError.DoubleSpend;
         }
 
-        // (Issuance policy on `mint` — block-reward / supply schedule — is a consensus-layer check,
-        //  out of scope for this state machine; the proof guarantees the balance holds given `mint`.)
-
-        // 4. Apply (only after all checks pass).
+        // 5. Apply (only after all checks pass).
         for (t.nullifiers) |nf| self.nullifiers.put(nf, {}) catch return TxError.Internal;
         for (t.outputs) |o| {
             _ = self.insertCommitment(o.cm) catch return TxError.Internal;
@@ -500,17 +505,18 @@ test "unknown anchor rejected" {
     try testing.expectError(TxError.UnknownAnchor, chain.verifyAndApply(t));
 }
 
-test "coinbase mint funds an output with no input value" {
+test "arbitrary issuance (mint > 0) is rejected — no inflation" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     mock.install();
     defer mock.uninstall();
     var chain = try Chain.init(a);
-    const miner = try account(3);
-    // Two zero-value inputs; issuance (mint=500) funds a 500 output, no fee.
-    const inputs = try fundTwoInputs(a, &chain, miner, 0, 20);
-    const outs = [_]OutputReq{.{ .recipient = miner.address(), .value = 500 }};
-    const t = try buildTransfer(a, miner, &inputs, &outs, 0, 500, chain.anchor());
-    try chain.verifyAndApply(t);
+    const attacker = try account(3);
+    // The attacker tries to conjure value: two zero-value inputs, mint=500 funding a 500 output.
+    // The circuit's balance holds (0 + 500 = 500 + 0), so a missing node-side gate would mint money.
+    const inputs = try fundTwoInputs(a, &chain, attacker, 0, 20);
+    const outs = [_]OutputReq{.{ .recipient = attacker.address(), .value = 500 }};
+    const t = try buildTransfer(a, attacker, &inputs, &outs, 0, 500, chain.anchor());
+    try testing.expectError(TxError.IllegalIssuance, chain.verifyAndApply(t));
 }
