@@ -108,6 +108,9 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
    **deltas** over join-split: the `note_type`/`htlc_root`/owner-MUX/tag-match/hashlock/timeout columns
    and constraints, and especially the **mode-independent-nullifier** double-spend argument. Read after
    the join-split audit.
+2b. **`docs/v3-internal-audit.md`** (v3) — the internal pre-audit (four adversarial reviewers + a
+   soundness read) run before this external audit: findings, the defense-in-depth fixes applied at both
+   the solver and node layers, and the documented residuals. Read for the v3 threat coverage + known gaps.
 3. **`docs/soundness-budget.md`** — the C-04 proven/conjectured security accounting (~103 / ~127-bit).
 4. **`docs/protocol-v1-decisions.md`** — the deliberate v1 parameter decisions + limitations
    (single-asset, key model, note randomness, issuance, the deterministic-encryption interaction).
