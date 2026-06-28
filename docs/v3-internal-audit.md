@@ -41,7 +41,7 @@ Severity: Crit / High / Med / Low / Nit. Layer = where the fix belongs.
 | D‑O3 | HTLC C ABI had only happy-path tests; a future edit could silently drop a hardening check. | Low | tests | **Fixed** |
 | A‑F2 / C‑F8 | The redeem hashlock binding's SHA256 half is out-of-circuit (by design); `note_type`/`mode` are private, so the node can't tell redeem from refund. | Med | design | **Verified sound** (see §4) |
 | A‑F7 / C‑(nf) | Intra-tx nullifier distinctness is not enforced in-circuit. | Low | node | **Already enforced** (the `seen` set in `applyHtlc`/`applyChecked` rejects duplicates) |
-| C‑F3b | No production path to **create** an HTLC note (only test-only `bootstrapNote`); `applyHtlc` is sound but currently only reachable in tests. | Med | feature | **Documented** (§5) |
+| C‑F3b | No production path to **create** an HTLC note (only test-only `bootstrapNote`); `applyHtlc` was sound but only reachable in tests. | Med | feature | **Fixed** (`buildHtlcLock`, commit `7deab14`) |
 | C‑F5 | No bounded anchor window / reorg-undo / commitment index (HTLC watch-by-cm). | Med | host-chain | **Documented** (§5) |
 | A‑F5 | Output `note_type` boolean-ness / `htlc_root` well-formedness unvalidated at creation (an unspendable note — sender footgun, not a soundness hole; wallet-prevented). | Low | solver/wallet | **Documented** (§5) |
 | A‑F6 | One `redeem_hashlock` public input ⇒ at most one distinct-hashlock HTLC redeem per tx. | Low | design | **Documented** (§5; the 1-HTLC-per-leg use case is unaffected) |
@@ -79,12 +79,12 @@ The trust reduces to the node's SHA256 implementation and the public-input bindi
 Intra-tx and cross-chain nullifier-distinctness are enforced by the node's nullifier set (A‑F7).
 
 ## 5. Documented residuals (not fixed — rationale)
-- **C‑F3b — production HTLC-note creation (the "lock").** `applyHtlc` (spend) is audited and sound, but
-  in production there is no path to *create* an HTLC note: `bootstrapNote` is genesis/test-only and
-  join-split outputs are `note_type = 0`. The production lock is an `htlc_air` tx with PLAIN inputs and
-  an HTLC-typed output (`note_type = 1`, owner = `htlc_root`) — `htlc_air` already supports a free
-  output `note_type`, so no circuit change is needed; it needs a `buildHtlcLock` wallet builder. This is
-  feature-completion (Phase A2 RPC), not a soundness gap. **Recommend implementing before value-bearing use.**
+- **C‑F3b — production HTLC-note creation (the "lock"): FIXED post-audit.** `node.buildHtlcLock` (commit
+  `7deab14`) builds the production lock — an `htlc_air` tx with PLAIN inputs and an HTLC-typed output
+  (owner = `htlc_root`) + change; no circuit change was needed. The full **real** lock → redeem (and
+  refund-before-timeout reject) lifecycle is now exercised in `scripts/run-real-integration.sh`. The
+  new HTLC note is watched by commitment; the redeemer learns its opening via the off-chain communicated
+  lock (the cm→position index that lets a watcher *locate* it on-chain remains host-chain scope, F5).
 - **C‑F5 — anchor window / reorg-undo / commitment index.** The in-memory node keeps an unbounded
   anchor set and no reorg-undo or `cm→position` index. These are host-chain (`rubble-node-zig`)
   consensus responsibilities, already out of scope per `AUDITORS.md` §7 and
@@ -102,7 +102,10 @@ Intra-tx and cross-chain nullifier-distinctness are enforced by the node's nulli
 
 ## 6. Validation
 `v3` tip after this pass: **73 Rust tests** (incl. the new circuit + ABI negatives), the full **Zig**
-suite, **`zig build check-production`** (HTLC surface), and **`scripts/run-real-integration.sh`** (real
-join-split + HTLC redeem/refund-timelock prove→verify) all green. Audit commits: `850fdb5` (solver
-hardening), `4c0acc2` (node hardening), `0b2df7e` (ABI negatives), `e7680e6` (soundness regression
-tests). This internal pass does not replace the external Codex audit — it front-loads the fixes.
+suite (incl. the HTLC lock→redeem lifecycle + the new node-reject tests), **`zig build
+check-production`** (the full HTLC surface incl. `buildHtlcLock`), and
+**`scripts/run-real-integration.sh`** — which now drives a **real** join-split plus a full HTLC
+**lock → refund-before-timeout-reject → redeem** lifecycle through the live node (both 469 KB proofs
+accepted) — all green. Audit commits: `850fdb5` (solver hardening), `4c0acc2` (node hardening),
+`0b2df7e` (ABI negatives), `e7680e6` (soundness regression tests), `7deab14` (`buildHtlcLock`, F3b).
+This internal pass does not replace the external Codex audit — it front-loads the fixes.
