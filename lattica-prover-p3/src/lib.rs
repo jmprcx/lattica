@@ -5,6 +5,7 @@
 //! node calls — matching `src/ffi.zig`.
 
 pub mod joinsplit_air;
+pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsplit_air, extended
 pub mod poseidon2_air;
 pub mod spend_air;
 
