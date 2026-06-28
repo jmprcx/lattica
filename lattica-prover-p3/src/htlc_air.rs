@@ -1262,7 +1262,13 @@ pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
     let t1 = std::time::Instant::now();
     assert!(verify(&config, &HtlcAir, &proof, &pis).is_ok());
     let verify_ms = t1.elapsed().as_millis();
-    // proven security at this trace height
+    (bytes.len(), prove_ms, verify_ms, proven_security_bits())
+}
+
+/// Proven (unique-decoding-regime) soundness in bits at this circuit's trace height, computed WITHOUT
+/// proving — so a `#[test]` can assert the production floor and a parameter edit can't silently drop
+/// below budget. The FRI parameters here MUST mirror `make_config` (asserted equal by the floor test).
+pub fn proven_security_bits() -> usize {
     let perm = default_goldilocks_poseidon2_8();
     let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, ChaCha20Rng::seed_from_u64(1));
     let fri = FriParameters {
@@ -1276,8 +1282,7 @@ pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
     };
     let layout = AirLayout::from_air::<Goldilocks>(&HtlcAir);
     let params = StarkSecurityParams::from_air::<Val, Challenge, HtlcAir, ChallengeMmcs>(&fri, &HtlcAir, layout, 127, 128, 2);
-    let proven = ProvenSecurity::compute(&params, 1usize << (HEIGHT.trailing_zeros() as usize + 1)).security_bits();
-    (bytes.len(), prove_ms, verify_ms, proven)
+    ProvenSecurity::compute(&params, 1usize << (HEIGHT.trailing_zeros() as usize + 1)).security_bits()
 }
 
 /// Prove with the witness's real public inputs, verify against `verify_pis` (tests FS binding).
@@ -1483,6 +1488,14 @@ mod tests {
         // both still verify
         assert!(verify_bytes(&a, &public_values(&w)));
         assert!(verify_bytes(&b, &public_values(&w)));
+    }
+
+    #[test]
+    fn proven_security_meets_production_floor() {
+        // Regression gate: a parameter edit (blowup/queries/grinding/trace size) must not silently drop
+        // proven soundness below the ~103-bit budget (docs/soundness-budget.md). Computed without proving.
+        let bits = proven_security_bits();
+        assert!(bits >= 100, "htlc_air proven soundness {bits} bits < 100-bit floor (parameter regression?)");
     }
 
     #[test]

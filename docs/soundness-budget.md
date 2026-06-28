@@ -3,11 +3,14 @@
 Resolves audit finding **C-04** ("~50-bit soundness on the 64-bit base field"). The production
 spend proof (`lattica-prover-p3/`) operates over the **Goldilocks** base field but draws all
 Fiat–Shamir / DEEP / FRI challenges from the **quadratic extension `F_p²`** (~127-bit), and uses FRI
-parameters chosen for a ≥100-bit *proven* and ≥128-bit *conjectured* security level. The numbers
-below are **machine-checked** by `full_spend_air::security_report()` and the
-`production_security_budget` test (which asserts proven ≥ 100 and conjectured ≥ 128), computed with
-Plonky3's own accounting (`StarkSecurityParams` / `ProvenSecurity` / `ConjecturedSecurity`,
-cross-checked against Ethereum's `soundcalc`).
+parameters chosen for a ≥100-bit *proven* and ≥128-bit *conjectured* security level. The proven level
+is **machine-checked** per production circuit by `proven_security_bits()` + the
+`proven_security_meets_production_floor` test (asserts proven ≥ 100) in both `joinsplit_air` and
+`htlc_air`, and is reported (with prove/verify timings + proof size) by each circuit's `measure()`,
+computed with Plonky3's own accounting (`StarkSecurityParams` / `ProvenSecurity`, cross-checked against
+Ethereum's `soundcalc`). Both production circuits share one `make_config` and resolve to the same
+budget. (The earlier `full_spend_air::security_report()` / `production_security_budget` names predate
+the Plonky3 join-split cutover and no longer exist.)
 
 ## Production parameters
 
@@ -22,7 +25,7 @@ cross-checked against Ethereum's `soundcalc`).
 | Commit grinding | 0 bits | |
 | `log_final_poly_len` / `max_log_arity` | 0 / **4** | fold to a constant, arity 16 (proof-size lever) |
 | Merkle cap height | **6** | 2⁶ cap ⇒ shorter query paths (proof-size lever) |
-| Trace | height **2048** (`DEPTH=32`), width 17 | 62 constraints, max degree 8 |
+| Trace | height **4096** (`NUM_BLOCKS = next_pow2(USED_BLOCKS) = 128`, `BLOCK=32`, `DEPTH=32`); width **19** (join-split) / **31** (htlc) | max constraint degree 8 (Poseidon2 round); same height/degree both circuits |
 
 The `max_log_arity` and `cap_height` values are FRI *encoding* choices — they shrink the proof with
 **no** effect on the security level (see the sweep below). They were chosen by `cargo run --bin
@@ -84,6 +87,12 @@ What the data shows:
 ## Two further levers, measured (and rejected)
 
 ### Trace height / padding (`DEPTH` recompiles)
+> **Historical (pre-v3) figures.** This sweep predates the current layout and counts only one input
+> span (36 blocks → 64). The current circuits use the **total** `USED_BLOCKS` (80 join-split / 88 htlc)
+> padded to **128** ⇒ **height 4096**; the production proof is ~0.42–0.47 MB. The lever's *conclusion*
+> (proof size ~logarithmic in height; padding is cheap) still holds. Re-measure before quoting absolute
+> numbers.
+
 `DEPTH=32` uses 36 blocks, padded to 64 (height 2048, ~44% "dead"). Measured at the production FRI
 params:
 

@@ -5,7 +5,7 @@ that **every witness column is constrained** and **no binding is vacuous** (the 
 external audit hunts for). This is a self-audit to feed the Phase-3 review, not a substitute for it.
 
 Layout: `N_IN` input spans + `M_OUT` output regions + a fee region + a **mint region** + padding,
-each block = 32 rows (one Poseidon2 permutation). `WIDTH = 18`. Selectors are period-32 (round
+each block = 32 rows (one Poseidon2 permutation). `WIDTH = 19` (col 18 = `asset`, v3 substrate). Selectors are period-32 (round
 schedule) or full-length one-hots (region boundaries / bindings). The nullifier key `nk` is **two
 field elements** (128-bit spend authority): limb 0 in col 9 (`nk`), limb 1 in col 16 (`nk1`). Note
 randomness `rho`/`rcm` are likewise **two elements each** (128-bit); the commitment is therefore a
@@ -27,6 +27,7 @@ blocks.
 | 12 | `pos_acc` | reset 0 at span start, `+= bit·2^d` at each link, constant else; pinned into the nullifier input (lane 5) ⇒ **A1**. |
 | 13 | `val_acc` | 0 at row 0; `+val` at each commit, `+val` at the mint row, `−val` at each output, `−val` at the fee row; `=0` at the final row (after the mint contribution) ⇒ balance `Σin + mint = Σout + fee`. |
 | 14–15 | `rem`,`rbit` | range running-remainder, seeded `=val` and closed `=0` per value; `rbit` boolean. Free (unread) outside the per-value windows. |
+| 18 | `asset` | (v3 multi-asset substrate) hidden asset id; **global-persistent** — constant on every adjacent row pair across the *whole* trace (an ungated `when_transition` equality, NOT in the region-freed local-persistent set), pinned at every `commit_b` lane 6 for inputs **and** outputs ⇒ one hidden asset per tx, `input.asset == output.asset`. |
 
 Intentionally-free witnesses (note trapdoors, never bound — by design): commitment `rcm0`/`rcm1`
 (`commit_b` lanes 4,5), and each output note's `out_recipient`/`out_rho`/`out_rcm`. These are hidden
@@ -64,8 +65,10 @@ randomness; the proof binds only what the statement needs (the digests + values)
      `H1 = H(DOM_CM ‖ recipient ‖ value ‖ rho0 ‖ rho1)`.
    - **chain link**: `commit_b.in[0..4] = commit_a.out[0..4]` (same shape as the recipient link, at
      lane offset 0) — pins the chaining value; also applied to outputs (`out_b.in = out_a.out`).
-   - `commit_b`: lanes 4,5 = `rcm0,rcm1` (free trapdoor), lanes 6,7 pinned `0` ⇒
-     `cm = H(chain ‖ rcm0 ‖ rcm1 ‖ 0 ‖ 0)`. The 256-bit chain ⇒ 128-bit collision resistance.
+   - `commit_b`: lanes 4,5 = `rcm0,rcm1` (free trapdoor); lane 6 = `asset` (global `ASSET`, v3); lane 7
+     pinned `0` (note_type — join-split is PLAIN-only; pinning it 0 keeps join-split unable to mint or
+     spend an HTLC note, preserving the htlc_air spend boundary) ⇒
+     `cm = H(chain ‖ rcm0 ‖ rcm1 ‖ asset ‖ 0)`. The 256-bit chain ⇒ 128-bit collision resistance.
 9. **Membership link.** Places the running digest by `bit` (general position), `bit` boolean; the
    first link carries `commit_b`'s output (= `cm`) as the leaf. Folds to the root.
 10. **Root.** Each input's root row `= public anchor` (all inputs under one anchor).
