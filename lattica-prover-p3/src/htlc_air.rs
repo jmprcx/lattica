@@ -323,7 +323,8 @@ const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant acro
 // the span. Carries the owner into commit_a without block-adjacency, so the htlc_root (computed in the
 // span-end blocks) can feed commit_a (audit/AIR layout note in the header).
 const OWNER0: usize = 19;
-const WIDTH: usize = 23; // OWNER0..3 occupy 19..23
+const NT: usize = 23; // note_type (0=PLAIN, 1=HTLC), local-persistent; == committed commit_b lane 7
+const WIDTH: usize = 24; // OWNER0..3 = 19..23, NT = 23
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
@@ -345,9 +346,10 @@ const P_RANGE_ACTIVE: usize = 25; // decomposition rows
 const P_RANGE_CLOSE: usize = 26; // rem = 0 (value < 2^BITS)
 const P_ROW0: usize = 27; // VALACC = 0
 const P_FINAL: usize = 28; // VALACC = 0 (balance)
-const P_NULLOUT: usize = 29; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 29 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 29 + N_IN + M_OUT;
+const P_IN_COMMIT_B: usize = 29; // input commit_b ONLY (binds lane 7 = note_type); outputs free
+const P_NULLOUT: usize = 30; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 30 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 30 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
 const PI_ANCHOR: usize = 0;
@@ -494,6 +496,8 @@ fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&range_close)); // P_RANGE_CLOSE
     cols.push(one_hot(&[0])); // P_ROW0
     cols.push(one_hot(&[mint_in_row() + MINT_BLOCKS * BLOCK - 1])); // P_FINAL (after mint contribution)
+    let in_commit_b: Vec<usize> = (0..N_IN).map(commit_b_in_row).collect(); // input commit_b only
+    cols.push(one_hot(&in_commit_b)); // P_IN_COMMIT_B
     for i in 0..N_IN {
         cols.push(one_hot(&[null_out_row(i)])); // P_NULLOUT + i
     }
@@ -558,7 +562,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // persistence a prover could use one rho1 in the commitment and another in the nullifier,
         // minting a fresh nullifier for a real note ⇒ double-spend.
         let not_last = one.clone() - p[P_REGION_LAST].clone();
-        for &c in &[NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3] {
+        for &c in &[NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3, NT] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
         // ASSET is GLOBAL-persistent: constant across the whole trace (one hidden asset per tx), so
@@ -628,8 +632,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
 
         // ---- commit_b input: [chain(4), rcm0, rcm1, 0, 0] — pad lanes 6,7 pinned to 0 (rcm free) ----
         let cb = p[P_COMMIT_B].clone();
-        builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone())); // lane 6 = hidden asset id
-        builder.assert_zero(cb.clone() * cur[DIGEST + 3].clone()); // lane 7 = 0 (reserved)
+        builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone())); // lane 6 = hidden asset id (in & out)
+        // lane 7 = note_type: bound to NT for INPUT commitments (the spend gates on it); free for
+        // outputs (part of the recipient's note, like out_recipient / out_rho).
+        builder.assert_zero(p[P_IN_COMMIT_B].clone() * (cur[DIGEST + 3].clone() - cur[NT].clone()));
 
         // ---- membership links: place running digest (= commit_b output) by the bit ----
         let ml = p[P_MEM_LINK].clone();
@@ -839,6 +845,7 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         for k in 0..DIGEST {
             fill_col(&mut t, lo, hi, OWNER0 + k, recipient[k]);
         }
+        fill_col(&mut t, lo, hi, NT, inp.note_type); // note_type (committed in commit_b lane 7)
         // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
         let mut acc = 0u64;
         let mut links: Vec<(usize, u64)> = Vec::new();
