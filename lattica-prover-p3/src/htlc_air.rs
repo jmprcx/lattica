@@ -347,9 +347,13 @@ const P_RANGE_CLOSE: usize = 26; // rem = 0 (value < 2^BITS)
 const P_ROW0: usize = 27; // VALACC = 0
 const P_FINAL: usize = 28; // VALACC = 0 (balance)
 const P_IN_COMMIT_B: usize = 29; // input commit_b ONLY (binds lane 7 = note_type); outputs free
-const P_NULLOUT: usize = 30; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 30 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 30 + N_IN + M_OUT;
+const P_HTLC_IN0: usize = 30; // htlc block 0 input: lane0=DOM_HTLC, lanes1-3=0
+const P_HTLC_LINK: usize = 31; // htlc blocks 0,1,2 OUTPUT: chain link out[0..4] -> next in[0..4]
+const P_HTLC_IN3: usize = 32; // htlc block 3 input: capacity lanes 5,6,7 = 0
+const P_HTLC_ROOT: usize = 33; // htlc block 3 OUTPUT = htlc_root (owner gate when HTLC)
+const P_NULLOUT: usize = 34; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 34 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 34 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
 const PI_ANCHOR: usize = 0;
@@ -498,6 +502,20 @@ fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&[mint_in_row() + MINT_BLOCKS * BLOCK - 1])); // P_FINAL (after mint contribution)
     let in_commit_b: Vec<usize> = (0..N_IN).map(commit_b_in_row).collect(); // input commit_b only
     cols.push(one_hot(&in_commit_b)); // P_IN_COMMIT_B
+    // htlc_root chain selectors (span-end blocks 0..HTLC_BLOCKS of each input)
+    let htlc_in0: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 0) * BLOCK).collect();
+    let mut htlc_link: Vec<usize> = Vec::new();
+    for i in 0..N_IN {
+        for k in 0..HTLC_BLOCKS - 1 {
+            htlc_link.push(htlc_out_row(i, k)); // block k output → block k+1 input (chain)
+        }
+    }
+    let htlc_in3: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, HTLC_BLOCKS - 1) * BLOCK).collect();
+    let htlc_root_out: Vec<usize> = (0..N_IN).map(|i| htlc_out_row(i, HTLC_BLOCKS - 1)).collect();
+    cols.push(one_hot(&htlc_in0)); // P_HTLC_IN0
+    cols.push(one_hot(&htlc_link)); // P_HTLC_LINK
+    cols.push(one_hot(&htlc_in3)); // P_HTLC_IN3
+    cols.push(one_hot(&htlc_root_out)); // P_HTLC_ROOT
     for i in 0..N_IN {
         cols.push(one_hot(&[null_out_row(i)])); // P_NULLOUT + i
     }
@@ -536,6 +554,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
         let dom_cm = AB::Expr::from(Goldilocks::from_u64(DOM_CM));
         let dom_nf = AB::Expr::from(Goldilocks::from_u64(DOM_NF));
+        let dom_htlc = AB::Expr::from(Goldilocks::from_u64(DOM_HTLC));
+        let dom_nf_htlc = AB::Expr::from(Goldilocks::from_u64(DOM_NF_HTLC));
 
         let is_init = p[0].clone();
         let is_full = p[1].clone();
@@ -605,13 +625,35 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
             builder.assert_zero(own.clone() * cur[i].clone());
         }
 
-        // ---- owner binding: OWNER == own.out (the recipient digest) at the ownership output ----
-        // OWNER (local-persistent) carries the note owner into commit_a without block adjacency. For an
-        // HTLC note OWNER is instead bound to htlc_root at the span-end chain; that gating is added with
-        // the HTLC owner stage. Here (PLAIN) OWNER == own.out = recipient.
+        // ---- owner binding (note_type-gated) ----
+        // NT is boolean (PLAIN=0 / HTLC=1).
+        builder.assert_zero(p[P_OWN_IN].clone() * cur[NT].clone() * (cur[NT].clone() - one.clone()));
+        let nt = cur[NT].clone();
+        let not_htlc = one.clone() - nt.clone();
+        // PLAIN: OWNER == own.out (the recipient digest) at the ownership output.
         let rl = p[P_RECIP_LINK].clone();
         for k in 0..DIGEST {
-            builder.assert_zero(rl.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()));
+            builder.assert_zero(rl.clone() * not_htlc.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()));
+        }
+        // HTLC: OWNER == htlc_root (= htlc block 3 output) at the htlc_root row.
+        let hr = p[P_HTLC_ROOT].clone();
+        for k in 0..DIGEST {
+            builder.assert_zero(hr.clone() * nt.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()));
+        }
+        // ---- htlc_root chain: MD-chain(DOM_HTLC ‖ redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout) binds
+        //      all four HTLC terms into the committed owner (else cm wouldn't be in the tree). ----
+        let h0 = p[P_HTLC_IN0].clone();
+        builder.assert_zero(h0.clone() * (cur[0].clone() - dom_htlc.clone())); // block 0 lane0 = DOM_HTLC
+        for k in 1..DIGEST {
+            builder.assert_zero(h0.clone() * cur[k].clone()); // capacity lanes 1..4 = 0 (redeem_tag in lanes 4..8)
+        }
+        let hl = p[P_HTLC_LINK].clone();
+        for k in 0..DIGEST {
+            builder.when_transition().assert_zero(hl.clone() * (nxt[k].clone() - cur[k].clone())); // chain out[0..4] → next in[0..4]
+        }
+        let h3 = p[P_HTLC_IN3].clone();
+        for k in (DIGEST + 1)..8 {
+            builder.assert_zero(h3.clone() * cur[k].clone()); // block 3 capacity lanes 5,6,7 = 0 (timeout in lane 4)
         }
 
         // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
@@ -652,17 +694,28 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
             builder.assert_zero(pr.clone() * (cur[k].clone() - pis[PI_ANCHOR + k].clone()));
         }
 
-        // ---- nullifier input: [DOM_NF, nk0, nk1, rho0, rho1, pos_acc, 0, 0] (A1: pos = pos_acc) ----
+        // ---- nullifier input (A1: pos = pos_acc), note_type-gated ----
+        // PLAIN: [DOM_NF, nk0, nk1, rho0, rho1, pos, 0, 0]
+        // HTLC : [DOM_NF_HTLC, owner(4), rho0, rho1, pos]  — owner-based ⇒ mode/party-independent, so
+        //        one HTLC note has exactly one nullifier across redeem and refund (no double-spend).
         let ni = p[P_NULL_IN].clone();
-        builder.assert_zero(ni.clone() * (cur[0].clone() - dom_nf.clone()));
-        builder.assert_zero(ni.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(ni.clone() * (cur[2].clone() - cur[NK1].clone()));
-        builder.assert_zero(ni.clone() * (cur[3].clone() - cur[RHO].clone()));
-        builder.assert_zero(ni.clone() * (cur[4].clone() - cur[RHO1].clone()));
-        builder.assert_zero(ni.clone() * (cur[5].clone() - cur[POSACC].clone()));
-        for i in 6..8 {
-            builder.assert_zero(ni.clone() * cur[i].clone());
+        let nip = ni.clone() * not_htlc.clone();
+        builder.assert_zero(nip.clone() * (cur[0].clone() - dom_nf.clone()));
+        builder.assert_zero(nip.clone() * (cur[1].clone() - cur[NK].clone()));
+        builder.assert_zero(nip.clone() * (cur[2].clone() - cur[NK1].clone()));
+        builder.assert_zero(nip.clone() * (cur[3].clone() - cur[RHO].clone()));
+        builder.assert_zero(nip.clone() * (cur[4].clone() - cur[RHO1].clone()));
+        builder.assert_zero(nip.clone() * (cur[5].clone() - cur[POSACC].clone()));
+        builder.assert_zero(nip.clone() * cur[6].clone());
+        builder.assert_zero(nip.clone() * cur[7].clone());
+        let nih = ni.clone() * nt.clone();
+        builder.assert_zero(nih.clone() * (cur[0].clone() - dom_nf_htlc.clone()));
+        for k in 0..DIGEST {
+            builder.assert_zero(nih.clone() * (cur[1 + k].clone() - cur[OWNER0 + k].clone()));
         }
+        builder.assert_zero(nih.clone() * (cur[1 + DIGEST].clone() - cur[RHO].clone()));
+        builder.assert_zero(nih.clone() * (cur[2 + DIGEST].clone() - cur[RHO1].clone()));
+        builder.assert_zero(nih.clone() * (cur[3 + DIGEST].clone() - cur[POSACC].clone()));
         // ---- nullifier output: per-input public nf_i ----
         for i in 0..N_IN {
             let sel = p[P_NULLOUT + i].clone();
@@ -774,16 +827,33 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         own[3] = inp.div; // diversifier (free input)
         set_block(&mut t, base, own);
         let recipient = recipient_of(nk0, nk1, inp.div);
-        // commit_a: H1 = perm([DOM_CM, recipient(4), value, rho0, rho1]); its digest is the chain.
+        // htlc_root chain (the HTLC owner): computed here so it can feed commit_a; the 4 chain blocks
+        // are placed at the span END below (reusing these inputs).
+        let is_htlc = inp.note_type == Val::from_u64(NOTE_HTLC);
+        let mut hs = [[Val::ZERO; 8]; HTLC_BLOCKS];
+        hs[0][0] = Val::from_u64(DOM_HTLC);
+        hs[0][DIGEST..].copy_from_slice(&inp.redeem_tag);
+        let hc0 = native_permute(hs[0]);
+        hs[1][..DIGEST].copy_from_slice(&hc0[..DIGEST]);
+        hs[1][DIGEST..].copy_from_slice(&inp.refund_tag);
+        let hc1 = native_permute(hs[1]);
+        hs[2][..DIGEST].copy_from_slice(&hc1[..DIGEST]);
+        hs[2][DIGEST..].copy_from_slice(&inp.hashlock);
+        let hc2 = native_permute(hs[2]);
+        hs[3][..DIGEST].copy_from_slice(&hc2[..DIGEST]);
+        hs[3][DIGEST] = Val::from_u64(inp.timeout);
+        let htlc_owner: [Val; DIGEST] = native_permute(hs[3])[..DIGEST].try_into().unwrap();
+        let owner: [Val; DIGEST] = if is_htlc { htlc_owner } else { recipient };
+        // commit_a: H1 = perm([DOM_CM, owner(4), value, rho0, rho1]); its digest is the chain.
         let mut a = [Val::ZERO; 8];
         a[0] = Val::from_u64(DOM_CM);
-        a[1..1 + DIGEST].copy_from_slice(&recipient);
+        a[1..1 + DIGEST].copy_from_slice(&owner);
         a[1 + DIGEST] = value;
         a[1 + DIGEST + 1] = inp.rho[0];
         a[1 + DIGEST + 2] = inp.rho[1];
         set_block(&mut t, base + 1, a);
         let chain = native_permute(a);
-        // commit_b: cm = perm([chain(4), rcm0, rcm1, asset, 0]).
+        // commit_b: cm = perm([chain(4), rcm0, rcm1, asset, note_type]).
         let mut b = [Val::ZERO; 8];
         b[..DIGEST].copy_from_slice(&chain[..DIGEST]);
         b[DIGEST] = inp.rcm[0];
@@ -791,7 +861,7 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         b[DIGEST + 2] = inp.asset;
         b[DIGEST + 3] = inp.note_type;
         set_block(&mut t, base + 2, b);
-        let mut node = commit(recipient, value, inp.rho, inp.rcm, inp.asset, inp.note_type); // = perm(b)[..DIGEST]
+        let mut node = commit(owner, value, inp.rho, inp.rcm, inp.asset, inp.note_type); // = perm(b)[..DIGEST]
         for d in 0..DEPTH {
             let (l, r) = if inp.bits[d] { (inp.sib[d], node) } else { (node, inp.sib[d]) };
             let mut min = [Val::ZERO; 8];
@@ -801,39 +871,29 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
             t[((base + 3 + d) * BLOCK) * WIDTH + BIT] = if inp.bits[d] { Val::ONE } else { Val::ZERO };
             node = merge(l, r);
         }
-        // nullifier block: [DOM_NF, nk0, nk1, rho0, rho1, pos, 0, 0]
+        // nullifier block — PLAIN: [DOM_NF, nk0, nk1, rho0, rho1, pos]; HTLC: mode/party-independent
+        // [DOM_NF_HTLC, owner(4), rho0, rho1, pos] (owner-based, so one note ⇒ one nullifier).
         let pos = pos_of(&inp.bits);
         let mut nin = [Val::ZERO; 8];
-        nin[0] = Val::from_u64(DOM_NF);
-        nin[1] = nk0;
-        nin[2] = nk1;
-        nin[3] = inp.rho[0];
-        nin[4] = inp.rho[1];
-        nin[5] = pos;
+        if is_htlc {
+            nin[0] = Val::from_u64(DOM_NF_HTLC);
+            nin[1..1 + DIGEST].copy_from_slice(&owner);
+            nin[1 + DIGEST] = inp.rho[0];
+            nin[2 + DIGEST] = inp.rho[1];
+            nin[3 + DIGEST] = pos;
+        } else {
+            nin[0] = Val::from_u64(DOM_NF);
+            nin[1] = nk0;
+            nin[2] = nk1;
+            nin[3] = inp.rho[0];
+            nin[4] = inp.rho[1];
+            nin[5] = pos;
+        }
         set_block(&mut t, null_block(i), nin);
-        // htlc_root chain at the span END (blocks 4+DEPTH..7+DEPTH): the HTLC owner =
-        // MD-chain(DOM_HTLC ‖ redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout). Always filled as valid
-        // permutations so the round constraints hold; for PLAIN notes (zero HTLC fields) the result is
-        // unused. The owner-binding/gating eval constraints are added in later stages.
-        let mut hs0 = [Val::ZERO; 8];
-        hs0[0] = Val::from_u64(DOM_HTLC);
-        hs0[DIGEST..].copy_from_slice(&inp.redeem_tag);
-        set_block(&mut t, htlc_block(i, 0), hs0);
-        let mut hc = native_permute(hs0);
-        let mut hs1 = [Val::ZERO; 8];
-        hs1[..DIGEST].copy_from_slice(&hc[..DIGEST]);
-        hs1[DIGEST..].copy_from_slice(&inp.refund_tag);
-        set_block(&mut t, htlc_block(i, 1), hs1);
-        hc = native_permute(hs1);
-        let mut hs2 = [Val::ZERO; 8];
-        hs2[..DIGEST].copy_from_slice(&hc[..DIGEST]);
-        hs2[DIGEST..].copy_from_slice(&inp.hashlock);
-        set_block(&mut t, htlc_block(i, 2), hs2);
-        hc = native_permute(hs2);
-        let mut hs3 = [Val::ZERO; 8];
-        hs3[..DIGEST].copy_from_slice(&hc[..DIGEST]);
-        hs3[DIGEST] = Val::from_u64(inp.timeout);
-        set_block(&mut t, htlc_block(i, 3), hs3);
+        // htlc_root chain blocks at the span END (reuse the chain inputs computed above).
+        for k in 0..HTLC_BLOCKS {
+            set_block(&mut t, htlc_block(i, k), hs[k]);
+        }
         // local-persistent nk/rho/value/owner across the span (extends over the span-end htlc blocks)
         let (lo, hi) = (own_in_row(i), span_last_row(i));
         fill_col(&mut t, lo, hi, NK, nk0);
@@ -841,9 +901,9 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         fill_col(&mut t, lo, hi, RHO, inp.rho[0]);
         fill_col(&mut t, lo, hi, RHO1, inp.rho[1]);
         fill_col(&mut t, lo, hi, VAL, value);
-        // OWNER = the note owner (recipient for PLAIN; htlc_root for HTLC, set in the HTLC owner stage).
+        // OWNER = the note owner (recipient for PLAIN; htlc_root for HTLC).
         for k in 0..DIGEST {
-            fill_col(&mut t, lo, hi, OWNER0 + k, recipient[k]);
+            fill_col(&mut t, lo, hi, OWNER0 + k, owner[k]);
         }
         fill_col(&mut t, lo, hi, NT, inp.note_type); // note_type (committed in commit_b lane 7)
         // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
@@ -1491,6 +1551,21 @@ mod tests {
         let redeem = native_outputs(&htlc_witness(true, 5, hl, 10));
         let refund = native_outputs(&htlc_witness(false, 10, hl, 10));
         assert_eq!(redeem.nullifiers[0], refund.nullifiers[0], "HTLC nullifier must not depend on mode/party");
+    }
+
+    /// In-circuit: an HTLC note (owner = htlc_root, owner-based nullifier) proves and verifies through
+    /// the AIR, matching the native oracle. Exercises the span-end htlc_root chain + the owner MUX +
+    /// the note_type-gated nullifier.
+    #[test]
+    fn htlc_redeem_air_verifies() {
+        let hl = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+        prove_verify(&htlc_witness(true, 5, hl, 10)).expect("HTLC redeem must verify in-circuit");
+    }
+
+    #[test]
+    fn htlc_refund_air_verifies() {
+        let hl = [Val::from_u64(7), Val::from_u64(8), Val::from_u64(9), Val::from_u64(10)];
+        prove_verify(&htlc_witness(false, 10, hl, 10)).expect("HTLC refund must verify in-circuit");
     }
 
     #[test]
