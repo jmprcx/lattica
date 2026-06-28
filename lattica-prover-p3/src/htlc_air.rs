@@ -319,7 +319,11 @@ const RBIT: usize = 15;
 const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
 const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
 const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant across the whole tx)
-const WIDTH: usize = 19;
+// OWNER0..3: the note's owner digest (recipient for PLAIN, htlc_root for HTLC), local-persistent in
+// the span. Carries the owner into commit_a without block-adjacency, so the htlc_root (computed in the
+// span-end blocks) can feed commit_a (audit/AIR layout note in the header).
+const OWNER0: usize = 19;
+const WIDTH: usize = 23; // OWNER0..3 occupy 19..23
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
@@ -554,7 +558,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // persistence a prover could use one rho1 in the commitment and another in the nullifier,
         // minting a fresh nullifier for a real note ⇒ double-spend.
         let not_last = one.clone() - p[P_REGION_LAST].clone();
-        for &c in &[NK, NK1, RHO, RHO1, VAL] {
+        for &c in &[NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
         // ASSET is GLOBAL-persistent: constant across the whole trace (one hidden asset per tx), so
@@ -597,15 +601,21 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
             builder.assert_zero(own.clone() * cur[i].clone());
         }
 
-        // ---- recipient link: commit.in[1..5] = own.out[0..4] ----
+        // ---- owner binding: OWNER == own.out (the recipient digest) at the ownership output ----
+        // OWNER (local-persistent) carries the note owner into commit_a without block adjacency. For an
+        // HTLC note OWNER is instead bound to htlc_root at the span-end chain; that gating is added with
+        // the HTLC owner stage. Here (PLAIN) OWNER == own.out = recipient.
         let rl = p[P_RECIP_LINK].clone();
         for k in 0..DIGEST {
-            builder.when_transition().assert_zero(rl.clone() * (nxt[1 + k].clone() - cur[k].clone()));
+            builder.assert_zero(rl.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()));
         }
 
-        // ---- commit_a input: [DOM_CM, recipient(link), value, rho0, rho1] ----
+        // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
         let ca = p[P_COMMIT_A_IN].clone();
         builder.assert_zero(ca.clone() * (cur[0].clone() - dom_cm.clone()));
+        for k in 0..DIGEST {
+            builder.assert_zero(ca.clone() * (cur[1 + k].clone() - cur[OWNER0 + k].clone())); // owner lanes
+        }
         builder.assert_zero(ca.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // value (lane 5)
         builder.assert_zero(ca.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone())); // rho0  (lane 6)
         builder.assert_zero(ca.clone() * (cur[3 + DIGEST].clone() - cur[RHO1].clone())); // rho1 (lane 7)
@@ -818,13 +828,17 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         hs3[..DIGEST].copy_from_slice(&hc[..DIGEST]);
         hs3[DIGEST] = Val::from_u64(inp.timeout);
         set_block(&mut t, htlc_block(i, 3), hs3);
-        // local-persistent nk/rho/value across the span (now extends over the span-end htlc blocks)
+        // local-persistent nk/rho/value/owner across the span (extends over the span-end htlc blocks)
         let (lo, hi) = (own_in_row(i), span_last_row(i));
         fill_col(&mut t, lo, hi, NK, nk0);
         fill_col(&mut t, lo, hi, NK1, nk1);
         fill_col(&mut t, lo, hi, RHO, inp.rho[0]);
         fill_col(&mut t, lo, hi, RHO1, inp.rho[1]);
         fill_col(&mut t, lo, hi, VAL, value);
+        // OWNER = the note owner (recipient for PLAIN; htlc_root for HTLC, set in the HTLC owner stage).
+        for k in 0..DIGEST {
+            fill_col(&mut t, lo, hi, OWNER0 + k, recipient[k]);
+        }
         // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
         let mut acc = 0u64;
         let mut links: Vec<(usize, u64)> = Vec::new();
