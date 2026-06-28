@@ -245,6 +245,30 @@ pub fn proveJoinSplit(allocator: std.mem.Allocator, witness: []const u8) ![]u8 {
     return allocator.dupe(u8, buf[0..proof_len]);
 }
 
+var htlc_prove_backend: ?ProveFn = null;
+
+pub fn setHtlcProveBackend(f: ProveFn) void {
+    htlc_prove_backend = f;
+}
+pub fn clearHtlcProveBackend() void {
+    htlc_prove_backend = null;
+}
+
+/// Prove an HTLC spend from a serialized witness via the installed prover backend (the Rust
+/// `lattica_htlc_prove` in production). Returns the proof bytes (allocator-owned).
+pub fn proveHtlc(allocator: std.mem.Allocator, witness: []const u8) ![]u8 {
+    const f = htlc_prove_backend orelse return error.NoProveBackend;
+    const buf = try allocator.alloc(u8, MAX_PROOF_LEN);
+    defer allocator.free(buf);
+    var pi: [HtlcPublicInputs.ENCODED_LEN]u8 = undefined;
+    var proof_len: usize = 0;
+    var pi_len: usize = 0;
+    const rc = f(witness.ptr, witness.len, buf.ptr, buf.len, &proof_len, &pi, pi.len, &pi_len);
+    if (rc != 0) return error.ProveFailed;
+    if (proof_len > buf.len) return error.ProveFailed;
+    return allocator.dupe(u8, buf[0..proof_len]);
+}
+
 // ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------

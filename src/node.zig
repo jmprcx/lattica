@@ -71,6 +71,22 @@ pub const OutputReq = struct {
     value: u64,
 };
 
+/// A spendable HTLC note plus the swap terms the claiming party knows (the lock descriptor). The
+/// claimer's key (`nk`) must own the mode-appropriate tag: `recipientId(nk, claim_div) == redeem_tag`
+/// (redeem) or `== refund_tag` (refund). `note.recipient` is the htlc_root committing all four terms.
+pub const HtlcSpend = struct {
+    note: tx.Note, // recipient = htlc_root, note_type = poseidon2.NOTE_HTLC
+    position: u64,
+    path: tree.MerklePath,
+    claim_div: u64, // diversifier s.t. recipientId(claimer.nk, claim_div) == the claimed tag
+    mode: u64, // 1 = redeem, 0 = refund
+    redeem_tag: Hash32,
+    refund_tag: Hash32,
+    hashlock: Hash32, // the note's committed hashlock (= SHA256(preimage))
+    timeout: u64,
+    preimage: ?[32]u8, // revealed on redeem; null for refund
+};
+
 /// A shielded join-split transaction. The only public data is the join-split statement plus the
 /// encrypted output notes; values and input commitments stay hidden in the proof.
 pub const ShieldedTx = struct {
@@ -320,6 +336,147 @@ pub fn buildTransfer(
     return t;
 }
 
+/// Serialize an HTLC spend witness (matching `lattica-prover-p3::parse_htlc_witness`): input 0 is the
+/// HTLC note (note_type = HTLC + the claimed tag/terms), input 1 a PLAIN dummy, then the outputs
+/// (each with note_type), then fee/mint/tx_binding/current_height.
+fn encodeHtlcWitness(
+    a: Allocator,
+    claimer: tx.FullKey,
+    spend: HtlcSpend,
+    dummy: InputSpend,
+    out_notes: [M_OUT]tx.Note,
+    fee: u64,
+    mint: u64,
+    tx_binding: Hash32,
+    current_height: u64,
+) ![]u8 {
+    var w: std.ArrayList(u8) = .empty;
+    errdefer w.deinit(a);
+    const nk0 = std.mem.readInt(u64, claimer.nk[0..8], .little);
+    const nk1 = std.mem.readInt(u64, claimer.nk[8..16], .little);
+    var le: [8]u8 = undefined;
+    // input 0: the HTLC note.
+    try putU64(&w, a, nk0);
+    try putU64(&w, a, nk1);
+    std.mem.writeInt(u64, &le, spend.claim_div, .little);
+    try putFelt(&w, a, &le);
+    std.mem.writeInt(u64, &le, spend.note.asset, .little);
+    try putFelt(&w, a, &le);
+    std.mem.writeInt(u64, &le, poseidon2.NOTE_HTLC, .little);
+    try putFelt(&w, a, &le); // note_type
+    try putU64(&w, a, spend.note.value);
+    try putFelt(&w, a, spend.note.rho[0..8]);
+    try putFelt(&w, a, spend.note.rho[8..16]);
+    try putFelt(&w, a, spend.note.rcm[0..8]);
+    try putFelt(&w, a, spend.note.rcm[8..16]);
+    for (spend.path.siblings) |sib| try putDigest(&w, a, sib);
+    var d: usize = 0;
+    while (d < DEPTH) : (d += 1) try w.append(a, @intCast((spend.position >> @intCast(d)) & 1));
+    std.mem.writeInt(u64, &le, spend.mode, .little);
+    try putFelt(&w, a, &le); // mode
+    try putDigest(&w, a, spend.redeem_tag);
+    try putDigest(&w, a, spend.refund_tag);
+    try putDigest(&w, a, spend.hashlock);
+    try putU64(&w, a, spend.timeout);
+    // input 1: a PLAIN dummy (htlc fields zeroed).
+    try putU64(&w, a, nk0);
+    try putU64(&w, a, nk1);
+    std.mem.writeInt(u64, &le, dummy.note.div, .little);
+    try putFelt(&w, a, &le);
+    std.mem.writeInt(u64, &le, dummy.note.asset, .little);
+    try putFelt(&w, a, &le);
+    std.mem.writeInt(u64, &le, poseidon2.NOTE_PLAIN, .little);
+    try putFelt(&w, a, &le);
+    try putU64(&w, a, dummy.note.value);
+    try putFelt(&w, a, dummy.note.rho[0..8]);
+    try putFelt(&w, a, dummy.note.rho[8..16]);
+    try putFelt(&w, a, dummy.note.rcm[0..8]);
+    try putFelt(&w, a, dummy.note.rcm[8..16]);
+    for (dummy.path.siblings) |sib| try putDigest(&w, a, sib);
+    d = 0;
+    while (d < DEPTH) : (d += 1) try w.append(a, @intCast((dummy.position >> @intCast(d)) & 1));
+    std.mem.writeInt(u64, &le, 0, .little);
+    try putFelt(&w, a, &le); // mode = 0
+    try putDigest(&w, a, [_]u8{0} ** 32); // redeem_tag
+    try putDigest(&w, a, [_]u8{0} ** 32); // refund_tag
+    try putDigest(&w, a, [_]u8{0} ** 32); // hashlock
+    try putU64(&w, a, 0); // timeout
+    // outputs (note_type added vs join-split).
+    for (out_notes) |o| {
+        try putDigest(&w, a, o.recipient);
+        std.mem.writeInt(u64, &le, o.asset, .little);
+        try putFelt(&w, a, &le);
+        std.mem.writeInt(u64, &le, o.note_type, .little);
+        try putFelt(&w, a, &le);
+        try putU64(&w, a, o.value);
+        try putFelt(&w, a, o.rho[0..8]);
+        try putFelt(&w, a, o.rho[8..16]);
+        try putFelt(&w, a, o.rcm[0..8]);
+        try putFelt(&w, a, o.rcm[8..16]);
+    }
+    try putU64(&w, a, fee);
+    try putU64(&w, a, mint);
+    try putDigest(&w, a, tx_binding);
+    try putU64(&w, a, current_height);
+    return w.toOwnedSlice(a);
+}
+
+/// Build a shielded HTLC spend (redeem or refund) for `spend` (input 0) padded with the owned
+/// zero-value `dummy` (input 1), paying `outputs`, leaving `fee`, validated at `current_height`. The
+/// proof is produced via the installed HTLC prover. The dummy's `asset` must equal the HTLC note's.
+pub fn buildHtlcSpend(
+    allocator: Allocator,
+    claimer: tx.FullKey,
+    spend: HtlcSpend,
+    dummy: InputSpend,
+    outputs: []const OutputReq,
+    fee: u64,
+    current_height: u64,
+    anchor: Hash32,
+) !ShieldedHtlcTx {
+    if (outputs.len > M_OUT) return TxError.Internal;
+    if (dummy.note.asset != spend.note.asset) return TxError.Internal; // single hidden asset per tx
+    // nf0 = owner-based HTLC nullifier (mode/party-independent); nf1 = the PLAIN dummy's nullifier.
+    const owner = poseidon2.digestFromBytes(spend.note.recipient);
+    const rho = [2]u64{ poseidon2.feltLE(spend.note.rho[0..8]), poseidon2.feltLE(spend.note.rho[8..16]) };
+    const nf0 = poseidon2.digestBytes(poseidon2.nullifierHtlc(owner, rho, spend.position));
+    const nf1 = dummy.note.nullifier(&claimer.nk, dummy.position);
+    const nfs = [_]Hash32{ nf0, nf1 };
+
+    var out_notes: [M_OUT]tx.Note = undefined;
+    var tns: [M_OUT]tx.TransmittedNote = undefined;
+    for (0..M_OUT) |j| {
+        const recipient: tx.Address = if (j < outputs.len) outputs[j].recipient else claimer.address();
+        const value: u64 = if (j < outputs.len) outputs[j].value else 0;
+        const jb = [_]u8{@intCast(j)};
+        const orho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nf0, &jb });
+        const orcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nf0, &jb });
+        out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .div = recipient.div, .asset = spend.note.asset, .rho = orho, .rcm = orcm };
+        tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal;
+    }
+
+    // Value balance (redeem/refund both conserve value): Σin = Σout + fee.
+    const in_sum = std.math.add(u64, spend.note.value, dummy.note.value) catch return TxError.ValueOverflow;
+    var out_sum: u64 = fee;
+    for (out_notes) |o| out_sum = std.math.add(u64, out_sum, o.value) catch return TxError.ValueOverflow;
+    if (in_sum != out_sum) return TxError.Unbalanced;
+
+    var t = ShieldedHtlcTx{
+        .anchor = anchor,
+        .nullifiers = nfs,
+        .fee = fee,
+        .mint = 0,
+        .current_height = current_height,
+        .redeem_preimage = spend.preimage,
+        .proof = &.{},
+        .outputs = tns,
+    };
+    const binding = t.txBinding();
+    const witness = encodeHtlcWitness(allocator, claimer, spend, dummy, out_notes, fee, 0, binding, current_height) catch return TxError.Internal;
+    t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.Internal;
+    return t;
+}
+
 // ---------------------------------------------------------------------------------------
 // Chain state
 // ---------------------------------------------------------------------------------------
@@ -411,6 +568,26 @@ pub const Chain = struct {
         self.transmitted.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal;
 
         // Infallible commit.
+        self.supply = candidate_supply;
+        const pos = self.tree.appendAssumeCapacity(tn.cm);
+        self.anchors.putAssumeCapacity(self.tree.root(), {});
+        self.transmitted.appendAssumeCapacity(tn);
+        return .{ .note = note, .pos = pos };
+    }
+
+    /// Genesis/test-only: insert a pre-built note (e.g. an HTLC note whose `recipient` is an htlc_root)
+    /// as a tree member, crediting the shielded pool by its value. Mirrors `bootstrapMint`'s two-phase
+    /// apply. HTLC notes are watched by commitment (not scanned), so the ciphertext is a placeholder.
+    pub fn bootstrapNote(self: *Chain, note: tx.Note) !Minted {
+        if (production) @compileError("bootstrapNote is genesis/test-only");
+        const ct = self.allocator.alloc(u8, 0) catch return TxError.Internal;
+        errdefer self.allocator.free(ct);
+        const tn = tx.TransmittedNote{ .cm = note.commitment(), .kem_ct = [_]u8{0} ** p.CT_LEN, .ciphertext = ct };
+        var candidate_supply = self.supply;
+        candidate_supply.apply(.{ .issued = note.value, .burned = 0, .fee = 0 }) catch return TxError.ValueOverflow;
+        self.tree.ensureUnusedCapacity(1) catch return TxError.TreeFull;
+        self.anchors.ensureUnusedCapacity(1) catch return TxError.Internal;
+        self.transmitted.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal;
         self.supply = candidate_supply;
         const pos = self.tree.appendAssumeCapacity(tn.cm);
         self.anchors.putAssumeCapacity(self.tree.root(), {});
@@ -591,6 +768,27 @@ pub const mock = if (production) struct {} else struct {
         return 1;
     }
 
+    /// HTLC "proof" = the witness's tx_binding. In the htlc witness layout tx_binding is the
+    /// second-to-last field (the last 8 bytes are current_height), so it's at [len-40 .. len-8].
+    pub fn proveHtlc(
+        witness_ptr: [*]const u8,
+        witness_len: usize,
+        proof_out: [*]u8,
+        proof_cap: usize,
+        proof_len: *usize,
+        pi_out: [*]u8,
+        pi_cap: usize,
+        pi_len: *usize,
+    ) callconv(.c) i32 {
+        _ = pi_out;
+        _ = pi_cap;
+        if (witness_len < 40 or proof_cap < 32) return 1;
+        @memcpy(proof_out[0..32], witness_ptr[witness_len - 40 .. witness_len - 8]);
+        proof_len.* = 32;
+        pi_len.* = 0;
+        return 0;
+    }
+
     /// Same model for the HTLC statement: tx_binding sits at the same offset (anchor ‖ nf ‖ out_cm ‖
     /// tx_binding ‖ …), only the total length differs.
     pub fn verifyHtlc(proof_ptr: [*]const u8, proof_len: usize, pi_ptr: [*]const u8, pi_len: usize) callconv(.c) i32 {
@@ -605,11 +803,13 @@ pub const mock = if (production) struct {} else struct {
     pub fn install() void {
         ffi.setJoinSplitProveBackend(&prove);
         ffi.setJoinSplitBackend(&verify);
+        ffi.setHtlcProveBackend(&proveHtlc);
         ffi.setHtlcBackend(&verifyHtlc);
     }
     pub fn uninstall() void {
         ffi.clearJoinSplitProveBackend();
         ffi.clearJoinSplitBackend();
+        ffi.clearHtlcProveBackend();
         ffi.clearHtlcBackend();
     }
 };
@@ -957,4 +1157,58 @@ test "node: a tampered HTLC body (different preimage) is rejected" {
     // no longer matches the body ⇒ rejected (the cross-chain atomic value can't be forged).
     t.redeem_preimage = [_]u8{0xCD} ** 32;
     try testing.expectError(TxError.BadAuthProof, chain.applyHtlc(t, 50));
+}
+
+test "node: buildHtlcSpend → applyHtlc end-to-end (mock backend)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const claimer = try account(1); // the redeem party
+    const refunder = try account(2);
+
+    // The HTLC note: owner = htlc_root(redeem_tag, refund_tag, hashlock, timeout), note_type = HTLC.
+    const preimage = [_]u8{0xAB} ** 32;
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&preimage, &sha, .{});
+    const hashlock = poseidon2.digestBytes(poseidon2.digestFromBytes(sha));
+    const redeem_tag = claimer.address().recipientId();
+    const refund_tag = refunder.address().recipientId();
+    const timeout: u64 = 100;
+    const owner = poseidon2.digestBytes(poseidon2.htlcRoot(
+        poseidon2.digestFromBytes(redeem_tag),
+        poseidon2.digestFromBytes(refund_tag),
+        poseidon2.digestFromBytes(hashlock),
+        timeout,
+    ));
+    const htlc_note = tx.Note{ .value = 1000, .recipient = owner, .div = 0, .note_type = poseidon2.NOTE_HTLC, .rho = p.hashDomain("t:hrho", &.{}), .rcm = p.hashDomain("t:hrcm", &.{}) };
+    const locked = try chain.bootstrapNote(htlc_note);
+    const dummy = try chain.bootstrapMint(claimer.address(), 0, [_]u8{9} ** 32); // owned zero-value pad
+
+    const spend = HtlcSpend{
+        .note = htlc_note,
+        .position = locked.pos,
+        .path = try chain.merklePath(a, locked.pos),
+        .claim_div = claimer.address().div,
+        .mode = 1, // redeem
+        .redeem_tag = redeem_tag,
+        .refund_tag = refund_tag,
+        .hashlock = hashlock,
+        .timeout = timeout,
+        .preimage = preimage,
+    };
+    const dummy_in = InputSpend{ .note = dummy.note, .position = dummy.pos, .path = try chain.merklePath(a, dummy.pos) };
+    const outs = [_]OutputReq{.{ .recipient = claimer.address(), .value = 1000 }};
+
+    const t = try buildHtlcSpend(a, claimer, spend, dummy_in, &outs, 0, 50, chain.anchor()); // height 50 < timeout 100
+    try chain.applyHtlc(t, 50);
+
+    var got: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (tx.tryDecrypt(a, claimer, tn)) |n| got += n.value;
+    }
+    try testing.expectEqual(@as(u64, 1000), got); // claimer redeemed the locked 1000
+    try testing.expect(chain.supply.invariantHolds());
 }
