@@ -504,6 +504,179 @@ pub unsafe extern "C" fn lattica_joinsplit_prove(
     0
 }
 
+// --- HTLC wallet-side prover ABI --------------------------------------------------------------
+
+/// Canonical wallet→prover **HTLC** witness layout = the join-split layout plus the HTLC fields.
+/// Per input: nk0,nk1 (u64) ‖ div ‖ asset ‖ note_type ‖ value (u64) ‖ rho0,rho1 ‖ rcm0,rcm1 ‖
+/// sib[DEPTH]·digest ‖ bits[DEPTH] ‖ mode ‖ redeem_tag(32) ‖ refund_tag(32) ‖ hashlock(32) ‖
+/// timeout (u64). Per output: recipient(32) ‖ asset ‖ note_type ‖ value (u64) ‖ rho ‖ rcm. Tail:
+/// fee,mint (u64) ‖ tx_binding(32) ‖ current_height (u64).
+const fn htlc_witness_len() -> usize {
+    let d = htlc_air::DEPTH;
+    let per_in = 16 + 8 + 8 + 8 + 8 + 16 + 16 + d * 32 + d + 8 + 32 + 32 + 32 + 8;
+    let per_out = 32 + 8 + 8 + 8 + 16 + 16;
+    htlc_air::N_IN * per_in + htlc_air::M_OUT * per_out + 8 + 8 + 32 + 8
+}
+const HTLC_WITNESS_LEN: usize = htlc_witness_len();
+
+fn parse_htlc_witness(b: &[u8]) -> Option<htlc_air::Witness> {
+    use htlc_air::{Input, Output, Witness, DEPTH, M_OUT, N_IN};
+    if b.len() != HTLC_WITNESS_LEN {
+        return None;
+    }
+    let mut off = 0usize;
+    let mut inputs = Vec::with_capacity(N_IN);
+    for _ in 0..N_IN {
+        let nk = [rd_u64(b, &mut off), rd_u64(b, &mut off)];
+        let div = rd_felt(b, &mut off)?;
+        let asset = rd_felt(b, &mut off)?;
+        let note_type = rd_felt(b, &mut off)?;
+        let value = rd_u64(b, &mut off);
+        let rho = rd_felt2(b, &mut off)?;
+        let rcm = rd_felt2(b, &mut off)?;
+        let mut sib = Vec::with_capacity(DEPTH);
+        for _ in 0..DEPTH {
+            sib.push(rd_digest(b, &mut off)?);
+        }
+        let sib: [[Goldilocks; 4]; DEPTH] = sib.try_into().ok()?;
+        let mut bits = [false; DEPTH];
+        for bit in bits.iter_mut() {
+            *bit = match b[off] {
+                0 => false,
+                1 => true,
+                _ => return None, // canonical path bits (audit M-03)
+            };
+            off += 1;
+        }
+        let mode = rd_felt(b, &mut off)?;
+        let redeem_tag = rd_digest(b, &mut off)?;
+        let refund_tag = rd_digest(b, &mut off)?;
+        let hashlock = rd_digest(b, &mut off)?;
+        let timeout = rd_u64(b, &mut off);
+        inputs.push(Input {
+            nk, div, asset, note_type, value, rho, rcm, sib, bits, mode, redeem_tag, refund_tag, hashlock, timeout,
+        });
+    }
+    let inputs: [Input; N_IN] = inputs.try_into().ok()?;
+    let mut outputs = Vec::with_capacity(M_OUT);
+    for _ in 0..M_OUT {
+        let recipient = rd_digest(b, &mut off)?;
+        let asset = rd_felt(b, &mut off)?;
+        let note_type = rd_felt(b, &mut off)?;
+        let value = rd_u64(b, &mut off);
+        let rho = rd_felt2(b, &mut off)?;
+        let rcm = rd_felt2(b, &mut off)?;
+        outputs.push(Output { recipient, asset, note_type, value, rho, rcm });
+    }
+    let outputs: [Output; M_OUT] = outputs.try_into().ok()?;
+    let fee = rd_u64(b, &mut off);
+    let mint = rd_u64(b, &mut off);
+    let tx_binding = rd_digest(b, &mut off)?;
+    let current_height = rd_u64(b, &mut off);
+    Some(Witness { inputs, outputs, fee, mint, tx_binding, current_height })
+}
+
+/// Encode an HTLC witness into the canonical byte layout (inverse of `parse_htlc_witness`).
+pub fn encode_htlc_witness(w: &htlc_air::Witness) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HTLC_WITNESS_LEN);
+    let put_felt = |o: &mut Vec<u8>, f: Goldilocks| o.extend_from_slice(&f.as_canonical_u64().to_le_bytes());
+    let put_u64 = |o: &mut Vec<u8>, v: u64| o.extend_from_slice(&v.to_le_bytes());
+    let put_digest = |o: &mut Vec<u8>, d: &[Goldilocks; 4]| {
+        for &f in d {
+            o.extend_from_slice(&f.as_canonical_u64().to_le_bytes());
+        }
+    };
+    for inp in &w.inputs {
+        put_u64(&mut out, inp.nk[0]);
+        put_u64(&mut out, inp.nk[1]);
+        put_felt(&mut out, inp.div);
+        put_felt(&mut out, inp.asset);
+        put_felt(&mut out, inp.note_type);
+        put_u64(&mut out, inp.value);
+        put_felt(&mut out, inp.rho[0]);
+        put_felt(&mut out, inp.rho[1]);
+        put_felt(&mut out, inp.rcm[0]);
+        put_felt(&mut out, inp.rcm[1]);
+        for row in &inp.sib {
+            for &f in row {
+                put_felt(&mut out, f);
+            }
+        }
+        for &bit in &inp.bits {
+            out.push(bit as u8);
+        }
+        put_felt(&mut out, inp.mode);
+        put_digest(&mut out, &inp.redeem_tag);
+        put_digest(&mut out, &inp.refund_tag);
+        put_digest(&mut out, &inp.hashlock);
+        put_u64(&mut out, inp.timeout);
+    }
+    for o in &w.outputs {
+        put_digest(&mut out, &o.recipient);
+        put_felt(&mut out, o.asset);
+        put_felt(&mut out, o.note_type);
+        put_u64(&mut out, o.value);
+        put_felt(&mut out, o.rho[0]);
+        put_felt(&mut out, o.rho[1]);
+        put_felt(&mut out, o.rcm[0]);
+        put_felt(&mut out, o.rcm[1]);
+    }
+    put_u64(&mut out, w.fee);
+    put_u64(&mut out, w.mint);
+    put_digest(&mut out, &w.tx_binding);
+    put_u64(&mut out, w.current_height);
+    out
+}
+
+/// C ABI: prove an HTLC spend from a serialized witness, writing the proof + `HtlcPublicInputs` bytes.
+/// Same fail-closed / panic-isolated / buffer-checked contract as `lattica_joinsplit_prove`.
+///
+/// # Safety
+/// `witness_ptr` must point to `witness_len` readable bytes; `*_out` to `*_cap` writable bytes; the
+/// `len` pointers writable.
+#[no_mangle]
+pub unsafe extern "C" fn lattica_htlc_prove(
+    witness_ptr: *const u8,
+    witness_len: usize,
+    proof_out: *mut u8,
+    proof_cap: usize,
+    proof_len: *mut usize,
+    pi_out: *mut u8,
+    pi_cap: usize,
+    pi_len: *mut usize,
+) -> i32 {
+    if witness_ptr.is_null()
+        || proof_out.is_null()
+        || pi_out.is_null()
+        || proof_len.is_null()
+        || pi_len.is_null()
+    {
+        return 1;
+    }
+    let wb = slice::from_raw_parts(witness_ptr, witness_len);
+    let w = match parse_htlc_witness(wb) {
+        Some(w) => w,
+        None => return 1,
+    };
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let pib = encode_htlc_public_inputs(&htlc_air::public_values(&w))?;
+        let proof = htlc_air::prove_to_bytes(&w);
+        Some((proof, pib))
+    }));
+    let (proof, pib) = match built {
+        Ok(Some(x)) => x,
+        _ => return 1,
+    };
+    if proof.len() > proof_cap || pib.len() > pi_cap {
+        return 2;
+    }
+    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
+    *proof_len = proof.len();
+    core::ptr::copy_nonoverlapping(pib.as_ptr(), pi_out, pib.len());
+    *pi_len = pib.len();
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +867,31 @@ mod tests {
         assert_eq!(
             unsafe { lattica_htlc_verify(pbuf.as_ptr(), pl, pibuf.as_ptr(), pil) },
             0
+        );
+    }
+
+    #[test]
+    fn htlc_prove_abi_roundtrip() {
+        // The wallet→prover path: encode an HTLC witness, prove it via the C ABI, verify the result.
+        let w = crate::htlc_air::demo_htlc_witness();
+        let wb = encode_htlc_witness(&w);
+        assert_eq!(wb.len(), HTLC_WITNESS_LEN);
+        // the byte layout round-trips to the same statement
+        let w2 = parse_htlc_witness(&wb).unwrap();
+        assert_eq!(crate::htlc_air::public_values(&w2), crate::htlc_air::public_values(&w));
+        // prove from the serialized witness → the proof verifies against the returned public inputs
+        let mut pbuf = vec![0u8; 1 << 20];
+        let mut pibuf = vec![0u8; 512];
+        let (mut pl, mut pil) = (0usize, 0usize);
+        let rc = unsafe {
+            lattica_htlc_prove(wb.as_ptr(), wb.len(), pbuf.as_mut_ptr(), pbuf.len(), &mut pl, pibuf.as_mut_ptr(), pibuf.len(), &mut pil)
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(unsafe { lattica_htlc_verify(pbuf.as_ptr(), pl, pibuf.as_ptr(), pil) }, 0);
+        // a truncated witness is rejected (fail-closed)
+        assert_eq!(
+            unsafe { lattica_htlc_prove(wb.as_ptr(), wb.len() - 1, pbuf.as_mut_ptr(), pbuf.len(), &mut pl, pibuf.as_mut_ptr(), pibuf.len(), &mut pil) },
+            1
         );
     }
 }
