@@ -21,6 +21,11 @@ pub const Digest = [DIGEST_FELTS]Felt;
 pub const DOM_OWN: u64 = 1;
 pub const DOM_CM: u64 = 2;
 pub const DOM_NF: u64 = 3;
+pub const DOM_HTLC: u64 = 4; // v3: htlc_root MD-chain (must match htlc_air::DOM_HTLC)
+pub const DOM_NF_HTLC: u64 = 5; // v3: owner-based HTLC nullifier (must match htlc_air::DOM_NF_HTLC)
+
+pub const NOTE_PLAIN: u64 = 0;
+pub const NOTE_HTLC: u64 = 1;
 
 // --- vetted constants (generated; do not edit by hand — regenerate via dump_p2) ---------------
 const DIAG8 = [8]u64{ 18446744069414584319, 1, 2, 9223372034707292161, 3, 9223372034707292160, 18446744069414584318, 18446744069414584317 };
@@ -106,18 +111,40 @@ pub fn recipient(nk0: Felt, nk1: Felt, d: Felt) Digest {
     return h(DOM_OWN, &.{ nk0, nk1, d }); // 128-bit nullifier key + diversifier
 }
 
-/// Two-permutation commitment (128-bit note randomness; must match joinsplit_air::commit):
-///   H1 = perm([DOM_CM, rcp(4), value, rho0, rho1]); cm = perm([H1(4), rcm0, rcm1, 0, 0]).
-pub fn commitNote(rcp: Digest, value: Felt, rho: [2]Felt, rcm: [2]Felt, asset: Felt) Digest {
-    var a = [_]Felt{ DOM_CM, rcp[0], rcp[1], rcp[2], rcp[3], value, rho[0], rho[1] };
+/// Two-permutation commitment (128-bit note randomness; must match joinsplit_air/htlc_air::commit):
+///   H1 = perm([DOM_CM, owner(4), value, rho0, rho1]); cm = perm([H1(4), rcm0, rcm1, asset, note_type]).
+/// `owner` is the recipient digest (PLAIN) or the htlc_root (HTLC); `note_type` is 0 (PLAIN) / 1 (HTLC).
+pub fn commitNote(owner: Digest, value: Felt, rho: [2]Felt, rcm: [2]Felt, asset: Felt, note_type: Felt) Digest {
+    var a = [_]Felt{ DOM_CM, owner[0], owner[1], owner[2], owner[3], value, rho[0], rho[1] };
     permute(&a);
-    var b = [_]Felt{ a[0], a[1], a[2], a[3], rcm[0], rcm[1], asset, 0 }; // lane6 = hidden asset id
+    var b = [_]Felt{ a[0], a[1], a[2], a[3], rcm[0], rcm[1], asset, note_type }; // lane6=asset, lane7=note_type
     permute(&b);
     return b[0..4].*;
 }
 
 pub fn nullifierHash(nk0: Felt, nk1: Felt, rho: [2]Felt, pos: Felt) Digest {
     return h(DOM_NF, &.{ nk0, nk1, rho[0], rho[1], pos });
+}
+
+/// v3 HTLC owner = `htlc_root`: domain-tagged MD-chain over the two party tags, the hashlock, and the
+/// timeout (must match `htlc_air::htlc_root`). Block 0 = [DOM_HTLC,0,0,0, redeem_tag]; blocks 1-3 are
+/// merge-shaped (chain ‖ data) absorbing refund_tag, hashlock, then [timeout,0,0,0].
+pub fn htlcRoot(redeem_tag: Digest, refund_tag: Digest, hashlock: Digest, timeout: Felt) Digest {
+    var s0 = [_]Felt{ DOM_HTLC, 0, 0, 0, redeem_tag[0], redeem_tag[1], redeem_tag[2], redeem_tag[3] };
+    permute(&s0);
+    var s1 = [_]Felt{ s0[0], s0[1], s0[2], s0[3], refund_tag[0], refund_tag[1], refund_tag[2], refund_tag[3] };
+    permute(&s1);
+    var s2 = [_]Felt{ s1[0], s1[1], s1[2], s1[3], hashlock[0], hashlock[1], hashlock[2], hashlock[3] };
+    permute(&s2);
+    var s3 = [_]Felt{ s2[0], s2[1], s2[2], s2[3], timeout, 0, 0, 0 };
+    permute(&s3);
+    return s3[0..4].*;
+}
+
+/// v3 HTLC nullifier: owner-based (mode/party-independent) — `H(DOM_NF_HTLC ‖ owner ‖ rho ‖ pos)`
+/// (must match `htlc_air::nullifier_owner`).
+pub fn nullifierHtlc(owner: Digest, rho: [2]Felt, pos: Felt) Digest {
+    return h(DOM_NF_HTLC, &.{ owner[0], owner[1], owner[2], owner[3], rho[0], rho[1], pos });
 }
 
 /// 2-to-1 Merkle compression `H(l ‖ r)` (untagged, fills all 8 lanes).
@@ -163,7 +190,17 @@ test "poseidon2: permute matches the circuit (KAT)" {
 test "poseidon2: domain-tagged hashes match the circuit (KAT)" {
     const rcp = recipient(7, 70, 5);
     try testing.expectEqual(Digest{ 12117778067832875188, 10864618677725252023, 10798466789515031362, 11357075400886075001 }, rcp);
-    try testing.expectEqual(Digest{ 10467251944032595743, 15951568864992726969, 686076823887839950, 2164025591647199027 }, commitNote(rcp, 1000, .{ 11, 211 }, .{ 100, 300 }, 9));
+    try testing.expectEqual(Digest{ 10467251944032595743, 15951568864992726969, 686076823887839950, 2164025591647199027 }, commitNote(rcp, 1000, .{ 11, 211 }, .{ 100, 300 }, 9, 0));
     try testing.expectEqual(Digest{ 2354178473207051117, 1485123762175440172, 16578445368892662424, 12056995742034228502 }, nullifierHash(7, 70, .{ 11, 211 }, 9));
     try testing.expectEqual(Digest{ 15506260347376358782, 2994144798473533345, 1833939590059144543, 15204941819943812974 }, merge(.{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 }));
+}
+
+test "poseidon2: v3 HTLC hashing matches the circuit (KAT)" {
+    const rt = Digest{ 1, 2, 3, 4 };
+    const ft = Digest{ 5, 6, 7, 8 };
+    const hl = Digest{ 81, 82, 83, 84 };
+    const owner = htlcRoot(rt, ft, hl, 10);
+    try testing.expectEqual(Digest{ 15897177719484060033, 8361144046291395814, 17600889302656618771, 11272242158371267546 }, owner);
+    try testing.expectEqual(Digest{ 6647950231430050009, 7373637167084619540, 13996079761633078941, 10314879934369199903 }, commitNote(owner, 1000, .{ 11, 211 }, .{ 100, 300 }, 9, 1));
+    try testing.expectEqual(Digest{ 2979738625760449383, 13574316116928341014, 8042570794412156501, 16772505299821460388 }, nullifierHtlc(owner, .{ 11, 211 }, 9));
 }

@@ -44,6 +44,9 @@ pub const Note = struct {
     div: u64,
     /// Hidden asset id (0 = native). Bound into the commitment; all notes in a tx share one asset.
     asset: u64 = 0,
+    /// Note type: 0 = PLAIN, 1 = HTLC. For an HTLC note `recipient` is the htlc_root. Committed in
+    /// commitment lane 7 so the spend circuit can distinguish PLAIN vs HTLC.
+    note_type: u64 = 0,
     /// Uniqueness input tying this note to its nullifier.
     rho: Hash32,
     /// Commitment trapdoor (hiding randomness).
@@ -57,6 +60,7 @@ pub const Note = struct {
             .rho = &self.rho,
             .rcm = &self.rcm,
             .asset = self.asset,
+            .note_type = self.note_type,
         });
     }
 
@@ -65,28 +69,30 @@ pub const Note = struct {
         return p.nullifier(nk, &self.rho, position);
     }
 
-    /// Fixed-length wire encoding of the note plaintext (120 bytes).
-    pub fn toBytes(self: Note) [120]u8 {
-        var out: [120]u8 = undefined;
+    /// Fixed-length wire encoding of the note plaintext (128 bytes).
+    pub fn toBytes(self: Note) [128]u8 {
+        var out: [128]u8 = undefined;
         std.mem.writeInt(u64, out[0..8], self.value, .little);
         @memcpy(out[8..40], &self.recipient);
         std.mem.writeInt(u64, out[40..48], self.div, .little);
         std.mem.writeInt(u64, out[48..56], self.asset, .little);
-        @memcpy(out[56..88], &self.rho);
-        @memcpy(out[88..120], &self.rcm);
+        std.mem.writeInt(u64, out[56..64], self.note_type, .little);
+        @memcpy(out[64..96], &self.rho);
+        @memcpy(out[96..128], &self.rcm);
         return out;
     }
 
     /// Parse a note plaintext produced by `toBytes`.
     pub fn fromBytes(bytes: []const u8) !Note {
-        if (bytes.len != 120) return error.BadNoteLength;
+        if (bytes.len != 128) return error.BadNoteLength;
         var note: Note = undefined;
         note.value = std.mem.readInt(u64, bytes[0..8], .little);
         @memcpy(&note.recipient, bytes[8..40]);
         note.div = std.mem.readInt(u64, bytes[40..48], .little);
         note.asset = std.mem.readInt(u64, bytes[48..56], .little);
-        @memcpy(&note.rho, bytes[56..88]);
-        @memcpy(&note.rcm, bytes[88..120]);
+        note.note_type = std.mem.readInt(u64, bytes[56..64], .little);
+        @memcpy(&note.rho, bytes[64..96]);
+        @memcpy(&note.rcm, bytes[96..128]);
         return note;
     }
 
@@ -95,6 +101,7 @@ pub const Note = struct {
             std.mem.eql(u8, &self.recipient, &other.recipient) and
             self.div == other.div and
             self.asset == other.asset and
+            self.note_type == other.note_type and
             std.mem.eql(u8, &self.rho, &other.rho) and
             std.mem.eql(u8, &self.rcm, &other.rcm);
     }

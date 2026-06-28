@@ -2,6 +2,7 @@
 //! Zig `poseidon2.zig` can match the circuit byte-for-byte (C-03). Run: `cargo run --bin dump_p2`.
 
 use lattica_prover_p3::joinsplit_air::{commit, merge, nullifier, recipient_of};
+use lattica_prover_p3::htlc_air::{htlc_root, nullifier_owner};
 use lattica_prover_p3::poseidon2_air::native_permute;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::{
@@ -60,4 +61,13 @@ fn main() {
     let l = [g(1), g(2), g(3), g(4)];
     let r = [g(5), g(6), g(7), g(8)];
     println!("// KAT merge([1..4],[5..8]) = {:?}", merge(l, r).map(u));
+
+    // v3 HTLC hashing KATs (htlc_root over the terms; the HTLC commitment; the owner-based nullifier)
+    let rt = [g(1), g(2), g(3), g(4)]; // redeem_tag
+    let ft = [g(5), g(6), g(7), g(8)]; // refund_tag
+    let hl = [g(81), g(82), g(83), g(84)]; // hashlock
+    let owner = htlc_root(rt, ft, hl, g(10));
+    println!("// KAT htlc_root(rt[1..4],ft[5..8],hl[81..84],timeout=10) = {:?}", owner.map(u));
+    println!("// KAT commit(owner,1000,[11,211],[100,300],asset=9,note_type=1) = {:?}", lattica_prover_p3::htlc_air::commit(owner, g(1000), [g(11), g(211)], [g(100), g(300)], g(9), g(1)).map(u));
+    println!("// KAT nullifier_owner(owner,[11,211],9) = {:?}", nullifier_owner(owner, [g(11), g(211)], g(9)).map(u));
 }

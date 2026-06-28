@@ -86,6 +86,7 @@ pub const NoteCommitmentInput = struct {
     rho: *const Hash32,
     rcm: *const Hash32,
     asset: u64 = 0, // hidden asset id (0 = native); all notes in a tx share one asset
+    note_type: u64 = 0, // 0 = PLAIN, 1 = HTLC (committed in commitment lane 7)
 };
 
 /// `cm = H(DOM_CM, recipient, value, rho, rcm)` — **the in-circuit Poseidon2 commitment** (C-03), so
@@ -100,12 +101,15 @@ pub fn noteCommitment(in: NoteCommitmentInput) Hash32 {
     std.mem.writeInt(u64, &value_le, in.value, .little);
     var asset_le: [8]u8 = undefined;
     std.mem.writeInt(u64, &asset_le, in.asset, .little);
+    var nt_le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &nt_le, in.note_type, .little);
     const cm = poseidon2.commitNote(
         poseidon2.digestFromBytes(rcp),
         poseidon2.feltLE(&value_le),
         .{ poseidon2.feltLE(in.rho[0..8]), poseidon2.feltLE(in.rho[8..16]) }, // 128-bit rho
         .{ poseidon2.feltLE(in.rcm[0..8]), poseidon2.feltLE(in.rcm[8..16]) }, // 128-bit rcm
         poseidon2.feltLE(&asset_le),
+        poseidon2.feltLE(&nt_le),
     );
     return poseidon2.digestBytes(cm);
 }
