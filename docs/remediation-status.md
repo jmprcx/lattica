@@ -56,11 +56,19 @@ M-01..M-04 (ABI/codec/alloc hardening), L-01/L-02 (docs + format). All addressed
 - **L-03** README rewritten to the Plonky3 join-split path (removed-file refs deleted; `tx_binding`
   replaces the ML-DSA binding-signature flow); points to `AUDITORS.md`.
 
-See the **Developer Remediation Response** tables (Round 1, Round 2, Round 3) in
-`docs/lattica-implementation-audit.md` for the finding-by-finding mapping. Re-validated each round
-(31 Rust tests as of round 3, full Zig suite incl. the production-mode probe, `zig build
-check-production`, and the real cross-language integration — ghost-coin rejected through the real Rust
-verifier).
+**v3-audit re-audit** (Codex, 2026-06-28, against tag `v3-audit`) — new findings addressed:
+- **M-11** legacy one-input spend FFI surface removed — `SpendPublicInputs`/`verifySpend`/`setBackend`/
+  `clearBackend` deleted from `src/ffi.zig` (the live node uses the join-split + HTLC seams, both
+  size-guarded); `ffi.zig` header + `docs/audit-scope-p3.md` (trust model, proof-serialization layout,
+  frozen-params note) rewritten to the `lattica_joinsplit_verify`/`lattica_htlc_verify` shapes.
+- **P-01** full-node consensus integration — out of lattica's scope (host chain); the HTLC-specific
+  production requirements are specified in `docs/full-node-security-integration.md`. No in-package change.
+
+See the **Developer Remediation Response** tables (Round 1–3 + the v3-audit re-audit) in
+`docs/lattica-implementation-audit.md` for the finding-by-finding mapping. Re-validated each round (the
+Rust circuit/ABI suite + the exhaustive `--ignored` audit suite, the full Zig suite incl. the
+production-mode probe, `zig build check-production`, and the real cross-language integration — incl. the
+v3 HTLC lock→redeem lifecycle).
 
 ## Out of lattica's scope (host chain `rubble-node-zig`)
 

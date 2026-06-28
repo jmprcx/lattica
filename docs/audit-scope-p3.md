@@ -55,9 +55,9 @@ differential oracle for the hashes, not a production artifact.
 ## 2. Trust model & assumptions
 
 - **Roles.** The **prover** (wallet) is fully untrusted. The **verifier** (node, via
-  `lattica_spend_verify`) is the security boundary. A spend proof is a *validity witness*; the node
-  enforces the stateful checks the proof does not (nullifier-set non-membership = double-spend
-  prevention; anchor is a known tree root; fee policy).
+  `lattica_joinsplit_verify` / `lattica_htlc_verify`) is the security boundary. A spend proof is a
+  *validity witness*; the node enforces the stateful checks the proof does not (nullifier-set
+  non-membership = double-spend prevention; anchor is a known tree root; fee policy).
 - **Cryptographic assumptions.**
   - **Poseidon2-Goldilocks** (vetted `p3-goldilocks` constants) modeled as collision-resistant /
     random-oracle-like. *A dedicated Poseidon2 parameter & algebraic-attack review is explicitly
@@ -107,11 +107,12 @@ the in-circuit hash equals the protocol's native `Poseidon2Goldilocks` (differen
 | FRI | `log_blowup=4`, `num_queries=96`, `query_pow=16`, `commit_pow=0`, `max_log_arity=4`, `cap_height=6` |
 | Soundness | ≈103-bit proven / ~127-bit conjectured |
 | Circuit params | `DEPTH=32`, `BITS=52`, `recipient`=4-element digest |
-| Proof serialization | postcard; `SpendPublicInputs` = `anchor‖nullifier‖out_cm‖tx_binding (4×32) ‖ fee(8 LE)` = 136 bytes |
-| Proof size / verify | ~421 KB / ~8 ms (single spend, `DEPTH=32`) |
+| Proof serialization | postcard; `JoinSplitPublicInputs` = `anchor ‖ N·nf ‖ M·out_cm ‖ tx_binding ‖ fee(8 LE) ‖ mint(8 LE)` = 208 bytes; `HtlcPublicInputs` = that ‖ `current_height(8 LE)` ‖ `redeem_hashlock(32)` = 248 bytes (`lib.rs` `encode_{joinsplit,htlc}_public_inputs`) |
+| Proof size / verify | ~421 KB / ~8 ms join-split; ~469 KB HTLC (`DEPTH=32`) |
 
-These freeze for the audited artifact. Join-split (§6) adds `N` (inputs) and `M` (outputs)
-parameters and widens the public inputs accordingly; the freeze is re-confirmed once §6 lands.
+These freeze for the audited artifact. The live circuit is the **join-split** (`N=2` inputs, `M=2`
+outputs); the **v3 HTLC** circuit (`htlc_air`) is the same shape plus the HTLC columns/public inputs
+(see `docs/htlc-constraint-audit.md`). The pre-Plonky3 one-input spend path has been removed.
 
 ## 5. Known limitations & open items (must close before audit)
 

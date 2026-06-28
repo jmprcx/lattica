@@ -1,8 +1,97 @@
 # Lattica Implementation Audit
 
-**Date:** 2026-06-27  
+**Date:** 2026-06-28
 **Entry point:** `docs/AUDITORS.md`
 **Scope covered:** Plonky3 join-split AIR, Rust C ABI, Zig FFI seam, protocol hashing, transaction construction, node state machine, note/key/encryption code, canonical codecs, tests, and operational/security areas needed by a production full node.
+
+## v3-audit Tag Re-Audit (2026-06-28)
+
+**Basepoint audited:** tag `v3-audit`, commit `61f66d520bf478c50d728c72fd549adb4d877728` (`git describe --tags --always --dirty` returned `v3-audit`; working tree was clean before this documentation update).
+
+### Verdict
+
+No new Critical or High severity implementation issue was found in the live Lattica transaction stack on the `v3-audit` tag. The prior v1 remediation set remains effective, and the v3 shielded-HTLC additions are implemented in the expected live paths:
+
+- `htlc_air` binds asset lane 6 and `note_type` lane 7 into commitments, computes the HTLC owner root, enforces redeem/refund party tag matching, binds redeem hashlock to the node-provided SHA256 preimage digest, rejects zero redeem hashlocks in-circuit, range-checks timeout/current height, forces HTLC `mint == 0`, and derives HTLC nullifiers from the note owner rather than the claiming party.
+- The Rust C ABI for join-split and HTLC verification rejects oversize proofs, wrong public-input lengths, non-canonical Goldilocks limbs, malformed proofs, null pointers, and panics fail-closed.
+- The Zig node path derives public inputs from the transaction body, bounds proof/ciphertext/fee/height before proof work, checks anchors and duplicate/spent nullifiers before mutation, enforces `applyHtlc` height pinning to the caller's consensus height, and applies accepted transactions in a two-phase commit with chain-owned transmitted-note ciphertexts.
+- The wallet/node HTLC builders reject out-of-range timeouts and zero/non-canonical hashlocks at lock construction, bind the raw redeem preimage into `tx_binding`, and construct HTLC lock/redeem transactions through the same real Rust prover/verifier integration path.
+
+This does **not** clear the repository for value-bearing production as a standalone full node. The remaining production blocker is the host-chain integration surface: canonical block/transaction bytes, committed note/nullifier/supply/event roots, block-height source, reorg undo, snapshots, mempool policy, proof cache, emission schedule, and verifier startup attestation must be implemented and audited in the full node.
+
+### Verification Performed
+
+Commands run on the `v3-audit` checkout:
+
+```sh
+cd lattica-prover-p3 && cargo test --release
+cd lattica-prover-p3 && cargo test --release -- --ignored
+zig build test
+zig build check-production
+scripts/run-real-integration.sh
+cd lattica-prover-p3 && cargo run --release --bin dump_p2
+```
+
+Results:
+
+- `cargo test --release`: passed, **82 passed / 3 ignored** across 6 suites.
+- `cargo test --release -- --ignored`: passed, **3 passed / 82 filtered out** across 6 suites.
+- `zig build test`: passed.
+- `zig build check-production`: passed.
+- `scripts/run-real-integration.sh`: C FFI harness passed in sandbox; in-node integration hit the documented sandbox Zig-stdlib `ReadOnlyFileSystem` issue, then passed outside the sandbox. The real integration accepted valid join-split and HTLC proofs, rejected tampered anchor/output/hashlock cases, rejected replay/double spend, rejected refund-before-timeout through the real prover, and completed a real HTLC lock/redeem lifecycle.
+- `cargo run --release --bin dump_p2`: completed and printed the vetted Poseidon2 constants used by the Zig KATs.
+
+### Remediation Status Checked
+
+| Area | Status |
+|---|---|
+| **C-01 output-commitment ghost coin** | Verified still remediated. `outputs[j].cm` is the single source used for public inputs, `tx_binding`, and tree insertion. Real integration rejects tampered output commitments. |
+| **H-03/H-04 atomic apply and ciphertext ownership** | Verified still remediated. Transactions reserve capacity and deep-copy output ciphertexts before consensus mutation; chain history owns stored ciphertexts. |
+| **M-05/M-08 verifier size limits** | Verified remediated for live join-split and HTLC seams. `ffi.verifyJoinSplit`, `ffi.verifyHtlc`, and Rust C ABI verifiers cap proof size before backend/deserialization work. |
+| **M-09/M-10 bootstrap/mock production gating** | Verified remediated. `lattica_production = true` removes genesis/test-only APIs and mock backend from production roots; production probe compiles the live surface. |
+| **v3 height/mint/hashlock hardening** | Verified in code and tests. HTLC current height is range-checked in-circuit and node-pinned in `applyHtlc`; HTLC mint is zero in-circuit and node-side; lock builder rejects non-canonical or reduced-zero hashlocks. |
+| **v3 OVK deterministic encryption fix** | Spot-checked live note-encryption/key hierarchy and tests. The v3 round-2 deanonymization oracle fix is present, with recipient detection/decryption through viewing-key-derived diversifier/KEM material. |
+
+### New Findings / Residual Risks
+
+#### M-11: Legacy one-input spend FFI surface and stale verifier comments remain exported
+
+**Severity:** Medium integration risk; no live-node exploit observed
+**Area:** Zig FFI API hygiene / production integration
+**Files:** `src/ffi.zig`, `docs/audit-scope-p3.md`
+
+`src/ffi.zig` still begins with a pre-Plonky3/Winterfell `lattica_spend_verify` description and keeps the older `SpendPublicInputs`, `setBackend`, and `verifySpend` API. The active node does not use this path; it uses `setJoinSplitBackend`/`verifyJoinSplit` and `setHtlcBackend`/`verifyHtlc`. However, the legacy `verifySpend` wrapper is still public and does not carry the reusable `MAX_PROOF_LEN` guard added to the active join-split/HTLC wrappers. `docs/audit-scope-p3.md` also still contains stale trust-model/proof-serialization text naming `lattica_spend_verify` and the 136-byte one-input spend layout, even though `docs/AUDITORS.md` lists it as an auditor entry document.
+
+**Impact:** a production integrator following the stale API comments or stale scope text could wire a non-production verifier boundary, miss the v3 HTLC/join-split statement shape, or bypass the proof-size guard expected on the active verifier seam. This is not a proof-system soundness issue in the current node path, but it is a production integration hazard.
+
+**Required remediation:**
+
+- Remove the legacy `SpendPublicInputs` / `verifySpend` / `setBackend` surface from production modules, or move it behind an explicit reference/test-only namespace.
+- If kept temporarily, add the same `MAX_PROOF_LEN` guard and deprecation comments as the active wrappers.
+- Rewrite `src/ffi.zig` top-level comments and `docs/audit-scope-p3.md` to describe `lattica_joinsplit_verify` and `lattica_htlc_verify` only.
+
+#### P-01: Full-node consensus integration remains the production blocker
+
+**Severity:** Production blocker outside this package
+**Area:** host-chain consensus / block validation / auditability
+**Docs:** `docs/full-node-security-integration.md`
+
+The in-repo `Chain` remains an in-memory transaction-state component. A production full node still must provide and audit the surrounding consensus machinery: canonical transaction/block encoding, header-committed transaction/note/nullifier/supply/event roots, consensus parameter hash, emission schedule, reorg undo, root-verified snapshots, mempool duplicate-nullifier and anchor-window policy, proof-result cache invalidation, real-verifier startup attestation, and HTLC-specific block-height/preimage event handling.
+
+**HTLC-specific production requirements:**
+
+- `applyHtlc(..., at_height)` must receive the block height from consensus only; transaction-provided height cannot be trusted.
+- Redeem preimages should be emitted in a canonical event stream so cross-chain watchers can claim the other leg.
+- Lock descriptors and HTLC note commitments need reliable wallet/watch indexing, since HTLC lock output 0 intentionally carries a placeholder ciphertext.
+- Reorg policy must define HTLC timeout safety margins and mempool conflict handling for competing redeem/refund spends of the same nullifier.
+- Full-node replay must recompute the same supply and nullifier outcomes from genesis without wallet secrets.
+
+### Developer Remediation Response — v3-audit re-audit (M-11, P-01)
+
+| Finding | Resolution |
+|---|---|
+| **M-11** legacy one-input spend FFI surface + stale comments | **Fixed.** Removed the pre-Plonky3 `SpendPublicInputs`, `verifySpend`, `setBackend`, `clearBackend`, and the `backend` var from `src/ffi.zig` (they were public but used nowhere outside the module's own tests; the live node uses `setJoinSplitBackend`/`verifyJoinSplit` + `setHtlcBackend`/`verifyHtlc`, both of which carry the `MAX_PROOF_LEN` guard). The shared `VerifyFn` is retained (used by the active seams). Rewrote the `ffi.zig` top-level comment to describe only the join-split + HTLC verify/prove boundary. Removed the legacy tests; the active wrappers' tests already cover encode / fail-closed / backend-reached / oversize-reject. Updated `docs/audit-scope-p3.md`: the trust-model now names `lattica_joinsplit_verify`/`lattica_htlc_verify`, the proof-serialization row gives the real `JoinSplitPublicInputs` (208 B) / `HtlcPublicInputs` (248 B) layouts, and the frozen-params note states the live circuit is the join-split + the v3 HTLC (the one-input spend path is removed). `zig build test`, `check-production`, and `scripts/run-real-integration.sh` green. |
+| **P-01** full-node consensus integration | **Out of lattica's scope; already documented.** This is the host-chain (`rubble-node-zig`) production blocker, not a defect in this package. The required machinery — incl. all five HTLC-specific items (consensus-only `at_height`, the canonical preimage event stream, the commitment/lock-descriptor index for the placeholder ciphertext, reorg timeout cushions + redeem/refund nullifier-conflict policy, and genesis replay of supply/nullifier state) — is specified in `docs/full-node-security-integration.md` ("HTLC Full-Node Requirements" + the consensus pipeline), and the boundary is restated in `AUDITORS.md` §7. The lattica node already enforces its half in-package (`applyHtlc` pins `current_height == at_height` and rejects a tx-supplied height; the supply accumulator + nullifier set are deterministic). No in-package code change; production use remains gated on the host-chain integration + the Phase-B xchain work. |
 
 ## Current Re-Audit (post-round-3 remediation verification, 2026-06-28)
 
