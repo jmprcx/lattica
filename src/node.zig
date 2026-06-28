@@ -129,6 +129,75 @@ pub const ShieldedTx = struct {
     }
 };
 
+/// A shielded **HTLC** spend (redeem or refund), verified by the `htlc_air` circuit. Like `ShieldedTx`
+/// plus the timeout's `current_height` and, for a redeem, the revealed `redeem_preimage` — the node
+/// derives `redeem_hashlock = SHA256(preimage)` and the circuit binds the redeemed note's committed
+/// hashlock to it (the cross-chain atomic link). `outputs[j].cm` is the single source of truth (C-01).
+pub const ShieldedHtlcTx = struct {
+    anchor: Hash32,
+    nullifiers: [N_IN]Hash32,
+    fee: u64,
+    mint: u64, // always 0 for an HTLC spend (issuance only via the join-split coinbase)
+    current_height: u64,
+    redeem_preimage: ?[32]u8, // Some(preimage) for a redeem; null for a refund
+    proof: []const u8,
+    outputs: [M_OUT]tx.TransmittedNote,
+
+    pub fn outCms(self: ShieldedHtlcTx) [M_OUT]Hash32 {
+        var cms: [M_OUT]Hash32 = undefined;
+        for (self.outputs, 0..) |o, j| cms[j] = o.cm;
+        return cms;
+    }
+
+    /// `redeem_hashlock = SHA256(preimage)` reduced to the canonical 4-limb digest (== the redeemed
+    /// note's committed hashlock). All-zero for a refund (the circuit binds it only on redeem). The
+    /// revealed preimage is what lets the cross-chain counterparty claim the other leg.
+    pub fn redeemHashlock(self: ShieldedHtlcTx) Hash32 {
+        const pre = self.redeem_preimage orelse return [_]u8{0} ** 32;
+        var sha: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&pre, &sha, .{});
+        return poseidon2.digestBytes(poseidon2.digestFromBytes(sha));
+    }
+
+    /// Canonical body digest the proof binds (incl. current_height + redeem_hashlock so the whole HTLC
+    /// body — not just the join-split fields — is bound).
+    pub fn txBinding(self: ShieldedHtlcTx) Hash32 {
+        var dh = p.DomainHasher.init(TX_DOMAIN);
+        var le: [8]u8 = undefined;
+        dh.field(&self.anchor);
+        for (self.nullifiers) |nf| dh.field(&nf);
+        const out_cms = self.outCms();
+        for (out_cms) |cm| dh.field(&cm);
+        std.mem.writeInt(u64, &le, self.fee, .little);
+        dh.field(&le);
+        std.mem.writeInt(u64, &le, self.mint, .little);
+        dh.field(&le);
+        std.mem.writeInt(u64, &le, self.current_height, .little);
+        dh.field(&le);
+        const hl = self.redeemHashlock();
+        dh.field(&hl);
+        for (self.outputs) |tn| {
+            dh.field(&tn.kem_ct);
+            dh.field(tn.ciphertext);
+        }
+        const raw = dh.final();
+        return poseidon2.digestBytes(poseidon2.digestFromBytes(raw));
+    }
+
+    pub fn publicInputs(self: ShieldedHtlcTx) ffi.HtlcPublicInputs {
+        return .{
+            .anchor = self.anchor,
+            .nullifiers = self.nullifiers,
+            .out_cms = self.outCms(),
+            .tx_binding = self.txBinding(),
+            .fee = self.fee,
+            .mint = self.mint,
+            .current_height = self.current_height,
+            .redeem_hashlock = self.redeemHashlock(),
+        };
+    }
+};
+
 // ---------------------------------------------------------------------------------------
 // Wallet-side transfer construction
 // ---------------------------------------------------------------------------------------
@@ -429,6 +498,54 @@ pub const Chain = struct {
             self.transmitted.appendAssumeCapacity(o);
         }
     }
+
+    /// Validate and apply a shielded **HTLC** spend (redeem or refund) at consensus height `at_height`.
+    /// Same shape as `applyChecked` (cheap checks → htlc proof verify → atomic two-phase apply) but
+    /// over the htlc_air statement: issuance is forbidden (`mint == 0`), and the node pins
+    /// `current_height` so a prover can't backdate/forward the timeout window. The proof binds the
+    /// redeem/refund mode, the party (tag-match), the timeout (vs `current_height`), and — on redeem —
+    /// the committed hashlock == `SHA256(redeem_preimage)`.
+    pub fn applyHtlc(self: *Chain, t: ShieldedHtlcTx, at_height: u64) TxError!void {
+        if (t.mint != 0) return TxError.IllegalIssuance; // HTLC spends never issue
+        if (t.current_height != at_height) return TxError.Internal; // node-pinned timeout height
+        if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
+        if (t.proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
+        for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
+
+        var seen = HashSet.init(self.allocator);
+        defer seen.deinit();
+        for (t.nullifiers) |nf| {
+            if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
+            const gop = seen.getOrPut(nf) catch return TxError.Internal;
+            if (gop.found_existing) return TxError.DoubleSpend;
+        }
+
+        if (!ffi.verifyHtlc(t.proof, t.publicInputs())) return TxError.BadAuthProof;
+
+        // Atomic two-phase apply (H-03/H-04), identical discipline to applyChecked.
+        var candidate_supply = self.supply;
+        candidate_supply.apply(.{ .issued = 0, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
+        self.nullifiers.ensureUnusedCapacity(@intCast(N_IN)) catch return TxError.Internal;
+        self.anchors.ensureUnusedCapacity(@intCast(M_OUT)) catch return TxError.Internal;
+        self.transmitted.ensureUnusedCapacity(self.allocator, M_OUT) catch return TxError.Internal;
+        self.tree.ensureUnusedCapacity(M_OUT) catch return TxError.TreeFull;
+        var owned: [M_OUT]tx.TransmittedNote = undefined;
+        var copied: usize = 0;
+        errdefer for (owned[0..copied]) |o| self.allocator.free(o.ciphertext);
+        for (&owned, t.outputs) |*dst, o| {
+            const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
+            dst.* = .{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct };
+            copied += 1;
+        }
+
+        self.supply = candidate_supply;
+        for (t.nullifiers) |nf| self.nullifiers.putAssumeCapacity(nf, {});
+        for (owned) |o| {
+            _ = self.tree.appendAssumeCapacity(o.cm);
+            self.anchors.putAssumeCapacity(self.tree.root(), {});
+            self.transmitted.appendAssumeCapacity(o);
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------------------
@@ -474,14 +591,26 @@ pub const mock = if (production) struct {} else struct {
         return 1;
     }
 
-    /// Install both mock backends (test / demo only).
+    /// Same model for the HTLC statement: tx_binding sits at the same offset (anchor ‖ nf ‖ out_cm ‖
+    /// tx_binding ‖ …), only the total length differs.
+    pub fn verifyHtlc(proof_ptr: [*]const u8, proof_len: usize, pi_ptr: [*]const u8, pi_len: usize) callconv(.c) i32 {
+        if (proof_len != 32 or pi_len != ffi.HtlcPublicInputs.ENCODED_LEN) return 1;
+        const proof = proof_ptr[0..32];
+        const pi = pi_ptr[0..pi_len];
+        if (std.mem.eql(u8, proof, pi[TXB_OFFSET .. TXB_OFFSET + 32])) return 0;
+        return 1;
+    }
+
+    /// Install the mock backends (test / demo only).
     pub fn install() void {
         ffi.setJoinSplitProveBackend(&prove);
         ffi.setJoinSplitBackend(&verify);
+        ffi.setHtlcBackend(&verifyHtlc);
     }
     pub fn uninstall() void {
         ffi.clearJoinSplitProveBackend();
         ffi.clearJoinSplitBackend();
+        ffi.clearHtlcBackend();
     }
 };
 
@@ -761,4 +890,71 @@ test "coinbase issuance: mint accepted iff it matches the consensus reward" {
         if (tx.tryDecrypt(a, miner, tn)) |n| minted += n.value;
     }
     try testing.expectEqual(@as(u64, 500), minted);
+}
+
+test "node: a shielded HTLC redeem verifies and applies (mock backend)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const claimer = try account(1);
+    // Output notes: the redeemed funds → claimer (+ a zero-value dummy), like a join-split's outputs.
+    var tns: [M_OUT]tx.TransmittedNote = undefined;
+    const values = [_]u64{ 900, 0 };
+    for (0..M_OUT) |j| {
+        const jb = [_]u8{@intCast(j)};
+        const rho = p.hashDomain("test:htlc-out-rho", &.{&jb});
+        const rcm = p.hashDomain("test:htlc-out-rcm", &.{&jb});
+        const note = tx.Note{ .value = values[j], .recipient = claimer.address().recipientId(), .div = claimer.address().div, .rho = rho, .rcm = rcm };
+        tns[j] = try tx.encryptNote(a, claimer.address(), note);
+    }
+    var t = ShieldedHtlcTx{
+        .anchor = chain.anchor(),
+        .nullifiers = .{ [_]u8{7} ** 32, [_]u8{8} ** 32 },
+        .fee = 0,
+        .mint = 0,
+        .current_height = 50,
+        .redeem_preimage = [_]u8{0xAB} ** 32,
+        .proof = &.{},
+        .outputs = tns,
+    };
+    const binding = t.txBinding(); // the mock "proof" is the body's tx_binding
+    t.proof = binding[0..];
+    try chain.applyHtlc(t, 50);
+    // applied: the nullifier is spent, the claimer can decrypt 900, and supply stays consistent.
+    try testing.expect(chain.nullifiers.contains([_]u8{7} ** 32));
+    try testing.expect(chain.supply.invariantHolds());
+    var got: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (tx.tryDecrypt(a, claimer, tn)) |n| got += n.value;
+    }
+    try testing.expectEqual(@as(u64, 900), got);
+    // The node pins current_height: a tx claiming a different height than consensus is rejected.
+    try testing.expectError(TxError.Internal, chain.applyHtlc(t, 51));
+}
+
+test "node: a tampered HTLC body (different preimage) is rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const claimer = try account(1);
+    var tns: [M_OUT]tx.TransmittedNote = undefined;
+    const ovals = [_]u64{ 900, 0 };
+    for (0..M_OUT) |j| {
+        const jb = [_]u8{@intCast(j)};
+        const note = tx.Note{ .value = ovals[j], .recipient = claimer.address().recipientId(), .div = claimer.address().div, .rho = p.hashDomain("test:o-rho", &.{&jb}), .rcm = p.hashDomain("test:o-rcm", &.{&jb}) };
+        tns[j] = try tx.encryptNote(a, claimer.address(), note);
+    }
+    var t = ShieldedHtlcTx{ .anchor = chain.anchor(), .nullifiers = .{ [_]u8{7} ** 32, [_]u8{8} ** 32 }, .fee = 0, .mint = 0, .current_height = 50, .redeem_preimage = [_]u8{0xAB} ** 32, .proof = &.{}, .outputs = tns };
+    const binding = t.txBinding();
+    t.proof = binding[0..];
+    // Swap the revealed preimage after binding ⇒ redeem_hashlock (and tx_binding) change ⇒ the proof
+    // no longer matches the body ⇒ rejected (the cross-chain atomic value can't be forged).
+    t.redeem_preimage = [_]u8{0xCD} ** 32;
+    try testing.expectError(TxError.BadAuthProof, chain.applyHtlc(t, 50));
 }
