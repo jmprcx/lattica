@@ -1904,4 +1904,411 @@ mod tests {
         let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
         let _ = native_outputs(&htlc_witness(false, 9, hl, 10)); // height < timeout, refund ⇒ reject
     }
+
+    // =====================================================================================
+    // ADVERSARIAL VERIFICATION SUITE (executable soundness probes)
+    // Added as an independent, executed audit of htlc_air's persistence/binding constraints.
+    // =====================================================================================
+
+    /// Part 1 — EXHAUSTIVE persistent-column non-vacuity.
+    ///
+    /// For EACH committed/persistent column the spend binds — NK, NK1, RHO, RHO1, VAL, ASSET,
+    /// OWNER0..3, NT, CLAIM0..3, MODE, TIMEOUT — corrupt it at an *interior* span row (row 167:
+    /// inside a membership merge block). Columns ≥ 9 are untouched by the Poseidon round
+    /// constraints, and an interior membership row is read by NO block-local binding, so the ONLY
+    /// constraint that can catch the corruption is the persistence (or global-persistence, for
+    /// ASSET) constraint. The published statement is left = the real `public_values`, so nothing
+    /// downstream can mask the result. A column whose corruption VERIFIES is a vacuous binding —
+    /// the rho1-class double-spend gap. We run a PLAIN witness and BOTH HTLC modes so every column
+    /// is live (MODE/TIMEOUT/owner-as-htlc_root/CLAIM tag-match are HTLC-only).
+    #[test]
+    #[ignore = "exhaustive audit suite (proves ~51 circuits, ~130s); run with `cargo test --release -- --ignored`"]
+    fn persistent_columns_are_non_vacuous() {
+        let cols: &[(&str, usize)] = &[
+            ("NK", NK), ("NK1", NK1), ("RHO", RHO), ("RHO1", RHO1), ("VAL", VAL), ("ASSET", ASSET),
+            ("OWNER0", OWNER0), ("OWNER1", OWNER0 + 1), ("OWNER2", OWNER0 + 2), ("OWNER3", OWNER0 + 3),
+            ("NT", NT),
+            ("CLAIM0", CLAIM0), ("CLAIM1", CLAIM0 + 1), ("CLAIM2", CLAIM0 + 2), ("CLAIM3", CLAIM0 + 3),
+            ("MODE", MODE), ("TIMEOUT", TIMEOUT),
+        ];
+        let r0 = 5 * BLOCK + 7; // interior membership row of input 0's span — no block-local read here
+        assert!(r0 < HEIGHT && r0 < span_last_row(0), "interior probe row must be inside input 0's span");
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let cases: [(&str, Witness); 3] = [
+            ("PLAIN", sample()),
+            ("HTLC-redeem", htlc_witness(true, 5, hl, 10)),
+            ("HTLC-refund", htlc_witness(false, 10, hl, 10)),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (wname, w) in &cases {
+            for (cname, c) in cols {
+                let mut trace = build_trace(w);
+                trace.values[r0 * WIDTH + *c] += Val::ONE; // break persistence at an interior row
+                let rejected = corrupt_trace_rejected(trace, public_values(w));
+                eprintln!("[persist] {wname:>11} col {cname:>7} (#{c:>2}) -> rejected={rejected}");
+                if !rejected {
+                    failures.push(format!("{wname}/{cname}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "VACUOUS persistence (corruption VERIFIED) for: {failures:?}");
+    }
+
+    // index-derived pseudo-randomness (splitmix64) — deterministic, NOT thread/OS rng.
+    fn sm64(x: u64) -> u64 {
+        let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    /// A randomized but always-VALID witness derived from sample index `s`: varies asset, note_type
+    /// (PLAIN vs HTLC), redeem/refund, value/fee/output split, keys/diversifier, rho/rcm, the HTLC
+    /// party tags, hashlock, timeout, current_height (kept inside the timeout window for the chosen
+    /// mode), output note_types, and tx_binding. Input 1 is a zero-value PLAIN dummy owned by the
+    /// claimer (keeps balance trivial); input 0 carries the variation.
+    fn rand_witness(s: u64) -> Witness {
+        let r = |k: u64| sm64(s.wrapping_mul(0x100000001B3).wrapping_add(k).wrapping_add(1));
+        let asset = Val::from_u64(1 + r(0) % 100_000);
+        let is_htlc = (r(1) & 1) == 1;
+        let redeem = (r(2) & 1) == 1;
+        let v0 = 1 + (r(3) % (1u64 << 40)); // < 2^40, nonzero
+        let fee = r(4) % (v0 + 1);
+        let rest = v0 - fee;
+        let out0 = r(5) % (rest + 1);
+        let out1 = rest - out0;
+        let cnk = [1 + r(6) % 100_000, 1 + r(7) % 100_000];
+        let cdiv = Val::from_u64(1 + r(8) % 100_000);
+        let claim = recipient_of(Val::from_u64(cnk[0]), Val::from_u64(cnk[1]), cdiv);
+        let rho = [Val::from_u64(1 + r(9)), Val::from_u64(1 + r(10))];
+        let rcm = [Val::from_u64(1 + r(11)), Val::from_u64(1 + r(12))];
+        let other = recipient_of(Val::from_u64(1 + r(13)), Val::from_u64(1 + r(14)), Val::from_u64(1 + r(15)));
+        let hashlock = [Val::from_u64(r(16)), Val::from_u64(r(17)), Val::from_u64(r(18)), Val::from_u64(r(19))];
+        let timeout = 2 + r(20) % (1u64 << 30);
+        let height = if !is_htlc {
+            r(21) % (1u64 << 30)
+        } else if redeem {
+            r(21) % timeout // height < timeout
+        } else {
+            timeout + (r(21) % (1u64 << 20)) // height >= timeout
+        };
+        let (redeem_tag, refund_tag) = if redeem { (claim, other) } else { (other, claim) };
+        let nt0 = if is_htlc { Val::from_u64(NOTE_HTLC) } else { Val::ZERO };
+        let owner0 = if is_htlc { htlc_root(redeem_tag, refund_tag, hashlock, Val::from_u64(timeout)) } else { claim };
+        let cm0 = commit(owner0, Val::from_u64(v0), rho, rcm, asset, nt0);
+        let drho = [Val::from_u64(1 + r(22)), Val::from_u64(1 + r(23))];
+        let drcm = [Val::from_u64(1 + r(24)), Val::from_u64(1 + r(25))];
+        let cm1 = commit(claim, Val::ZERO, drho, drcm, asset, Val::ZERO);
+        let (_, paths) = build_paths(&[cm0, cm1]);
+        let zero = [Val::ZERO; DIGEST];
+        let in0 = Input {
+            nk: cnk, div: cdiv, asset, note_type: nt0, value: v0, rho, rcm,
+            sib: paths[0].0, bits: paths[0].1,
+            mode: Val::from_u64(if is_htlc { redeem as u64 } else { 0 }),
+            redeem_tag: if is_htlc { redeem_tag } else { zero },
+            refund_tag: if is_htlc { refund_tag } else { zero },
+            hashlock: if is_htlc { hashlock } else { zero },
+            timeout: if is_htlc { timeout } else { 0 },
+        };
+        let in1 = Input {
+            nk: cnk, div: cdiv, asset, note_type: Val::ZERO, value: 0, rho: drho, rcm: drcm,
+            sib: paths[1].0, bits: paths[1].1, mode: Val::ZERO,
+            redeem_tag: zero, refund_tag: zero, hashlock: zero, timeout: 0,
+        };
+        let ont = |b: bool| if b { Val::from_u64(NOTE_HTLC) } else { Val::ZERO };
+        let outputs = [
+            Output {
+                recipient: recipient_of(Val::from_u64(1 + r(26)), Val::from_u64(1 + r(27)), Val::from_u64(1 + r(28))),
+                asset, note_type: ont((r(29) & 1) == 1), value: out0,
+                rho: [Val::from_u64(1 + r(30)), Val::from_u64(1 + r(31))],
+                rcm: [Val::from_u64(1 + r(32)), Val::from_u64(1 + r(33))],
+            },
+            Output {
+                recipient: recipient_of(Val::from_u64(1 + r(34)), Val::from_u64(1 + r(35)), Val::from_u64(1 + r(36))),
+                asset, note_type: ont((r(37) & 1) == 1), value: out1,
+                rho: [Val::from_u64(1 + r(38)), Val::from_u64(1 + r(39))],
+                rcm: [Val::from_u64(1 + r(40)), Val::from_u64(1 + r(41))],
+            },
+        ];
+        Witness {
+            inputs: [in0, in1], outputs, fee, mint: 0,
+            tx_binding: core::array::from_fn(|i| Val::from_u64(1 + r(42 + i as u64))),
+            current_height: height,
+        }
+    }
+
+    /// Part 2 — DIFFERENTIAL native-oracle vs constrained-AIR agreement over a large random sample.
+    ///
+    /// For each pseudo-random VALID witness: (a) `public_values` (the native oracle) must not panic
+    /// and the AIR must ACCEPT it (prove→verify ok); (b) perturbing EVERY public-input field by +1
+    /// must make the AIR REJECT (statement / Fiat–Shamir binding). Confirms the native oracle and the
+    /// in-circuit constraints agree on acceptance, and that every published field is bound.
+    #[test]
+    #[ignore = "exhaustive audit suite (random differential, many proofs); run with `cargo test --release -- --ignored`"]
+    fn differential_native_vs_air() {
+        const N_SAMPLES: u64 = 16;
+        let config = make_config();
+        let mut htlc_seen = 0u32;
+        let mut plain_seen = 0u32;
+        for s in 0..N_SAMPLES {
+            let w = rand_witness(s);
+            if w.inputs[0].note_type == Val::from_u64(NOTE_HTLC) { htlc_seen += 1 } else { plain_seen += 1 }
+            let pis = public_values(&w); // native oracle (panics if the witness is inconsistent)
+            let trace = build_trace(&w);
+            let proof = prove(&config, &HtlcAir, trace, &pis);
+            assert!(verify(&config, &HtlcAir, &proof, &pis).is_ok(), "sample {s}: AIR rejected a valid witness");
+            for k in 0..pis.len() {
+                let mut bad = pis.clone();
+                bad[k] += Val::ONE;
+                assert!(
+                    verify(&config, &HtlcAir, &proof, &bad).is_err(),
+                    "sample {s}: perturbing public input #{k} was NOT rejected (unbound statement field)"
+                );
+            }
+        }
+        eprintln!("[differential] {N_SAMPLES} samples accepted, each with {N_PUBLIC} PI-perturbations rejected; HTLC={htlc_seen} PLAIN={plain_seen}");
+    }
+
+    /// Part 3a — redeem/refund timeout WINDOW boundaries (in-circuit accept/reject).
+    #[test]
+    fn boundary_redeem_refund_windows() {
+        let hl = [Val::from_u64(5), Val::from_u64(6), Val::from_u64(7), Val::from_u64(8)];
+        // redeem valid at height = timeout-1, invalid at height = timeout.
+        prove_verify(&htlc_witness(true, 9, hl, 10)).expect("redeem at timeout-1 must verify");
+        {
+            let w = htlc_witness(true, 9, hl, 10); // prove a valid redeem (height 9 < timeout 10)
+            let trace = build_trace(&w);
+            let mut pis = public_values(&w);
+            pis[PI_HEIGHT] = Val::from_u64(10); // height == timeout
+            assert!(corrupt_trace_rejected(trace, pis), "redeem at height == timeout must be rejected");
+        }
+        // refund valid at height = timeout, invalid at height = timeout-1.
+        prove_verify(&htlc_witness(false, 10, hl, 10)).expect("refund at timeout must verify");
+        {
+            let w = htlc_witness(false, 10, hl, 10);
+            let trace = build_trace(&w);
+            let mut pis = public_values(&w);
+            pis[PI_HEIGHT] = Val::from_u64(9); // height == timeout-1
+            assert!(corrupt_trace_rejected(trace, pis), "refund at height == timeout-1 must be rejected");
+        }
+    }
+
+    /// Part 3b — value / fee / timeout / current_height at the range boundary {0, 1, 2^52-1, 2^52}.
+    /// 2^BITS-1 is the largest in-range value; 2^BITS must be rejected by the range argument.
+    #[test]
+    #[ignore = "exhaustive audit suite (range boundaries, several proofs); run with `cargo test --release -- --ignored`"]
+    fn boundary_range_values() {
+        let max = (1u64 << BITS) - 1;
+        let over = 1u64 << BITS;
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+
+        // ---- value ----
+        for v in [0u64, 1, max] {
+            prove_verify(&witness_with([v, 0], [v, 0], 0)).unwrap_or_else(|e| panic!("value {v} must verify: {e}"));
+        }
+        // 2^52: in-range outputs (2^51 each) keep the balance so ONLY the input range fails.
+        assert!(
+            prove_verify(&witness_with([over, 0], [1u64 << 51, 1u64 << 51], 0)).is_err(),
+            "input value 2^52 must be rejected by the range argument"
+        );
+
+        // ---- fee ----
+        for f in [0u64, 1, max] {
+            prove_verify(&witness_with([f, 0], [0, 0], f)).unwrap_or_else(|e| panic!("fee {f} must verify: {e}"));
+        }
+        // 2^52 fee, in-range inputs (2^51 each), zero outputs ⇒ only the fee range fails.
+        assert!(
+            prove_verify(&witness_with([1u64 << 51, 1u64 << 51], [0, 0], over)).is_err(),
+            "fee 2^52 must be rejected by the range argument"
+        );
+
+        // ---- timeout (HTLC) ----
+        prove_verify(&htlc_witness(false, 0, hl, 0)).expect("timeout 0 (refund) must verify");
+        prove_verify(&htlc_witness(false, 1, hl, 1)).expect("timeout 1 (refund) must verify");
+        prove_verify(&htlc_witness(false, max, hl, max)).expect("timeout 2^52-1 (refund) must verify");
+        // timeout 2^52 via REDEEM (height small & in-range, diff = timeout-height-1 < 2^52) ⇒ only the
+        // TIMEOUT range check fails.
+        assert!(
+            prove_verify(&htlc_witness(true, 5, hl, over)).is_err(),
+            "timeout 2^52 must be rejected by the range argument"
+        );
+
+        // ---- current_height (HTLC) ----
+        prove_verify(&htlc_witness(true, 0, hl, 10)).expect("height 0 (redeem) must verify");
+        prove_verify(&htlc_witness(true, 1, hl, 10)).expect("height 1 (redeem) must verify");
+        prove_verify(&htlc_witness(false, max, hl, 10)).expect("height 2^52-1 (refund) must verify");
+        // height 2^52: refund satisfies its window for any large height, but the in-circuit height
+        // range-check must reject it (closes the field wrap-around forgery).
+        {
+            let w = htlc_witness(false, over, hl, 10);
+            assert!(!verify_bytes(&prove_to_bytes(&w), &public_values(&w)), "height 2^52 must be rejected");
+        }
+    }
+
+    /// Part 3c — a transaction with TWO HTLC inputs (one redeemed, one refunded, at a shared height),
+    /// folding to one anchor and publishing two DISTINCT owner-based nullifiers.
+    #[test]
+    fn two_htlc_input_tx_verifies() {
+        let asset = Val::from_u64(42);
+        let (height, to0, to1) = (50u64, 100u64, 10u64); // in0 redeem (50<100), in1 refund (50>=10)
+        let hl0 = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+        let hl1 = [Val::from_u64(0x61), Val::from_u64(0x62), Val::from_u64(0x63), Val::from_u64(0x64)];
+        // note 0: redeemed by party A; note 1: refunded by party B.
+        let (nk0, div0) = ([7u64, 70u64], Val::from_u64(1));
+        let (nk1, div1) = ([9u64, 90u64], Val::from_u64(2));
+        let claim0 = recipient_of(Val::from_u64(nk0[0]), Val::from_u64(nk0[1]), div0);
+        let claim1 = recipient_of(Val::from_u64(nk1[0]), Val::from_u64(nk1[1]), div1);
+        let other = recipient_of(Val::from_u64(123), Val::from_u64(456), Val::from_u64(789));
+        let owner0 = htlc_root(claim0, other, hl0, Val::from_u64(to0)); // redeem ⇒ claim0 == redeem_tag
+        let owner1 = htlc_root(other, claim1, hl1, Val::from_u64(to1)); // refund ⇒ claim1 == refund_tag
+        let (v0, v1) = (1000u64, 500u64);
+        let rho0 = [Val::from_u64(11), Val::from_u64(211)];
+        let rho1 = [Val::from_u64(13), Val::from_u64(213)];
+        let rcm0 = [Val::from_u64(100), Val::from_u64(300)];
+        let rcm1 = [Val::from_u64(101), Val::from_u64(301)];
+        let cm0 = commit(owner0, Val::from_u64(v0), rho0, rcm0, asset, Val::from_u64(NOTE_HTLC));
+        let cm1 = commit(owner1, Val::from_u64(v1), rho1, rcm1, asset, Val::from_u64(NOTE_HTLC));
+        let (_, paths) = build_paths(&[cm0, cm1]);
+        let in0 = Input {
+            nk: nk0, div: div0, asset, note_type: Val::from_u64(NOTE_HTLC), value: v0, rho: rho0, rcm: rcm0,
+            sib: paths[0].0, bits: paths[0].1, mode: Val::from_u64(1),
+            redeem_tag: claim0, refund_tag: other, hashlock: hl0, timeout: to0,
+        };
+        let in1 = Input {
+            nk: nk1, div: div1, asset, note_type: Val::from_u64(NOTE_HTLC), value: v1, rho: rho1, rcm: rcm1,
+            sib: paths[1].0, bits: paths[1].1, mode: Val::from_u64(0),
+            redeem_tag: other, refund_tag: claim1, hashlock: hl1, timeout: to1,
+        };
+        let outputs = [
+            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: v0 + v1, rho: [Val::from_u64(21), Val::from_u64(221)], rcm: [Val::from_u64(22), Val::from_u64(222)] },
+            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 0, rho: [Val::from_u64(23), Val::from_u64(223)], rcm: [Val::from_u64(24), Val::from_u64(224)] },
+        ];
+        let w = Witness { inputs: [in0, in1], outputs, fee: 0, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: height };
+        let pis = public_values(&w);
+        // input 0 is a redeem ⇒ its hashlock is the published redeem_hashlock.
+        assert_eq!(pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST], hl0[..]);
+        assert_ne!(pis[PI_NF..PI_NF + DIGEST], pis[PI_NF + DIGEST..PI_NF + 2 * DIGEST], "the two HTLC nullifiers must differ");
+        assert!(verify_bytes(&prove_to_bytes(&w), &pis), "a 2-HTLC-input tx (redeem + refund) must verify");
+    }
+
+    /// Part 3d — an all-zero hashlock is a legitimate (if degenerate) hashlock: a redeem against it
+    /// must verify, and verifying against a non-zero published hashlock must be rejected.
+    #[test]
+    fn all_zero_hashlock_redeem() {
+        let zero_hl = [Val::ZERO; DIGEST];
+        let w = htlc_witness(true, 5, zero_hl, 10);
+        let pis = public_values(&w);
+        assert_eq!(pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST], zero_hl[..], "published redeem_hashlock should be all-zero");
+        assert!(verify_bytes(&prove_to_bytes(&w), &pis), "an all-zero hashlock redeem must verify");
+        let mut bad = pis.clone();
+        bad[PI_HASHLOCK] += Val::ONE;
+        assert!(corrupt_trace_rejected(build_trace(&w), bad), "redeem vs a wrong (non-zero) hashlock must be rejected");
+    }
+
+    // ---- Part 4 — end-to-end forge / theft attempts (each MUST fail to verify) ----
+
+    /// Forge a SECOND, distinct nullifier for one HTLC note by feeding a different rho0 to the
+    /// nullifier than to the commitment (cm — and so membership — stays valid). RHO persistence
+    /// (commit_a lane 6 ↔ nullifier lane 5) must reject ⇒ a note cannot be double-spent.
+    #[test]
+    fn forge_htlc_second_nullifier_via_rho_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(true, 5, hl, 10);
+        let mut trace = build_trace(&w);
+        let nr = null_in_row(0);
+        let mut owner = [Val::ZERO; DIGEST];
+        for k in 0..DIGEST {
+            owner[k] = trace.values[nr * WIDTH + OWNER0 + k];
+        }
+        let rho0 = w.inputs[0].rho[0] + Val::ONE; // forged at the nullifier only
+        let rho1 = w.inputs[0].rho[1];
+        let pos = pos_of(&w.inputs[0].bits);
+        let nih = [Val::from_u64(DOM_NF_HTLC), owner[0], owner[1], owner[2], owner[3], rho0, rho1, pos];
+        set_block(&mut trace.values, null_block(0), nih);
+        for r in null_in_row(0)..=null_out_row(0) {
+            trace.values[r * WIDTH + RHO] = rho0; // satisfy the local nih binding ⇒ only persistence is left
+        }
+        let mut pis = public_values(&w);
+        let nf = nullifier_owner(owner, [rho0, rho1], pos);
+        pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&nf);
+        assert!(corrupt_trace_rejected(trace, pis), "a 2nd HTLC nullifier via a forged rho must not verify");
+    }
+
+    /// Theft: spend an HTLC note as if it were PLAIN (note_type = 0) to bypass the timeout / hashlock /
+    /// tag-match gates. The committed note_type is 1 (IN_COMMIT_B binds commit_b lane 7 == NT) and the
+    /// PLAIN owner gate (OWNER == own.out recipient) fails (OWNER = htlc_root). Must reject.
+    #[test]
+    fn forge_spend_htlc_as_plain_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(true, 5, hl, 10);
+        let mut trace = build_trace(&w);
+        let (lo, hi) = (own_in_row(0), span_last_row(0));
+        for r in lo..=hi {
+            trace.values[r * WIDTH + NT] = Val::ZERO; // claim PLAIN to dodge the HTLC rules
+        }
+        assert!(corrupt_trace_rejected(trace, public_values(&w)), "spending an HTLC note as PLAIN must not verify");
+    }
+
+    /// Theft: redeem an HTLC note with a key that does NOT own the redeem_tag. Rewrite input 0's
+    /// ownership block + NK/CLAIM columns to a foreign key (CLAIM stays consistent with own.out, the
+    /// owner/cm/anchor and the owner-based nullifier are untouched), so ONLY the redeem tag-match
+    /// (CLAIM == redeem_tag, bound into the committed htlc_root) can reject — and it must.
+    #[test]
+    fn forge_wrong_key_redeem_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(true, 5, hl, 10);
+        let mut trace = build_trace(&w);
+        let (bnk0, bnk1, bdiv) = (Val::from_u64(999_001), Val::from_u64(999_002), Val::from_u64(999_003));
+        let mut own = [Val::ZERO; 8];
+        own[0] = Val::from_u64(DOM_OWN);
+        own[1] = bnk0;
+        own[2] = bnk1;
+        own[3] = bdiv;
+        set_block(&mut trace.values, input_base(0), own); // own.out = recipient_of(foreign key)
+        let new_claim = recipient_of(bnk0, bnk1, bdiv);
+        let (lo, hi) = (own_in_row(0), span_last_row(0));
+        for r in lo..=hi {
+            trace.values[r * WIDTH + NK] = bnk0;
+            trace.values[r * WIDTH + NK1] = bnk1;
+            for k in 0..DIGEST {
+                trace.values[r * WIDTH + CLAIM0 + k] = new_claim[k]; // CLAIM == own.out (recip-link holds)
+            }
+        }
+        assert!(corrupt_trace_rejected(trace, public_values(&w)), "redeem with a non-owning key must not verify");
+    }
+
+    /// Theft: redeem well AFTER the timeout (height = 20, timeout = 10). The DIFF compute
+    /// (mode·(timeout-height-1)) no longer matches the range-bounded DIFF column. Must reject.
+    #[test]
+    fn forge_redeem_after_timeout_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(true, 5, hl, 10);
+        let trace = build_trace(&w);
+        let mut pis = public_values(&w);
+        pis[PI_HEIGHT] = Val::from_u64(20);
+        assert!(corrupt_trace_rejected(trace, pis), "redeem after timeout must not verify");
+    }
+
+    /// Theft: refund BEFORE the timeout (height = 3, timeout = 10). Symmetric to the above. Must reject.
+    #[test]
+    fn forge_refund_before_timeout_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(false, 10, hl, 10);
+        let trace = build_trace(&w);
+        let mut pis = public_values(&w);
+        pis[PI_HEIGHT] = Val::from_u64(3);
+        assert!(corrupt_trace_rejected(trace, pis), "refund before timeout must not verify");
+    }
+
+    /// Theft: claim issuance (mint > 0) on an HTLC spend to inflate value. The circuit forces
+    /// pis[PI_MINT] == 0. Must reject.
+    #[test]
+    fn forge_mint_inflation_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(true, 5, hl, 10);
+        let trace = build_trace(&w);
+        let mut pis = public_values(&w);
+        pis[PI_MINT] += Val::ONE;
+        assert!(corrupt_trace_rejected(trace, pis), "mint > 0 on an HTLC spend must not verify");
+    }
 }
