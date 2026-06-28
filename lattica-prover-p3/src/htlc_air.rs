@@ -19,9 +19,15 @@
 //! Every binding is differential-tested against the native oracle below and probed with adversarial
 //! corrupted-trace tests (as in `joinsplit_air`), because this is atomic-swap fund-critical.
 //!
-//! ## Hashes (A2 — domain separation)
-//! Every data hash carries a distinct **domain tag in lane 0** of the Poseidon2 input, so a digest
-//! produced in one context can't be reinterpreted in another:
+//! ## AIR layout note (block adjacency — learned the hard way)
+//! The recipient link (`own.out → commit_a.in`) and the chain/membership links are **block-adjacent**
+//! (cur→nxt) constraints. So the 4 htlc_root blocks CANNOT be inserted between ownership and commit_a
+//! (that breaks the own→commit_a adjacency). The correct layout puts the htlc_root chain at the
+//! **span end** (after the nullifier), carries the selected owner in 4 persistent `OWNER` columns
+//! (`OWNER = note_type ? htlc_root : recipient`), binds `commit_a.in[owner] == OWNER` (local, no
+//! adjacency), and binds `OWNER` to `own.out` (PLAIN) / the htlc chain output (HTLC) at those rows.
+//! Adding span-end blocks also requires extending the persistence region (`P_REGION_LAST`) and the
+//! NK/RHO/VAL/POSACC fills to the new span end. This is the remaining AIR work.
 //!
 //! ## Hashes (A2 — domain separation)
 //! Every data hash carries a distinct **domain tag in lane 0** of the Poseidon2 input, so a digest
