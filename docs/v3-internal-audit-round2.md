@@ -9,9 +9,9 @@ a fix could live at the solver or the node, it was applied at both.
 constants), the FRI/STARK soundness config (identical to the audited join-split, ~103-bit proven /
 ~127 conjectured), the join-split circuit under the v3 asset substrate, and the Merkle tree + codec all
 passed with no soundness defects. The expanded scope surfaced issues only in the **v1 encryption
-layer** and in **wallet-side resource handling** — most now fixed. **One HIGH finding (H-1, a
-recipient-deanonymization oracle from deterministic ML-KEM encapsulation) requires a v1 encryption
-design decision and is reported for sign-off, not silently changed.**
+layer** and in **wallet-side resource handling** — **all now fixed**, including the one HIGH finding
+(H-1, a recipient-deanonymization oracle from deterministic ML-KEM encapsulation), which was confirmed
+by an adversarial refutation pass and then remediated with the user-approved OVK fix (§3).
 
 ## 1. Dimensions reviewed & verdicts
 | # | Dimension | Verdict |
@@ -28,7 +28,7 @@ design decision and is reported for sign-off, not silently changed.**
 ## 2. Findings & disposition
 | ID | Finding | Sev | Status |
 |---|---|---|---|
-| **H-1** | Deterministic ML-KEM encapsulation (`coins = expand(cm)`, public `kem_ek`) is a **recipient-deanonymization oracle**: anyone holding a (public, shareable) address can recompute `kem_ct` for every on-chain output and test equality, enumerating all payments to that address — defeating the viewing-key capability separation. **Confirmed by the refutation skeptic on every axis.** | **HIGH** | **Decision pending** (§3) — v1 encryption design change |
+| **H-1** | Deterministic ML-KEM encapsulation (`coins = expand(cm)`, public `kem_ek`) is a **recipient-deanonymization oracle**: anyone holding a (public, shareable) address can recompute `kem_ct` for every on-chain output and test equality, enumerating all payments to that address — defeating the viewing-key capability separation. **Confirmed by the refutation skeptic on every axis.** | **HIGH** | **Fixed** (`08c773f`, option A) — OVK-derived coins (§3) |
 | M-3 | `tryDecrypt`/`detect` returned the wire `div`, which is AEAD-authed but **not cm-bound**; a hostile sender could ship a correct `recipient` + garbage `div` that bricks the default spend (recoverable). | Med | **Fixed** (`f22d38c`) — re-derive div from the matched index |
 | F1 | Witness slice leaked on the success path of all three builders. | Med | **Fixed** (`f22d38c`) |
 | F2 | Output ciphertexts leaked on the builder error path. | Low-Med | **Fixed** (`f22d38c`) |
@@ -41,7 +41,15 @@ design decision and is reported for sign-off, not silently changed.**
 | privacy | Redeem vs refund is **publicly distinguishable** (redeem carries a preimage + nonzero redeem_hashlock); the shared SHA256 links the two swap legs; HTLC txs form a distinct anonymity set (empty-ciphertext output). | Med | **Documented** (corrects round-1's A-F2/C-F8 framing) — partly inherent to HTLC |
 | Phase B | Cross-chain height↔seconds timeout cushion (free-option/reorg race); `await_lock` must verify the communicated lock's **asset**/htlc_root/membership. | High/Med | **Documented** — `rubble-xchain-xfer` scope, not this branch |
 
-## 3. H-1 — the one open decision (v1 encryption)
+## 3. H-1 — RESOLVED (option A implemented, commit `08c773f`)
+Implemented the OVK fix: added `ovk = expand(seed,"ovk")` to the key hierarchy and changed the KEM
+encapsulation coins from `expand(cm)` to `H(ovk ‖ cm)`. A third party lacks the sender's `ovk` so it
+can no longer reproduce `kem_ct` (oracle closed); the sender holds `ovk` so seed-restorability is
+preserved; recipient decryption (sk-based) and the circuit/Rust side are unchanged. Regression test
+`kem_ct is NOT recomputable from the public address` asserts both halves. The original analysis +
+rejected alternatives are kept below for the record.
+
+### Original decision framing (for the record)
 The deterministic encapsulation was a deliberate v1 choice for **seed-restorability** (a sender
 reconstructs sent notes from a seed). But deriving the encaps coins from the *public* `cm` makes
 `kem_ct` publicly recomputable from the recipient's *public* address, which deanonymizes recipients of
@@ -60,5 +68,7 @@ changed unilaterally.
 After the round-2 fixes: **74 Rust tests** (incl. the proven-security gate), the full **Zig** suite
 (incl. the new M-3 test and a leak-checking-allocator build test that would fail pre-fix),
 **`check-production`**, and **`run-real-integration.sh`** (real join-split + HTLC lock→redeem lifecycle)
-all green. Round-2 commits: `d0e67dc` (Rust/doc), `f22d38c` (node/tx). This pass does not replace the
-external Codex audit; H-1 in particular is flagged for sign-off.
+all green, plus the new H-1 regression test (`kem_ct` not recomputable without the sender's `ovk`).
+Round-2 commits: `d0e67dc` (Rust/doc), `f22d38c` (node/tx), `a66dadd` (report + doc corrections),
+`08c773f` (H-1 OVK fix). This internal pass does not replace the external Codex audit, but every
+finding it raised — including the HIGH H-1 — is now remediated and tested.
