@@ -2,14 +2,11 @@
 //! production circuits are `joinsplit_air` (v1 N-in/M-out join-split) and `htlc_air` (v3 shielded HTLC
 //! spend); both build on `poseidon2_air` (the Poseidon2 permutation AIR). This top level adds the
 //! canonical proof serialization + the `lattica_joinsplit_*` / `lattica_htlc_*` **C ABI** the Zig node
-//! calls (matching `src/ffi.zig`). NOTE: `spend_air` is a superseded milestone (M4b) — it is NOT a
-//! building block of the production circuits and is reachable only from the `main` demo binary + its own
-//! tests (never via the C ABI). It is a candidate for removal (audit r3, R-B Finding 1).
+//! calls (matching `src/ffi.zig`).
 
 pub mod joinsplit_air;
 pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsplit_air, extended
 pub mod poseidon2_air;
-pub mod spend_air; // superseded (M4b); demo/test-only, not on the production C-ABI path — see the note above
 
 use core::slice;
 use p3_field::PrimeField64;

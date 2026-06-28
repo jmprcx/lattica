@@ -14,7 +14,7 @@
 //! membership + nullifier + ownership + balance + range + tx-binding) over the Poseidon2 chip via a
 //! lookup argument (`p3-lookup`/LogUp). The Winterfell `lattica-prover` stays as a differential oracle.
 
-use lattica_prover_p3::{joinsplit_air, poseidon2_air, spend_air};
+use lattica_prover_p3::{joinsplit_air, poseidon2_air};
 
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
@@ -164,20 +164,6 @@ fn main() {
         Ok(()) => println!("  M4a across-rows Poseidon2 AIR (ZK): ACCEPTED"),
         Err(e) => {
             println!("  M4a across-rows Poseidon2 AIR: FAILED ({e})");
-            std::process::exit(1);
-        }
-    }
-
-    // M4b: commitment + general-position Merkle membership.
-    let opening: [Val; 4] = core::array::from_fn(|i| Val::new(i as u64 + 1));
-    let sib: [[Val; 4]; spend_air::DEPTH] =
-        core::array::from_fn(|d| core::array::from_fn(|k| Val::new((d * 10 + k + 100) as u64)));
-    let bits: [bool; spend_air::DEPTH] = core::array::from_fn(|d| d % 2 == 1);
-    let root = spend_air::native_root(opening, &sib, &bits);
-    match spend_air::prove_verify(opening, sib, bits, root) {
-        Ok(()) => println!("  M4b commitment + membership (ZK): ACCEPTED"),
-        Err(e) => {
-            println!("  M4b commitment + membership: FAILED ({e})");
             std::process::exit(1);
         }
     }
