@@ -187,7 +187,7 @@ fn run() !void {
         // height 50 < timeout 100 ⇒ the prover can't satisfy the refund time-lock ⇒ proving fails.
         if (node.buildHtlcSpend(a, refunder, refund, d_in, &o_ref, 0, 50, chain.anchor())) |_| {
             return Err.TamperAccepted;
-        } else |e| if (e != node.TxError.Internal) return Err.WrongError;
+        } else |e| if (e != node.TxError.ProveFailed) return Err.WrongError;
         std.debug.print("refund before timeout: REJECT (real prover)\n", .{});
     }
 

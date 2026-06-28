@@ -19,8 +19,28 @@ const tree = @import("tree.zig");
 const tx = @import("tx.zig");
 const ffi = @import("ffi.zig");
 const poseidon2 = @import("poseidon2.zig");
+const field = @import("field.zig");
 const protocol = @import("protocol.zig");
 const Hash32 = p.Hash32;
+
+/// The circuit's range-check width (`htlc_air`/`joinsplit_air` `BITS`): every range-checked quantity
+/// (values, fee, the HTLC timeout/height) is proven `< 2^RANGE_BITS`, chosen so `2·2^RANGE_BITS < p`
+/// (no field wraparound). The node enforces the same bounds (defense-in-depth) so consensus never
+/// trusts the proof alone for a quantity whose unboundedness would break soundness.
+pub const RANGE_BITS: u6 = 52;
+pub const MAX_RANGE_VALUE: u64 = @as(u64, 1) << RANGE_BITS; // exclusive bound on values / fee / height
+
+/// True iff every 8-byte little-endian limb of `h` is a canonical field element (`< p`). A
+/// non-canonical encoding is a *different* 32-byte key for the *same* field element, which would let a
+/// byte-keyed nullifier set be bypassed if a verifier backend reduced instead of rejecting; the node
+/// rejects non-canonical public fields as a backstop to the verifier's own canonical parse.
+fn isCanonicalDigest(h: Hash32) bool {
+    var k: usize = 0;
+    while (k < 4) : (k += 1) {
+        if (std.mem.readInt(u64, h[k * 8 ..][0..8], .little) >= field.P) return false;
+    }
+    return true;
+}
 
 const root_module = @import("root");
 /// Genesis/test-only helpers — `Chain.bootstrapMint` and the `mock` backend — compile only when the
@@ -49,6 +69,11 @@ pub const TxError = error{
     TreeFull,
     OversizeProof,
     OversizeOutput,
+    OversizeFee, // fee ≥ 2^RANGE_BITS (defense-in-depth with the circuit's fee range check)
+    OversizeHeight, // current_height ≥ 2^RANGE_BITS (would let the HTLC timeout compare wrap)
+    HeightMismatch, // tx's current_height ≠ the consensus height the node is validating at
+    NonCanonicalField, // a public 32-byte field has a limb ≥ p (non-canonical encoding)
+    ProveFailed, // wallet-side: the prover rejected the witness (e.g. an unsatisfiable timelock)
     Internal,
 };
 
@@ -332,7 +357,7 @@ pub fn buildTransfer(
     };
     const binding = t.txBinding();
     const witness = encodeWitness(allocator, sender, inputs, out_notes, fee, mint, binding) catch return TxError.Internal;
-    t.proof = ffi.proveJoinSplit(allocator, witness) catch return TxError.Internal;
+    t.proof = ffi.proveJoinSplit(allocator, witness) catch return TxError.ProveFailed;
     return t;
 }
 
@@ -473,7 +498,7 @@ pub fn buildHtlcSpend(
     };
     const binding = t.txBinding();
     const witness = encodeHtlcWitness(allocator, claimer, spend, dummy, out_notes, fee, 0, binding, current_height) catch return TxError.Internal;
-    t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.Internal;
+    t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.ProveFailed;
     return t;
 }
 
@@ -628,6 +653,11 @@ pub const Chain = struct {
         // Size limits before any heavy parsing/verification (DoS — audit M-05).
         if (t.proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
         for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
+        if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee; // defense-in-depth with the circuit range
+        // Reject non-canonical public-field encodings before they key the nullifier set / enter the tree.
+        if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
+        for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
+        for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
 
         // Nullifiers: reject any already spent, or duplicated within this transaction.
         var seen = HashSet.init(self.allocator);
@@ -682,12 +712,24 @@ pub const Chain = struct {
     /// `current_height` so a prover can't backdate/forward the timeout window. The proof binds the
     /// redeem/refund mode, the party (tag-match), the timeout (vs `current_height`), and — on redeem —
     /// the committed hashlock == `SHA256(redeem_preimage)`.
+    ///
+    /// `at_height` MUST be the node's own consensus block height — never a value taken from the
+    /// transaction. The node both pins `t.current_height == at_height` (so the timeout window is
+    /// evaluated at the real height) and bounds it `< 2^RANGE_BITS` (so the in-circuit timeout
+    /// subtraction cannot wrap); both checks are mirrored in the circuit (defense-in-depth).
     pub fn applyHtlc(self: *Chain, t: ShieldedHtlcTx, at_height: u64) TxError!void {
-        if (t.mint != 0) return TxError.IllegalIssuance; // HTLC spends never issue
-        if (t.current_height != at_height) return TxError.Internal; // node-pinned timeout height
+        if (t.mint != 0) return TxError.IllegalIssuance; // HTLC spends never issue (also forced in-circuit)
+        if (t.current_height >= MAX_RANGE_VALUE) return TxError.OversizeHeight; // no field-wrap in the compare
+        if (t.current_height != at_height) return TxError.HeightMismatch; // node-pinned consensus height
+        if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee; // defense-in-depth with the circuit range
         if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
         if (t.proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
         for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
+        // Reject non-canonical encodings of the public field elements before they key the nullifier set
+        // or enter the tree (backstop to the verifier's canonical parse).
+        if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
+        for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
+        for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
 
         var seen = HashSet.init(self.allocator);
         defer seen.deinit();
@@ -1132,7 +1174,7 @@ test "node: a shielded HTLC redeem verifies and applies (mock backend)" {
     }
     try testing.expectEqual(@as(u64, 900), got);
     // The node pins current_height: a tx claiming a different height than consensus is rejected.
-    try testing.expectError(TxError.Internal, chain.applyHtlc(t, 51));
+    try testing.expectError(TxError.HeightMismatch, chain.applyHtlc(t, 51));
 }
 
 test "node: a tampered HTLC body (different preimage) is rejected" {
@@ -1211,4 +1253,47 @@ test "node: buildHtlcSpend → applyHtlc end-to-end (mock backend)" {
     }
     try testing.expectEqual(@as(u64, 1000), got); // claimer redeemed the locked 1000
     try testing.expect(chain.supply.invariantHolds());
+}
+
+test "node: applyHtlc defense-in-depth rejects (height/fee bounds + non-canonical fields)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const claimer = try account(1);
+    var tns: [M_OUT]tx.TransmittedNote = undefined;
+    for (0..M_OUT) |j| {
+        const jb = [_]u8{@intCast(j)};
+        const note = tx.Note{ .value = 0, .recipient = claimer.address().recipientId(), .div = claimer.address().div, .rho = p.hashDomain("t:dr", &.{&jb}), .rcm = p.hashDomain("t:dc", &.{&jb}) };
+        tns[j] = try tx.encryptNote(a, claimer.address(), note);
+    }
+    const base = ShieldedHtlcTx{ .anchor = chain.anchor(), .nullifiers = .{ [_]u8{7} ** 32, [_]u8{8} ** 32 }, .fee = 0, .mint = 0, .current_height = 50, .redeem_preimage = null, .proof = &.{}, .outputs = tns };
+
+    { // mint > 0 is forbidden (also forced in-circuit)
+        var t = base;
+        t.mint = 1;
+        try testing.expectError(TxError.IllegalIssuance, chain.applyHtlc(t, 50));
+    }
+    { // current_height ≥ 2^RANGE_BITS would let the timeout compare wrap
+        var t = base;
+        t.current_height = MAX_RANGE_VALUE;
+        try testing.expectError(TxError.OversizeHeight, chain.applyHtlc(t, MAX_RANGE_VALUE));
+    }
+    { // the node pins current_height to consensus (a tx claiming another height is rejected)
+        try testing.expectError(TxError.HeightMismatch, chain.applyHtlc(base, 51));
+    }
+    { // fee ≥ 2^RANGE_BITS (defense-in-depth with the circuit range)
+        var t = base;
+        t.fee = MAX_RANGE_VALUE;
+        try testing.expectError(TxError.OversizeFee, chain.applyHtlc(t, 50));
+    }
+    { // a non-canonical nullifier encoding (limb == p) is rejected before it keys the nullifier set
+        var t = base;
+        var nf: Hash32 = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, nf[0..8], field.P, .little);
+        t.nullifiers[0] = nf;
+        try testing.expectError(TxError.NonCanonicalField, chain.applyHtlc(t, 50));
+    }
 }

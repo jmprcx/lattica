@@ -21,4 +21,9 @@ pub fn main() void {
     _ = &node.Chain.isKnownAnchor;
     _ = &node.Chain.merklePath;
     _ = &node.buildTransfer;
+    // v3 shielded-HTLC consensus surface (must also compile free of test-only helpers).
+    _ = &node.Chain.applyHtlc;
+    _ = &node.buildHtlcSpend;
+    _ = node.ShieldedHtlcTx;
+    _ = node.HtlcSpend;
 }
