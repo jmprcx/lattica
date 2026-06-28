@@ -46,11 +46,23 @@ validated by the full suite + the real in-node prove→verify.
 **Interaction with deterministic note encryption.** Note encryption is deterministic — the ML-KEM
 encapsulation coins are `expand(cm, "kem-encaps")` and the AEAD key+nonce are `H(ss ‖ kem_ct ‖ cm ‖ …)`
 (`primitives.deriveNoteKey`), all derived from `cm` (chosen for seed-restorability, no stored `esk`).
-The AEAD `(key,nonce)` is therefore unique up to a `cm` collision; with the 128-bit `rho`/`rcm` the
-commitment binds the full note randomness and the margin is the commitment's 128-bit collision
-resistance (was ~2⁶⁴ when `cm` bound only 64-bit `rho`/`rcm`). This differs from a randomized scheme
-(Zcash uses a fresh `esk` per note); an auditor should still note the determinism, but the
-randomness-width concern is resolved.
+The AEAD `(key,nonce)` is therefore unique up to a `cm` collision.
+
+> **Corrections (v3 round-2 internal audit).** Two claims here were imprecise:
+> 1. **`cm` does NOT bind the *full* plaintext** (finding M-2). It binds `recipient`, `value`,
+>    `rho[0..16]`, `rcm[0..16]`, `asset`, `note_type` — but **not** the wire `div`, nor the high 16
+>    bytes of `rho`/`rcm`. So distinct plaintexts can share a `cm` (hence a `(key,nonce)`) **without**
+>    a hash collision. This was assessed **inert** (only a malicious sender, who already knows both
+>    plaintexts, can trigger it; the unbound bytes are never read) — but the invariant as written is
+>    false. The `div` half is what enabled the **M-3** griefing (fixed: decryption now re-derives `div`
+>    from the matched address index).
+> 2. **The determinism is not merely a stylistic difference** — deriving the encaps coins from the
+>    *public* `cm` makes `kem_ct` publicly recomputable from the recipient's *public* address, a
+>    **recipient-deanonymization oracle** (finding **H-1**, HIGH). See `v3-internal-audit-round2.md` §3
+>    for the fix options (OVK-derived coins preserve restorability while closing the oracle).
+
+This differs from a randomized scheme (Zcash uses a fresh `esk` per note + an OVK so the sender can
+still recover sent notes without leaking recipient anonymity); the H-1 fix adopts the OVK part.
 
 ## 4. Issuance — **mint (v1); burn deferred**
 Shielded issuance via a **public `mint` amount** in the join-split balance:

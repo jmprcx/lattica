@@ -108,9 +108,15 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
    **deltas** over join-split: the `note_type`/`htlc_root`/owner-MUX/tag-match/hashlock/timeout columns
    and constraints, and especially the **mode-independent-nullifier** double-spend argument. Read after
    the join-split audit.
-2b. **`docs/v3-internal-audit.md`** (v3) — the internal pre-audit (four adversarial reviewers + a
-   soundness read) run before this external audit: findings, the defense-in-depth fixes applied at both
-   the solver and node layers, and the documented residuals. Read for the v3 threat coverage + known gaps.
+2b. **`docs/v3-internal-audit.md`** + **`docs/v3-internal-audit-round2.md`** (v3) — the internal
+   pre-audit run before this external audit. Round 1 (four reviewers): the defense-in-depth fixes at
+   both layers. Round 2 (eight reviewers + a refutation skeptic): expanded into Poseidon2, the FRI
+   config, join-split-under-v3, memory safety, encryption/keys, economic attacks, and tree/codec — all
+   foundational layers verified sound; fixed two memory leaks + the M-3 div-griefing + lock guards; and
+   **flags one HIGH open item for sign-off — H-1, a recipient-deanonymization oracle in the v1
+   deterministic note encryption** (round-2 §3). Read both for the v3 threat coverage, known gaps, and
+   the H-1 decision. **`scripts/run-real-integration.sh` is a required gate** for the cross-language
+   witness/PI byte-match (the mock backends do not validate it).
 3. **`docs/soundness-budget.md`** — the C-04 proven/conjectured security accounting (~103 / ~127-bit).
 4. **`docs/protocol-v1-decisions.md`** — the deliberate v1 parameter decisions + limitations
    (single-asset, key model, note randomness, issuance, the deterministic-encryption interaction).
