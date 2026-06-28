@@ -295,7 +295,11 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
 // per-instance public bindings. Built incrementally; each stage differential-tested vs the oracle.
 // ==============================================================================================
 
-const SPAN_BLOCKS: usize = 4 + DEPTH; // ownership, commit_a, commit_b, DEPTH merges, nullifier
+// ownership, commit_a, commit_b, DEPTH merges, nullifier, then 4 htlc_root blocks at the span END
+// (kept after the nullifier so the existing PLAIN block adjacencies are untouched; the HTLC owner is
+// carried into commit_a via the persistent OWNER columns rather than block adjacency).
+const HTLC_BLOCKS: usize = 4;
+const SPAN_BLOCKS: usize = 4 + DEPTH + HTLC_BLOCKS;
 const OUT_BLOCKS: usize = 2; // out_cm perm_a + perm_b (2-permutation commitment; also 64 rows for the value range)
 const FEE_BLOCKS: usize = 2; // fee binding + range
 const MINT_BLOCKS: usize = 2; // mint (issuance) binding + range
@@ -380,6 +384,17 @@ const fn null_in_row(i: usize) -> usize {
 const fn null_out_row(i: usize) -> usize {
     null_block(i) * BLOCK + BLOCK - 1
 }
+/// htlc_root chain blocks live at the span END (blocks 4+DEPTH .. 7+DEPTH of input `i`).
+const fn htlc_block(i: usize, k: usize) -> usize {
+    input_base(i) + 4 + DEPTH + k
+}
+const fn htlc_out_row(i: usize, k: usize) -> usize {
+    htlc_block(i, k) * BLOCK + BLOCK - 1
+}
+/// The last row of an input span (now the final htlc_root block) — the region-persistence boundary.
+const fn span_last_row(i: usize) -> usize {
+    htlc_out_row(i, HTLC_BLOCKS - 1)
+}
 const fn out_base(j: usize) -> usize {
     N_IN * SPAN_BLOCKS + j * OUT_BLOCKS
 }
@@ -441,7 +456,7 @@ fn periodic() -> Vec<Vec<Val>> {
     let null_in: Vec<usize> = (0..N_IN).map(null_in_row).collect();
     let out_a_in: Vec<usize> = (0..M_OUT).map(out_in_row).collect();
     // region-last rows (gate local-persistent columns at region boundaries)
-    let mut region_last: Vec<usize> = (0..N_IN).map(null_out_row).collect();
+    let mut region_last: Vec<usize> = (0..N_IN).map(span_last_row).collect(); // span end (after htlc blocks)
     region_last.extend((0..M_OUT).map(|j| out_in_row(j) + OUT_BLOCKS * BLOCK - 1));
     region_last.push(fee_in_row() + FEE_BLOCKS * BLOCK - 1);
     region_last.push(mint_in_row() + MINT_BLOCKS * BLOCK - 1);
@@ -780,8 +795,31 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         nin[4] = inp.rho[1];
         nin[5] = pos;
         set_block(&mut t, null_block(i), nin);
-        // local-persistent nk/rho/value across the span
-        let (lo, hi) = (own_in_row(i), null_out_row(i));
+        // htlc_root chain at the span END (blocks 4+DEPTH..7+DEPTH): the HTLC owner =
+        // MD-chain(DOM_HTLC ‖ redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout). Always filled as valid
+        // permutations so the round constraints hold; for PLAIN notes (zero HTLC fields) the result is
+        // unused. The owner-binding/gating eval constraints are added in later stages.
+        let mut hs0 = [Val::ZERO; 8];
+        hs0[0] = Val::from_u64(DOM_HTLC);
+        hs0[DIGEST..].copy_from_slice(&inp.redeem_tag);
+        set_block(&mut t, htlc_block(i, 0), hs0);
+        let mut hc = native_permute(hs0);
+        let mut hs1 = [Val::ZERO; 8];
+        hs1[..DIGEST].copy_from_slice(&hc[..DIGEST]);
+        hs1[DIGEST..].copy_from_slice(&inp.refund_tag);
+        set_block(&mut t, htlc_block(i, 1), hs1);
+        hc = native_permute(hs1);
+        let mut hs2 = [Val::ZERO; 8];
+        hs2[..DIGEST].copy_from_slice(&hc[..DIGEST]);
+        hs2[DIGEST..].copy_from_slice(&inp.hashlock);
+        set_block(&mut t, htlc_block(i, 2), hs2);
+        hc = native_permute(hs2);
+        let mut hs3 = [Val::ZERO; 8];
+        hs3[..DIGEST].copy_from_slice(&hc[..DIGEST]);
+        hs3[DIGEST] = Val::from_u64(inp.timeout);
+        set_block(&mut t, htlc_block(i, 3), hs3);
+        // local-persistent nk/rho/value across the span (now extends over the span-end htlc blocks)
+        let (lo, hi) = (own_in_row(i), span_last_row(i));
         fill_col(&mut t, lo, hi, NK, nk0);
         fill_col(&mut t, lo, hi, NK1, nk1);
         fill_col(&mut t, lo, hi, RHO, inp.rho[0]);
