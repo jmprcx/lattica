@@ -339,7 +339,13 @@ const MODE: usize = 28; // 1 = redeem, 0 = refund (local-persistent, boolean)
 // HTLC timeout compare (range argument, reusing REM/RBIT in the free span-end htlc region):
 const TIMEOUT: usize = 29; // the committed timeout (== htlc block 3 input lane 4), local-persistent
 const DIFF: usize = 30; // redeem: timeout-height-1 ; refund: height-timeout ; range-checked ≥ 0
-const WIDTH: usize = 31; // …, MODE=28, TIMEOUT=29, DIFF=30
+// Redeem hashlock-nonzero gadget (audit r3 hardening): on a redeem, PI_HASHLOCK must be non-zero, else
+// a maliciously-locked zero hashlock could be redeemed with a null preimage (no secret revealed). The
+// HLINV_k witness inverses of the hashlock limbs; HLPROD = Π_k(1 − PI_HASHLOCK[k]·HLINV_k) is 0 iff
+// some limb is invertible (non-zero). Used only at the htlc block-2 rows.
+const HLINV0: usize = 31; // HLINV0..3 = 31..35
+const HLPROD: usize = 35;
+const WIDTH: usize = 36; // …, TIMEOUT=29, DIFF=30, HLINV0..3=31..35, HLPROD=35
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
@@ -733,6 +739,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         for k in 0..DIGEST {
             builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - pis[PI_HASHLOCK + k].clone()));
         }
+        // ---- redeem hashlock-nonzero backstop (audit r3): on a redeem, PI_HASHLOCK must be ≠ 0 ----
+        // HLPROD = Π_k (1 − PI_HASHLOCK[k]·HLINV_k); it is 0 iff some limb is invertible (non-zero).
+        // Defined at the htlc block-2 rows (degree 9, keeps log_quotient_degree=3), then required to be 0
+        // on the redeem path (degree 4). A zero hashlock makes every factor 1 ⇒ HLPROD=1 ⇒ rejected, so a
+        // maliciously-locked zero hashlock can't be redeemed with a null preimage (consensus backstop to
+        // the wallet/await_lock guards).
+        let mut hlprod = one.clone();
+        for k in 0..DIGEST {
+            hlprod = hlprod * (one.clone() - pis[PI_HASHLOCK + k].clone() * cur[HLINV0 + k].clone());
+        }
+        builder.assert_zero(h2.clone() * (cur[HLPROD].clone() - hlprod));
+        builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * cur[HLPROD].clone());
 
         // ---- HTLC timeout compare (range argument on current_height vs the committed timeout) ----
         // TIMEOUT == htlc block 3 input lane 4 (the committed timeout).
@@ -920,6 +938,31 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
     fill_col(&mut t, 0, HEIGHT - 1, ASSET, w.inputs[0].asset);
     // The single global current_height range window (defense-in-depth; see height_seed_row).
     fill_range(&mut t, height_seed_row(), w.current_height);
+
+    // Redeem hashlock-nonzero gadget: at each htlc block-2 row, witness the inverse of a non-zero
+    // hashlock limb so HLPROD = Π(1 − PI_HASHLOCK·HLINV) = 0 (proving PI_HASHLOCK ≠ 0). When there is no
+    // redeem (PI_HASHLOCK = 0) every factor is 1, so HLPROD = 1 (the redeem constraint is then gated off).
+    let mut rhl = [Val::ZERO; DIGEST];
+    for inp in w.inputs.iter() {
+        if inp.note_type == Val::from_u64(NOTE_HTLC) && inp.mode == Val::from_u64(1) {
+            rhl = inp.hashlock;
+            break;
+        }
+    }
+    let rhl_nonzero = rhl.iter().any(|&x| x != Val::ZERO);
+    for i in 0..N_IN {
+        let r = htlc_block(i, 2) * BLOCK;
+        if rhl_nonzero {
+            for k in 0..DIGEST {
+                if rhl[k] != Val::ZERO {
+                    t[r * WIDTH + HLINV0 + k] = rhl[k].inverse(); // HLPROD stays 0 (the product is 0)
+                    break;
+                }
+            }
+        } else {
+            t[r * WIDTH + HLPROD] = Val::ONE; // no redeem ⇒ product = 1
+        }
+    }
 
     // --- inputs: ownership, commitment, membership, nullifier (+ local-persistent + pos_acc) ---
     for (i, inp) in w.inputs.iter().enumerate() {
@@ -2194,15 +2237,17 @@ mod tests {
     /// Part 3d — an all-zero hashlock is a legitimate (if degenerate) hashlock: a redeem against it
     /// must verify, and verifying against a non-zero published hashlock must be rejected.
     #[test]
-    fn all_zero_hashlock_redeem() {
+    fn all_zero_hashlock_redeem_is_rejected() {
+        // audit r3 backstop: a maliciously-locked ZERO hashlock must NOT be redeemable with a null
+        // preimage (which would reveal no secret and break atomicity). The in-circuit hashlock-nonzero
+        // gadget forces PI_HASHLOCK ≠ 0 on the redeem path, so this redeem fails to verify in-circuit —
+        // independent of the wallet/await_lock guards. (Refunds, which set PI_HASHLOCK=0 legitimately,
+        // are unaffected: the gadget is gated by MODE=redeem — see htlc_refund_air_verifies.)
         let zero_hl = [Val::ZERO; DIGEST];
         let w = htlc_witness(true, 5, zero_hl, 10);
         let pis = public_values(&w);
-        assert_eq!(pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST], zero_hl[..], "published redeem_hashlock should be all-zero");
-        assert!(verify_bytes(&prove_to_bytes(&w), &pis), "an all-zero hashlock redeem must verify");
-        let mut bad = pis.clone();
-        bad[PI_HASHLOCK] += Val::ONE;
-        assert!(corrupt_trace_rejected(build_trace(&w), bad), "redeem vs a wrong (non-zero) hashlock must be rejected");
+        assert_eq!(pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST], zero_hl[..], "published redeem_hashlock is all-zero");
+        assert!(!verify_bytes(&prove_to_bytes(&w), &pis), "an all-zero hashlock redeem must be rejected (no-secret redeem)");
     }
 
     // ---- Part 4 — end-to-end forge / theft attempts (each MUST fail to verify) ----
