@@ -90,16 +90,24 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
 - **Deterministic note encryption** — the AEAD key+nonce derive from the commitment (chosen for
   seed-restorability); the (key,nonce)-uniqueness margin is the commitment's 128-bit collision
   resistance. Differs from a randomized scheme; see `protocol-v1-decisions.md §3`.
-- **PoC chain scope** — `node.zig` is an in-memory state machine (no blocks/PoW/mempool/networking/fee
-  collection); those belong to the host chain. The audit target is the circuit + the tx-validation
-  logic, not a full node.
+- **PoC chain scope** — `node.zig` is an in-memory state machine. It now keeps a node-visible public
+  **supply accumulator** (`Chain.supply`, the `issued − burned == shielded_pool + fees` invariant from
+  public mint/fee deltas), but block-level commitments (state-root, nullifier-set-root, event-root,
+  header) and PoW/mempool/networking/reorg-undo belong to the host chain (`rubble-node-zig`). The audit
+  target is the circuit + the tx-validation logic, not a full node.
 - **Toolchain** — the `.sframe` linker caveat above (real prove/verify via the script, not `zig build`).
 
 **Self-review history (transparency):** four adversarial recheck passes during development found and
 fixed real bugs — a fixed-seed (non-CSPRNG) ZK-blinding RNG; a node-layer `mint` **inflation** hole; a
 verifier **panic** across the C ABI; and a missing `rho1` **persistence** constraint that would have
-allowed a forged second nullifier per note. Each has a regression test. We expect an independent
-auditor to find more — budget accordingly, especially in the areas below.
+allowed a forged second nullifier per note. Each has a regression test.
+
+**Implementation audit + remediation (Codex, 2026-06-27):** see `docs/lattica-implementation-audit.md`.
+It found a **critical ghost-coin bug (C-01)** — the live node applied `outputs[j].cm` to the tree
+without binding it to the proof — plus hardening items (H-01/H-02, M-01..M-04, L-01/L-02). **All are
+remediated** (single-source output commitment, reordered validation, supply accumulator, ABI/codec
+hardening); the finding-by-finding response is the table at the end of that file. We still expect an
+independent re-review to find more — budget accordingly, especially in the areas below.
 
 ## 6. Highest-risk areas to focus
 

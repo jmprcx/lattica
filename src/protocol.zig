@@ -1,6 +1,13 @@
 //! The unified **shielded-only** transaction format, canonical serialization, transaction-binding
 //! digest, and the public supply model.
 //!
+//! **Status (audit L-01/L-02).** `SupplyState` (below) is **live** — wired into `node.zig`'s `Chain`
+//! as the node's public supply accumulator. The `ShieldedTx` canonical codec / `bindingDigest` here
+//! are **reference / transitional**: the live node uses its own `node.ShieldedTx` (join-split
+//! statement) with its own `txBinding`; this codec is the canonical serialization design (not yet on
+//! the live path). The header note below mentions Rescue-Prime/SHA3 for historical reasons — the
+//! live hash is Poseidon2-Goldilocks (`poseidon2.zig`).
+//!
 //! Per `docs/full-node-security-integration.md`, a shielded-only chain keeps the supply invariant
 //!   `issued - burned = shielded_pool_value + fees`
 //! publicly recomputable without learning any note value. Each transaction proves, *in the spend

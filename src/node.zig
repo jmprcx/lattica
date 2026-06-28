@@ -19,6 +19,7 @@ const tree = @import("tree.zig");
 const tx = @import("tx.zig");
 const ffi = @import("ffi.zig");
 const poseidon2 = @import("poseidon2.zig");
+const protocol = @import("protocol.zig");
 const Hash32 = p.Hash32;
 
 const TX_DOMAIN: []const u8 = "lattica:v1:tx-binding";
@@ -60,12 +61,22 @@ pub const OutputReq = struct {
 pub const ShieldedTx = struct {
     anchor: Hash32,
     nullifiers: [N_IN]Hash32,
-    out_cms: [M_OUT]Hash32,
     fee: u64,
     mint: u64,
     proof: []const u8,
-    /// Encrypted output notes (recipients trial-decrypt to find theirs).
+    /// Encrypted output notes (recipients trial-decrypt to find theirs). **Each `outputs[j].cm` is
+    /// the single source of truth for output commitment `j`** — it is the value appended to the note
+    /// tree, the value fed to the verifier as a public input, AND the value hashed into `tx_binding`.
+    /// There is no separate `out_cms` field, so the applied commitment can never differ from the
+    /// proven one (audit C-01 / L-02).
     outputs: [M_OUT]tx.TransmittedNote,
+
+    /// The output commitments, derived from the transmitted notes (the consensus-applied values).
+    pub fn outCms(self: ShieldedTx) [M_OUT]Hash32 {
+        var cms: [M_OUT]Hash32 = undefined;
+        for (self.outputs, 0..) |o, j| cms[j] = o.cm;
+        return cms;
+    }
 
     /// Canonical 4-element digest of the public body — the sighash the proof binds via its
     /// `tx_binding` public input. Recomputed by the node so the prover can never disagree with the
@@ -75,7 +86,8 @@ pub const ShieldedTx = struct {
         var le: [8]u8 = undefined;
         dh.field(&self.anchor);
         for (self.nullifiers) |nf| dh.field(&nf);
-        for (self.out_cms) |cm| dh.field(&cm);
+        const out_cms = self.outCms();
+        for (out_cms) |cm| dh.field(&cm);
         std.mem.writeInt(u64, &le, self.fee, .little);
         dh.field(&le);
         std.mem.writeInt(u64, &le, self.mint, .little);
@@ -94,7 +106,7 @@ pub const ShieldedTx = struct {
         return .{
             .anchor = self.anchor,
             .nullifiers = self.nullifiers,
-            .out_cms = self.out_cms,
+            .out_cms = self.outCms(),
             .tx_binding = self.txBinding(),
             .fee = self.fee,
             .mint = self.mint,
@@ -187,7 +199,6 @@ pub fn buildTransfer(
     // Output notes (pad to M_OUT with zero-value notes back to the sender), commitments, ciphertexts.
     var out_notes: [M_OUT]tx.Note = undefined;
     var tns: [M_OUT]tx.TransmittedNote = undefined;
-    var out_cms: [M_OUT]Hash32 = undefined;
     for (0..M_OUT) |j| {
         const recipient: tx.Address = if (j < outputs.len) outputs[j].recipient else sender.address();
         const value: u64 = if (j < outputs.len) outputs[j].value else 0;
@@ -195,8 +206,7 @@ pub fn buildTransfer(
         const rho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nfs[0], &jb });
         const rcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &jb });
         out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .div = recipient.div, .rho = rho, .rcm = rcm };
-        out_cms[j] = out_notes[j].commitment();
-        tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal;
+        tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal; // tns[j].cm = out_notes[j].commitment()
     }
 
     // Value balance (wallet-side, before proving): Σin + mint = Σout + fee.
@@ -209,7 +219,6 @@ pub fn buildTransfer(
     var t = ShieldedTx{
         .anchor = anchor,
         .nullifiers = nfs,
-        .out_cms = out_cms,
         .fee = fee,
         .mint = mint,
         .proof = &.{},
@@ -243,6 +252,13 @@ pub const Chain = struct {
     nullifiers: HashSet,
     /// Every transmitted note ever added, so wallets can scan and trial-decrypt.
     transmitted: std.ArrayList(tx.TransmittedNote),
+    /// Public, genesis-recomputable supply accounting (audit H-01). Updated from each transaction's
+    /// PUBLIC delta (mint/fee) — never from hidden note values — so the invariant
+    /// `issued - burned == shielded_pool + fees_paid` holds after every applied tx. The per-tx
+    /// hidden-value balance itself is guaranteed cryptographically by the join-split proof; this is
+    /// the node-visible aggregate a full node recomputes from genesis and a consensus layer compares
+    /// against the emission schedule.
+    supply: protocol.SupplyState,
 
     pub fn init(allocator: Allocator) !Chain {
         var t = try tree.MerkleTree.init(allocator, TREE_DEPTH);
@@ -254,6 +270,7 @@ pub const Chain = struct {
             .anchors = anchors,
             .nullifiers = HashSet.init(allocator),
             .transmitted = .empty,
+            .supply = .{},
         };
     }
 
@@ -292,6 +309,8 @@ pub const Chain = struct {
         const rcm = p.expand(&seed, "mint-rcm");
         const note = tx.Note{ .value = value, .recipient = address.recipientId(), .div = address.div, .rho = rho, .rcm = rcm };
         const tn = tx.encryptNote(self.allocator, address, note) catch return TxError.Internal;
+        // Bootstrap issuance: this value enters the shielded pool (coinbase-style).
+        self.supply.apply(.{ .issued = value, .burned = 0, .fee = 0 }) catch return TxError.ValueOverflow;
         const pos = try self.insertCommitment(tn.cm);
         self.transmitted.append(self.allocator, tn) catch return TxError.Internal;
         return .{ .note = note, .pos = pos };
@@ -316,21 +335,20 @@ pub const Chain = struct {
     /// Shared validation + application. `allowed_mint` is the only permitted issuance (0 for a normal
     /// tx; the block reward for a coinbase).
     fn applyChecked(self: *Chain, t: ShieldedTx, allowed_mint: u64) TxError!void {
-        // 1. The join-split proof is the sole authorization — fail-closed (no backend ⇒ reject). It
-        //    binds ownership, membership under the anchor, nullifier correctness, balance, and range;
-        //    its tx_binding == the public body (recomputed here) so nothing can be swapped.
-        if (!ffi.verifyJoinSplit(t.proof, t.publicInputs())) return TxError.BadAuthProof;
+        // Cheap, deterministic consensus checks run FIRST so an invalid tx is rejected before the
+        // expensive proof verification (DoS hardening — audit H-02). Proof verification still runs
+        // before any state mutation.
 
-        // 2. Issuance gate. The circuit only proves balance *given* `mint`, so the node must pin
+        // 1. Issuance gate. The circuit only proves balance *given* `mint`, so the node must pin
         //    `mint` to the consensus-authorized amount — otherwise anyone could submit dummy inputs +
         //    mint > 0 + a matching output and inflate the supply. Normal txs require mint == 0;
         //    coinbase requires mint == reward.
         if (t.mint != allowed_mint) return TxError.IllegalIssuance;
 
-        // 3. The anchor must be one the chain published.
+        // 2. The anchor must be one the chain published.
         if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
 
-        // 4. Nullifiers: reject any already spent, or duplicated within this transaction.
+        // 3. Nullifiers: reject any already spent, or duplicated within this transaction.
         var seen = HashSet.init(self.allocator);
         defer seen.deinit();
         for (t.nullifiers) |nf| {
@@ -339,7 +357,17 @@ pub const Chain = struct {
             if (gop.found_existing) return TxError.DoubleSpend;
         }
 
-        // 5. Apply (only after all checks pass).
+        // 4. The join-split proof is the sole authorization — fail-closed (no backend ⇒ reject). It
+        //    binds ownership, membership under the anchor, nullifier correctness, balance, and range;
+        //    its tx_binding == the public body (recomputed here, incl. every output commitment), and
+        //    `publicInputs().out_cms` is derived from `outputs[j].cm` (the value applied below), so the
+        //    proof binds exactly what is inserted into the tree — no unproven ghost commitment (C-01).
+        if (!ffi.verifyJoinSplit(t.proof, t.publicInputs())) return TxError.BadAuthProof;
+
+        // 5. Apply (only after all checks pass). Update the public supply accounting FIRST: it uses
+        //    checked wide arithmetic on the public (mint, fee) delta, so a delta that would break the
+        //    invariant (e.g. fees exceeding the pool) rejects before any state mutation (audit H-01).
+        self.supply.apply(.{ .issued = t.mint, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
         for (t.nullifiers) |nf| self.nullifiers.put(nf, {}) catch return TxError.Internal;
         for (t.outputs) |o| {
             _ = self.insertCommitment(o.cm) catch return TxError.Internal;
@@ -490,7 +518,7 @@ test "unbalanced transfer rejected at build" {
     try testing.expectError(TxError.Unbalanced, buildTransfer(a, alice, &inputs, &outs, 99, 0, chain.anchor()));
 }
 
-test "tampered output is rejected (tx-binding)" {
+test "C-01: a swapped/ghost output commitment is rejected and not applied" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -502,9 +530,39 @@ test "tampered output is rejected (tx-binding)" {
     const inputs = try fundTwoInputs(a, &chain, alice, 1000, 5);
     const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
     var t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
-    // Swap an output commitment after proving: tx_binding no longer matches the proof ⇒ rejected.
-    t.out_cms[0][0] +%= 1;
+    // Audit C-01: an attacker swaps output 0's commitment to an unproven (e.g. high-value ghost) note
+    // after proving. outputs[j].cm is the SINGLE source bound by BOTH the proof (public input) and
+    // tx_binding, so the proof no longer matches ⇒ rejected — and because apply happens only after
+    // verify, the ghost commitment is never inserted (the anchor is unchanged).
+    const anchor_before = chain.anchor();
+    t.outputs[0].cm[0] +%= 1;
     try testing.expectError(TxError.BadAuthProof, chain.verifyAndApply(t));
+    try testing.expectEqual(anchor_before, chain.anchor());
+}
+
+test "H-01: public supply accounting tracks mint/fee and the invariant holds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    // Bootstrap issuance of 1000 into the shielded pool (the second padding mint is 0).
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 5);
+    try testing.expect(chain.supply.invariantHolds());
+    try testing.expectEqual(@as(u128, 1000), chain.supply.issued);
+    try testing.expectEqual(@as(u128, 1000), chain.supply.shielded_pool);
+    try testing.expectEqual(@as(u128, 0), chain.supply.fees_paid);
+    // A transfer with fee=100: the fee leaves the pool, issuance is unchanged, invariant still holds.
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    const t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    try chain.verifyAndApply(t);
+    try testing.expect(chain.supply.invariantHolds());
+    try testing.expectEqual(@as(u128, 1000), chain.supply.issued);
+    try testing.expectEqual(@as(u128, 100), chain.supply.fees_paid);
+    try testing.expectEqual(@as(u128, 900), chain.supply.shielded_pool);
 }
 
 test "unknown anchor rejected" {

@@ -70,7 +70,10 @@ pub const Reader = struct {
         return .{ .data = data };
     }
     pub fn getBytes(self: *Reader, n: usize) Error![]const u8 {
-        if (self.pos + n > self.data.len) return Error.Truncated;
+        // Overflow-safe bound: `self.pos + n` could wrap for a maliciously large `n` (audit M-02).
+        // `pos` is only ever advanced past a checked read, so `pos <= data.len` is an invariant; the
+        // explicit guard keeps the subtraction underflow-safe regardless.
+        if (self.pos > self.data.len or n > self.data.len - self.pos) return Error.Truncated;
         const s = self.data[self.pos .. self.pos + n];
         self.pos += n;
         return s;
@@ -160,4 +163,17 @@ test "codec: truncation is rejected" {
     const short = [_]u8{ 1, 2, 3 };
     var r = Reader.init(&short);
     try testing.expectError(Error.Truncated, r.u64v());
+}
+
+test "codec: oversized varBytes length is rejected without overflow (M-02)" {
+    // A near-maxInt(u32) length prefix on a short buffer must return Truncated, not overflow `pos + n`.
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], std.math.maxInt(u32) - 1, .little); // huge length
+    buf[4] = 0xAA; // a couple of payload bytes (far fewer than claimed)
+    buf[5] = 0xBB;
+    var r = Reader.init(buf[0..6]);
+    try testing.expectError(Error.Truncated, r.varBytes());
+    // also exercise getBytes directly at the boundary
+    var r2 = Reader.init(buf[0..6]);
+    try testing.expectError(Error.Truncated, r2.getBytes(std.math.maxInt(usize)));
 }

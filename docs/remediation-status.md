@@ -1,147 +1,46 @@
-# Transaction-stack audit — remediation status
+# Remediation status
 
-Tracks `docs/transaction-stack-audit.md` findings against the approved plan (shielded-only in
-rubble-node-zig; vetted transparent-PQ STARK framework via FFI; `lattica` as a Zig package).
-Phases per the plan: P0 framework spike · P1 protocol finalization · P2 production circuit ·
-P3 external audit · P4 rubble integration · P5 testnet.
+Current state of audit-finding remediation. **Entry point for reviewers: `docs/AUDITORS.md`.**
 
-**Important framing:** remediation was done by building a **parallel production stack**
-(`lattica-prover` Rust crate + `src/{codec,protocol,ffi}.zig`) plus two live-layer fixes (L-01,
-I-01). The **live node (`node.zig`) is otherwise unchanged** — it still runs the hand-rolled
-`stark.zig` generic-preimage proof with native checks. So a "✅ in new stack" finding is **fixed by
-construction in the production design but not yet on the live path** (that is the Phase-4 cutover).
-None of the audit's 8 release gates are met; the Phase-3 external audit has not run.
+## Current live path (M6 cutover — COMPLETE)
 
-| Finding | Sev | Status | Where / notes |
-|---|---|---|---|
-| **L-01** value overflow | L | ✅ **Closed (live)** | `node.zig` `std.math.add` + `TxError.ValueOverflow`; overflow test. |
-| **I-01** malleable encoding | I | ✅ **Closed** | `stark.zig` rejects ≥`P`/trailing bytes; generalized in `codec.zig` with tests. |
-| **C-05** unvetted hash | C | ✅ in new stack (not live) | `lattica-prover` AIR for vetted `Rp64_256`, differential-tested. Live node still uses `rescue.zig`. |
-| **I-02** RNG via debug assert | I | ✅ in new stack (not live) | Production prover RNG is Winterfell's; live node still uses `stark.zig`. |
-| **I-03** engine duplication | I | ✅ in new stack (not live) | Production = single Winterfell engine; hand-rolled engines remain in `src/` and on the live path. |
-| **C-04** ~50-bit soundness | C | ✅ resolved in new stack (not live) | `lattica-prover-p3` draws challenges from `F_p²` (~127-bit) with FRI `log_blowup=4`/`num_queries=96`/`query_pow=16` ⇒ **≈103-bit proven / ~127-bit conjectured**, machine-checked (`docs/soundness-budget.md`, `production_security_budget` test). Live cutover = P4. |
-| **C-01** auth not bound | C | 🟡 circuit built, **NOT live** | `spend.rs` binds ownership+nullifier+commitment+membership+balance+tx-binding (validated). But `node.zig` still calls `circuit.verifyAuthorization` (generic preimage). Cutover = P4. |
-| **C-02** full spend not live | C | 🟡 circuit + ABI built, **NOT live** | Full spend AIR + real `lattica_spend_verify` exist; `verifyAndApply` does not call them yet. Cutover = P4. |
-| **C-03** demo-depth / not protocol-complete | C | 🟡 mostly (new stack) | New `lattica-prover-p3` circuit is **production-shaped**: `DEPTH=32`, `recipient` = full 4-element digest, `BITS=52`, vetted Poseidon2 = the in-circuit hash. Residual: the protocol side (`tx.zig`/`primitives.zig`) must switch its `noteCommitment`/`nullifier`/Merkle hashing to Poseidon2-Goldilocks so on-chain == in-circuit (part of P4/M6). |
-| **ZK-01** spend proof not zero-knowledge *(found in the remediation review)* | C | ✅ resolved in new stack (not live) | Re-built on **Plonky3** (`lattica-prover-p3/`): the full spend statement proves/verifies under the **hiding (ZK) FRI PCS** on stable. Winterfell 0.13 had no ZK; the new production stack does. Live cutover = P4 (M6). |
+The live node runs the **Plonky3 join-split** path end to end:
+- `src/node.zig` authorizes transactions solely via `ffi.verifyJoinSplit` →
+  `lattica_joinsplit_verify` (fail-closed, panic-isolated). The wallet proves via
+  `lattica_joinsplit_prove`.
+- On-chain hashing is Poseidon2-Goldilocks (`src/poseidon2.zig`), KAT-equal to the circuit, so the
+  node-reconstructed public inputs equal the proof's.
+- The pre-Plonky3 cluster (`stark.zig`, `rescue.zig`, `circuit.zig`, the Winterfell `lattica-prover`,
+  `lattica_spend_verify`) has been **removed**. References to those in older revisions of this file
+  are obsolete.
 
-Legend: ✅ closed · 🟡 partial (mechanism built, not closed) · ❌ open · ⏳ subsumed.
+So the earlier "✅ in new stack (not live)" caveats are resolved: the new stack **is** the live path.
 
-## Done this iteration
-- L-01, I-01 (the two findings the plan keeps in the Zig protocol layer) — closed with tests.
-- **Phase 0 complete:** framework decision = **Winterfell** (see `docs/framework-decision.md`).
-  The spike (`framework-spike/`) proves+verifies the authorization-proof core (x⁷ S-box) on
-  Winterfell with Goldilocks `f64` + vetted `Rp64_256` + F_p² challenges at **127-bit**
-  conjectured security; 3/3 spike tests pass.
+## Original transaction-stack audit (`docs/transaction-stack-audit.md`) — closed / superseded
 
-## Phase 1 — done
-`src/codec.zig` (canonical encoding), `src/protocol.zig` (unified shielded tx + canonical
-serialization + tx-binding digest + checked-arithmetic supply model), `src/ffi.zig` (spend verify
-boundary: `SpendPublicInputs` + C ABI shape + fail-closed pluggable backend). 97/97 Zig tests.
+| Finding | Status |
+|---|---|
+| L-01 value overflow | ✅ closed (live; `TxError.ValueOverflow` + tests) |
+| I-01 malleable encoding | ✅ closed (`codec.zig` rejects ≥P / trailing, overflow-safe bounds) |
+| C-05 unvetted hash | ✅ superseded — vetted Poseidon2-Goldilocks AIR == on-chain hash |
+| I-02 RNG via debug assert | ✅ superseded — production prover RNG (ChaCha20 CSPRNG, reseeded per proof) |
+| I-03 engine duplication | ✅ superseded — single production circuit (`joinsplit_air`); hand-rolled engines removed |
+| C-04 ~50-bit soundness | ✅ resolved — `F_p²` challenges + hardened FRI ⇒ ≈103-bit proven / ~127 conjectured (`docs/soundness-budget.md`) |
+| C-01/C-02 auth + full spend not live | ✅ resolved — live node verifies the full join-split statement |
+| C-03 protocol hash match | ✅ resolved — `poseidon2.zig` KAT-equal to the circuit |
+| ZK-01 not zero-knowledge | ✅ resolved — hiding FRI PCS (ZK) on Plonky3 |
 
-## Phase 2 — spend statement built & validated (not yet live; not yet ZK)
-`lattica-prover/` (Winterfell). **Current totals: 21/21 Rust tests, 97/97 Zig tests.** (Per-bullet
-counts below are historical, from the iteration that added each piece.)
-- **Rescue-Prime `Rp64_256` permutation AIR**, cross-validated against the native hash
-  (`trace_output_matches_native_oracle`), valid-verifies, tamper-rejected. The vetted in-circuit
-  hash (C-05 in-circuit).
-- **Merkle membership AIR** (`membership.rs`): a multi-permutation trace folding a private leaf up
-  a **general-position** authentication path (position-bit column + periodic round/link selector)
-  to a public root via the Rescue 2-to-1 compression. Validated: `native_merge` equals
-  `Rp64_256::merge`; the AIR trace root equals the native fold; valid-verifies; wrong-root and
-  tampered-path rejected. **The heart of C-02.**
-- **Spend AIR** (`spend.rs`): one proof for public `(root, nf, out_cm, tx_binding, fee)` proving
-  (0) **ownership** `recipient = H(nk)[0]`, (1) `cm = H(recipient, value, rho, rcm)`, (2) `cm` folds
-  up a general-position path to `root`, (3) `nf = H(nk, rho, pos)`, (4) `out_cm =
-  H(out_recipient, out_value, out_rho, out_rcm)`, (5) **value-balance** `value = out_value + fee`,
-  (6) **range** (`value`/`out_value < 2^BITS`), (7) **tx-binding** — with the **same `rho`** in
-  (1)/(3) and the **same `nk`** in (0)/(3). Cross-region binding via **persistent columns**
-  (`rho`, `value`, `out_value`, `nk`); `recipient` flows ownership→commitment by adjacency; no
-  auxiliary grand-product segment. Per-boundary periodic selectors gate round / commit-load /
-  merge-link / nullifier-load / output-load / row-0 / range. Validated: `recipient`/`cm`/`nf`/
-  `out_cm` equal the native hashes; AIR `root`/`nf`/`out_cm` equal the native oracles;
-  valid-verifies; wrong-root, wrong-nf, wrong-out_cm, tampered-opening, **inconsistent-`rho`**,
-  **wrong-`nk`** (ownership), **unbalanced**, **out-of-range**, and **wrong-tx-binding** all
-  rejected. **C-01/C-02/C-03 core + ownership + value-balance + range.**
-- `lattica_spend_verify` C ABI is **real** (lib.rs): parses the `SpendPublicInputs` byte layout
-  from `src/ffi.zig` (canonical field-element + length checks), deserializes the Winterfell proof,
-  and calls `verify_spend` — fail-closed on any parse error. Round-trip tested (accept / tampered-
-  root reject / malformed-length fail-closed). 19/19 Rust tests (incl. the range AIR).
+## Implementation audit (`docs/lattica-implementation-audit.md`, Codex, 2026-06-27) — remediated
 
-### Remaining within Phase 2
-1. ~~Merkle membership (general position).~~ **Done.**
-2. ~~Commitment opening + leaf binding.~~ **Done.**
-3. ~~Nullifier + shared-`rho` binding.~~ **Done** (`spend.rs`). `recipient`/`nk`/`pos` are single
-   field elements (demo); `DEPTH=4` (8 blocks, pow-2 trace) — depth-32 needs a block-count pad.
-4. ~~Bind the public **tx-binding** digest.~~ **Done** (`spend.rs`): `tx_binding` is a public input
-   absorbed into the Fiat-Shamir transcript; a proof for one tx fails against another
-   (`wrong_tx_binding_rejected`). 16/16 Rust tests.
-5. ~~**Ownership** (recipient ↔ `nk`).~~ **Done** (`spend.rs`): ownership block `recipient =
-   H(nk)[0]`, with the same `nk` driving the nullifier (`wrong_nk_breaks_membership`). Demo-strength
-   (1-element recipient; production = full 4-element digest). **Position-consistency** (nullifier
-   `pos` ↔ the membership path) remains.
-6. ~~**Balance** `value = out_value + fee` with `out_cm` binding + **range** (no wraparound).~~
-   **Done** (`spend.rs`): output-commitment region + value-conservation (`fee` a given public
-   input, `unbalanced_rejected`) + two parallel `rem` columns carrying the range decompositions of
-   the *hidden* `value`/`out_value`, seeded at row 0 and closed by `rem[BITS]=0`
-   (`out_of_range_value_rejected`). Value-balance is now wraparound-sound. `mint`/`burn` for the
-   coinbase/issuance path remains.
-7. ~~The real `lattica_spend_verify` over `SpendPublicInputs`.~~ **Done** (lib.rs): canonical
-   public-input parsing + Winterfell proof (de)serialization, fail-closed. A `lattica_spend_prove`
-   ABI (wallet side) and linking the static lib into a Zig integration test remain.
-8. Differential test the whole statement vs. the hand-rolled reference; production parameters +
-   written soundness budget (Phase 5).
+All findings (C-01 critical ghost-coin binding; H-01 supply accumulator; H-02 validation order;
+M-01..M-04 hardening; L-01/L-02 docs + format consolidation) addressed on the audit branch. See the
+**Developer Remediation Response** table at the end of `docs/lattica-implementation-audit.md` for the
+finding-by-finding mapping. Re-validated: 30 Rust tests, full Zig suite, and the real cross-language
+integration (which rejects the C-01 ghost-coin attack through the real Rust verifier).
 
-## Open items not yet closed (the gaps the remediation review surfaced)
-- **ZK-01 (blocking):** the spend proof is **not zero-knowledge** under Winterfell — FRI openings
-  would leak the hidden witness. **Path validated:** the `plonky2-spike/` proves the full spend-core
-  statement with zero-knowledge on (vetted Poseidon + range/select gadgets, Goldilocks, FRI/PQ;
-  `ZK re-randomized: true`, 5/5 tests). Recommendation (`docs/framework-decision.md` "ZK-01 spike
-  result"): a ZK-capable framework is needed (Winterfell has none). Options evaluated — **plonky2**
-  (ZK, gadgets/small audit surface; *nightly*), **Plonky3** (ZK + **stable** + **proven-security**;
-  AIR-style, our AIR ports), **zkVM** (ZK by construction; heavy, large TCB). All three spiked:
-  plonky2 (`plonky2-spike/`, full spend core, ZK ✓) and Plonky3 (`plonky3-spike/`, degree-7 core,
-  ZK on **stable** ✓, `ZK re-randomized: true`). **Recommended: Plonky3** (only option with ZK +
-  stable + proven security). **Decided: Plonky3.** Port started (`lattica-prover-p3/`,
-  `docs/plonky3-port-plan.md`): **M1 done** — vetted Poseidon2-Goldilocks AIR proves/verifies on
-  stable, hash matches the protocol's native `Poseidon2Goldilocks` (addresses C-03 at the hash
-  level). **M2 done** — foundation proves/verifies in **zero-knowledge** (hiding FRI PCS +
-  `DuplexChallenger`, `F_p²`) on stable. **M3 done** — investigated the composition architecture:
-  `p3-lookup` (LogUp) exists but p3 ships no multi-table prover, so chose a single-`uni-stark` AIR
-  (vetted Poseidon2 constants + hand-written rounds, differential-tested) over building un-vetted
-  multi-table orchestration. **M4 done** — the full spend statement (ownership + commitment +
-  general-position membership + nullifier + output + value-balance + range + tx-binding) proves and
-  verifies in **zero-knowledge** on stable, validated against an independent native
-  `Poseidon2Goldilocks` oracle with a negative test for every binding (`poseidon2_air.rs`,
-  `spend_air.rs`, `full_spend_air.rs`). **M5 done** — canonical proof serialization + the
-  `lattica_spend_verify` **C ABI** matching `src/ffi.zig` (fail-closed; staticlib exports the
-  symbol). **ZK-01 is resolved in the new stack** (the production proof is now ZK). **C-04 + the
-  parameter hardening are also done**: `F_p²` challenges + FRI (`log_blowup=4`/`q=96`/`pow=16`) ⇒
-  ≈103-bit proven / ~127-bit conjectured (machine-checked, `docs/soundness-budget.md`); `DEPTH=32`,
-  4-element recipient, `BITS=52`. Remaining: M6 Phase-4 node cutover (`lattica_spend_prove` + wire
-  into `node.zig` + switch protocol hashing). 22/22 `lattica-prover-p3` tests.
-- **C-03 protocol match:** the in-circuit `Rp64_256` hash must match the protocol's
-  `noteCommitment`/`nullifier` (switch `tx.zig`/`primitives.zig` to the field hash); full note
-  format; `recipient` → 4-element digest; `DEPTH` → 32; widen `BITS`.
-- **C-01/C-02 live cutover (Phase 4):** wire `lattica_spend_verify` into `node.zig:verifyAndApply`
-  (via `ffi.setBackend`), add `lattica_spend_prove`, link the static lib, demote native checks.
-- ~~**C-04:** finalize production parameters + the soundness budget.~~ **Done** (new stack):
-  ≈103-bit proven / ~127-bit conjectured, machine-checked (`docs/soundness-budget.md`).
-- Position-consistency (nullifier `pos` ↔ path); `mint`/`burn` issuance.
+## Out of lattica's scope (host chain `rubble-node-zig`)
 
-**Pre-audit work (see `docs/audit-scope-p3.md` — scope, threat model, frozen params, readiness):**
-- ✅ **Soundness gaps A1–A4 closed** in the new **join-split** circuit (`joinsplit_air`): A1
-  position-consistency (`pos = Σ bits·2^d` bound into the nullifier), A2 domain separation
-  (`DOM_OWN/DOM_CM/DOM_NF`), A3 fee+value range (all addends `< 2^BITS`, accumulator balance), A4
-  nullifier-derivation argument written.
-- ✅ **Join-split (N-in/M-out) landed** (decided 2026-06-26): `joinsplit_air`, fixed 2-in/2-out,
-  `DEPTH=32`, proof ~444 KB, prove ~8.3 s, verify ~24 ms, proven 103-bit, 12/12 tests (34 crate-wide).
-- ✅ **C ABI + byte layout** (`lattica_joinsplit_verify`), **constraint self-audit**
-  (`docs/joinsplit-constraint-audit.md`), **variable (N,M)** via dummy notes, **C-03 hash match in
-  Zig** (`src/poseidon2.zig`, KAT-equal to the circuit), and the **end-to-end FFI test**
-  (`lattica-prover-p3/tests/ffi_integration.c`: prove→verify→tamper→double-spend, verified).
-- ⏳ **Remaining: C-03 protocol note-model swap** (migrate `tx.zig`/`tree.zig` off SHA3 onto
-  `poseidon2.zig`) — protocol-wide, lands with the **M6 node cutover**. Then the Phase-3 audit.
-
-Then **Phase 3** (external audit of the circuit + protocol + FFI glue) gates value-bearing use; none
-of the audit's 8 release gates are met yet.
+Block consensus / PoW / mempool / networking / emission schedule, and block-level commitments
+(state-root, nullifier-set-root, event-root, header) + reorg undo logs. lattica provides the
+shielded-tx + issuance *mechanisms* and the node-visible supply accumulator; the host chain owns
+block-level supply recomputation and commitments.

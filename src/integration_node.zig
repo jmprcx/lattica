@@ -68,6 +68,21 @@ fn run() !void {
     const t = try node.buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
     std.debug.print("real prove: proof = {d} bytes\n", .{t.proof.len});
 
+    // Audit C-01, real-verifier path — run on the FRESH (unspent) tx so it reaches the verifier (the
+    // reordered validation rejects an already-spent tx as DoubleSpend before verifying). Swapping in an
+    // unproven output commitment (outputs[j].cm is the single source bound by both the proof's public
+    // inputs and tx_binding) ⇒ the REAL verifier rejects; nothing is applied (anchor unchanged).
+    {
+        const anchor_before = chain.anchor();
+        var tampered = t;
+        tampered.outputs[0].cm[0] +%= 1;
+        if (chain.verifyAndApply(tampered)) |_| {
+            return Err.TamperAccepted;
+        } else |e| if (e != node.TxError.BadAuthProof) return Err.WrongError;
+        if (!std.mem.eql(u8, &anchor_before, &chain.anchor())) return Err.TamperAccepted;
+        std.debug.print("ghost/tampered out_cm: REJECT (real verifier)\n", .{});
+    }
+
     // verifyAndApply runs the REAL verifier (Zig-reconstructed public inputs -> Rust verify).
     try chain.verifyAndApply(t);
     std.debug.print("real verify (in-node): ACCEPT\n", .{});
@@ -86,13 +101,5 @@ fn run() !void {
     } else |e| if (e != node.TxError.DoubleSpend) return Err.WrongError;
     std.debug.print("double-spend (replay): REJECT\n", .{});
 
-    // Tampering an output commitment changes tx_binding ⇒ the REAL verifier rejects.
-    var tampered = t;
-    tampered.out_cms[0][0] +%= 1;
-    if (chain.verifyAndApply(tampered)) |_| {
-        return Err.TamperAccepted;
-    } else |e| if (e != node.TxError.BadAuthProof) return Err.WrongError;
-    std.debug.print("tampered out_cm: REJECT (real verifier)\n", .{});
-
-    std.debug.print("OK: real in-node prove -> verify -> double-spend-reject -> tamper-reject\n", .{});
+    std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject\n", .{});
 }

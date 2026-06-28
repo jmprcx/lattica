@@ -116,6 +116,9 @@ pub unsafe extern "C" fn lattica_joinsplit_prove_demo(
     pi_cap: usize,
     pi_len: *mut usize,
 ) -> i32 {
+    if proof_out.is_null() || pi_out.is_null() || proof_len.is_null() || pi_len.is_null() {
+        return 1; // fail-closed on any null pointer (audit M-01)
+    }
     let w = joinsplit_air::demo_witness();
     let proof = joinsplit_air::prove_to_bytes(&w);
     let pib = match encode_joinsplit_public_inputs(&joinsplit_air::public_values(&w)) {
@@ -223,7 +226,11 @@ fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
         let sib: [[Goldilocks; 4]; DEPTH] = sib.try_into().ok()?;
         let mut bits = [false; DEPTH];
         for bit in bits.iter_mut() {
-            *bit = b[off] != 0;
+            *bit = match b[off] {
+                0 => false,
+                1 => true,
+                _ => return None, // path bits must be canonical 0/1 (audit M-03)
+            };
             off += 1;
         }
         inputs.push(Input { nk, div, value, rho, rcm, sib, bits });
@@ -305,8 +312,13 @@ pub unsafe extern "C" fn lattica_joinsplit_prove(
     pi_cap: usize,
     pi_len: *mut usize,
 ) -> i32 {
-    if witness_ptr.is_null() || proof_out.is_null() || pi_out.is_null() {
-        return 1;
+    if witness_ptr.is_null()
+        || proof_out.is_null()
+        || pi_out.is_null()
+        || proof_len.is_null()
+        || pi_len.is_null()
+    {
+        return 1; // fail-closed on any null pointer, incl. the output length pointers (audit M-01)
     }
     let wb = slice::from_raw_parts(witness_ptr, witness_len);
     let w = match parse_joinsplit_witness(wb) {
@@ -431,5 +443,50 @@ mod tests {
             )
         };
         assert_eq!(rc_bad, 1);
+    }
+
+    #[test]
+    fn joinsplit_prove_abi_rejects_null_output_pointers() {
+        // Every pointer argument is fail-closed, including the output length pointers (audit M-01).
+        let w = crate::joinsplit_air::demo_witness();
+        let wb = encode_joinsplit_witness(&w);
+        let mut proof = vec![0u8; 1 << 20];
+        let mut pi = vec![0u8; 512];
+        let (mut pl, mut pil) = (0usize, 0usize);
+        let np: *mut u8 = core::ptr::null_mut();
+        let nl: *mut usize = core::ptr::null_mut();
+        let prove = |wp: *const u8, wl: usize, po: *mut u8, pc: usize, plp: *mut usize, pio: *mut u8, pic: usize, pilp: *mut usize| unsafe {
+            lattica_joinsplit_prove(wp, wl, po, pc, plp, pio, pic, pilp)
+        };
+        let (wp, wl) = (wb.as_ptr(), wb.len());
+        let (po, pc) = (proof.as_mut_ptr(), proof.len());
+        let (pio, pic) = (pi.as_mut_ptr(), pi.len());
+        assert_eq!(prove(core::ptr::null(), 0, po, pc, &mut pl, pio, pic, &mut pil), 1); // witness_ptr
+        assert_eq!(prove(wp, wl, np, pc, &mut pl, pio, pic, &mut pil), 1); // proof_out
+        assert_eq!(prove(wp, wl, po, pc, nl, pio, pic, &mut pil), 1); // proof_len
+        assert_eq!(prove(wp, wl, po, pc, &mut pl, np, pic, &mut pil), 1); // pi_out
+        assert_eq!(prove(wp, wl, po, pc, &mut pl, pio, pic, nl), 1); // pi_len
+        // demo prover: each output pointer null → fail-closed
+        assert_eq!(unsafe { lattica_joinsplit_prove_demo(np, pc, &mut pl, pio, pic, &mut pil) }, 1);
+        assert_eq!(unsafe { lattica_joinsplit_prove_demo(po, pc, nl, pio, pic, &mut pil) }, 1);
+        assert_eq!(unsafe { lattica_joinsplit_prove_demo(po, pc, &mut pl, np, pic, &mut pil) }, 1);
+        assert_eq!(unsafe { lattica_joinsplit_prove_demo(po, pc, &mut pl, pio, pic, nl) }, 1);
+    }
+
+    #[test]
+    fn joinsplit_witness_non_canonical_bit_rejected() {
+        // A path-bit byte other than 0/1 is non-canonical ⇒ parse fails ⇒ prove returns nonzero (M-03).
+        let w = crate::joinsplit_air::demo_witness();
+        let mut wb = encode_joinsplit_witness(&w);
+        // input 0's path bits start after nk(16)+div(8)+value(8)+rho(16)+rcm(16)+sib(DEPTH*32) = 64+DEPTH*32.
+        let bits0 = 64 + crate::joinsplit_air::DEPTH * 32;
+        wb[bits0] = 2;
+        let mut proof = vec![0u8; 1 << 20];
+        let mut pi = vec![0u8; 512];
+        let (mut pl, mut pil) = (0usize, 0usize);
+        let rc = unsafe {
+            lattica_joinsplit_prove(wb.as_ptr(), wb.len(), proof.as_mut_ptr(), proof.len(), &mut pl, pi.as_mut_ptr(), pi.len(), &mut pil)
+        };
+        assert_eq!(rc, 1);
     }
 }

@@ -165,13 +165,16 @@ pub const MAX_PROOF_LEN: usize = 1 << 21;
 pub fn proveJoinSplit(allocator: std.mem.Allocator, witness: []const u8) ![]u8 {
     const f = joinsplit_prove_backend orelse return error.NoProveBackend;
     const buf = try allocator.alloc(u8, MAX_PROOF_LEN);
-    errdefer allocator.free(buf);
+    defer allocator.free(buf); // `buf` is max-size scratch — always freed; we return an exact-sized copy.
     var pi: [JoinSplitPublicInputs.ENCODED_LEN]u8 = undefined;
     var proof_len: usize = 0;
     var pi_len: usize = 0;
     const rc = f(witness.ptr, witness.len, buf.ptr, buf.len, &proof_len, &pi, pi.len, &pi_len);
     if (rc != 0) return error.ProveFailed;
-    return allocator.realloc(buf, proof_len) catch buf[0..proof_len];
+    if (proof_len > buf.len) return error.ProveFailed; // backend must not claim more than the buffer
+    // Exact-sized copy so the returned slice's length matches its allocation — avoids a wrong-size
+    // free for allocators with exact-size semantics (audit M-04).
+    return allocator.dupe(u8, buf[0..proof_len]);
 }
 
 // ---------------------------------------------------------------------------------------
