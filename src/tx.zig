@@ -172,7 +172,9 @@ pub const IncomingViewingKey = struct {
         while (i < SCAN_WINDOW) : (i += 1) {
             const kem = deriveKem(&self.kem_master, i) catch continue;
             if (decryptWith(allocator, kem.sk, &self.recipient_ids[i], tn)) |note| {
-                return .{ .note = note, .index = i };
+                var n = note;
+                n.div = deriveDiv(&self.div_master, i); // see tryDecrypt: re-derive div, ignore the wire value
+                return .{ .note = n, .index = i };
             }
         }
         return null;
@@ -265,8 +267,18 @@ pub fn tryDecrypt(allocator: Allocator, key: FullKey, tn: TransmittedNote) ?Note
     var i: u32 = 0;
     while (i < SCAN_WINDOW) : (i += 1) {
         const kem = deriveKem(&key.kem_master, i) catch continue;
-        const rid = recipientId(&key.nk, deriveDiv(&key.div_master, i));
-        if (decryptWith(allocator, kem.sk, &rid, tn)) |note| return note;
+        const div_i = deriveDiv(&key.div_master, i);
+        const rid = recipientId(&key.nk, div_i);
+        if (decryptWith(allocator, kem.sk, &rid, tn)) |note| {
+            // The wire `div` is AEAD-authenticated but NOT bound by `cm` (which binds only
+            // `recipient = H(nk‖div)`), so a hostile sender can ship a correct `recipient` with a
+            // garbage `div` that would brick the default spend (`H(nk‖garbage) ≠ recipient`). The true
+            // diversifier is uniquely determined by the matched index, so re-derive it and discard the
+            // wire value — the note stays spendable regardless of the sender (audit r2 M-3).
+            var n = note;
+            n.div = div_i;
+            return n;
+        }
     }
     return null;
 }
@@ -303,6 +315,31 @@ test "non-recipient cannot decrypt" {
     const tn = try encryptNote(a, alice.address(), note);
     defer a.free(tn.ciphertext);
     try testing.expect(tryDecrypt(a, bob, tn) == null);
+}
+
+test "tryDecrypt re-derives div, ignoring an attacker-malleable wire div (audit r2 M-3)" {
+    const a = testing.allocator;
+    const alice = try account(1);
+    const addr = alice.address();
+    // A note correctly addressed to alice (recipient = her rid) but with a GARBAGE wire div. cm binds
+    // `recipient = H(nk‖div_0)`, NOT the wire `div`, so the AEAD/cm/recipient checks all still pass —
+    // this is the malicious-sender ciphertext a hostile payer could hand-seal (encryptNote itself would
+    // reject the div mismatch, so we seal it directly).
+    const note = Note{ .value = 500, .recipient = addr.recipient_id, .div = 0xDEAD_BEEF, .rho = [_]u8{3} ** 32, .rcm = [_]u8{4} ** 32 };
+    const cm = note.commitment();
+    const coins = p.expand(&cm, "kem-encaps");
+    const enc = try p.encapsulate(&addr.kem_ek, coins);
+    const key = p.deriveNoteKey(&enc.ss, &enc.ct, &cm);
+    const ct = try p.seal(a, key, &note.toBytes(), &cm);
+    defer a.free(ct);
+    const tn = TransmittedNote{ .cm = cm, .kem_ct = enc.ct, .ciphertext = ct };
+
+    const got = tryDecrypt(a, alice, tn) orelse return error.NotDetected;
+    // the returned div is alice's TRUE (re-derived) diversifier, not the wire garbage…
+    try testing.expectEqual(addr.div, got.div);
+    try testing.expect(got.div != 0xDEAD_BEEF);
+    // …so the note is spendable: H(nk ‖ re-derived div) == the committed recipient (what the circuit recomputes).
+    try testing.expectEqualSlices(u8, &got.recipient, &recipientId(&alice.nk, got.div));
 }
 
 test "diversified addresses are distinct but same-wallet detectable + spendable" {

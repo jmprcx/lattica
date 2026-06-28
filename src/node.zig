@@ -77,8 +77,8 @@ pub const TxError = error{
     Internal,
 };
 
-/// Upper bound on a single output's note ciphertext (a 120-byte note plaintext + AEAD overhead is
-/// ~136 bytes; this generous cap lets the node reject malformed/oversize outputs before the expensive
+/// Upper bound on a single output's note ciphertext (the 128-byte note plaintext + AEAD tag is
+/// ~144 bytes; this generous cap lets the node reject malformed/oversize outputs before the expensive
 /// proof verification — audit M-05). The proof size bound is `ffi.MAX_PROOF_LEN`.
 pub const MAX_NOTE_CIPHERTEXT_LEN: usize = 256;
 
@@ -217,6 +217,9 @@ pub const ShieldedHtlcTx = struct {
         dh.field(&le);
         const hl = self.redeemHashlock();
         dh.field(&hl);
+        // Bind the RAW 32-byte preimage directly (not only via its reduced-limb hashlock above), so
+        // atomicity does not rest solely on SHA256→field-reduction second-preimage resistance (audit r2).
+        dh.field(&(self.redeem_preimage orelse [_]u8{0} ** 32));
         for (self.outputs) |tn| {
             dh.field(&tn.kem_ct);
             dh.field(tn.ciphertext);
@@ -330,6 +333,8 @@ pub fn buildTransfer(
     // Output notes (pad to M_OUT with zero-value notes back to the sender), commitments, ciphertexts.
     var out_notes: [M_OUT]tx.Note = undefined;
     var tns: [M_OUT]tx.TransmittedNote = undefined;
+    var built: usize = 0;
+    errdefer for (tns[0..built]) |tn| allocator.free(tn.ciphertext); // free outputs on any later error (audit r2 F2)
     for (0..M_OUT) |j| {
         const recipient: tx.Address = if (j < outputs.len) outputs[j].recipient else sender.address();
         const value: u64 = if (j < outputs.len) outputs[j].value else 0;
@@ -338,6 +343,7 @@ pub fn buildTransfer(
         const rcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &jb });
         out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .div = recipient.div, .rho = rho, .rcm = rcm };
         tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal; // tns[j].cm = out_notes[j].commitment()
+        built += 1;
     }
 
     // Value balance (wallet-side, before proving): Σin + mint = Σout + fee.
@@ -357,6 +363,7 @@ pub fn buildTransfer(
     };
     const binding = t.txBinding();
     const witness = encodeWitness(allocator, sender, inputs, out_notes, fee, mint, binding) catch return TxError.Internal;
+    defer allocator.free(witness); // the prover only reads it; free it once proven (audit r2 F1)
     t.proof = ffi.proveJoinSplit(allocator, witness) catch return TxError.ProveFailed;
     return t;
 }
@@ -502,6 +509,8 @@ pub fn buildHtlcSpend(
 
     var out_notes: [M_OUT]tx.Note = undefined;
     var tns: [M_OUT]tx.TransmittedNote = undefined;
+    var built: usize = 0;
+    errdefer for (tns[0..built]) |tn| allocator.free(tn.ciphertext); // free outputs on any later error (audit r2 F2)
     for (0..M_OUT) |j| {
         const recipient: tx.Address = if (j < outputs.len) outputs[j].recipient else claimer.address();
         const value: u64 = if (j < outputs.len) outputs[j].value else 0;
@@ -510,6 +519,7 @@ pub fn buildHtlcSpend(
         const orcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nf0, &jb });
         out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .div = recipient.div, .asset = spend.note.asset, .rho = orho, .rcm = orcm };
         tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal;
+        built += 1;
     }
 
     // Value balance (redeem/refund both conserve value): Σin = Σout + fee.
@@ -530,6 +540,7 @@ pub fn buildHtlcSpend(
     };
     const binding = t.txBinding();
     const witness = encodeHtlcWitness(allocator, claimer, spend, dummy, out_notes, fee, 0, binding, current_height) catch return TxError.Internal;
+    defer allocator.free(witness); // the prover only reads it; free it once proven (audit r2 F1)
     t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.ProveFailed;
     return t;
 }
@@ -569,6 +580,15 @@ pub fn buildHtlcLock(
     if (inputs.len != N_IN) return TxError.Internal;
     const asset = inputs[0].note.asset;
     for (inputs) |in_| if (in_.note.asset != asset) return TxError.Internal; // single hidden asset per tx
+    // Fail fast (audit r2) on lock parameters that would otherwise create a permanently-FROZEN note:
+    // an out-of-range timeout proves fine at lock time (the timeout is only hashed into htlc_root, not
+    // range-checked) but makes every future redeem/refund unprovable (the spend range-checks TIMEOUT).
+    if (timeout >= MAX_RANGE_VALUE) return TxError.OversizeHeight;
+    if (lock_value >= MAX_RANGE_VALUE) return TxError.ValueOverflow;
+    if (fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
+    // A zero hashlock is an atomicity footgun: a "redeem" with a null preimage derives redeem_hashlock=0
+    // and would satisfy the binding while revealing no secret — refuse to create such a lock.
+    if (std.mem.allEqual(u8, &hashlock, 0)) return TxError.Internal;
 
     // Value balance: Σin = lock_value + change + fee.
     var in_sum: u64 = 0;
@@ -604,6 +624,7 @@ pub fn buildHtlcLock(
     const crcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &[_]u8{1} });
     out_notes[1] = .{ .value = change, .recipient = locker.address().recipientId(), .div = locker.address().div, .asset = asset, .rho = crho, .rcm = crcm };
     tns[1] = tx.encryptNote(allocator, locker.address(), out_notes[1]) catch return TxError.Internal;
+    errdefer allocator.free(tns[1].ciphertext); // free the change ciphertext on any later error (audit r2 F2)
 
     var t = ShieldedHtlcTx{
         .anchor = anchor,
@@ -617,6 +638,7 @@ pub fn buildHtlcLock(
     };
     const binding = t.txBinding();
     const witness = encodeHtlcLockWitness(allocator, locker, inputs, out_notes, fee, 0, binding, current_height) catch return TxError.Internal;
+    defer allocator.free(witness); // the prover only reads it; free it once proven (audit r2 F1)
     t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.ProveFailed;
     return .{ .tx = t, .note = out_notes[0] };
 }
@@ -1475,4 +1497,38 @@ test "node: HTLC lifecycle — buildHtlcLock → apply → buildHtlcSpend redeem
     }
     try testing.expectEqual(@as(u64, 900), bob_total); // Bob redeemed the locked 900
     try testing.expect(chain.supply.invariantHolds());
+}
+
+test "node: build path is leak-free on success AND error (audit r2 F1/F2)" {
+    // Uses the leak-checking testing allocator (NOT an arena — arenas mask the F1/F2 leaks). Asserts the
+    // builders free their internal witness (F1) and, on error, their output ciphertexts (F2).
+    const a = testing.allocator;
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    defer chain.deinit();
+    const alice = try account(1);
+    const bob = try account(2);
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{2} ** 32);
+    const p0 = try chain.merklePath(a, m0.pos);
+    defer a.free(p0.siblings);
+    const p1 = try chain.merklePath(a, m1.pos);
+    defer a.free(p1.siblings);
+    const inputs = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = p0 },
+        .{ .note = m1.note, .position = m1.pos, .path = p1 },
+    };
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+
+    // Success: the internal witness must be freed (F1); we free only the tx-owned proof + ciphertexts.
+    const t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    a.free(t.proof);
+    for (t.outputs) |o| a.free(o.ciphertext);
+
+    // Error path: no prover backend ⇒ ProveFailed; the builder must free its outputs (F2) + witness (F1).
+    mock.uninstall();
+    try testing.expectError(TxError.ProveFailed, buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor()));
+    mock.install(); // restore so the top-level defer uninstall stays balanced
+    // testing.allocator fails the test at scope exit if anything above leaked.
 }
