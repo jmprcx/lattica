@@ -138,6 +138,71 @@ pub fn verifyJoinSplit(proof: []const u8, pi: JoinSplitPublicInputs) bool {
     return f(proof.ptr, proof.len, &enc, enc.len) == 0;
 }
 
+// --- v3 shielded HTLC verifier seam (mirrors the join-split seam; backend = Rust lattica_htlc_verify) ---
+
+/// Public statement of a shielded HTLC spend. Adds `current_height` (timeout compare) and
+/// `redeem_hashlock` (= SHA256(preimage) for a redeem) to the join-split statement.
+pub const HtlcPublicInputs = struct {
+    anchor: Hash32,
+    nullifiers: [JOINSPLIT_N_IN]Hash32,
+    out_cms: [JOINSPLIT_M_OUT]Hash32,
+    tx_binding: Hash32,
+    fee: u64,
+    mint: u64,
+    current_height: u64,
+    redeem_hashlock: Hash32,
+
+    pub const ENCODED_LEN: usize = 32 * (2 + JOINSPLIT_N_IN + JOINSPLIT_M_OUT) + 8 + 8 + 8 + 32;
+
+    /// anchor ‖ N·nf ‖ M·out_cm ‖ tx_binding ‖ fee(LE) ‖ mint(LE) ‖ current_height(LE) ‖ redeem_hashlock.
+    /// Matches `lattica-prover-p3`'s `HtlcPublicInputs` byte layout (`parse_htlc_public_inputs`).
+    pub fn encode(self: HtlcPublicInputs) [ENCODED_LEN]u8 {
+        var out: [ENCODED_LEN]u8 = undefined;
+        var off: usize = 0;
+        @memcpy(out[off..][0..32], &self.anchor);
+        off += 32;
+        for (self.nullifiers) |nf| {
+            @memcpy(out[off..][0..32], &nf);
+            off += 32;
+        }
+        for (self.out_cms) |oc| {
+            @memcpy(out[off..][0..32], &oc);
+            off += 32;
+        }
+        @memcpy(out[off..][0..32], &self.tx_binding);
+        off += 32;
+        std.mem.writeInt(u64, out[off..][0..8], self.fee, .little);
+        off += 8;
+        std.mem.writeInt(u64, out[off..][0..8], self.mint, .little);
+        off += 8;
+        std.mem.writeInt(u64, out[off..][0..8], self.current_height, .little);
+        off += 8;
+        @memcpy(out[off..][0..32], &self.redeem_hashlock);
+        return out;
+    }
+};
+
+var htlc_backend: ?VerifyFn = null;
+
+pub fn setHtlcBackend(f: VerifyFn) void {
+    htlc_backend = f;
+}
+pub fn clearHtlcBackend() void {
+    htlc_backend = null;
+}
+pub fn hasHtlcBackend() bool {
+    return htlc_backend != null;
+}
+
+/// Verify an HTLC spend proof. Fail-closed (no backend ⇒ reject) and proof-size-bounded at the seam
+/// (audit M-08), exactly like `verifyJoinSplit`.
+pub fn verifyHtlc(proof: []const u8, pi: HtlcPublicInputs) bool {
+    if (proof.len > MAX_PROOF_LEN) return false;
+    const f = htlc_backend orelse return false;
+    const enc = pi.encode();
+    return f(proof.ptr, proof.len, &enc, enc.len) == 0;
+}
+
 /// The C ABI the production prover implements (`lattica_joinsplit_prove`): consume a serialized
 /// witness, write the proof + the `JoinSplitPublicInputs` bytes. Returns 0 ok, nonzero on failure.
 pub const ProveFn = *const fn (
@@ -249,6 +314,33 @@ test "ffi: verifyJoinSplit rejects an oversize proof without invoking the backen
     try testing.expect(!Rec.called);
     // Sanity: a normal-size proof DOES reach the backend.
     try testing.expect(verifyJoinSplit("x", pi));
+    try testing.expect(Rec.called);
+}
+
+test "ffi: htlc public inputs encode + fail-closed + size-bound" {
+    var pi = std.mem.zeroes(HtlcPublicInputs);
+    pi.anchor = [_]u8{1} ** 32;
+    pi.current_height = 0x0102_0304_0506_0708;
+    pi.redeem_hashlock = [_]u8{7} ** 32;
+    const e = pi.encode();
+    try testing.expectEqual(@as(usize, 32 * 6 + 24 + 32), HtlcPublicInputs.ENCODED_LEN); // == Rust HTLC_PUBLIC_INPUTS_LEN
+    try testing.expectEqual(HtlcPublicInputs.ENCODED_LEN, e.len);
+    try testing.expect(!verifyHtlc("proof", pi)); // fail-closed without a backend
+    const Rec = struct {
+        var called: bool = false;
+        fn vfn(_: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) i32 {
+            called = true;
+            return 0;
+        }
+    };
+    Rec.called = false;
+    setHtlcBackend(&Rec.vfn);
+    defer clearHtlcBackend();
+    const oversize = try testing.allocator.alloc(u8, MAX_PROOF_LEN + 1);
+    defer testing.allocator.free(oversize);
+    try testing.expect(!verifyHtlc(oversize, pi)); // oversize ⇒ rejected, backend not called
+    try testing.expect(!Rec.called);
+    try testing.expect(verifyHtlc("x", pi)); // normal-size reaches the backend
     try testing.expect(Rec.called);
 }
 
