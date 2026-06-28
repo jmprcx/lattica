@@ -1,6 +1,14 @@
 //! # htlc_air — v3 shielded HTLC spend circuit (redeem / refund)
 //!
-//! **Status: SCAFFOLD.** This started as a faithful clone of `joinsplit_air` (the audited v1 circuit)
+//! **Status: in-circuit HTLC spend implemented except the timeout compare.** The AIR proves/verifies
+//! HTLC notes: owner = htlc_root (span-end chain over redeem_tag/refund_tag/hashlock/timeout, carried
+//! into commit_a via the OWNER columns), note_type-gated commitment + mode-independent owner-nullifier,
+//! the spend access control (tag-match: claim == mode-selected party), and the redeem hashlock binding
+//! (== public redeem_hashlock = SHA256(preimage)). All positive + negative tested. **Remaining: the
+//! timeout compare (redeem height<timeout / refund height>=timeout) via a range argument on
+//! current_height vs the committed timeout (PI_HEIGHT is already a public input).**
+//!
+//! This started as a faithful clone of `joinsplit_air` (the audited v1 circuit)
 //! so the HTLC circuit reuses its proven machinery — Poseidon2 blocks, the two-permutation commitment
 //! (with the substrate's hidden `asset_id` in lane 6), multi-input membership to a shared anchor,
 //! value balance + range, the position-bound nullifier, and the `tx_binding` Fiat-Shamir binding. It
