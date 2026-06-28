@@ -22,6 +22,14 @@ const poseidon2 = @import("poseidon2.zig");
 const protocol = @import("protocol.zig");
 const Hash32 = p.Hash32;
 
+const root_module = @import("root");
+/// Genesis/test-only helpers — `Chain.bootstrapMint` and the `mock` backend — compile only when the
+/// root module does NOT set `pub const lattica_production = true`. A production consensus build sets it,
+/// turning any reference to those helpers into a **compile error** (audit M-09/M-10). The probe
+/// `src/production_probe.zig` builds the production consensus surface with this flag on, proving the
+/// live path is free of test-only APIs (`zig build check-production`, also run by `zig build test`).
+const production: bool = @hasDecl(root_module, "lattica_production") and root_module.lattica_production;
+
 const TX_DOMAIN: []const u8 = "lattica:v1:tx-binding";
 const OUT_RHO_DOMAIN: []const u8 = "lattica:v1:out-rho";
 const OUT_RCM_DOMAIN: []const u8 = "lattica:v1:out-rcm";
@@ -311,6 +319,7 @@ pub const Chain = struct {
     /// never call this. Atomic: all fallible work (reservation, candidate supply) precedes any state
     /// mutation, so a failure leaves the chain unchanged (audit H-03).
     pub fn bootstrapMint(self: *Chain, address: tx.Address, value: u64, seed: Hash32) !Minted {
+        if (production) @compileError("bootstrapMint is genesis/test-only; production issuance must go through applyCoinbase");
         var value_le: [8]u8 = undefined;
         std.mem.writeInt(u64, &value_le, value, .little);
         const rho = p.hashDomain("lattica:v1:mint-rho", &.{ &seed, &value_le });
@@ -423,7 +432,10 @@ pub const Chain = struct {
 // covered by `lattica-prover-p3/tests/ffi_integration.c` and `src/ffi_integration.zig`.
 // ---------------------------------------------------------------------------------------
 
-pub const mock = struct {
+// The mock backend is compiled out of production builds (audit M-10): in a build whose root sets
+// `lattica_production = true`, `mock` is an empty namespace, so `node.mock.install()` is a compile
+// error — a production binary cannot install the test tx-binding backend instead of the real verifier.
+pub const mock = if (production) struct {} else struct {
     const TXB_OFFSET: usize = 32 * (1 + N_IN + M_OUT); // anchor ‖ N·nf ‖ M·out_cm, then tx_binding
 
     /// "Proof" = the witness's tx_binding (its last 32 bytes), modeling that the proof commits to it.

@@ -46,10 +46,21 @@ M-01..M-04 (ABI/codec/alloc hardening), L-01/L-02 (docs + format). All addressed
   remain host-chain scope (see "Out of lattica's scope" below).
 - **L-01/L-02** — pre-Plonky3 docs banner'd reference-only; `AUDITORS.md` §4 lists canonical vs historical.
 
-See the **Developer Remediation Response** tables (Round 1 and Round 2) in
-`docs/lattica-implementation-audit.md` for the finding-by-finding mapping. Re-validated each round:
-30 Rust tests, full Zig suite, and the real cross-language integration (ghost-coin rejected through the
-real Rust verifier).
+**Round 3** (re-audit new findings) — also addressed:
+- **M-08** verifier-seam size limit — `ffi.verifyJoinSplit` and the Rust `lattica_joinsplit_verify`
+  reject oversize proofs before the backend/deserializer (matching `MAX_PROOF_LEN`).
+- **M-09/M-10** test-only APIs compile-gated — `bootstrapMint` and `node.mock` are unavailable in a
+  build whose root sets `lattica_production = true` (referencing them is a compile error). The probe
+  `src/production_probe.zig` + `zig build check-production` (run by `zig build test`) assert the live
+  consensus surface compiles without them.
+- **L-03** README rewritten to the Plonky3 join-split path (removed-file refs deleted; `tx_binding`
+  replaces the ML-DSA binding-signature flow); points to `AUDITORS.md`.
+
+See the **Developer Remediation Response** tables (Round 1, Round 2, Round 3) in
+`docs/lattica-implementation-audit.md` for the finding-by-finding mapping. Re-validated each round
+(31 Rust tests as of round 3, full Zig suite incl. the production-mode probe, `zig build
+check-production`, and the real cross-language integration — ghost-coin rejected through the real Rust
+verifier).
 
 ## Out of lattica's scope (host chain `rubble-node-zig`)
 

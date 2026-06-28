@@ -128,8 +128,11 @@ pub fn clearJoinSplitBackend() void {
     joinsplit_backend = null;
 }
 
-/// Verify a join-split proof against its public inputs. Fail-closed (no backend ⇒ reject).
+/// Verify a join-split proof against its public inputs. Fail-closed (no backend ⇒ reject). Bounds the
+/// proof size at this reusable seam so any direct caller — not just `node.applyChecked` — is protected
+/// from oversize-proof DoS, and the backend/deserializer is never invoked on an oversize buffer (M-08).
 pub fn verifyJoinSplit(proof: []const u8, pi: JoinSplitPublicInputs) bool {
+    if (proof.len > MAX_PROOF_LEN) return false;
     const f = joinsplit_backend orelse return false;
     const enc = pi.encode();
     return f(proof.ptr, proof.len, &enc, enc.len) == 0;
@@ -225,6 +228,28 @@ test "ffi: join-split public inputs encode to the fixed canonical layout" {
 test "ffi: join-split fail-closed without a backend" {
     const pi = std.mem.zeroes(JoinSplitPublicInputs);
     try testing.expect(!verifyJoinSplit("proof", pi));
+}
+
+test "ffi: verifyJoinSplit rejects an oversize proof without invoking the backend (M-08)" {
+    const Rec = struct {
+        var called: bool = false;
+        fn vfn(_: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) i32 {
+            called = true;
+            return 0; // would "accept" if it were reached
+        }
+    };
+    Rec.called = false;
+    setJoinSplitBackend(&Rec.vfn);
+    defer clearJoinSplitBackend();
+    const pi = std.mem.zeroes(JoinSplitPublicInputs);
+    const oversize = try testing.allocator.alloc(u8, MAX_PROOF_LEN + 1);
+    defer testing.allocator.free(oversize);
+    // Oversize ⇒ rejected at the seam, backend never called.
+    try testing.expect(!verifyJoinSplit(oversize, pi));
+    try testing.expect(!Rec.called);
+    // Sanity: a normal-size proof DOES reach the backend.
+    try testing.expect(verifyJoinSplit("x", pi));
+    try testing.expect(Rec.called);
 }
 
 // A stub backend that accepts iff the proof is exactly "good" and the anchor's first byte is 7 —

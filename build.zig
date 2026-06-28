@@ -37,6 +37,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit + integration tests");
     test_step.dependOn(&run_tests.step);
 
+    // Production-mode compile probe (audit M-09/M-10): builds the consensus surface with
+    // `lattica_production = true`, so `node.bootstrapMint` and `node.mock` are compiled out — a
+    // successful compile proves the live path uses no genesis/test-only helpers. Compiling is the test.
+    const prod_probe = b.addExecutable(.{
+        .name = "lattica-production-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/production_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const check_prod = b.step("check-production", "Compile the production-mode probe (test-only APIs gated out)");
+    check_prod.dependOn(&prod_probe.step);
+    test_step.dependOn(&prod_probe.step); // always exercised by `zig build test`
+
     // End-to-end FFI integration test: links the prebuilt Rust prover staticlib.
     // Build it first: `cd lattica-prover-p3 && cargo build --release`.
     const ffi_it_mod = b.createModule(.{

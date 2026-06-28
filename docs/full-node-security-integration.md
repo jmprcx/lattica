@@ -17,7 +17,7 @@ This document turns the transaction-stack audit and supply-audit discussion into
 
 - Live transaction validation now uses the Plonky3 join-split proof path end to end: ownership, commitment opening, Merkle membership, nullifier derivation, value range, balance, output commitments, `mint`, and `tx_binding` are proven by `lattica-prover-p3` and checked through the Rust C ABI.
 - The original C-01 ghost-coin output-commitment binding bug is remediated; see `docs/lattica-implementation-audit.md`.
-- The current production blockers are state-update atomicity, transmitted-note ownership, verifier/input size limits, issuance API gating, canonical live transaction/block encoding, state-root commitments, reorg undo logs, snapshot validation, and mempool proof-cache policy.
+- Round 2 verified live-node state-update atomicity, transmitted-note ownership, and admission size checks. Round 3 added reusable verifier-boundary size limits (M-08), and **compile-gated** the genesis/test issuance API (`bootstrapMint`) and the mock backend out of production builds (M-09/M-10, via `lattica_production`; see `src/production_probe.zig` / `zig build check-production`). Remaining blockers are host-chain consensus integration: canonical live transaction/block encoding, state-root / nullifier-set-root / event-root commitments, reorg undo logs, snapshot validation, and mempool proof-cache policy.
 - This document remains the full-node production checklist: `src/node.zig` is an in-memory shielded transaction state machine, not a complete production consensus node.
 
 ## Core Supply Invariant

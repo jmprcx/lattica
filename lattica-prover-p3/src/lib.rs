@@ -16,6 +16,11 @@ use p3_goldilocks::Goldilocks;
 const GOLDILOCKS_ORDER: u64 = 0xFFFF_FFFF_0000_0001;
 const DIGEST_BYTES: usize = 32; // a 4-element Goldilocks digest, little-endian
 
+/// Upper bound on an accepted proof, in bytes (real proofs are ~0.5 MB). The verifier C ABI rejects
+/// anything larger before deserialization so untrusted callers can't force huge parse work (audit
+/// M-08). Must match `src/ffi.zig`'s `MAX_PROOF_LEN`.
+const MAX_PROOF_LEN: usize = 1 << 21;
+
 fn parse_felt(b: &[u8]) -> Option<Goldilocks> {
     let v = u64::from_le_bytes(b.try_into().ok()?);
     if v >= GOLDILOCKS_ORDER {
@@ -82,6 +87,11 @@ pub unsafe extern "C" fn lattica_joinsplit_verify(
     pi_len: usize,
 ) -> i32 {
     if proof_ptr.is_null() || pi_ptr.is_null() {
+        return 1;
+    }
+    // Bound the proof size before building/deserializing the slice, so C callers get fail-closed
+    // behaviour even if a Zig-side cap is bypassed (audit M-08). Must match `ffi.MAX_PROOF_LEN`.
+    if proof_len > MAX_PROOF_LEN {
         return 1;
     }
     let proof = slice::from_raw_parts(proof_ptr, proof_len);
@@ -488,5 +498,18 @@ mod tests {
             lattica_joinsplit_prove(wb.as_ptr(), wb.len(), proof.as_mut_ptr(), proof.len(), &mut pl, pi.as_mut_ptr(), pi.len(), &mut pil)
         };
         assert_eq!(rc, 1);
+    }
+
+    #[test]
+    fn joinsplit_verify_rejects_oversize_proof() {
+        // An oversize `proof_len` is rejected before the slice is deserialized (audit M-08). We pass a
+        // tiny real buffer with a huge claimed length; the size check returns before any deref.
+        let pis = crate::joinsplit_air::public_values(&crate::joinsplit_air::demo_witness());
+        let pib = encode_joinsplit_public_inputs(&pis).unwrap();
+        let buf = [0u8; 8];
+        assert_ne!(
+            unsafe { lattica_joinsplit_verify(buf.as_ptr(), MAX_PROOF_LEN + 1, pib.as_ptr(), pib.len()) },
+            0
+        );
     }
 }

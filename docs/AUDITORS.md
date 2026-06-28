@@ -64,6 +64,11 @@ scripts/run-real-integration.sh
 
 # 4. Regenerate the Poseidon2 known-answer vectors and re-confirm Zig == circuit.
 cd lattica-prover-p3 && cargo run --release --bin dump_p2
+
+# 5. Production-mode compile gate: builds the consensus surface with the genesis/test-only helpers
+#    (bootstrapMint, the mock backend) gated out — a successful compile proves the live path uses none
+#    (audit M-09/M-10). A production consumer sets `pub const lattica_production = true;` in its root.
+zig build check-production   # (also run as part of `zig build test`)
 ```
 
 **Toolchain caveat (documented, not a defect):** this host's Zig 0.16 linker cannot link the
@@ -109,12 +114,13 @@ fixed real bugs — a fixed-seed (non-CSPRNG) ZK-blinding RNG; a node-layer `min
 verifier **panic** across the C ABI; and a missing `rho1` **persistence** constraint that would have
 allowed a forged second nullifier per note. Each has a regression test.
 
-**Implementation audit + remediation re-audit (Codex, 2026-06-27):** see
-`docs/lattica-implementation-audit.md` and read the current re-audit section first. The original
-**critical ghost-coin bug (C-01)** is verified remediated (single-source output commitment, reordered
-validation, supply accumulator, ABI/codec hardening). The re-audit still blocks production on
-state-update atomicity, transmitted-note ownership, verifier/input size limits, issuance API gating,
-and full-node consensus integration. Budget independent review especially in the areas below.
+**Implementation audit + remediation re-audit (Codex, 2026-06-28):** see
+`docs/lattica-implementation-audit.md` and read the newest current re-audit section first. The original
+**critical ghost-coin bug (C-01)** remains remediated, and Round 2 live-node fixes for state-update
+atomicity, transmitted-note ownership, and admission size checks were verified. Production is still
+blocked on full-node consensus integration plus hardening of the reusable verifier boundary,
+genesis/test-only issuance APIs, mock backend build gating, and stale public docs. Budget independent
+review especially in the areas below.
 
 ## 6. Highest-risk areas to focus
 

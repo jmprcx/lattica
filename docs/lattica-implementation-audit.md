@@ -1,8 +1,135 @@
 # Lattica Implementation Audit
 
 **Date:** 2026-06-27  
-**Entry point:** `docs/AUDITORS.md`  
+**Entry point:** `docs/AUDITORS.md`
 **Scope covered:** Plonky3 join-split AIR, Rust C ABI, Zig FFI seam, protocol hashing, transaction construction, node state machine, note/key/encryption code, canonical codecs, tests, and operational/security areas needed by a production full node.
+
+## Current Re-Audit (post-round-2 remediation, 2026-06-28)
+
+### Current Verdict
+
+The Round 2 remediation commit was checked against the codebase and reproduction suite. The original C-01 ghost-coin bug remains fixed, and the live-node remediations for H-03/H-04/M-05 are verified on the active `src/node.zig` path:
+
+- state/supply application now uses a two-phase pattern: candidate supply, capacity reservation, and chain-owned ciphertext copies occur before consensus mutation;
+- `SupplyState.apply` is atomic on arithmetic failure;
+- applied transmitted-note ciphertexts are deep-copied into chain-owned memory and freed by `Chain.deinit`;
+- live node admission rejects oversize proofs and output ciphertexts before proof verification.
+
+This still does **not** clear the repository for value-bearing production. The remaining issues are mostly production-integration and hardening boundaries: full-node consensus state is outside this package, the reusable FFI verifier wrapper still relies on callers for size limits, genesis/test-only APIs remain publicly callable, mock backends are exported for tests/demo, and `README.md` still describes removed pre-Plonky3 components as if they were live.
+
+### Verification Re-Run
+
+Commands run:
+
+```sh
+cd lattica-prover-p3 && cargo test --release
+zig build test
+scripts/run-real-integration.sh
+```
+
+Results:
+
+- `cargo test --release`: passed, 30 Rust tests.
+- `zig build test`: passed, including H-03/H-04/M-05 remediation tests.
+- `scripts/run-real-integration.sh`: C FFI harness passed in sandbox; the live-node integration hit the documented Zig stdlib sandbox read issue, then passed when rerun outside the sandbox. Real prover/verifier accepted the valid tx, rejected tampered output commitment, and rejected replay/double spend.
+
+### Round 2 Remediation Verification
+
+| Finding | Current status |
+|---|---|
+| **H-03** non-atomic state on error | Verified fixed for the live node path. `SupplyState.apply` computes locals then assigns, and `applyChecked` reserves capacities/deep-copies before mutation. Remaining production work is block-level atomicity/reorg undo in the host chain. |
+| **H-04** transmitted-note ownership | Verified fixed for the live node path. `applyChecked` deep-copies output ciphertexts into chain-owned storage, and `Chain.deinit` frees stored ciphertexts. |
+| **M-05** verifier size limits | Partially fixed. `applyChecked` rejects oversize `proof`/ciphertext before calling the verifier. The reusable `ffi.verifyJoinSplit` wrapper and Rust C ABI still accept arbitrary `proof_len` from direct callers, so production should enforce the same cap at that seam too. |
+| **M-06** issuance API | Partially fixed. `Chain.mint` was renamed/commented as `bootstrapMint`, but it is still `pub` and callable by any module importing `node.zig`. Production integration should compile-gate or move it to genesis/test/demo code. |
+| **M-07** full-node consensus surface | Still open/outside this package: canonical block/tx encoding for the active object, header-committed note/nullifier/supply/event roots, reorg undo logs, snapshots, mempool policy, and proof cache remain host-chain work. |
+
+### New / Still-Open Findings
+
+#### M-08: Reusable verifier boundary does not enforce proof size limits
+
+**Severity:** Medium DoS hardening
+**Area:** Zig FFI wrapper / Rust C ABI
+**Files:** `src/ffi.zig`, `lattica-prover-p3/src/lib.rs`
+
+The live node now checks `t.proof.len > ffi.MAX_PROOF_LEN` before verification, but `ffi.verifyJoinSplit` itself forwards any proof slice length to the backend (`src/ffi.zig:132-135`), and `lattica_joinsplit_verify` builds a Rust slice for any non-null pointer/length before parsing (`lattica-prover-p3/src/lib.rs:78-95`).
+
+**Impact:** live `Chain.applyChecked` is protected, but direct consumers of the reusable verifier seam can still hand very large proof buffers to proof deserialization. This is a DoS footgun for future mempool/block-verifier integrations and external C callers.
+
+**Required remediation:**
+- Enforce `MAX_PROOF_LEN` inside `ffi.verifyJoinSplit`, or expose only a bounded verifier API.
+- Mirror the proof-size cap in `lattica_joinsplit_verify` so C callers get fail-closed behavior even if Zig-side checks are bypassed.
+- Add tests proving an oversize proof does not invoke the backend/deserializer.
+
+#### M-09: Genesis/test issuance helper remains publicly callable
+
+**Severity:** Medium integration risk
+**Area:** issuance API boundaries
+**File:** `src/node.zig`
+
+`bootstrapMint` is clearly documented as genesis/test-only, but it remains a public function on `Chain`. The remediation reduces accidental misuse by renaming it, but it does not create a compile-time or type-level production boundary.
+
+**Impact:** a production host-chain/RPC integration can still bypass `applyCoinbase` by calling `bootstrapMint` directly. That would be an integration bug rather than a proof-system break, but issuance APIs should be impossible to misuse in production builds.
+
+**Required remediation:**
+- Move bootstrap minting into a genesis/test helper module that production consensus code does not import.
+- Alternatively compile-gate it behind an explicit demo/test build option.
+- Add a production-mode build/test that proves arbitrary post-genesis minting is unavailable.
+
+#### M-10: Mock prover/verifier backend is exported from the live node module
+
+**Severity:** Medium integration risk
+**Area:** backend configuration / build hardening
+**File:** `src/node.zig`
+
+`node.mock.install()` is public and installs a 32-byte tx-binding mock backend for tests and the wallet demo. The real integration installs `lattica_joinsplit_prove`/`lattica_joinsplit_verify`, and the default verifier remains fail-closed with no backend, but production builds should not expose a mock verifier path in the same module as consensus validation.
+
+**Impact:** a misconfigured production binary could install the mock backend and accept transactions authorized only by the test binding model, not the real Plonky3 proof.
+
+**Required remediation:**
+- Compile-gate `node.mock` behind test/demo builds.
+- Make production startup require and attest the real Rust verifier symbols/parameters before accepting blocks.
+- Add a production-mode test that `node.mock` is not available.
+
+#### L-03: Public documentation still describes removed pre-Plonky3 components
+
+**Severity:** Low/Medium audit and operator risk
+**Area:** documentation / audit handoff
+**Files:** `README.md`, selected historical docs
+
+`docs/AUDITORS.md` correctly points reviewers to the Plonky3 join-split path, and several historical docs carry reference-only banners. `README.md` still lists removed Zig files such as `rescue.zig`, `stark.zig`, `membership.zig`, `permutation.zig`, `spend.zig`, and `circuit.zig`, and describes an ML-DSA binding-signature flow rather than the live join-split proof path.
+
+**Impact:** external reviewers, operators, or integrators can audit or build against the wrong transaction model. This does not affect consensus directly, but it is a real production-readiness issue for an audit handoff.
+
+**Required remediation:**
+- Rewrite `README.md` to match the current Plonky3 join-split path, or add a clear historical banner and point to `docs/AUDITORS.md`.
+- Keep `docs/audit-scope-p3.md` and `docs/remediation-status.md` synchronized with the current live path and reproduction counts.
+
+### Additional Audit Areas Covered
+
+- **AIR soundness:** spot-checked public-input order, nullifier position binding, `RHO1` persistence, output-commitment public binding, range/balance rows, and corrupted-trace tests. No new AIR soundness bug found in this pass.
+- **Cross-language consistency:** checked Zig public-input encoding against Rust parsing order and ran real integration.
+- **Node state machine:** checked issuance gate, anchor check, nullifier duplicate/spent check, size checks, proof verification, and atomic commit ordering.
+- **Supply auditability:** checked atomic `SupplyState.apply`, invariant tests, live `Chain.supply`, and remaining need for host-chain block/header commitments.
+- **Wallet/key/encryption path:** checked deterministic note encryption binding to commitment, viewing-key detection, chain-owned ciphertext storage after apply, and deterministic-output-randomness sign-off area.
+- **Codec/canonicalization:** checked overflow-safe byte reads, non-canonical field rejection, and transitional status of `src/protocol.zig` codec versus active `node.ShieldedTx`.
+
+### Developer Remediation Response — Round 3 (new findings)
+
+All new findings addressed on the audit branch. Re-validated: **31 Rust tests**, the **full Zig suite**
+(incl. the production-mode compile probe), the **real integration**, and `zig build check-production`.
+
+| Finding | Resolution | Where |
+|---|---|---|
+| **M-08** verifier seam size limit | `ffi.verifyJoinSplit` rejects `proof.len > MAX_PROOF_LEN` **before** invoking the backend, and the Rust `lattica_joinsplit_verify` rejects an oversize `proof_len` **before** building/deserializing the slice (matching `MAX_PROOF_LEN = 1<<21`). Tests: Zig (oversize ⇒ false, backend not called) + Rust (oversize `proof_len` ⇒ reject). | `src/ffi.zig`, `lattica-prover-p3/src/lib.rs` |
+| **M-09** genesis/test mint API | `Chain.bootstrapMint` is **compile-gated**: in a build whose root sets `pub const lattica_production = true`, any reference is a compile error (`@compileError`). Verified — a probe calling it fails to compile. | `src/node.zig` |
+| **M-10** mock backend in the live module | `node.mock` is **compiled out** of production builds (`pub const mock = if (production) struct {} else …`), so `node.mock.install()` is a compile error there. Verified — a probe calling it fails to compile. | `src/node.zig` |
+| production-mode test | `src/production_probe.zig` builds the consensus surface with `lattica_production = true` (test-only APIs gated out); `zig build check-production` — also a dependency of `zig build test` — compiles it. The successful compile *is* the assertion that the live path uses no genesis/test-only helper. | `src/production_probe.zig`, `build.zig` |
+| **L-03** stale README | `README.md` rewritten to the Plonky3 join-split path (correct layout, removed-file references deleted, `tx_binding` replaces the ML-DSA binding-signature flow) and points to `docs/AUDITORS.md`. | `README.md` |
+
+**Scope note:** the M-09/M-10 compile-gate prevents a production *build* from including the helpers. The
+complementary runtime step — a production node attesting the real Rust verifier symbols/parameters at
+startup before accepting blocks — is host-chain (`rubble-node-zig`) scope, as is M-07 (full-node
+consensus surface: block format, committed roots, reorg undo, mempool cache).
 
 ## Current Re-Audit (post-remediation, 2026-06-27)
 
