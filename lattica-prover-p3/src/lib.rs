@@ -894,4 +894,70 @@ mod tests {
             1
         );
     }
+
+    // --- HTLC ABI hardening regression tests (parallels of the join-split ones; audit O-3) ---
+
+    #[test]
+    fn htlc_verify_rejects_oversize_proof() {
+        // Oversize proof_len rejected before the slice is built (audit M-08).
+        let pis = crate::htlc_air::public_values(&crate::htlc_air::demo_htlc_witness());
+        let pib = encode_htlc_public_inputs(&pis).unwrap();
+        let buf = [0u8; 8];
+        assert_ne!(
+            unsafe { lattica_htlc_verify(buf.as_ptr(), MAX_PROOF_LEN + 1, pib.as_ptr(), pib.len()) },
+            0
+        );
+    }
+
+    #[test]
+    fn htlc_public_input_non_canonical_rejected() {
+        // A digest limb == p is non-canonical ⇒ parse fails ⇒ verify fails-closed (M-03).
+        let pis = crate::htlc_air::public_values(&crate::htlc_air::demo_htlc_witness());
+        let mut pib = encode_htlc_public_inputs(&pis).unwrap();
+        pib[0..8].copy_from_slice(&GOLDILOCKS_ORDER.to_le_bytes()); // anchor limb 0 = p
+        assert!(parse_htlc_public_inputs(&pib).is_none());
+        let proof = [0u8; 8];
+        assert_ne!(
+            unsafe { lattica_htlc_verify(proof.as_ptr(), proof.len(), pib.as_ptr(), pib.len()) },
+            0
+        );
+    }
+
+    #[test]
+    fn htlc_prove_abi_rejects_null_output_pointers() {
+        // Every pointer incl. the output length pointers is fail-closed (audit M-01).
+        let wb = encode_htlc_witness(&crate::htlc_air::demo_htlc_witness());
+        let mut proof = vec![0u8; 1 << 20];
+        let mut pi = vec![0u8; 512];
+        let (mut pl, mut pil) = (0usize, 0usize);
+        let np: *mut u8 = core::ptr::null_mut();
+        let nl: *mut usize = core::ptr::null_mut();
+        let (wp, wl) = (wb.as_ptr(), wb.len());
+        let (po, pc) = (proof.as_mut_ptr(), proof.len());
+        let (pio, pic) = (pi.as_mut_ptr(), pi.len());
+        let prove = |wp, wl, po, pc, plp, pio, pic, pilp| unsafe {
+            lattica_htlc_prove(wp, wl, po, pc, plp, pio, pic, pilp)
+        };
+        assert_eq!(prove(core::ptr::null(), 0, po, pc, &mut pl, pio, pic, &mut pil), 1);
+        assert_eq!(prove(wp, wl, np, pc, &mut pl, pio, pic, &mut pil), 1);
+        assert_eq!(prove(wp, wl, po, pc, nl, pio, pic, &mut pil), 1);
+        assert_eq!(prove(wp, wl, po, pc, &mut pl, np, pic, &mut pil), 1);
+        assert_eq!(prove(wp, wl, po, pc, &mut pl, pio, pic, nl), 1);
+    }
+
+    #[test]
+    fn htlc_witness_non_canonical_bit_rejected() {
+        // A path-bit byte other than 0/1 ⇒ parse fails ⇒ prove returns nonzero (M-03). Input 0's bits
+        // begin after nk(16)+div(8)+asset(8)+note_type(8)+value(8)+rho(16)+rcm(16)+sib(DEPTH*32).
+        let mut wb = encode_htlc_witness(&crate::htlc_air::demo_htlc_witness());
+        let bits0 = 80 + crate::htlc_air::DEPTH * 32;
+        wb[bits0] = 2;
+        let mut proof = vec![0u8; 1 << 20];
+        let mut pi = vec![0u8; 512];
+        let (mut pl, mut pil) = (0usize, 0usize);
+        let rc = unsafe {
+            lattica_htlc_prove(wb.as_ptr(), wb.len(), proof.as_mut_ptr(), proof.len(), &mut pl, pi.as_mut_ptr(), pi.len(), &mut pil)
+        };
+        assert_eq!(rc, 1);
+    }
 }
