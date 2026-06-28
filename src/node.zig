@@ -587,7 +587,12 @@ pub fn buildHtlcLock(
     if (lock_value >= MAX_RANGE_VALUE) return TxError.ValueOverflow;
     if (fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
     // A zero hashlock is an atomicity footgun: a "redeem" with a null preimage derives redeem_hashlock=0
-    // and would satisfy the binding while revealing no secret — refuse to create such a lock.
+    // and would satisfy the binding while revealing no secret. The value that actually enters htlc_root
+    // is the FIELD-REDUCED digest, so we must reject not just all-zero bytes but any NON-CANONICAL
+    // encoding (a limb ≥ p reduces in-field and could reduce to 0 — e.g. the limb `p` itself), which
+    // would slip past a raw all-zero check (audit r3 M-1). Canonical + non-zero ⇒ the reduced hashlock
+    // is non-zero.
+    if (!isCanonicalDigest(hashlock)) return TxError.NonCanonicalField;
     if (std.mem.allEqual(u8, &hashlock, 0)) return TxError.Internal;
 
     // Value balance: Σin = lock_value + change + fee.
@@ -1532,4 +1537,34 @@ test "node: build path is leak-free on success AND error (audit r2 F1/F2)" {
     try testing.expectError(TxError.ProveFailed, buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor()));
     mock.install(); // restore so the top-level defer uninstall stays balanced
     // testing.allocator fails the test at scope exit if anything above leaked.
+}
+
+test "node: buildHtlcLock rejects a non-canonical (in-field-zero) hashlock (audit r3 M-1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{2} ** 32);
+    const li = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+    const redeem_tag = bob.address().recipientId();
+    const refund_tag = alice.address().recipientId();
+
+    // A hashlock whose 4 LE limbs each equal p: NON-canonical (≥ p) and reduces in-field to [0,0,0,0]
+    // — the exploit a raw all-zero check missed. Must be rejected.
+    var hl_p: Hash32 = undefined;
+    var k: usize = 0;
+    while (k < 4) : (k += 1) std.mem.writeInt(u64, hl_p[k * 8 ..][0..8], field.P, .little);
+    try testing.expectError(TxError.NonCanonicalField, buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, hl_p, 100, 900, 0, 50, chain.anchor()));
+    // A genuine all-zero hashlock is also rejected…
+    try testing.expectError(TxError.Internal, buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, [_]u8{0} ** 32, 100, 900, 0, 50, chain.anchor()));
+    // …while a canonical, non-zero hashlock is accepted.
+    _ = try buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, [_]u8{7} ** 32, 100, 900, 0, 50, chain.anchor());
 }
