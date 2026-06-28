@@ -24,7 +24,7 @@ The frozen `(N_IN, M_OUT) = (2, 2)` shape is unchanged; an HTLC spend uses one H
 dummy. Span layout: `SPAN_BLOCKS = 8 + DEPTH` (DEPTH = 32); the 4 `htlc_root` blocks sit at the **span
 end** (blocks `4+DEPTH … 7+DEPTH`) so the recipient/chain/membership block-adjacency of the join-split
 layout is untouched — the computed `htlc_root` is carried back into `commit_a` through the persistent
-`OWNER` columns (see #2). `WIDTH = 31`.
+`OWNER` columns (see #2). `WIDTH = 36`.
 
 ## Columns — what determines each (delta over join-split)
 
@@ -37,6 +37,8 @@ layout is untouched — the computed `htlc_root` is carried back into `commit_a`
 | 28 | `MODE` | spend mode (1 = redeem, 0 = refund); local-persistent; boolean (#6); gates the tag-match, hashlock bind, and timeout direction. |
 | 29 | `TIMEOUT` | the committed timeout; local-persistent; pinned `TIMEOUT == htlc block-3 input lane 4` (#9) and range-checked `< 2^BITS` (#10) ⇒ a sound comparison operand. |
 | 30 | `DIFF` | the timeout-compare slack (`redeem: timeout−height−1`, `refund: height−timeout`); range-checked `≥ 0` (#10). Read only at its range seed. |
+| 31–34 | `HLINV0..3` | witnessed inverses of the hashlock limbs (redeem hashlock-nonzero gadget, #5a). Read only at the htlc block-2 rows; free elsewhere. |
+| 35 | `HLPROD` | `Π_k(1 − PI_HASHLOCK[k]·HLINV_k)`; defined at the htlc block-2 rows (#5a), required `== 0` on redeem ⇒ `PI_HASHLOCK ≠ 0`. Free elsewhere. |
 
 Intentionally-free witnesses (unchanged philosophy): `rcm0/rcm1`, output trapdoors, and — for a PLAIN
 note — `redeem_tag/refund_tag/hashlock/timeout` (ignored; their constraints are `note_type`-gated off).
@@ -78,6 +80,17 @@ equality) are **unchanged** and not repeated. New/changed:
    committed hashlock, so a redeem is valid **iff** the spender revealed a preimage hashing to the
    committed lock. (SHA256 itself is computed by the node from the publicly revealed preimage and bound
    as a public input; the circuit proves equality only — see Residuals.) Not bound on refund (`MODE=0`).
+5a. **Redeem hashlock-nonzero backstop** (audit-r3 hardening). On the redeem path the committed
+   hashlock — which equals `pis[redeem_hashlock]` by #5 — must be **non-zero**. Without this, a
+   maliciously-locked note with a zero hashlock could be redeemed with a *null* preimage
+   (`redeem_hashlock = 0`), satisfying #5 while revealing no secret (an atomicity break). Gadget:
+   `HLPROD = Π_k (1 − pis[redeem_hashlock][k]·HLINV_k)` is defined at the htlc block-2 rows
+   (`h2·(HLPROD − Π…) = 0`, degree 9), and the redeem path asserts `h2·NT·MODE·HLPROD = 0`. Non-vacuous:
+   a zero hashlock makes every factor `1` ⇒ `HLPROD = 1` ⇒ the redeem assertion fails (no `HLINV`
+   choice helps); a non-zero hashlock has an invertible limb ⇒ `HLPROD = 0` ⇒ accepted. So a redeem
+   provably requires a non-zero (i.e., real-preimage) hashlock at the **circuit/consensus** level — a
+   backstop independent of the wallet `buildHtlcLock` guard and the Phase-B `await_lock` check. Refunds
+   (`MODE=0`, `redeem_hashlock=0` legitimately) are gated off.
 6. **Timeout compare** (the time-lock). `TIMEOUT == htlc block-3 lane 4` (#9 binds the operand to the
    committed timeout). `DIFF` is computed, gated by `NT`, as
    `DIFF = MODE·(TIMEOUT − height − 1) + (1−MODE)·(height − TIMEOUT)` where `height = pis[current_height]`,

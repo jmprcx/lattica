@@ -25,8 +25,8 @@ degree); **(C)** in an isolated git **worktree**, build + run *exhaustive* corru
 ## Findings & disposition
 | ID | Finding | Sev | Status |
 |---|---|---|---|
-| **M-1** | `buildHtlcLock`'s round-2 zero-hashlock guard checked the **raw bytes** for all-zero, but the value entering `htlc_root` is the **field-reduced** digest. A hashlock whose 4 LE limbs each equal `p` (`01 00 00 00 FF FF FF FF ×4`, non-canonical) isn't zero in bytes (passed the guard) yet reduces to `[0,0,0,0]` — re-opening the atomicity footgun (a "redeem" with a null preimage that reveals no secret). | **MED** | **Fixed** (`a56ceea`) — also reject a non-canonical hashlock (`isCanonicalDigest`); new test. **Recommended further hardening:** an in-circuit `PI_HASHLOCK != 0` on the redeem path (consensus-level), since a tx crafted outside `buildHtlcLock` bypasses the wallet guard. Primary defense remains the Phase-B `await_lock` hashlock check. |
-| spend_air | `spend_air.rs` is **dead code** — `nm` shows the only C-ABI symbols are the join-split + htlc verify/prove/demo; it's reachable only from the `main` demo binary + its own tests, and neither production circuit imports it. Doc-rot in `lib.rs:3`. | Low | **Doc fixed** (`11817e1`) — marked superseded/demo-only; **removal recommended** (not deleted unilaterally — it's pre-existing milestone code). |
+| **M-1** | `buildHtlcLock`'s round-2 zero-hashlock guard checked the **raw bytes** for all-zero, but the value entering `htlc_root` is the **field-reduced** digest. A hashlock whose 4 LE limbs each equal `p` (`01 00 00 00 FF FF FF FF ×4`, non-canonical) isn't zero in bytes (passed the guard) yet reduces to `[0,0,0,0]` — re-opening the atomicity footgun (a "redeem" with a null preimage that reveals no secret). | **MED** | **Fixed at both layers** — wallet (`a56ceea`, reject non-canonical) **and now in-circuit** (`2670e66`, the `PI_HASHLOCK != 0`-on-redeem backstop, hardening #1 below), so a tx crafted outside `buildHtlcLock` is also caught. Phase-B `await_lock` remains the primary off-chain defense. |
+| spend_air | `spend_air.rs` is **dead code** — `nm` shows the only C-ABI symbols are the join-split + htlc verify/prove/demo; it's reachable only from the `main` demo binary + its own tests, and neither production circuit imports it. Doc-rot in `lib.rs:3`. | Low | **Removed** (`1fc5716`, hardening #2 below) — deleted the module + the M4b demo block + the doc-rot. |
 | nit | The `"lattica:v1:kem-encaps"` domain tag (from the H-1 fix) is a bare literal, not registered in the `domain` struct convention. | Nit | Documented. |
 | OVK rewrite | H-1 fix: `ovk` is domain-separated from nk/div/kem/ml-dsa, never leaked (absent from Address + IVK), coins injective in (ovk,cm); all callers pass the sender's ovk. | — | **Confirmed correct** (R-A). |
 | M-3 / mint / height / canonical / leaks / preimage | The other round-1/2 fixes. | — | **Confirmed correct** (R-A): div-rederive in both decrypt paths; `P_HEIGHT_SEED` did NOT misalign any selector (1:1, `N_PERIODIC=43`); the height window is disjoint from all 10 other range windows; `isCanonicalDigest` has no false positives; the raw-preimage binding matches prover↔node for refund; the `defer`/`errdefer` leak fixes are safe. |
@@ -48,9 +48,18 @@ After round 3: default Rust suite green (51 htlc + the rest), the exhaustive aud
 join-split/HTLC integration green. Round-3 commits: `6c9f5af` (fuzz), `a56ceea` (M-1 fix), `11817e1`
 (regression tests + spend_air doc).
 
+## Post-round-3 hardening (both recommended items now done)
+1. **In-circuit `PI_HASHLOCK != 0` on redeem** (`2670e66`) — the consensus-level backstop for the
+   zero-hashlock footgun (see #5a in `htlc-constraint-audit.md`): witnessed per-limb inverses + an
+   `HLPROD` product, required `== 0` on redeem, degree 9 (no FRI config change), WIDTH 31→36. Validated:
+   redeem still verifies, refund unaffected, the zero-hashlock redeem now rejected in-circuit, the
+   exhaustive `--ignored` suite (51/51 non-vacuity, differential, boundary) still green, proven-security
+   floor ≥100 holds. M-1 is now defended at **both** the wallet and circuit layers.
+2. **Removed dead `spend_air`** (`1fc5716`) — module + M4b demo block + doc-rot deleted.
+
 ## Net across three rounds
 Round 1 found defense-in-depth gaps; round 2 found a HIGH privacy break (H-1, fixed) + leaks + M-3;
-round 3 audited the fixes themselves (catching M-1) and replaced argument with executable proof. The
-remaining open items are all out of lattica's scope (Phase-B `await_lock`/timeout, host-chain
-reorg/anchor-window/cm-index) or recommended hardening (in-circuit `PI_HASHLOCK != 0`, remove
-`spend_air`). The lattica v3 surface has now been read, reasoned, *and executed against* adversarially.
+round 3 audited the fixes themselves (catching M-1) and replaced argument with executable proof — then
+both recommended hardenings were implemented. The only remaining open items are out of lattica's scope
+(Phase-B `await_lock`/timeout, host-chain reorg/anchor-window/cm-index). The lattica v3 surface has now
+been read, reasoned, *and executed against* adversarially, and hardened at both layers.

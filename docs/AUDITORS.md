@@ -118,8 +118,10 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
    corrupted-trace 51/51; differential native-vs-AIR; forgery rejection). Two required gates beyond
    `cargo test`/`zig build test`: **`scripts/run-real-integration.sh`** (cross-language witness/PI
    byte-match) and **`cargo test --release -- --ignored`** (the exhaustive corrupted-trace/differential
-   audit suite, `#[ignore]`'d for speed). Open items are out-of-scope (Phase-B `await_lock`, host-chain
-   reorg/index) or recommended hardening (in-circuit `PI_HASHLOCK != 0`, remove `spend_air`).
+   audit suite, `#[ignore]`'d for speed). Both round-3 recommended hardenings were then implemented: the
+   in-circuit `PI_HASHLOCK != 0`-on-redeem backstop (`htlc_air`, see htlc-constraint-audit §5a) and the
+   removal of dead `spend_air`. The only remaining open items are **out of lattica's scope** — Phase-B
+   `await_lock`/timeout (xchain repo) and host-chain reorg/anchor-window/cm-index.
 3. **`docs/soundness-budget.md`** — the C-04 proven/conjectured security accounting (~103 / ~127-bit).
 4. **`docs/protocol-v1-decisions.md`** — the deliberate v1 parameter decisions + limitations
    (single-asset, key model, note randomness, issuance, the deterministic-encryption interaction).
