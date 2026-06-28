@@ -324,7 +324,11 @@ const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant acro
 // span-end blocks) can feed commit_a (audit/AIR layout note in the header).
 const OWNER0: usize = 19;
 const NT: usize = 23; // note_type (0=PLAIN, 1=HTLC), local-persistent; == committed commit_b lane 7
-const WIDTH: usize = 24; // OWNER0..3 = 19..23, NT = 23
+// CLAIM0..3: the claiming party's tag = own.out = H(DOM_OWN ‖ nk ‖ div), local-persistent. For an
+// HTLC note the spend proves CLAIM == the mode-selected party tag (redeem_tag / refund_tag).
+const CLAIM0: usize = 24;
+const MODE: usize = 28; // 1 = redeem, 0 = refund (local-persistent, boolean)
+const WIDTH: usize = 29; // OWNER0..3=19..23, NT=23, CLAIM0..3=24..28, MODE=28
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
@@ -351,9 +355,10 @@ const P_HTLC_IN0: usize = 30; // htlc block 0 input: lane0=DOM_HTLC, lanes1-3=0
 const P_HTLC_LINK: usize = 31; // htlc blocks 0,1,2 OUTPUT: chain link out[0..4] -> next in[0..4]
 const P_HTLC_IN3: usize = 32; // htlc block 3 input: capacity lanes 5,6,7 = 0
 const P_HTLC_ROOT: usize = 33; // htlc block 3 OUTPUT = htlc_root (owner gate when HTLC)
-const P_NULLOUT: usize = 34; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 34 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 34 + N_IN + M_OUT;
+const P_HTLC_IN1: usize = 34; // htlc block 1 input (refund_tag in lanes 4..8 — for the refund tag-match)
+const P_NULLOUT: usize = 35; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 35 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 35 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
 const PI_ANCHOR: usize = 0;
@@ -516,6 +521,8 @@ fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&htlc_link)); // P_HTLC_LINK
     cols.push(one_hot(&htlc_in3)); // P_HTLC_IN3
     cols.push(one_hot(&htlc_root_out)); // P_HTLC_ROOT
+    let htlc_in1: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 1) * BLOCK).collect();
+    cols.push(one_hot(&htlc_in1)); // P_HTLC_IN1
     for i in 0..N_IN {
         cols.push(one_hot(&[null_out_row(i)])); // P_NULLOUT + i
     }
@@ -582,7 +589,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // persistence a prover could use one rho1 in the commitment and another in the nullifier,
         // minting a fresh nullifier for a real note ⇒ double-spend.
         let not_last = one.clone() - p[P_REGION_LAST].clone();
-        for &c in &[NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3, NT] {
+        for &c in &[
+            NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3, NT,
+            CLAIM0, CLAIM0 + 1, CLAIM0 + 2, CLAIM0 + 3, MODE,
+        ] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
         // ASSET is GLOBAL-persistent: constant across the whole trace (one hidden asset per tx), so
@@ -654,6 +664,24 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         let h3 = p[P_HTLC_IN3].clone();
         for k in (DIGEST + 1)..8 {
             builder.assert_zero(h3.clone() * cur[k].clone()); // block 3 capacity lanes 5,6,7 = 0 (timeout in lane 4)
+        }
+
+        // ---- claim tag + HTLC tag-match (access control: who may spend the HTLC note) ----
+        // CLAIM == own.out = H(DOM_OWN ‖ nk ‖ div), the claiming party's tag (all notes).
+        for k in 0..DIGEST {
+            builder.assert_zero(rl.clone() * (cur[CLAIM0 + k].clone() - cur[k].clone()));
+        }
+        // MODE boolean (redeem=1 / refund=0).
+        let mode = cur[MODE].clone();
+        builder.assert_zero(own.clone() * mode.clone() * (mode.clone() - one.clone()));
+        // HTLC tag-match: the claiming party must own the mode-selected party tag. redeem_tag is block 0
+        // input lanes 4..8 (gated by MODE); refund_tag is block 1 input lanes 4..8 (gated by 1-MODE).
+        for k in 0..DIGEST {
+            builder.assert_zero(h0.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - cur[CLAIM0 + k].clone()));
+        }
+        let h1 = p[P_HTLC_IN1].clone();
+        for k in 0..DIGEST {
+            builder.assert_zero(h1.clone() * nt.clone() * (one.clone() - mode.clone()) * (cur[DIGEST + k].clone() - cur[CLAIM0 + k].clone()));
         }
 
         // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
@@ -906,6 +934,10 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
             fill_col(&mut t, lo, hi, OWNER0 + k, owner[k]);
         }
         fill_col(&mut t, lo, hi, NT, inp.note_type); // note_type (committed in commit_b lane 7)
+        for k in 0..DIGEST {
+            fill_col(&mut t, lo, hi, CLAIM0 + k, recipient[k]); // claim tag = own.out (the spender's tag)
+        }
+        fill_col(&mut t, lo, hi, MODE, inp.mode); // redeem(1)/refund(0)
         // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
         let mut acc = 0u64;
         let mut links: Vec<(usize, u64)> = Vec::new();
@@ -1566,6 +1598,23 @@ mod tests {
     fn htlc_refund_air_verifies() {
         let hl = [Val::from_u64(7), Val::from_u64(8), Val::from_u64(9), Val::from_u64(10)];
         prove_verify(&htlc_witness(false, 10, hl, 10)).expect("HTLC refund must verify in-circuit");
+    }
+
+    /// Access control (soundness): the refund party cannot spend the REDEEM branch. Take a valid refund
+    /// witness and flip MODE→redeem in the trace; the claimant is the refund party, so the redeem
+    /// tag-match (claim == redeem_tag) fails. Public inputs are unchanged (the HTLC nullifier is
+    /// owner-based, not mode/nk-based), so only the tag-match can reject — and it must.
+    #[test]
+    fn htlc_wrong_party_for_mode_is_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(false, 10, hl, 10); // refund: claimer = refund party, MODE=0
+        let mut trace = build_trace(&w);
+        let (lo, hi) = (own_in_row(0), span_last_row(0));
+        for r in lo..=hi {
+            trace.values[r * WIDTH + MODE] = Val::ONE; // claim the redeem branch with the refund party
+        }
+        let pis = public_values(&w);
+        assert!(corrupt_trace_rejected(trace, pis), "refund party must not pass the redeem tag-match");
     }
 
     #[test]
