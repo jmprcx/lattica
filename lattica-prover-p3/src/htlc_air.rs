@@ -336,7 +336,10 @@ const NT: usize = 23; // note_type (0=PLAIN, 1=HTLC), local-persistent; == commi
 // HTLC note the spend proves CLAIM == the mode-selected party tag (redeem_tag / refund_tag).
 const CLAIM0: usize = 24;
 const MODE: usize = 28; // 1 = redeem, 0 = refund (local-persistent, boolean)
-const WIDTH: usize = 29; // OWNER0..3=19..23, NT=23, CLAIM0..3=24..28, MODE=28
+// HTLC timeout compare (range argument, reusing REM/RBIT in the free span-end htlc region):
+const TIMEOUT: usize = 29; // the committed timeout (== htlc block 3 input lane 4), local-persistent
+const DIFF: usize = 30; // redeem: timeout-height-1 ; refund: height-timeout ; range-checked ≥ 0
+const WIDTH: usize = 31; // …, MODE=28, TIMEOUT=29, DIFF=30
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
@@ -365,9 +368,11 @@ const P_HTLC_IN3: usize = 32; // htlc block 3 input: capacity lanes 5,6,7 = 0
 const P_HTLC_ROOT: usize = 33; // htlc block 3 OUTPUT = htlc_root (owner gate when HTLC)
 const P_HTLC_IN1: usize = 34; // htlc block 1 input (refund_tag in lanes 4..8 — for the refund tag-match)
 const P_HTLC_IN2: usize = 35; // htlc block 2 input (hashlock in lanes 4..8 — for the redeem hashlock bind)
-const P_NULLOUT: usize = 36; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 36 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 36 + N_IN + M_OUT;
+const P_TO_SEED: usize = 36; // timeout range seed (REM = TIMEOUT), in the htlc region
+const P_DIFF_SEED: usize = 37; // diff range seed (REM = DIFF) + the height/timeout compare
+const P_NULLOUT: usize = 38; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 38 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 38 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4) ‖
 //                current_height(1) ‖ redeem_hashlock(4)
@@ -498,6 +503,16 @@ fn periodic() -> Vec<Vec<Val>> {
         range_active.extend(s..s + BITS);
         range_close.push(s + BITS);
     }
+    // HTLC timeout-compare range windows (reuse REM/RBIT in the free span-end htlc region): a TIMEOUT
+    // window at htlc block 0 and a DIFF window at htlc block 2 (each ≤ 53 rows; blocks 0-1 and 2-3 are
+    // disjoint). Their SEEDs read TIMEOUT/DIFF (separate selectors); active/close share the generic
+    // REM decomposition below.
+    let to_seeds: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 0) * BLOCK).collect();
+    let diff_seeds: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 2) * BLOCK).collect();
+    for &s in to_seeds.iter().chain(diff_seeds.iter()) {
+        range_active.extend(s..s + BITS);
+        range_close.push(s + BITS);
+    }
 
     cols.push(one_hot(&own_in)); // P_OWN_IN
     cols.push(one_hot(&recip)); // P_RECIP_LINK
@@ -537,6 +552,8 @@ fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&htlc_in1)); // P_HTLC_IN1
     let htlc_in2: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 2) * BLOCK).collect();
     cols.push(one_hot(&htlc_in2)); // P_HTLC_IN2
+    cols.push(one_hot(&to_seeds)); // P_TO_SEED
+    cols.push(one_hot(&diff_seeds)); // P_DIFF_SEED
     for i in 0..N_IN {
         cols.push(one_hot(&[null_out_row(i)])); // P_NULLOUT + i
     }
@@ -605,7 +622,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         let not_last = one.clone() - p[P_REGION_LAST].clone();
         for &c in &[
             NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3, NT,
-            CLAIM0, CLAIM0 + 1, CLAIM0 + 2, CLAIM0 + 3, MODE,
+            CLAIM0, CLAIM0 + 1, CLAIM0 + 2, CLAIM0 + 3, MODE, TIMEOUT,
         ] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
@@ -704,6 +721,23 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         for k in 0..DIGEST {
             builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - pis[PI_HASHLOCK + k].clone()));
         }
+
+        // ---- HTLC timeout compare (range argument on current_height vs the committed timeout) ----
+        // TIMEOUT == htlc block 3 input lane 4 (the committed timeout).
+        builder.assert_zero(h3.clone() * (cur[TIMEOUT].clone() - cur[DIGEST].clone()));
+        // Range seeds: REM = TIMEOUT, REM = DIFF (the generic REM decomposition + REM=0 close come from
+        // the shared P_RANGE_ACTIVE / P_RANGE_CLOSE, whose windows were extended to cover the htlc
+        // region) ⇒ TIMEOUT, DIFF ∈ [0, 2^BITS).
+        builder.assert_zero(p[P_TO_SEED].clone() * (cur[REM].clone() - cur[TIMEOUT].clone()));
+        builder.assert_zero(p[P_DIFF_SEED].clone() * (cur[REM].clone() - cur[DIFF].clone()));
+        // DIFF compute (HTLC only): redeem ⇒ timeout-height-1 ; refund ⇒ height-timeout. With TIMEOUT
+        // and DIFF range-bounded and the public current_height node-bounded < 2^BITS, DIFF ≥ 0 holds
+        // iff the timeout window does — redeem ⟺ height < timeout, refund ⟺ height ≥ timeout.
+        let height = pis[PI_HEIGHT].clone();
+        let redeem_diff = cur[TIMEOUT].clone() - height.clone() - one.clone();
+        let refund_diff = height.clone() - cur[TIMEOUT].clone();
+        let diff_expr = mode.clone() * redeem_diff + (one.clone() - mode.clone()) * refund_diff;
+        builder.assert_zero(p[P_DIFF_SEED].clone() * nt.clone() * (cur[DIFF].clone() - diff_expr));
 
         // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
         let ca = p[P_COMMIT_A_IN].clone();
@@ -959,6 +993,17 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
             fill_col(&mut t, lo, hi, CLAIM0 + k, recipient[k]); // claim tag = own.out (the spender's tag)
         }
         fill_col(&mut t, lo, hi, MODE, inp.mode); // redeem(1)/refund(0)
+        // HTLC timeout compare: TIMEOUT (committed), DIFF (redeem: timeout-height-1; refund:
+        // height-timeout; 0 for PLAIN), each range-decomposed via REM/RBIT in the free htlc region.
+        let diff_value: u64 = if is_htlc {
+            if inp.mode == Val::from_u64(1) { inp.timeout - w.current_height - 1 } else { w.current_height - inp.timeout }
+        } else {
+            0
+        };
+        fill_col(&mut t, lo, hi, TIMEOUT, Val::from_u64(inp.timeout));
+        fill_col(&mut t, lo, hi, DIFF, Val::from_u64(diff_value));
+        fill_range(&mut t, htlc_block(i, 0) * BLOCK, inp.timeout); // TIMEOUT ∈ [0, 2^BITS)
+        fill_range(&mut t, htlc_block(i, 2) * BLOCK, diff_value); // DIFF ∈ [0, 2^BITS)
         // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
         let mut acc = 0u64;
         let mut links: Vec<(usize, u64)> = Vec::new();
@@ -1657,6 +1702,38 @@ mod tests {
         let mut pis = public_values(&w);
         pis[PI_HASHLOCK] += Val::ONE; // a hashlock the revealed preimage does NOT hash to
         assert!(corrupt_trace_rejected(trace, pis), "redeem with a wrong hashlock must not verify");
+    }
+
+    /// Time-lock: redeem requires height < timeout. Prove a valid redeem (height 5 < timeout 10), then
+    /// verify against current_height = timeout — the DIFF compute (timeout-height-1 would be negative)
+    /// no longer matches the range-bounded DIFF, so it must reject.
+    #[test]
+    fn htlc_redeem_at_timeout_is_rejected_in_circuit() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(true, 5, hl, 10);
+        let trace = build_trace(&w);
+        let mut pis = public_values(&w);
+        pis[PI_HEIGHT] = Val::from_u64(10); // height == timeout ⇒ redeem window closed
+        assert!(corrupt_trace_rejected(trace, pis), "redeem at/after timeout must not verify");
+    }
+
+    /// Time-lock: refund requires height >= timeout. Prove a valid refund (height 10 == timeout), then
+    /// verify against current_height < timeout — must reject.
+    #[test]
+    fn htlc_refund_before_timeout_is_rejected_in_circuit() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(false, 10, hl, 10);
+        let trace = build_trace(&w);
+        let mut pis = public_values(&w);
+        pis[PI_HEIGHT] = Val::from_u64(9); // height < timeout ⇒ refund window not open
+        assert!(corrupt_trace_rejected(trace, pis), "refund before timeout must not verify");
+    }
+
+    /// Boundary: redeem at height = timeout-1 is the latest valid redeem (DIFF = 0).
+    #[test]
+    fn htlc_redeem_boundary_verifies() {
+        let hl = [Val::from_u64(5), Val::from_u64(6), Val::from_u64(7), Val::from_u64(8)];
+        prove_verify(&htlc_witness(true, 9, hl, 10)).expect("redeem at timeout-1 must verify");
     }
 
     #[test]
