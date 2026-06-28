@@ -77,7 +77,7 @@ pub fn recipient_of(nk0: Val, nk1: Val, d: Val) -> [Val; DIGEST] {
 ///   cm = perm([H1(4), rcm0, rcm1, 0, 0])                      (Merkle-Damgård chain)
 /// rho/rcm are each two field elements ⇒ 128-bit note randomness + hiding (vs 64-bit before). The
 /// second block is merge-shaped; the chaining value (256-bit) gives 128-bit collision resistance.
-pub fn commit(recipient: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2]) -> [Val; DIGEST] {
+pub fn commit(recipient: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2], asset: Val) -> [Val; DIGEST] {
     let mut a = [Val::ZERO; W];
     a[0] = Val::from_u64(DOM_CM);
     a[1..1 + DIGEST].copy_from_slice(&recipient);
@@ -89,6 +89,7 @@ pub fn commit(recipient: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2]
     b[..DIGEST].copy_from_slice(&chain[..DIGEST]);
     b[DIGEST] = rcm[0];
     b[DIGEST + 1] = rcm[1];
+    b[DIGEST + 2] = asset; // lane 6: hidden asset id (lane 7 stays 0, reserved for note_type)
     native_permute(b)[..DIGEST].try_into().unwrap()
 }
 
@@ -126,6 +127,7 @@ pub fn fold(leaf: [Val; DIGEST], sib: &[[Val; DIGEST]; DEPTH], bits: &[bool; DEP
 pub struct Input {
     pub nk: [u64; 2], // 128-bit nullifier key / spend authority
     pub div: Val, // diversifier of the address this note was sent to (recipient = H(nk ‖ div))
+    pub asset: Val, // hidden asset id (all notes in a tx share one asset)
     pub value: u64,
     pub rho: [Val; 2], // 128-bit note randomness
     pub rcm: [Val; 2], // 128-bit commitment trapdoor
@@ -136,6 +138,7 @@ pub struct Input {
 #[derive(Clone, Copy)]
 pub struct Output {
     pub recipient: [Val; DIGEST],
+    pub asset: Val, // hidden asset id (must equal the inputs' asset)
     pub value: u64,
     pub rho: [Val; 2],
     pub rcm: [Val; 2],
@@ -163,10 +166,12 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let mut anchor: Option<[Val; DIGEST]> = None;
     let mut nullifiers = [[Val::ZERO; DIGEST]; N_IN];
     let mut in_sum: u128 = 0;
+    let asset = w.inputs[0].asset; // the single (hidden) asset of this tx
     for (i, inp) in w.inputs.iter().enumerate() {
+        assert_eq!(inp.asset, asset, "input {i} uses a different asset (single-asset tx)");
         let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
         let recipient = recipient_of(nk0, nk1, inp.div);
-        let cm = commit(recipient, Val::from_u64(inp.value), inp.rho, inp.rcm);
+        let cm = commit(recipient, Val::from_u64(inp.value), inp.rho, inp.rcm, inp.asset);
         let root = fold(cm, &inp.sib, &inp.bits);
         match anchor {
             None => anchor = Some(root),
@@ -179,7 +184,8 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let mut out_cms = [[Val::ZERO; DIGEST]; M_OUT];
     let mut out_sum: u128 = 0;
     for (j, out) in w.outputs.iter().enumerate() {
-        out_cms[j] = commit(out.recipient, Val::from_u64(out.value), out.rho, out.rcm);
+        assert_eq!(out.asset, asset, "output {j} uses a different asset (single-asset tx)");
+        out_cms[j] = commit(out.recipient, Val::from_u64(out.value), out.rho, out.rcm, out.asset);
         out_sum += out.value as u128;
     }
     // value balance (A3: all values range-bounded ⇒ no wraparound)
@@ -212,7 +218,8 @@ const REM: usize = 14; // range running remainder
 const RBIT: usize = 15;
 const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
 const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
-const WIDTH: usize = 18;
+const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant across the whole tx)
+const WIDTH: usize = 19;
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
@@ -439,6 +446,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         for &c in &[NK, NK1, RHO, RHO1, VAL] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
+        // ASSET is GLOBAL-persistent: constant across the whole trace (one hidden asset per tx), so
+        // every note's committed asset (bound at commit_b below) equals this single value.
+        builder.when_transition().assert_zero(nxt[ASSET].clone() - cur[ASSET].clone());
         // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
         let bit = nxt[BIT].clone();
         builder.when_transition().assert_zero(
@@ -497,8 +507,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
 
         // ---- commit_b input: [chain(4), rcm0, rcm1, 0, 0] — pad lanes 6,7 pinned to 0 (rcm free) ----
         let cb = p[P_COMMIT_B].clone();
-        builder.assert_zero(cb.clone() * cur[DIGEST + 2].clone()); // lane 6
-        builder.assert_zero(cb.clone() * cur[DIGEST + 3].clone()); // lane 7
+        builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone())); // lane 6 = hidden asset id
+        builder.assert_zero(cb.clone() * cur[DIGEST + 3].clone()); // lane 7 = 0 (reserved)
 
         // ---- membership links: place running digest (= commit_b output) by the bit ----
         let ml = p[P_MEM_LINK].clone();
@@ -622,6 +632,9 @@ fn fill_col(t: &mut [Val], lo: usize, hi: usize, col: usize, v: Val) {
 fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
     let mut t = vec![Val::ZERO; HEIGHT * WIDTH];
 
+    // ASSET is global-persistent (one hidden asset id for the whole tx); fill it on every row.
+    fill_col(&mut t, 0, HEIGHT - 1, ASSET, w.inputs[0].asset);
+
     // --- inputs: ownership, commitment, membership, nullifier (+ local-persistent + pos_acc) ---
     for (i, inp) in w.inputs.iter().enumerate() {
         let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
@@ -643,13 +656,14 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         a[1 + DIGEST + 2] = inp.rho[1];
         set_block(&mut t, base + 1, a);
         let chain = native_permute(a);
-        // commit_b: cm = perm([chain(4), rcm0, rcm1, 0, 0]).
+        // commit_b: cm = perm([chain(4), rcm0, rcm1, asset, 0]).
         let mut b = [Val::ZERO; 8];
         b[..DIGEST].copy_from_slice(&chain[..DIGEST]);
         b[DIGEST] = inp.rcm[0];
         b[DIGEST + 1] = inp.rcm[1];
+        b[DIGEST + 2] = inp.asset;
         set_block(&mut t, base + 2, b);
-        let mut node = commit(recipient, value, inp.rho, inp.rcm); // = perm(b)[..DIGEST]
+        let mut node = commit(recipient, value, inp.rho, inp.rcm, inp.asset); // = perm(b)[..DIGEST]
         for d in 0..DEPTH {
             let (l, r) = if inp.bits[d] { (inp.sib[d], node) } else { (node, inp.sib[d]) };
             let mut min = [Val::ZERO; 8];
@@ -708,6 +722,7 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         ob[..DIGEST].copy_from_slice(&chain[..DIGEST]);
         ob[DIGEST] = out.rcm[0];
         ob[DIGEST + 1] = out.rcm[1];
+        ob[DIGEST + 2] = out.asset;
         set_block(&mut t, out_base(j) + 1, ob); // out_b: cm = perm(ob)[..DIGEST]
         let (lo, hi) = (out_in_row(j), out_in_row(j) + OUT_BLOCKS * BLOCK - 1);
         fill_col(&mut t, lo, hi, VAL, Val::from_u64(out.value));
@@ -814,6 +829,7 @@ pub fn demo_witness() -> Witness {
     let in_rho = |i: usize| [Val::from_u64(11 + i as u64), Val::from_u64(211 + i as u64)];
     let in_rcm = |i: usize| [Val::from_u64(100 + i as u64), Val::from_u64(300 + i as u64)];
     let in_div = |i: usize| Val::from_u64(500 + i as u64); // per-input diversifier
+    let asset = Val::from_u64(42); // single (hidden) asset for the whole tx
     let cms: Vec<[Val; DIGEST]> = (0..N_IN)
         .map(|i| {
             commit(
@@ -821,6 +837,7 @@ pub fn demo_witness() -> Witness {
                 Val::from_u64(in_values[i]),
                 in_rho(i),
                 in_rcm(i),
+                asset,
             )
         })
         .collect();
@@ -828,6 +845,7 @@ pub fn demo_witness() -> Witness {
     let inputs = core::array::from_fn(|i| Input {
         nk: nks[i],
         div: in_div(i),
+        asset,
         value: in_values[i],
         rho: in_rho(i),
         rcm: in_rcm(i),
@@ -836,6 +854,7 @@ pub fn demo_witness() -> Witness {
     });
     let outputs = core::array::from_fn(|j| Output {
         recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
+        asset,
         value: [900u64, 500][j],
         rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
         rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
@@ -949,13 +968,15 @@ mod tests {
         let in1 = (500u64, [9u64, 90u64], 13u64, 101u64, 502u64);
         let rho2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 200)];
         let rcm2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 300)];
+        let asset = Val::from_u64(42); // single hidden asset for the tx
         let cmf = |v: &(u64, [u64; 2], u64, u64, u64)| {
-            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1]), Val::from_u64(v.4)), Val::from_u64(v.0), rho2(v.2), rcm2(v.3))
+            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1]), Val::from_u64(v.4)), Val::from_u64(v.0), rho2(v.2), rcm2(v.3), asset)
         };
         let (_, paths) = build_paths(&[cmf(&in0), cmf(&in1)]);
         let mk_in = |v: (u64, [u64; 2], u64, u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
             nk: v.1,
             div: Val::from_u64(v.4),
+            asset,
             value: v.0,
             rho: rho2(v.2),
             rcm: rcm2(v.3),
@@ -964,8 +985,8 @@ mod tests {
         };
         let inputs = [mk_in(in0, &paths[0]), mk_in(in1, &paths[1])];
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), value: 900, rho: rho2(21), rcm: rcm2(22) },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), value: 500, rho: rho2(23), rcm: rcm2(24) },
+            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, value: 900, rho: rho2(21), rcm: rcm2(22) },
+            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, value: 500, rho: rho2(23), rcm: rcm2(24) },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
         Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
@@ -1011,6 +1032,7 @@ mod tests {
         let in_rho = |i: usize| [Val::from_u64(11 + i as u64), Val::from_u64(211 + i as u64)];
         let in_rcm = |i: usize| [Val::from_u64(100 + i as u64), Val::from_u64(300 + i as u64)];
         let in_div = |i: usize| Val::from_u64(500 + i as u64);
+        let asset = Val::from_u64(42); // single hidden asset for the tx
         let cms: Vec<[Val; DIGEST]> = (0..N_IN)
             .map(|i| {
                 commit(
@@ -1018,6 +1040,7 @@ mod tests {
                     Val::from_u64(in_values[i]),
                     in_rho(i),
                     in_rcm(i),
+                    asset,
                 )
             })
             .collect();
@@ -1025,6 +1048,7 @@ mod tests {
         let inputs = core::array::from_fn(|i| Input {
             nk: nk(i),
             div: in_div(i),
+            asset,
             value: in_values[i],
             rho: in_rho(i),
             rcm: in_rcm(i),
@@ -1033,6 +1057,7 @@ mod tests {
         });
         let outputs = core::array::from_fn(|j| Output {
             recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
+            asset,
             value: out_values[j],
             rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
             rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
@@ -1194,5 +1219,34 @@ mod tests {
         // must make the proof unverifiable regardless of the published statement.
         let pis = public_values(&w);
         assert!(corrupt_trace_rejected(trace, pis), "a forged commitment chaining value must not verify");
+    }
+
+    /// The hidden-asset binding must be non-vacuous: a prover must not turn the inputs' asset into a
+    /// different output asset. Forge output 0's committed asset (≠ the global ASSET) and publish the
+    /// matching out_cm, so ONLY the `lane6 == ASSET` binding is violated.
+    #[test]
+    fn output_with_mismatched_asset_is_rejected() {
+        let w = sample(); // asset = 42 on every note
+        let mut trace = build_trace(&w);
+        let out0 = w.outputs[0];
+        let alt = out0.asset + Val::ONE; // a different asset for the output
+        // recompute output 0's commit_b (out_a output = chain; lane6 = forged asset).
+        let mut oa = [Val::ZERO; 8];
+        oa[0] = Val::from_u64(DOM_CM);
+        oa[1..1 + DIGEST].copy_from_slice(&out0.recipient);
+        oa[1 + DIGEST] = Val::from_u64(out0.value);
+        oa[1 + DIGEST + 1] = out0.rho[0];
+        oa[1 + DIGEST + 2] = out0.rho[1];
+        let chain = native_permute(oa);
+        let mut ob = [Val::ZERO; 8];
+        ob[..DIGEST].copy_from_slice(&chain[..DIGEST]);
+        ob[DIGEST] = out0.rcm[0];
+        ob[DIGEST + 1] = out0.rcm[1];
+        ob[DIGEST + 2] = alt;
+        set_block(&mut trace.values, out_base(0) + 1, ob);
+        let new_cm: [Val; DIGEST] = native_permute(ob)[..DIGEST].try_into().unwrap();
+        let mut pis = public_values(&w);
+        pis[PI_OUTCM..PI_OUTCM + DIGEST].copy_from_slice(&new_cm);
+        assert!(corrupt_trace_rejected(trace, pis), "a mismatched output asset must not verify");
     }
 }

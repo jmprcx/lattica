@@ -108,10 +108,10 @@ pub fn recipient(nk0: Felt, nk1: Felt, d: Felt) Digest {
 
 /// Two-permutation commitment (128-bit note randomness; must match joinsplit_air::commit):
 ///   H1 = perm([DOM_CM, rcp(4), value, rho0, rho1]); cm = perm([H1(4), rcm0, rcm1, 0, 0]).
-pub fn commitNote(rcp: Digest, value: Felt, rho: [2]Felt, rcm: [2]Felt) Digest {
+pub fn commitNote(rcp: Digest, value: Felt, rho: [2]Felt, rcm: [2]Felt, asset: Felt) Digest {
     var a = [_]Felt{ DOM_CM, rcp[0], rcp[1], rcp[2], rcp[3], value, rho[0], rho[1] };
     permute(&a);
-    var b = [_]Felt{ a[0], a[1], a[2], a[3], rcm[0], rcm[1], 0, 0 };
+    var b = [_]Felt{ a[0], a[1], a[2], a[3], rcm[0], rcm[1], asset, 0 }; // lane6 = hidden asset id
     permute(&b);
     return b[0..4].*;
 }
@@ -163,7 +163,7 @@ test "poseidon2: permute matches the circuit (KAT)" {
 test "poseidon2: domain-tagged hashes match the circuit (KAT)" {
     const rcp = recipient(7, 70, 5);
     try testing.expectEqual(Digest{ 12117778067832875188, 10864618677725252023, 10798466789515031362, 11357075400886075001 }, rcp);
-    try testing.expectEqual(Digest{ 14056358681591825965, 5540776654529801612, 4068112119617669722, 6062265260024842144 }, commitNote(rcp, 1000, .{ 11, 211 }, .{ 100, 300 }));
+    try testing.expectEqual(Digest{ 10467251944032595743, 15951568864992726969, 686076823887839950, 2164025591647199027 }, commitNote(rcp, 1000, .{ 11, 211 }, .{ 100, 300 }, 9));
     try testing.expectEqual(Digest{ 2354178473207051117, 1485123762175440172, 16578445368892662424, 12056995742034228502 }, nullifierHash(7, 70, .{ 11, 211 }, 9));
     try testing.expectEqual(Digest{ 15506260347376358782, 2994144798473533345, 1833939590059144543, 15204941819943812974 }, merge(.{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 }));
 }

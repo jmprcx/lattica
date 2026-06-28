@@ -169,6 +169,9 @@ fn encodeWitness(
         var div_le: [8]u8 = undefined;
         std.mem.writeInt(u64, &div_le, in_.note.div, .little);
         try putFelt(&w, a, &div_le); // diversifier (recipient = H(nk ‖ div))
+        var asset_le: [8]u8 = undefined;
+        std.mem.writeInt(u64, &asset_le, in_.note.asset, .little);
+        try putFelt(&w, a, &asset_le); // hidden asset id
         try putU64(&w, a, in_.note.value);
         try putFelt(&w, a, in_.note.rho[0..8]);
         try putFelt(&w, a, in_.note.rho[8..16]); // rho limb 1 (128-bit)
@@ -180,6 +183,9 @@ fn encodeWitness(
     }
     for (out_notes) |o| {
         try putDigest(&w, a, o.recipient);
+        var oa_le: [8]u8 = undefined;
+        std.mem.writeInt(u64, &oa_le, o.asset, .little);
+        try putFelt(&w, a, &oa_le); // hidden asset id
         try putU64(&w, a, o.value);
         try putFelt(&w, a, o.rho[0..8]);
         try putFelt(&w, a, o.rho[8..16]);
