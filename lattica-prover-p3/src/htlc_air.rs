@@ -1,12 +1,12 @@
 //! # htlc_air — v3 shielded HTLC spend circuit (redeem / refund)
 //!
-//! **Status: in-circuit HTLC spend implemented except the timeout compare.** The AIR proves/verifies
-//! HTLC notes: owner = htlc_root (span-end chain over redeem_tag/refund_tag/hashlock/timeout, carried
-//! into commit_a via the OWNER columns), note_type-gated commitment + mode-independent owner-nullifier,
-//! the spend access control (tag-match: claim == mode-selected party), and the redeem hashlock binding
-//! (== public redeem_hashlock = SHA256(preimage)). All positive + negative tested. **Remaining: the
-//! timeout compare (redeem height<timeout / refund height>=timeout) via a range argument on
-//! current_height vs the committed timeout (PI_HEIGHT is already a public input).**
+//! **Status: in-circuit HTLC spend COMPLETE** (pending external audit). The AIR proves/verifies HTLC
+//! notes: owner = htlc_root (span-end chain over redeem_tag/refund_tag/hashlock/timeout, carried into
+//! commit_a via the OWNER columns), note_type-gated commitment + mode-independent owner-nullifier, the
+//! spend access control (tag-match: claim == mode-selected party), the redeem hashlock binding (==
+//! public redeem_hashlock = SHA256(preimage)), and the time-lock (redeem height<timeout / refund
+//! height>=timeout via a range argument on current_height vs the committed timeout). All positive +
+//! adversarial-negative tested. Remaining for v3: the ShieldedHtlcTx node integration + the v3 audit.
 //!
 //! This started as a faithful clone of `joinsplit_air` (the audited v1 circuit)
 //! so the HTLC circuit reuses its proven machinery — Poseidon2 blocks, the two-permutation commitment
