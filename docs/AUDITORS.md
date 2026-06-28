@@ -1,24 +1,33 @@
 # Lattica — external audit handoff (start here)
 
 Lattica is a **quantum-safe, Zcash-style shielded transaction layer** (it replaces Zcash
-Sapling/Orchard): a Plonky3 zero-knowledge **join-split** circuit + a Zig protocol layer, on a
-shielded-only value model. This is the entry point for the external security audit of the **v1
-single-asset** protocol. Read this first, then the deep-dive docs in §4.
+Sapling/Orchard): a Plonky3 zero-knowledge circuit + a Zig protocol layer, on a shielded-only value
+model. This is the entry point for the external security audit. Read this first, then the deep-dive
+docs in §4.
 
-> **Audit commit:** the tip of this branch (single-asset v1). Forward-looking multi-asset / bridge /
-> cross-chain work is deliberately **not** on this branch (see §6) — the audit is the gate before it.
+> **This branch is the v3 audit artifact.** It is the audited+remediated **v1 single-asset** protocol
+> (the join-split circuit) **plus the v3 shielded-HTLC layer**: a hidden asset id committed in every
+> note, and an `htlc_air` spend circuit + `ShieldedHtlcTx` node path that let two parties redeem/refund
+> a shielded HTLC note **with the asset type hidden on-chain** (the rubble leg of a noncustodial
+> rubble↔BTC atomic swap). v1 was already audited+remediated (three Codex rounds, all verified — see
+> §5); v3 builds on that, preserving every v1 remediation invariant. The cross-repo xchain swap stack
+> (`rubble-xchain-xfer`) and host chain (`rubble-node-zig`) remain **out of scope** (see §7).
 
 ## 1. What to audit (scope)
 
 **In scope:**
-- **The circuit** — `lattica-prover-p3/src/joinsplit_air.rs` (the single production AIR: the N-in/M-out
-  join-split statement), with building blocks `poseidon2_air.rs` (the Poseidon2-Goldilocks permutation
-  AIR) and `spend_air.rs`. The verify/prove **C ABI** + (de)serialization + canonical field parsing in
-  `lattica-prover-p3/src/lib.rs`.
-- **The Zig protocol seam** — `src/poseidon2.zig` (on-chain hashing, must equal the circuit),
-  `src/{tx,tree,primitives}.zig` (note model, commitment, nullifier, Merkle tree, key hierarchy +
-  diversified addresses + incoming viewing key), `src/node.zig` (the shielded-tx state machine:
-  verify→anchor→nullifier→apply), `src/ffi.zig` (the fail-closed verifier/prover boundary).
+- **The circuits** — `lattica-prover-p3/src/joinsplit_air.rs` (the v1 N-in/M-out join-split statement,
+  now with the substrate's hidden `asset`) **and `htlc_air.rs` (v3: the shielded-HTLC spend — a superset
+  of join-split adding the HTLC note type, `htlc_root` owner, redeem/refund modes, the time-lock, the
+  hashlock binding, and the mode-independent nullifier)**, with building blocks `poseidon2_air.rs` (the
+  Poseidon2-Goldilocks permutation AIR) and `spend_air.rs`. The verify/prove **C ABI** + (de)serialization
+  + canonical field parsing in `lattica-prover-p3/src/lib.rs` (both the `joinsplit_*` and `htlc_*` ABIs).
+- **The Zig protocol seam** — `src/poseidon2.zig` (on-chain hashing incl. `htlcRoot`/`nullifierHtlc` +
+  the `note_type` lane, must equal the circuit), `src/{tx,tree,primitives}.zig` (note model + the
+  `note_type` field, commitment, nullifier, Merkle tree, key hierarchy + diversified addresses +
+  incoming viewing key), `src/node.zig` (the shielded-tx state machine: verify→anchor→nullifier→apply,
+  incl. **`ShieldedHtlcTx` + `Chain.applyHtlc` + the `buildHtlcSpend` wallet flow**), `src/ffi.zig` (the
+  fail-closed verifier/prover boundary, incl. `verifyHtlc`/`proveHtlc`).
 
 Detailed file/line scope, trust model, frozen parameters, and the readiness checklist are in
 **`docs/audit-scope-p3.md`** (§1–§7).
@@ -44,6 +53,15 @@ forward-looking roadmap docs (§6).
   reject) and **panic-isolated** (malformed proofs reject, never UB across the C ABI).
 - **Keys** — diversified addresses (unlinkable per-payment) + a delegatable **incoming viewing key**
   (detect/decrypt without spend authority).
+- **v3 shielded HTLC** (`htlc_air`) — an HTLC note's owner is `htlc_root = H(DOM_HTLC ‖ redeem_tag ‖
+  refund_tag ‖ hashlock ‖ timeout)`, committed (so the terms are immutable). A spend proves: the
+  correct **party** for the mode (redeem ⇒ owns `redeem_tag`, refund ⇒ owns `refund_tag`); the
+  **time-lock** (redeem ⟺ `height < timeout`, refund ⟺ `height ≥ timeout`, via a range argument, no
+  wrap); on redeem, the committed `hashlock == redeem_hashlock` public input (= `SHA256(preimage)`, the
+  cross-chain atomic link); the **hidden asset** is preserved (`input.asset == output.asset`); and —
+  critically — the nullifier is **owner-based and mode/party-independent** (`nf = H(DOM_NF_HTLC ‖ owner
+  ‖ rho ‖ pos)`), so one HTLC note has **exactly one nullifier** across both spend windows (no
+  redeem-and-refund double-spend). The asset type stays hidden on-chain throughout.
 
 ## 3. Build, test & reproduce
 
@@ -51,15 +69,17 @@ Toolchain: **Rust 1.96** (edition 2021, no pinned toolchain), **Zig 0.16.0**, a 
 here) for the cross-language link.
 
 ```sh
-# 1. Circuit + ABI tests (incl. adversarial corrupted-trace soundness tests).
+# 1. Circuit + ABI tests (incl. adversarial corrupted-trace soundness tests, the htlc_air redeem/
+#    refund + negative tests, and the htlc prove/verify C-ABI round-trips). 66 tests.
 cd lattica-prover-p3 && cargo test --release
 
 # 2. The Zig protocol suite — incl. the Poseidon2 KATs that pin on-chain == circuit byte-for-byte.
 zig build test            # (from the repo root)
 
 # 3. The REAL cross-language path: prove (Rust) → verify (Rust) → tamper-reject → double-spend-reject,
-#    plus the live node driving the real prover/verifier in-process. Builds the Zig side as an object
-#    and links with the system cc (see the caveat below).
+#    plus the live node driving the real prover/verifier in-process — for BOTH join-split AND a v3 HTLC
+#    redeem (Zig builds the witness → Rust proves → node verifies/applies; refund-before-timeout is
+#    rejected by the real prover). Builds the Zig side as an object and links with the system cc.
 scripts/run-real-integration.sh
 
 # 4. Regenerate the Poseidon2 known-answer vectors and re-confirm Zig == circuit.
@@ -84,6 +104,10 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
 2. **`docs/joinsplit-constraint-audit.md`** — the **constraint-by-constraint** self-audit: every
    committed column, why each binding is non-vacuous, and the public-output soundness chain. The core
    correctness argument.
+2a. **`docs/htlc-constraint-audit.md`** (v3) — the same treatment for `htlc_air`, covering only the
+   **deltas** over join-split: the `note_type`/`htlc_root`/owner-MUX/tag-match/hashlock/timeout columns
+   and constraints, and especially the **mode-independent-nullifier** double-spend argument. Read after
+   the join-split audit.
 3. **`docs/soundness-budget.md`** — the C-04 proven/conjectured security accounting (~103 / ~127-bit).
 4. **`docs/protocol-v1-decisions.md`** — the deliberate v1 parameter decisions + limitations
    (single-asset, key model, note randomness, issuance, the deterministic-encryption interaction).
@@ -132,12 +156,24 @@ independent review especially in the areas below.
   between `node.zig`/`lib.rs` (the node reconstructs the public inputs; a mismatch is silent without
   the real backend linked).
 - **The verify boundary** (`ffi.zig` + `lib.rs`) — fail-closed + panic-isolation on adversarial proof
-  bytes.
+  bytes (now also `verifyHtlc` + the htlc public-input/witness codecs).
 - **Double-spend / nullifier** logic in `node.zig` + the A1 position binding.
+- **(v3) `htlc_air` soundness** (`docs/htlc-constraint-audit.md`) — focus on: the
+  **mode-independent owner-nullifier** (the property that prevents a redeem-AND-refund double-spend —
+  the highest-stakes v3 invariant); the **timeout compare** (direction + no field-wrap — a bug = a
+  wrong-time spend, breaking swap safety); the `note_type`-gated MUXes being mutually exclusive and
+  non-vacuous; and the **redeem hashlock binding** + its off-circuit SHA256 trust boundary (the node
+  computes `redeem_hashlock = SHA256(preimage)`; the circuit proves equality only). Corrupted-trace
+  negatives (`htlc_*_rejected`, the timeout/party/hashlock tests) probe these; extend adversarially.
+- **(v3) `current_height` trust** — it is a node-pinned public input (`applyHtlc` rejects a mismatch);
+  confirm the node cannot be made to validate at an attacker-chosen height, and that the `height <
+  2^BITS` assumption the timeout argument relies on holds.
 
 ## 7. Out of scope — forward-looking roadmap (NOT audited)
 
-`docs/multi-asset-exchanges-issuance-cto.md` (multi-asset, exchange integration, issuance/bridging
-designs) and the shielded-cross-chain-swap plan are **future work**, gated *behind* this audit. The
-multi-asset substrate (a first step) is parked on the `v3/multi-asset` branch, intentionally excluded
-from this audit artifact.
+The **cross-repo xchain swap stack** (`rubble-xchain-xfer`: the HTLC engine, the shielded backend, the
+P2P swap protocol/versioning that drive a rubble↔BTC swap over `htlc_air`) and the **host chain**
+(`rubble-node-zig`: block consensus/PoW/mempool/networking, committed roots, reorg undo, emission) are
+**future / separate-repo work**, not part of this artifact. `docs/multi-asset-exchanges-issuance-cto.md`
+(exchange integration, issuance/bridging beyond the single-hidden-asset substrate) is also future
+design. The v3 audit gate covers the lattica side: `htlc_air` + `ShieldedHtlcTx` + their seam.
