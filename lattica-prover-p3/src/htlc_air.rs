@@ -356,18 +356,22 @@ const P_HTLC_LINK: usize = 31; // htlc blocks 0,1,2 OUTPUT: chain link out[0..4]
 const P_HTLC_IN3: usize = 32; // htlc block 3 input: capacity lanes 5,6,7 = 0
 const P_HTLC_ROOT: usize = 33; // htlc block 3 OUTPUT = htlc_root (owner gate when HTLC)
 const P_HTLC_IN1: usize = 34; // htlc block 1 input (refund_tag in lanes 4..8 — for the refund tag-match)
-const P_NULLOUT: usize = 35; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 35 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 35 + N_IN + M_OUT;
+const P_HTLC_IN2: usize = 35; // htlc block 2 input (hashlock in lanes 4..8 — for the redeem hashlock bind)
+const P_NULLOUT: usize = 36; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 36 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 36 + N_IN + M_OUT;
 
-// public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
+// public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4) ‖
+//                current_height(1) ‖ redeem_hashlock(4)
 const PI_ANCHOR: usize = 0;
 const PI_NF: usize = 4;
 const PI_OUTCM: usize = 4 + N_IN * DIGEST;
 const PI_FEE: usize = 4 + N_IN * DIGEST + M_OUT * DIGEST;
 const PI_MINT: usize = PI_FEE + 1;
 const PI_TXBIND: usize = PI_MINT + 1;
-const N_PUBLIC: usize = PI_TXBIND + DIGEST;
+const PI_HEIGHT: usize = PI_TXBIND + DIGEST; // current block height (HTLC timeout compare)
+const PI_HASHLOCK: usize = PI_HEIGHT + 1; // SHA256(preimage) = the redeemed note's committed hashlock
+const N_PUBLIC: usize = PI_HASHLOCK + DIGEST;
 
 const fn input_base(i: usize) -> usize {
     i * SPAN_BLOCKS
@@ -523,6 +527,8 @@ fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&htlc_root_out)); // P_HTLC_ROOT
     let htlc_in1: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 1) * BLOCK).collect();
     cols.push(one_hot(&htlc_in1)); // P_HTLC_IN1
+    let htlc_in2: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 2) * BLOCK).collect();
+    cols.push(one_hot(&htlc_in2)); // P_HTLC_IN2
     for i in 0..N_IN {
         cols.push(one_hot(&[null_out_row(i)])); // P_NULLOUT + i
     }
@@ -682,6 +688,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         let h1 = p[P_HTLC_IN1].clone();
         for k in 0..DIGEST {
             builder.assert_zero(h1.clone() * nt.clone() * (one.clone() - mode.clone()) * (cur[DIGEST + k].clone() - cur[CLAIM0 + k].clone()));
+        }
+        // HTLC redeem: the note's hashlock (block 2 input lanes 4..8) == public redeem_hashlock =
+        // SHA256(preimage). The cross-chain atomic link — the node checks the revealed preimage hashes
+        // to it. Bound only on redeem (refund needs no preimage).
+        let h2 = p[P_HTLC_IN2].clone();
+        for k in 0..DIGEST {
+            builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - pis[PI_HASHLOCK + k].clone()));
         }
 
         // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
@@ -1033,6 +1046,15 @@ pub fn public_values(w: &Witness) -> Vec<Val> {
     pis[PI_FEE] = Val::from_u64(w.fee);
     pis[PI_MINT] = Val::from_u64(w.mint);
     pis[PI_TXBIND..PI_TXBIND + DIGEST].copy_from_slice(&w.tx_binding);
+    pis[PI_HEIGHT] = Val::from_u64(w.current_height);
+    // redeem_hashlock = SHA256(preimage) = the redeemed HTLC note's committed hashlock (node computes
+    // it from the publicly-revealed preimage). Bound in-circuit only for an HTLC redeem input.
+    for inp in w.inputs.iter() {
+        if inp.note_type == Val::from_u64(NOTE_HTLC) && inp.mode == Val::from_u64(1) {
+            pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST].copy_from_slice(&inp.hashlock);
+            break;
+        }
+    }
     pis
 }
 
@@ -1615,6 +1637,18 @@ mod tests {
         }
         let pis = public_values(&w);
         assert!(corrupt_trace_rejected(trace, pis), "refund party must not pass the redeem tag-match");
+    }
+
+    /// Atomicity: a redeem must reveal the preimage of the committed hashlock. Prove a valid redeem,
+    /// then verify against a wrong public redeem_hashlock — the hashlock binding must reject.
+    #[test]
+    fn htlc_redeem_wrong_hashlock_is_rejected() {
+        let hl = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+        let w = htlc_witness(true, 5, hl, 10);
+        let trace = build_trace(&w);
+        let mut pis = public_values(&w);
+        pis[PI_HASHLOCK] += Val::ONE; // a hashlock the revealed preimage does NOT hash to
+        assert!(corrupt_trace_rejected(trace, pis), "redeem with a wrong hashlock must not verify");
     }
 
     #[test]
