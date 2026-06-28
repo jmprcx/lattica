@@ -182,6 +182,149 @@ pub fn encode_joinsplit_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// --- HTLC (v3 shielded HTLC spend) C ABI ------------------------------------------------------
+
+/// `HtlcPublicInputs` byte layout: anchor(32) ‖ N·nullifier(32) ‖ M·out_cm(32) ‖ tx_binding(32) ‖
+/// fee(8 LE) ‖ mint(8 LE) ‖ current_height(8 LE) ‖ redeem_hashlock(32). Parsed into the htlc_air
+/// public-input vector (circuit order: …, fee, mint, tx_binding, current_height, redeem_hashlock).
+const HTLC_PUBLIC_INPUTS_LEN: usize =
+    DIGEST_BYTES * (2 + htlc_air::N_IN + htlc_air::M_OUT) + 8 + 8 + 8 + DIGEST_BYTES;
+
+fn parse_htlc_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
+    if b.len() != HTLC_PUBLIC_INPUTS_LEN {
+        return None;
+    }
+    let mut pis = Vec::with_capacity(htlc_air::NUM_PUBLIC_INPUTS);
+    let mut off = 0;
+    push_digest(&b[off..off + 32], &mut pis)?; // anchor
+    off += 32;
+    for _ in 0..htlc_air::N_IN {
+        push_digest(&b[off..off + 32], &mut pis)?; // nf_i
+        off += 32;
+    }
+    for _ in 0..htlc_air::M_OUT {
+        push_digest(&b[off..off + 32], &mut pis)?; // out_cm_j
+        off += 32;
+    }
+    let mut txb = Vec::with_capacity(4);
+    push_digest(&b[off..off + 32], &mut txb)?; // tx_binding (bytes order: before fee/mint)
+    off += 32;
+    pis.push(parse_felt(&b[off..off + 8])?); // fee
+    off += 8;
+    pis.push(parse_felt(&b[off..off + 8])?); // mint
+    off += 8;
+    pis.extend_from_slice(&txb); // tx_binding (circuit order: after fee/mint)
+    pis.push(parse_felt(&b[off..off + 8])?); // current_height
+    off += 8;
+    push_digest(&b[off..off + 32], &mut pis)?; // redeem_hashlock
+    Some(pis)
+}
+
+/// Encode the htlc_air public-input vector into the byte layout (inverse of `parse_htlc_public_inputs`).
+pub fn encode_htlc_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
+    if pis.len() != htlc_air::NUM_PUBLIC_INPUTS {
+        return None;
+    }
+    let d = htlc_air::DIGEST;
+    let n = htlc_air::N_IN;
+    let m = htlc_air::M_OUT;
+    let mut out = vec![0u8; HTLC_PUBLIC_INPUTS_LEN];
+    let put = |dst: &mut [u8], felts: &[Goldilocks]| {
+        for (k, f) in felts.iter().enumerate() {
+            dst[k * 8..k * 8 + 8].copy_from_slice(&f.as_canonical_u64().to_le_bytes());
+        }
+    };
+    let mut off = 0;
+    put(&mut out[off..off + 32], &pis[0..d]); // anchor
+    off += 32;
+    for i in 0..n {
+        put(&mut out[off..off + 32], &pis[d + i * d..d + (i + 1) * d]); // nf_i
+        off += 32;
+    }
+    let oc = d + n * d;
+    for j in 0..m {
+        put(&mut out[off..off + 32], &pis[oc + j * d..oc + (j + 1) * d]); // out_cm_j
+        off += 32;
+    }
+    // circuit order from fee_idx: fee, mint, tx_binding(d), current_height, redeem_hashlock(d)
+    let fee_idx = oc + m * d;
+    put(&mut out[off..off + 32], &pis[fee_idx + 2..fee_idx + 2 + d]); // tx_binding
+    off += 32;
+    out[off..off + 8].copy_from_slice(&pis[fee_idx].as_canonical_u64().to_le_bytes()); // fee
+    off += 8;
+    out[off..off + 8].copy_from_slice(&pis[fee_idx + 1].as_canonical_u64().to_le_bytes()); // mint
+    off += 8;
+    out[off..off + 8].copy_from_slice(&pis[fee_idx + 2 + d].as_canonical_u64().to_le_bytes()); // current_height
+    off += 8;
+    put(&mut out[off..off + 32], &pis[fee_idx + 2 + d + 1..fee_idx + 2 + d + 1 + d]); // redeem_hashlock
+    Some(out)
+}
+
+/// C ABI: verify a serialized **HTLC** proof against `HtlcPublicInputs` bytes. `0` accept / nonzero
+/// reject; fail-closed + panic-isolated + proof-size-bounded, exactly like `lattica_joinsplit_verify`.
+///
+/// # Safety
+/// `proof_ptr`/`pi_ptr` must point to `proof_len`/`pi_len` readable bytes (or be null).
+#[no_mangle]
+pub unsafe extern "C" fn lattica_htlc_verify(
+    proof_ptr: *const u8,
+    proof_len: usize,
+    pi_ptr: *const u8,
+    pi_len: usize,
+) -> i32 {
+    if proof_ptr.is_null() || pi_ptr.is_null() {
+        return 1;
+    }
+    if proof_len > MAX_PROOF_LEN {
+        return 1;
+    }
+    let proof = slice::from_raw_parts(proof_ptr, proof_len);
+    let pib = slice::from_raw_parts(pi_ptr, pi_len);
+    let pis = match parse_htlc_public_inputs(pib) {
+        Some(p) => p,
+        None => return 1,
+    };
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_air::verify_bytes(proof, &pis)));
+    if matches!(ok, Ok(true)) {
+        0
+    } else {
+        1
+    }
+}
+
+/// C ABI: prove the fixed demo HTLC-redeem witness, writing the proof + `HtlcPublicInputs` bytes.
+/// For the end-to-end FFI integration test. Returns 0 ok, 1 encode failure, 2 if a buffer is too small.
+///
+/// # Safety
+/// The four pointers must be valid; `*_out` to `*_cap` writable bytes; the `len` pointers writable.
+#[no_mangle]
+pub unsafe extern "C" fn lattica_htlc_prove_demo(
+    proof_out: *mut u8,
+    proof_cap: usize,
+    proof_len: *mut usize,
+    pi_out: *mut u8,
+    pi_cap: usize,
+    pi_len: *mut usize,
+) -> i32 {
+    if proof_out.is_null() || pi_out.is_null() || proof_len.is_null() || pi_len.is_null() {
+        return 1;
+    }
+    let w = htlc_air::demo_htlc_witness();
+    let proof = htlc_air::prove_to_bytes(&w);
+    let pib = match encode_htlc_public_inputs(&htlc_air::public_values(&w)) {
+        Some(b) => b,
+        None => return 1,
+    };
+    if proof.len() > proof_cap || pib.len() > pi_cap {
+        return 2;
+    }
+    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
+    *proof_len = proof.len();
+    core::ptr::copy_nonoverlapping(pib.as_ptr(), pi_out, pib.len());
+    *pi_len = pib.len();
+    0
+}
+
 // --- wallet-side prover ABI -------------------------------------------------------------------
 
 /// Canonical wallet→prover witness byte layout. Per input: nk0,nk1 (u64 LE) ‖ div (felt) ‖ value
@@ -514,6 +657,42 @@ mod tests {
         let buf = [0u8; 8];
         assert_ne!(
             unsafe { lattica_joinsplit_verify(buf.as_ptr(), MAX_PROOF_LEN + 1, pib.as_ptr(), pib.len()) },
+            0
+        );
+    }
+
+    #[test]
+    fn htlc_c_abi_roundtrip() {
+        let w = crate::htlc_air::demo_htlc_witness();
+        let proof = crate::htlc_air::prove_to_bytes(&w);
+        let pis = crate::htlc_air::public_values(&w);
+        let pib = encode_htlc_public_inputs(&pis).unwrap();
+        assert_eq!(pib.len(), HTLC_PUBLIC_INPUTS_LEN);
+        assert_eq!(parse_htlc_public_inputs(&pib).unwrap(), pis);
+        // accept the real proof against the encoded public inputs
+        assert_eq!(
+            unsafe { lattica_htlc_verify(proof.as_ptr(), proof.len(), pib.as_ptr(), pib.len()) },
+            0
+        );
+        // tamper the redeem_hashlock public input (last limb) → reject
+        let mut bad = pis.clone();
+        let last = bad.len() - 1;
+        bad[last] += Goldilocks::ONE;
+        let badb = encode_htlc_public_inputs(&bad).unwrap();
+        assert_ne!(
+            unsafe { lattica_htlc_verify(proof.as_ptr(), proof.len(), badb.as_ptr(), badb.len()) },
+            0
+        );
+        // demo prover ABI → proof verifies against its returned public inputs
+        let mut pbuf = vec![0u8; 1 << 20];
+        let mut pibuf = vec![0u8; 512];
+        let (mut pl, mut pil) = (0usize, 0usize);
+        let rc = unsafe {
+            lattica_htlc_prove_demo(pbuf.as_mut_ptr(), pbuf.len(), &mut pl, pibuf.as_mut_ptr(), pibuf.len(), &mut pil)
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(
+            unsafe { lattica_htlc_verify(pbuf.as_ptr(), pl, pibuf.as_ptr(), pil) },
             0
         );
     }

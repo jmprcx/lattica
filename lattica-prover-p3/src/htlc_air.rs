@@ -1194,6 +1194,39 @@ pub fn demo_witness() -> Witness {
     Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: 0 }
 }
 
+/// A demo HTLC **redeem** witness (input 0 = an HTLC note redeemed before timeout by the redeem party;
+/// input 1 = a zero-value PLAIN dummy) for the C-ABI / integration prove path.
+pub fn demo_htlc_witness() -> Witness {
+    let asset = Val::from_u64(42);
+    let (nk_r, div_r) = ([7u64, 70u64], Val::from_u64(1));
+    let (nk_f, div_f) = ([9u64, 90u64], Val::from_u64(2));
+    let redeem_tag = recipient_of(Val::from_u64(nk_r[0]), Val::from_u64(nk_r[1]), div_r);
+    let refund_tag = recipient_of(Val::from_u64(nk_f[0]), Val::from_u64(nk_f[1]), div_f);
+    let hashlock = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+    let (timeout, height) = (10u64, 5u64);
+    let owner = htlc_root(redeem_tag, refund_tag, hashlock, Val::from_u64(timeout));
+    let (v, rho, rcm) = (1000u64, [Val::from_u64(11), Val::from_u64(211)], [Val::from_u64(100), Val::from_u64(300)]);
+    let cm0 = commit(owner, Val::from_u64(v), rho, rcm, asset, Val::from_u64(NOTE_HTLC));
+    let (drho, drcm) = ([Val::from_u64(13), Val::from_u64(213)], [Val::from_u64(101), Val::from_u64(301)]);
+    let d_rcp = recipient_of(Val::from_u64(nk_r[0]), Val::from_u64(nk_r[1]), div_r);
+    let cm1 = commit(d_rcp, Val::ZERO, drho, drcm, asset, Val::ZERO);
+    let (_, paths) = build_paths(&[cm0, cm1]);
+    let in0 = Input {
+        nk: nk_r, div: div_r, asset, note_type: Val::from_u64(NOTE_HTLC), value: v, rho, rcm,
+        sib: paths[0].0, bits: paths[0].1, mode: Val::from_u64(1), redeem_tag, refund_tag, hashlock, timeout,
+    };
+    let in1 = Input {
+        nk: nk_r, div: div_r, asset, note_type: Val::ZERO, value: 0, rho: drho, rcm: drcm,
+        sib: paths[1].0, bits: paths[1].1, mode: Val::ZERO,
+        redeem_tag: [Val::ZERO; DIGEST], refund_tag: [Val::ZERO; DIGEST], hashlock: [Val::ZERO; DIGEST], timeout: 0,
+    };
+    let outputs = [
+        Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: v, rho: [Val::from_u64(21), Val::from_u64(221)], rcm: [Val::from_u64(22), Val::from_u64(222)] },
+        Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 0, rho: [Val::from_u64(23), Val::from_u64(223)], rcm: [Val::from_u64(24), Val::from_u64(224)] },
+    ];
+    Witness { inputs: [in0, in1], outputs, fee: 0, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: height }
+}
+
 /// (proof bytes, prove ms, verify ms, proven security bits) for a representative join-split.
 pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
     let config = make_config();
