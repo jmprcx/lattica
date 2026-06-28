@@ -16,6 +16,10 @@ extern int32_t lattica_joinsplit_prove_demo(uint8_t *proof, size_t proof_cap, si
                                             uint8_t *pi, size_t pi_cap, size_t *pi_len);
 extern int32_t lattica_joinsplit_verify(const uint8_t *proof, size_t proof_len,
                                         const uint8_t *pi, size_t pi_len);
+extern int32_t lattica_htlc_prove_demo(uint8_t *proof, size_t proof_cap, size_t *proof_len,
+                                       uint8_t *pi, size_t pi_cap, size_t *pi_len);
+extern int32_t lattica_htlc_verify(const uint8_t *proof, size_t proof_len,
+                                   const uint8_t *pi, size_t pi_len);
 
 #define DIGEST 32
 /* a trivial nullifier set */
@@ -56,7 +60,20 @@ int main(void) {
     if (apply_spend(proof, proof_len, pi, pi_len)) { printf("FAIL double-spend-accepted\n"); return 1; }
     printf("double spend (replay): REJECT\n");
 
+    /* --- v3 HTLC: REAL prove -> verify -> tamper-reject (reuses the proof buffer) --- */
+    size_t hpl = 0, hpil = 0;
+    uint8_t hpi[256];
+    if (lattica_htlc_prove_demo(proof, 1 << 20, &hpl, hpi, sizeof hpi, &hpil)) { printf("FAIL htlc prove\n"); return 1; }
+    if (hpil != 248) { printf("FAIL htlc pi_len=%zu\n", hpil); return 1; }
+    printf("htlc proved: proof=%zu bytes, pi=%zu bytes\n", hpl, hpil);
+    if (lattica_htlc_verify(proof, hpl, hpi, hpil) != 0) { printf("FAIL htlc verify-valid\n"); return 1; }
+    printf("htlc verify(real redeem proof): ACCEPT\n");
+    uint8_t ho = hpi[hpil - 1]; hpi[hpil - 1] ^= 1; /* tamper redeem_hashlock (last field) */
+    if (lattica_htlc_verify(proof, hpl, hpi, hpil) == 0) { printf("FAIL htlc tamper-accepted\n"); return 1; }
+    hpi[hpil - 1] = ho;
+    printf("htlc verify(tampered redeem_hashlock): REJECT\n");
+
     free(proof);
-    printf("OK: prove -> verify -> tamper-reject -> double-spend-reject\n");
+    printf("OK: prove -> verify -> tamper-reject -> double-spend-reject (join-split + HTLC)\n");
     return 0;
 }

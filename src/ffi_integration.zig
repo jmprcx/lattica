@@ -31,6 +31,20 @@ extern fn lattica_joinsplit_verify(
     pi: [*]const u8,
     pi_len: usize,
 ) callconv(.c) i32;
+extern fn lattica_htlc_prove_demo(
+    proof_out: [*]u8,
+    proof_cap: usize,
+    proof_len: *usize,
+    pi_out: [*]u8,
+    pi_cap: usize,
+    pi_len: *usize,
+) callconv(.c) i32;
+extern fn lattica_htlc_verify(
+    proof: [*]const u8,
+    proof_len: usize,
+    pi: [*]const u8,
+    pi_len: usize,
+) callconv(.c) i32;
 
 const NullifierSet = std.AutoHashMap([32]u8, void);
 
@@ -81,4 +95,38 @@ test "ffi integration: prove(rust) -> verify -> double-spend rejected" {
     const nfs = [_][32]u8{ nf_a, nf_b };
     try testing.expect(try applySpend(&set, proof_bytes, pi_bytes, &nfs)); // first spend accepted
     try testing.expect(!(try applySpend(&set, proof_bytes, pi_bytes, &nfs))); // replay rejected
+}
+
+test "ffi integration: real HTLC prove(rust) -> verify -> tamper rejected" {
+    const a = testing.allocator;
+
+    // 1. Prove the demo HTLC redeem in Rust, across the C ABI.
+    const proof = try a.alloc(u8, 1 << 20);
+    defer a.free(proof);
+    var pi: [256]u8 = undefined;
+    var proof_len: usize = 0;
+    var pi_len: usize = 0;
+    try testing.expectEqual(@as(i32, 0), lattica_htlc_prove_demo(proof.ptr, proof.len, &proof_len, &pi, pi.len, &pi_len));
+    try testing.expectEqual(ffi.HtlcPublicInputs.ENCODED_LEN, pi_len);
+    const pb = proof[0..proof_len];
+    const pib = pi[0..pi_len];
+
+    // 2. The real Rust HTLC verifier accepts the real proof (the node's verifyHtlc seam).
+    ffi.setHtlcBackend(&lattica_htlc_verify);
+    try testing.expectEqual(@as(i32, 0), lattica_htlc_verify(pb.ptr, pb.len, pib.ptr, pib.len));
+
+    // 3. C-03: the demo HTLC note's owner = htlc_root(redeem_tag, refund_tag, hashlock, timeout) and
+    //    its owner-based nullifier (Zig poseidon2) equal the circuit's public inputs. Demo: redeem
+    //    party (7,70,div=1), refund party (9,90,div=2), hashlock [81,82,83,84], timeout 10, rho (11,211).
+    const rt = poseidon2.recipient(7, 70, 1);
+    const ft = poseidon2.recipient(9, 90, 2);
+    const owner = poseidon2.htlcRoot(rt, ft, .{ 81, 82, 83, 84 }, 10);
+    const nf0 = poseidon2.digestBytes(poseidon2.nullifierHtlc(owner, .{ 11, 211 }, 0));
+    try testing.expectEqualSlices(u8, nf0[0..], pib[32..64]); // nf_0 (after the anchor)
+    const hl = poseidon2.digestBytes(.{ 81, 82, 83, 84 });
+    try testing.expectEqualSlices(u8, hl[0..], pib[pi_len - 32 .. pi_len]); // redeem_hashlock (last field)
+
+    // 4. Tampered public inputs are rejected by the real verifier.
+    pi[0] +%= 1;
+    try testing.expect(lattica_htlc_verify(pb.ptr, pb.len, pib.ptr, pib.len) != 0);
 }
