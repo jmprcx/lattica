@@ -116,11 +116,12 @@ allowed a forged second nullifier per note. Each has a regression test.
 
 **Implementation audit + remediation re-audit (Codex, 2026-06-28):** see
 `docs/lattica-implementation-audit.md` and read the newest current re-audit section first. The original
-**critical ghost-coin bug (C-01)** remains remediated, and Round 2 live-node fixes for state-update
-atomicity, transmitted-note ownership, and admission size checks were verified. Production is still
-blocked on full-node consensus integration plus hardening of the reusable verifier boundary,
-genesis/test-only issuance APIs, mock backend build gating, and stale public docs. Budget independent
-review especially in the areas below.
+**critical ghost-coin bug (C-01)** remains remediated; Round 2 live-node fixes for state-update
+atomicity, transmitted-note ownership, and admission size checks were verified; Round 3 fixes for the
+reusable verifier size cap, production compile-gating of genesis/test-only APIs and mock backends, and
+README cleanup were verified. Production remains blocked on host-chain full-node consensus integration
+(committed roots, reorg/snapshot/mempool policy, emission schedule, verifier attestation). Budget
+independent review especially in the areas below.
 
 ## 6. Highest-risk areas to focus
 

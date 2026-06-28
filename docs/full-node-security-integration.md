@@ -66,10 +66,12 @@ For each transaction, verify cheap context before proof work.
 - Chain id, epoch, feature flags, and tx version are accepted.
 - Fee policy and minimum relay fee are met.
 - Inputs, outputs, proof count, and byte size are within limits.
-- Binding signature verifies over the canonical tx digest.
+- Join-split proof is bound to the canonical `tx_binding` digest; any future host-chain signature
+  layer verifies under a separate domain.
 - Public mint/deposit/withdraw/burn fields are well formed and permitted by transaction type.
 
-**Default:** one canonical tx digest bound into every spend proof and every binding signature.  
+**Default:** one canonical tx digest (`tx_binding`) bound into every join-split proof; any host-chain
+signature or authorization layer must use a separate domain if added later.
 **Option:** separate digest domains for consensus validation, wallet authorization, and mempool policy to avoid cross-use.
 
 ### 3. Verify Shielded Spend Proofs

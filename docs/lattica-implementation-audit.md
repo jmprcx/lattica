@@ -4,6 +4,65 @@
 **Entry point:** `docs/AUDITORS.md`
 **Scope covered:** Plonky3 join-split AIR, Rust C ABI, Zig FFI seam, protocol hashing, transaction construction, node state machine, note/key/encryption code, canonical codecs, tests, and operational/security areas needed by a production full node.
 
+## Current Re-Audit (post-round-3 remediation verification, 2026-06-28)
+
+### Current Verdict
+
+Round 3 remediation was verified against the current codebase. No new Critical or High severity issue was found in the in-scope Lattica transaction stack during this pass.
+
+The following previously open live-code findings are now verified remediated:
+
+- **C-01:** output commitments remain single-source (`outputs[j].cm`) and are bound to public inputs, `tx_binding`, and tree insertion.
+- **H-03/H-04:** live node state application is two-phase/atomic and stores chain-owned transmitted-note ciphertexts.
+- **M-05/M-08:** proof-size limits are enforced both in live node admission and at the reusable Zig/Rust verifier seam.
+- **M-09/M-10:** genesis/test-only `bootstrapMint` and mock backend are compiled out for production roots via `lattica_production = true`, and `zig build check-production` verifies the production surface compiles without those helpers.
+- **L-03:** README now describes the Plonky3 join-split path instead of removed pre-Plonky3 components.
+
+Production is still **not cleared** because the full-node consensus layer remains outside this package: canonical block/transaction encoding for the active object, committed note/nullifier/supply/event roots, reorg undo, snapshot validation, mempool policy, proof-cache policy, emission schedule enforcement, and production startup attestation of the real verifier are still host-chain responsibilities. The Goldilocks soundness ceiling and deterministic note-encryption design remain deliberate v1 sign-off items.
+
+### Verification Re-Run
+
+Commands run:
+
+```sh
+cd lattica-prover-p3 && cargo test --release
+zig build test
+zig build check-production
+scripts/run-real-integration.sh
+```
+
+Results:
+
+- `cargo test --release`: passed, 31 Rust library tests plus 2 binary tests.
+- `zig build test`: passed.
+- `zig build check-production`: passed.
+- `scripts/run-real-integration.sh`: passed; C FFI harness and live Zig-node-to-real-Rust-prover/verifier path accepted a valid tx, rejected tampered output commitment, and rejected replay/double spend.
+
+### Remaining Production-Gate Items
+
+#### P-01: Host-chain full-node consensus integration remains unaudited here
+
+**Severity:** Production blocker outside this package
+**Area:** full-node consensus, block validation, replay/snapshot safety
+**Files/docs:** `docs/full-node-security-integration.md`, host chain (`rubble-node-zig`)
+
+Lattica now provides a hardened shielded transaction state machine and proof boundary, but it is still an in-memory component. A production full node must commit and replay the surrounding consensus state: canonical block/transaction bytes, tx root, note root, nullifier-set root, supply root, event root, consensus-parameter hash, reorg undo records, snapshot verification, mempool preverification, duplicate-nullifier mempool policy, proof-result caching, fee/emission schedule checks, and real-verifier startup attestation.
+
+**Required before production:**
+
+- Implement the full-node pipeline in `docs/full-node-security-integration.md`.
+- Require `lattica_production = true` for production consensus builds.
+- Attest real `lattica_joinsplit_verify` parameters/symbols at startup before accepting blocks.
+- Add genesis replay and cross-implementation root/supply comparison tests.
+
+#### L-04: Full-node integration text still referenced binding signatures
+
+**Severity:** Low documentation/integration risk
+**Area:** docs
+**File:** `docs/full-node-security-integration.md`
+
+The active v1 path uses a proof-bound canonical `tx_binding` digest, not a binding signature. One remaining line in the full-node integration plan still described the default as binding a digest into both a spend proof and binding signature. This pass corrected that wording to `tx_binding` and notes that any later host-chain signature layer must use a separate domain.
+
 ## Current Re-Audit (post-round-2 remediation, 2026-06-28)
 
 ### Current Verdict
