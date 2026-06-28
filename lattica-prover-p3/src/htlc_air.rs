@@ -1719,6 +1719,54 @@ mod tests {
         assert_eq!(redeem.nullifiers[0], refund.nullifiers[0], "HTLC nullifier must not depend on mode/party");
     }
 
+    /// Chain-level no-double-spend (the headline v3 property): a redeem AND a refund of the SAME htlc
+    /// note are each independently valid in-circuit, yet publish **byte-identical** nullifiers — so the
+    /// node's nullifier set rejects the second spend regardless of which window/party is used.
+    #[test]
+    fn htlc_redeem_and_refund_publish_the_same_nullifier() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let redeem = htlc_witness(true, 5, hl, 10);
+        let refund = htlc_witness(false, 10, hl, 10);
+        let rp = public_values(&redeem);
+        let fp = public_values(&refund);
+        assert!(verify_bytes(&prove_to_bytes(&redeem), &rp), "redeem must verify");
+        assert!(verify_bytes(&prove_to_bytes(&refund), &fp), "refund must verify");
+        assert_eq!(
+            rp[PI_NF..PI_NF + DIGEST],
+            fp[PI_NF..PI_NF + DIGEST],
+            "same note ⇒ identical published nullifier across redeem/refund (no double-spend)"
+        );
+    }
+
+    /// Regression defense (the class that hid the v1 rho1 double-spend): the HTLC nullifier is
+    /// owner-based, and OWNER is persisted from commit_a (where it = htlc_root, so cm is in the tree) to
+    /// the nullifier row. Forging a different OWNER only at the nullifier row — to mint a second,
+    /// distinct nullifier for the same note — must be caught by OWNER persistence. We keep the
+    /// nullifier-input binding satisfied (nih.owner == OWNER column) so ONLY persistence can reject it.
+    #[test]
+    fn forged_htlc_owner_nullifier_is_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let w = htlc_witness(true, 5, hl, 10); // input 0 = HTLC redeem
+        let mut trace = build_trace(&w);
+        let nr = null_in_row(0);
+        let mut owner = [Val::ZERO; DIGEST];
+        for k in 0..DIGEST {
+            owner[k] = trace.values[nr * WIDTH + OWNER0 + k]; // the real htlc_root, from the persisted column
+        }
+        let rho = w.inputs[0].rho;
+        let pos = pos_of(&w.inputs[0].bits);
+        owner[0] += Val::ONE; // forge a different owner at the nullifier row only
+        let nih = [Val::from_u64(DOM_NF_HTLC), owner[0], owner[1], owner[2], owner[3], rho[0], rho[1], pos];
+        set_block(&mut trace.values, null_block(0), nih);
+        for r in null_in_row(0)..=null_out_row(0) {
+            trace.values[r * WIDTH + OWNER0] = owner[0]; // make nih.owner==OWNER hold ⇒ only persistence is left
+        }
+        let mut pis = public_values(&w);
+        let nfp = nullifier_owner(owner, rho, pos);
+        pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&nfp);
+        assert!(corrupt_trace_rejected(trace, pis), "a forged HTLC owner-nullifier must not verify");
+    }
+
     /// In-circuit: an HTLC note (owner = htlc_root, owner-based nullifier) proves and verifies through
     /// the AIR, matching the native oracle. Exercises the span-end htlc_root chain + the owner MUX +
     /// the note_type-gated nullifier.
