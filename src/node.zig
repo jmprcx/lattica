@@ -361,9 +361,68 @@ pub fn buildTransfer(
     return t;
 }
 
-/// Serialize an HTLC spend witness (matching `lattica-prover-p3::parse_htlc_witness`): input 0 is the
-/// HTLC note (note_type = HTLC + the claimed tag/terms), input 1 a PLAIN dummy, then the outputs
-/// (each with note_type), then fee/mint/tx_binding/current_height.
+/// Write one HTLC-witness input in the canonical layout (matching `lattica-prover-p3::parse_htlc_witness`):
+/// nk0,nk1 ‖ div ‖ asset ‖ note_type ‖ value ‖ rho ‖ rcm ‖ sib[DEPTH] ‖ bits[DEPTH] ‖ mode ‖
+/// redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout. `note` supplies asset/value/rho/rcm; the htlc fields
+/// are zeroed for a PLAIN input.
+fn putHtlcInput(
+    w: *std.ArrayList(u8),
+    a: Allocator,
+    nk0: u64,
+    nk1: u64,
+    div: u64,
+    note: tx.Note,
+    note_type: u64,
+    path: tree.MerklePath,
+    position: u64,
+    mode: u64,
+    redeem_tag: Hash32,
+    refund_tag: Hash32,
+    hashlock: Hash32,
+    timeout: u64,
+) !void {
+    var le: [8]u8 = undefined;
+    try putU64(w, a, nk0);
+    try putU64(w, a, nk1);
+    std.mem.writeInt(u64, &le, div, .little);
+    try putFelt(w, a, &le);
+    std.mem.writeInt(u64, &le, note.asset, .little);
+    try putFelt(w, a, &le);
+    std.mem.writeInt(u64, &le, note_type, .little);
+    try putFelt(w, a, &le);
+    try putU64(w, a, note.value);
+    try putFelt(w, a, note.rho[0..8]);
+    try putFelt(w, a, note.rho[8..16]);
+    try putFelt(w, a, note.rcm[0..8]);
+    try putFelt(w, a, note.rcm[8..16]);
+    for (path.siblings) |sib| try putDigest(w, a, sib);
+    var d: usize = 0;
+    while (d < DEPTH) : (d += 1) try w.append(a, @intCast((position >> @intCast(d)) & 1));
+    std.mem.writeInt(u64, &le, mode, .little);
+    try putFelt(w, a, &le);
+    try putDigest(w, a, redeem_tag);
+    try putDigest(w, a, refund_tag);
+    try putDigest(w, a, hashlock);
+    try putU64(w, a, timeout);
+}
+
+/// Write one HTLC-witness output: recipient ‖ asset ‖ note_type ‖ value ‖ rho ‖ rcm.
+fn putHtlcOutput(w: *std.ArrayList(u8), a: Allocator, o: tx.Note) !void {
+    var le: [8]u8 = undefined;
+    try putDigest(w, a, o.recipient);
+    std.mem.writeInt(u64, &le, o.asset, .little);
+    try putFelt(w, a, &le);
+    std.mem.writeInt(u64, &le, o.note_type, .little);
+    try putFelt(w, a, &le);
+    try putU64(w, a, o.value);
+    try putFelt(w, a, o.rho[0..8]);
+    try putFelt(w, a, o.rho[8..16]);
+    try putFelt(w, a, o.rcm[0..8]);
+    try putFelt(w, a, o.rcm[8..16]);
+}
+
+/// Serialize an HTLC **spend** witness: input 0 is the HTLC note (note_type = HTLC + the claimed
+/// tag/terms), input 1 a PLAIN dummy, then the outputs, then fee/mint/tx_binding/current_height.
 fn encodeHtlcWitness(
     a: Allocator,
     claimer: tx.FullKey,
@@ -379,66 +438,39 @@ fn encodeHtlcWitness(
     errdefer w.deinit(a);
     const nk0 = std.mem.readInt(u64, claimer.nk[0..8], .little);
     const nk1 = std.mem.readInt(u64, claimer.nk[8..16], .little);
-    var le: [8]u8 = undefined;
-    // input 0: the HTLC note.
-    try putU64(&w, a, nk0);
-    try putU64(&w, a, nk1);
-    std.mem.writeInt(u64, &le, spend.claim_div, .little);
-    try putFelt(&w, a, &le);
-    std.mem.writeInt(u64, &le, spend.note.asset, .little);
-    try putFelt(&w, a, &le);
-    std.mem.writeInt(u64, &le, poseidon2.NOTE_HTLC, .little);
-    try putFelt(&w, a, &le); // note_type
-    try putU64(&w, a, spend.note.value);
-    try putFelt(&w, a, spend.note.rho[0..8]);
-    try putFelt(&w, a, spend.note.rho[8..16]);
-    try putFelt(&w, a, spend.note.rcm[0..8]);
-    try putFelt(&w, a, spend.note.rcm[8..16]);
-    for (spend.path.siblings) |sib| try putDigest(&w, a, sib);
-    var d: usize = 0;
-    while (d < DEPTH) : (d += 1) try w.append(a, @intCast((spend.position >> @intCast(d)) & 1));
-    std.mem.writeInt(u64, &le, spend.mode, .little);
-    try putFelt(&w, a, &le); // mode
-    try putDigest(&w, a, spend.redeem_tag);
-    try putDigest(&w, a, spend.refund_tag);
-    try putDigest(&w, a, spend.hashlock);
-    try putU64(&w, a, spend.timeout);
-    // input 1: a PLAIN dummy (htlc fields zeroed).
-    try putU64(&w, a, nk0);
-    try putU64(&w, a, nk1);
-    std.mem.writeInt(u64, &le, dummy.note.div, .little);
-    try putFelt(&w, a, &le);
-    std.mem.writeInt(u64, &le, dummy.note.asset, .little);
-    try putFelt(&w, a, &le);
-    std.mem.writeInt(u64, &le, poseidon2.NOTE_PLAIN, .little);
-    try putFelt(&w, a, &le);
-    try putU64(&w, a, dummy.note.value);
-    try putFelt(&w, a, dummy.note.rho[0..8]);
-    try putFelt(&w, a, dummy.note.rho[8..16]);
-    try putFelt(&w, a, dummy.note.rcm[0..8]);
-    try putFelt(&w, a, dummy.note.rcm[8..16]);
-    for (dummy.path.siblings) |sib| try putDigest(&w, a, sib);
-    d = 0;
-    while (d < DEPTH) : (d += 1) try w.append(a, @intCast((dummy.position >> @intCast(d)) & 1));
-    std.mem.writeInt(u64, &le, 0, .little);
-    try putFelt(&w, a, &le); // mode = 0
-    try putDigest(&w, a, [_]u8{0} ** 32); // redeem_tag
-    try putDigest(&w, a, [_]u8{0} ** 32); // refund_tag
-    try putDigest(&w, a, [_]u8{0} ** 32); // hashlock
-    try putU64(&w, a, 0); // timeout
-    // outputs (note_type added vs join-split).
-    for (out_notes) |o| {
-        try putDigest(&w, a, o.recipient);
-        std.mem.writeInt(u64, &le, o.asset, .little);
-        try putFelt(&w, a, &le);
-        std.mem.writeInt(u64, &le, o.note_type, .little);
-        try putFelt(&w, a, &le);
-        try putU64(&w, a, o.value);
-        try putFelt(&w, a, o.rho[0..8]);
-        try putFelt(&w, a, o.rho[8..16]);
-        try putFelt(&w, a, o.rcm[0..8]);
-        try putFelt(&w, a, o.rcm[8..16]);
+    const z = [_]u8{0} ** 32;
+    try putHtlcInput(&w, a, nk0, nk1, spend.claim_div, spend.note, poseidon2.NOTE_HTLC, spend.path, spend.position, spend.mode, spend.redeem_tag, spend.refund_tag, spend.hashlock, spend.timeout);
+    try putHtlcInput(&w, a, nk0, nk1, dummy.note.div, dummy.note, poseidon2.NOTE_PLAIN, dummy.path, dummy.position, 0, z, z, z, 0);
+    for (out_notes) |o| try putHtlcOutput(&w, a, o);
+    try putU64(&w, a, fee);
+    try putU64(&w, a, mint);
+    try putDigest(&w, a, tx_binding);
+    try putU64(&w, a, current_height);
+    return w.toOwnedSlice(a);
+}
+
+/// Serialize an HTLC **lock** witness: both inputs are the locker's PLAIN notes (the HTLC fields are
+/// zeroed; an HTLC note is created on the output side, not spent), then the outputs (output 0 is the
+/// new HTLC note), then fee/mint/tx_binding/current_height.
+fn encodeHtlcLockWitness(
+    a: Allocator,
+    locker: tx.FullKey,
+    inputs: []const InputSpend,
+    out_notes: [M_OUT]tx.Note,
+    fee: u64,
+    mint: u64,
+    tx_binding: Hash32,
+    current_height: u64,
+) ![]u8 {
+    var w: std.ArrayList(u8) = .empty;
+    errdefer w.deinit(a);
+    const nk0 = std.mem.readInt(u64, locker.nk[0..8], .little);
+    const nk1 = std.mem.readInt(u64, locker.nk[8..16], .little);
+    const z = [_]u8{0} ** 32;
+    for (inputs) |in_| {
+        try putHtlcInput(&w, a, nk0, nk1, in_.note.div, in_.note, poseidon2.NOTE_PLAIN, in_.path, in_.position, 0, z, z, z, 0);
     }
+    for (out_notes) |o| try putHtlcOutput(&w, a, o);
     try putU64(&w, a, fee);
     try putU64(&w, a, mint);
     try putDigest(&w, a, tx_binding);
@@ -500,6 +532,93 @@ pub fn buildHtlcSpend(
     const witness = encodeHtlcWitness(allocator, claimer, spend, dummy, out_notes, fee, 0, binding, current_height) catch return TxError.Internal;
     t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.ProveFailed;
     return t;
+}
+
+/// Build a shielded HTLC **lock**: the `locker` spends their PLAIN `inputs` (padded to `N_IN` with
+/// owned zero-value notes) and creates a new HTLC note worth `lock_value` owned by
+/// `htlc_root(redeem_tag, refund_tag, hashlock, timeout)`, with the remainder returned as change. This
+/// is an `htlc_air` tx with PLAIN inputs and an HTLC-typed output (the circuit already permits a free
+/// output note_type), proved via the installed HTLC prover.
+///
+/// The new HTLC note is **watched by commitment** (its on-chain ciphertext is an empty placeholder, as
+/// for any htlc_root-owned note); the redeemer/refunder learns its opening (value, rho, rcm, position)
+/// from the off-chain communicated lock. `out_notes[0]` (returned via the tx's first output) is the
+/// HTLC note the counterparty will later spend.
+/// The result of `buildHtlcLock`: the lock transaction plus the created HTLC note's opening (the
+/// `recipient` is the htlc_root). The locker sends `note` (+ the swap terms) to the counterparty as the
+/// communicated lock; once the tx is in a block the counterparty locates `note.commitment()` in the
+/// tree to build its spend path. `note`'s on-chain ciphertext is a placeholder (watched by commitment).
+pub const HtlcLock = struct {
+    tx: ShieldedHtlcTx,
+    note: tx.Note,
+};
+
+pub fn buildHtlcLock(
+    allocator: Allocator,
+    locker: tx.FullKey,
+    inputs: []const InputSpend,
+    redeem_tag: Hash32,
+    refund_tag: Hash32,
+    hashlock: Hash32,
+    timeout: u64,
+    lock_value: u64,
+    fee: u64,
+    current_height: u64,
+    anchor: Hash32,
+) !HtlcLock {
+    if (inputs.len != N_IN) return TxError.Internal;
+    const asset = inputs[0].note.asset;
+    for (inputs) |in_| if (in_.note.asset != asset) return TxError.Internal; // single hidden asset per tx
+
+    // Value balance: Σin = lock_value + change + fee.
+    var in_sum: u64 = 0;
+    for (inputs) |in_| in_sum = std.math.add(u64, in_sum, in_.note.value) catch return TxError.ValueOverflow;
+    const spent = std.math.add(u64, lock_value, fee) catch return TxError.ValueOverflow;
+    if (in_sum < spent) return TxError.Unbalanced;
+    const change = in_sum - spent;
+
+    // Both inputs are PLAIN ⇒ nk-based nullifiers.
+    var nfs: [N_IN]Hash32 = undefined;
+    for (inputs, 0..) |in_, i| nfs[i] = in_.note.nullifier(&locker.nk, in_.position);
+
+    // The new HTLC note's owner = htlc_root over the swap terms (computed on-chain == the circuit).
+    const htlc_root = poseidon2.digestBytes(poseidon2.htlcRoot(
+        poseidon2.digestFromBytes(redeem_tag),
+        poseidon2.digestFromBytes(refund_tag),
+        poseidon2.digestFromBytes(hashlock),
+        timeout,
+    ));
+
+    var out_notes: [M_OUT]tx.Note = undefined;
+    var tns: [M_OUT]tx.TransmittedNote = undefined;
+    // output 0: the HTLC note (owner = htlc_root, note_type = HTLC) — watched by commitment, so the
+    // on-chain ciphertext is an empty placeholder (the opening travels via the communicated lock).
+    const hrho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nfs[0], &[_]u8{0} });
+    const hrcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &[_]u8{0} });
+    out_notes[0] = .{ .value = lock_value, .recipient = htlc_root, .div = 0, .asset = asset, .note_type = poseidon2.NOTE_HTLC, .rho = hrho, .rcm = hrcm };
+    const ct0 = allocator.alloc(u8, 0) catch return TxError.Internal;
+    errdefer allocator.free(ct0);
+    tns[0] = .{ .cm = out_notes[0].commitment(), .kem_ct = [_]u8{0} ** p.CT_LEN, .ciphertext = ct0 };
+    // output 1: change back to the locker (normal encrypted PLAIN note).
+    const crho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nfs[0], &[_]u8{1} });
+    const crcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &[_]u8{1} });
+    out_notes[1] = .{ .value = change, .recipient = locker.address().recipientId(), .div = locker.address().div, .asset = asset, .rho = crho, .rcm = crcm };
+    tns[1] = tx.encryptNote(allocator, locker.address(), out_notes[1]) catch return TxError.Internal;
+
+    var t = ShieldedHtlcTx{
+        .anchor = anchor,
+        .nullifiers = nfs,
+        .fee = fee,
+        .mint = 0,
+        .current_height = current_height,
+        .redeem_preimage = null, // a lock reveals no preimage (redeem_hashlock = 0)
+        .proof = &.{},
+        .outputs = tns,
+    };
+    const binding = t.txBinding();
+    const witness = encodeHtlcLockWitness(allocator, locker, inputs, out_notes, fee, 0, binding, current_height) catch return TxError.Internal;
+    t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.ProveFailed;
+    return .{ .tx = t, .note = out_notes[0] };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1296,4 +1415,64 @@ test "node: applyHtlc defense-in-depth rejects (height/fee bounds + non-canonica
         t.nullifiers[0] = nf;
         try testing.expectError(TxError.NonCanonicalField, chain.applyHtlc(t, 50));
     }
+}
+
+test "node: HTLC lifecycle — buildHtlcLock → apply → buildHtlcSpend redeem (mock backend)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1); // locker
+    const bob = try account(2); // redeem party
+
+    // Alice's funds: a 1000 note + a zero-value pad (both tree members).
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{2} ** 32);
+    const li = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+
+    // Swap terms: redeem = Bob, refund = Alice, hashlock = SHA256(preimage).
+    const preimage = [_]u8{0xAB} ** 32;
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&preimage, &sha, .{});
+    const hashlock = poseidon2.digestBytes(poseidon2.digestFromBytes(sha));
+    const redeem_tag = bob.address().recipientId();
+    const refund_tag = alice.address().recipientId();
+    const timeout: u64 = 100;
+
+    // LOCK: Alice locks 900 into an HTLC note (100 change), at height 50.
+    const lock = try buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, hashlock, timeout, 900, 0, 50, chain.anchor());
+    const htlc_pos = m1.pos + 1; // the lock's output 0 (the HTLC note) lands right after the funded notes
+    try chain.applyHtlc(lock.tx, 50);
+    try testing.expectEqualSlices(u8, &lock.note.commitment(), &lock.tx.outputs[0].cm); // the communicated note
+
+    // REDEEM: Bob spends the created HTLC note before the timeout (the opening came via the lock).
+    const bdummy = try chain.bootstrapMint(bob.address(), 0, [_]u8{3} ** 32);
+    const spend = HtlcSpend{
+        .note = lock.note,
+        .position = htlc_pos,
+        .path = try chain.merklePath(a, htlc_pos),
+        .claim_div = bob.address().div,
+        .mode = 1, // redeem
+        .redeem_tag = redeem_tag,
+        .refund_tag = refund_tag,
+        .hashlock = hashlock,
+        .timeout = timeout,
+        .preimage = preimage,
+    };
+    const sdummy = InputSpend{ .note = bdummy.note, .position = bdummy.pos, .path = try chain.merklePath(a, bdummy.pos) };
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    const redeem_tx = try buildHtlcSpend(a, bob, spend, sdummy, &outs, 0, 60, chain.anchor()); // height 60 < timeout 100
+    try chain.applyHtlc(redeem_tx, 60);
+
+    var bob_total: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (tx.tryDecrypt(a, bob, tn)) |n| bob_total += n.value;
+    }
+    try testing.expectEqual(@as(u64, 900), bob_total); // Bob redeemed the locked 900
+    try testing.expect(chain.supply.invariantHolds());
 }

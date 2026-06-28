@@ -118,11 +118,13 @@ fn run() !void {
     } else |e| if (e != node.TxError.DoubleSpend) return Err.WrongError;
     std.debug.print("double-spend (replay): REJECT\n", .{});
 
-    // --- v3: a REAL shielded HTLC redeem (Zig builds the witness -> Rust proves -> Zig reconstructs
-    //         the public inputs -> Rust verifies -> the node applies). This is the cross-language
-    //         witness/PI byte-match for htlc_air that the mock backends cannot cover. ---
+    // --- v3: a REAL shielded HTLC LOCK → REDEEM lifecycle (Zig builds the lock + spend witnesses, Rust
+    //         proves, Zig reconstructs the public inputs, Rust verifies, the node applies). This covers
+    //         the cross-language witness/PI byte-match for BOTH htlc_air paths (PLAIN-inputs-HTLC-output
+    //         lock + HTLC-input spend) that the mock backends cannot. ---
     ffi.setHtlcProveBackend(&lattica_htlc_prove);
     ffi.setHtlcBackend(&lattica_htlc_verify);
+    const dave = try tx.FullKey.fromSeed([_]u8{5} ** 32); // the locker
     const carol = try tx.FullKey.fromSeed([_]u8{3} ** 32); // the redeem party
     const refunder = try tx.FullKey.fromSeed([_]u8{4} ** 32);
     const preimage = [_]u8{0xAB} ** 32;
@@ -132,64 +134,48 @@ fn run() !void {
     const redeem_tag = carol.address().recipientId();
     const refund_tag = refunder.address().recipientId();
     const timeout: u64 = 100;
-    const owner = poseidon2.digestBytes(poseidon2.htlcRoot(
-        poseidon2.digestFromBytes(redeem_tag),
-        poseidon2.digestFromBytes(refund_tag),
-        poseidon2.digestFromBytes(hashlock),
-        timeout,
-    ));
-    const htlc_note = tx.Note{ .value = 1000, .recipient = owner, .div = 0, .note_type = poseidon2.NOTE_HTLC, .rho = [_]u8{7} ** 32, .rcm = [_]u8{8} ** 32 };
-    const locked = try chain.bootstrapNote(htlc_note);
-    const dummy2 = try chain.bootstrapMint(carol.address(), 0, [_]u8{13} ** 32); // owned zero-value pad
-    const spend = node.HtlcSpend{
-        .note = htlc_note,
-        .position = locked.pos,
-        .path = try chain.merklePath(a, locked.pos),
-        .claim_div = carol.address().div,
-        .mode = 1, // redeem
-        .redeem_tag = redeem_tag,
-        .refund_tag = refund_tag,
-        .hashlock = hashlock,
-        .timeout = timeout,
-        .preimage = preimage,
-    };
-    const dummy_in = node.InputSpend{ .note = dummy2.note, .position = dummy2.pos, .path = try chain.merklePath(a, dummy2.pos) };
-    const outs2 = [_]node.OutputReq{.{ .recipient = carol.address(), .value = 1000 }};
-    const ht = try node.buildHtlcSpend(a, carol, spend, dummy_in, &outs2, 0, 50, chain.anchor()); // height 50 < timeout 100
-    std.debug.print("real htlc prove: proof = {d} bytes\n", .{ht.proof.len});
-    try chain.applyHtlc(ht, 50);
-    std.debug.print("real htlc verify (in-node): ACCEPT\n", .{});
-    var carol_total: u64 = 0;
-    for (chain.transmitted.items) |tn| {
-        if (tx.tryDecrypt(a, carol, tn)) |n| carol_total += n.value;
-    }
-    if (carol_total != 1000) return Err.BobDidNotReceive;
-    std.debug.print("carol redeemed (real htlc): {d}\n", .{carol_total});
 
-    // A refund before the timeout must be rejected by the REAL verifier (time-lock holds end to end).
+    // LOCK: Dave funds 1000 and locks it into an HTLC note (redeem=Carol, refund=Refunder).
+    const f0 = try chain.bootstrapMint(dave.address(), 1000, [_]u8{21} ** 32);
+    const f1 = try chain.bootstrapMint(dave.address(), 0, [_]u8{22} ** 32);
+    const li = [_]node.InputSpend{
+        .{ .note = f0.note, .position = f0.pos, .path = try chain.merklePath(a, f0.pos) },
+        .{ .note = f1.note, .position = f1.pos, .path = try chain.merklePath(a, f1.pos) },
+    };
+    const lock = try node.buildHtlcLock(a, dave, &li, redeem_tag, refund_tag, hashlock, timeout, 1000, 0, 50, chain.anchor());
+    const htlc_pos = f1.pos + 1; // the lock's output 0 (the HTLC note) lands right after Dave's funded notes
+    std.debug.print("real htlc lock: proof = {d} bytes\n", .{lock.tx.proof.len});
+    try chain.applyHtlc(lock.tx, 50);
+    std.debug.print("real htlc lock verify (in-node): ACCEPT\n", .{});
+
+    // A refund before the timeout must be rejected by the REAL prover (time-lock holds end to end). The
+    // locked note is untouched (the build fails before any state change), so the redeem below proceeds.
     {
-        const m_ref = try chain.bootstrapNote(htlc_note); // a fresh locked note to attempt an early refund on
-        const d_ref = try chain.bootstrapMint(refunder.address(), 0, [_]u8{14} ** 32);
-        const refund = node.HtlcSpend{
-            .note = htlc_note,
-            .position = m_ref.pos,
-            .path = try chain.merklePath(a, m_ref.pos),
-            .claim_div = refunder.address().div,
-            .mode = 0, // refund
-            .redeem_tag = redeem_tag,
-            .refund_tag = refund_tag,
-            .hashlock = hashlock,
-            .timeout = timeout,
-            .preimage = null,
-        };
+        const d_ref = try chain.bootstrapMint(refunder.address(), 0, [_]u8{23} ** 32);
+        const refund = node.HtlcSpend{ .note = lock.note, .position = htlc_pos, .path = try chain.merklePath(a, htlc_pos), .claim_div = refunder.address().div, .mode = 0, .redeem_tag = redeem_tag, .refund_tag = refund_tag, .hashlock = hashlock, .timeout = timeout, .preimage = null };
         const d_in = node.InputSpend{ .note = d_ref.note, .position = d_ref.pos, .path = try chain.merklePath(a, d_ref.pos) };
         const o_ref = [_]node.OutputReq{.{ .recipient = refunder.address(), .value = 1000 }};
-        // height 50 < timeout 100 ⇒ the prover can't satisfy the refund time-lock ⇒ proving fails.
-        if (node.buildHtlcSpend(a, refunder, refund, d_in, &o_ref, 0, 50, chain.anchor())) |_| {
+        if (node.buildHtlcSpend(a, refunder, refund, d_in, &o_ref, 0, 50, chain.anchor())) |_| { // height 50 < timeout 100
             return Err.TamperAccepted;
         } else |e| if (e != node.TxError.ProveFailed) return Err.WrongError;
         std.debug.print("refund before timeout: REJECT (real prover)\n", .{});
     }
 
-    std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject (+ HTLC redeem/refund-timelock)\n", .{});
+    // REDEEM: Carol spends the created HTLC note before the timeout (opening from the communicated lock).
+    const cdummy = try chain.bootstrapMint(carol.address(), 0, [_]u8{24} ** 32);
+    const spend = node.HtlcSpend{ .note = lock.note, .position = htlc_pos, .path = try chain.merklePath(a, htlc_pos), .claim_div = carol.address().div, .mode = 1, .redeem_tag = redeem_tag, .refund_tag = refund_tag, .hashlock = hashlock, .timeout = timeout, .preimage = preimage };
+    const sdummy = node.InputSpend{ .note = cdummy.note, .position = cdummy.pos, .path = try chain.merklePath(a, cdummy.pos) };
+    const outs2 = [_]node.OutputReq{.{ .recipient = carol.address(), .value = 1000 }};
+    const ht = try node.buildHtlcSpend(a, carol, spend, sdummy, &outs2, 0, 60, chain.anchor()); // height 60 < timeout 100
+    std.debug.print("real htlc redeem: proof = {d} bytes\n", .{ht.proof.len});
+    try chain.applyHtlc(ht, 60);
+    std.debug.print("real htlc redeem verify (in-node): ACCEPT\n", .{});
+    var carol_total: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (tx.tryDecrypt(a, carol, tn)) |n| carol_total += n.value;
+    }
+    if (carol_total != 1000) return Err.BobDidNotReceive;
+    std.debug.print("carol redeemed (real htlc lifecycle): {d}\n", .{carol_total});
+
+    std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject (+ HTLC lock/redeem/refund-timelock)\n", .{});
 }
