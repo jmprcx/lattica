@@ -370,9 +370,10 @@ const P_HTLC_IN1: usize = 34; // htlc block 1 input (refund_tag in lanes 4..8 �
 const P_HTLC_IN2: usize = 35; // htlc block 2 input (hashlock in lanes 4..8 — for the redeem hashlock bind)
 const P_TO_SEED: usize = 36; // timeout range seed (REM = TIMEOUT), in the htlc region
 const P_DIFF_SEED: usize = 37; // diff range seed (REM = DIFF) + the height/timeout compare
-const P_NULLOUT: usize = 38; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 38 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 38 + N_IN + M_OUT;
+const P_HEIGHT_SEED: usize = 38; // current_height range seed (REM = pis[PI_HEIGHT]); single global window
+const P_NULLOUT: usize = 39; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 39 + N_IN; // M_OUT one-hots: out_cm_j binding
+const N_PERIODIC: usize = 39 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4) ‖
 //                current_height(1) ‖ redeem_hashlock(4)
@@ -426,6 +427,13 @@ const fn htlc_out_row(i: usize, k: usize) -> usize {
 /// The last row of an input span (now the final htlc_root block) — the region-persistence boundary.
 const fn span_last_row(i: usize) -> usize {
     htlc_out_row(i, HTLC_BLOCKS - 1)
+}
+/// A single global range window for the public current_height, seeded at input 0's first membership
+/// merge block (blocks ≥ base+3 use the BIT column, not REM/RBIT, so the range columns are free for the
+/// BITS+1-row decomposition). v3 defense-in-depth: range-check current_height in-circuit so the timeout
+/// compare is sound without trusting the node for height < 2^BITS.
+const fn height_seed_row() -> usize {
+    (input_base(0) + 3) * BLOCK
 }
 const fn out_base(j: usize) -> usize {
     N_IN * SPAN_BLOCKS + j * OUT_BLOCKS
@@ -513,6 +521,9 @@ fn periodic() -> Vec<Vec<Val>> {
         range_active.extend(s..s + BITS);
         range_close.push(s + BITS);
     }
+    // the single global current_height window (in input 0's membership region; REM/RBIT free there)
+    range_active.extend(height_seed_row()..height_seed_row() + BITS);
+    range_close.push(height_seed_row() + BITS);
 
     cols.push(one_hot(&own_in)); // P_OWN_IN
     cols.push(one_hot(&recip)); // P_RECIP_LINK
@@ -554,6 +565,7 @@ fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&htlc_in2)); // P_HTLC_IN2
     cols.push(one_hot(&to_seeds)); // P_TO_SEED
     cols.push(one_hot(&diff_seeds)); // P_DIFF_SEED
+    cols.push(one_hot(&[height_seed_row()])); // P_HEIGHT_SEED (single global window for current_height)
     for i in 0..N_IN {
         cols.push(one_hot(&[null_out_row(i)])); // P_NULLOUT + i
     }
@@ -730,14 +742,23 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // region) ⇒ TIMEOUT, DIFF ∈ [0, 2^BITS).
         builder.assert_zero(p[P_TO_SEED].clone() * (cur[REM].clone() - cur[TIMEOUT].clone()));
         builder.assert_zero(p[P_DIFF_SEED].clone() * (cur[REM].clone() - cur[DIFF].clone()));
-        // DIFF compute (HTLC only): redeem ⇒ timeout-height-1 ; refund ⇒ height-timeout. With TIMEOUT
-        // and DIFF range-bounded and the public current_height node-bounded < 2^BITS, DIFF ≥ 0 holds
-        // iff the timeout window does — redeem ⟺ height < timeout, refund ⟺ height ≥ timeout.
+        // DIFF compute (HTLC only): redeem ⇒ timeout-height-1 ; refund ⇒ height-timeout. With TIMEOUT,
+        // DIFF, **and** current_height all range-bounded < 2^BITS (the height window just below), DIFF ≥ 0
+        // holds iff the timeout window does — redeem ⟺ height < timeout, refund ⟺ height ≥ timeout.
         let height = pis[PI_HEIGHT].clone();
         let redeem_diff = cur[TIMEOUT].clone() - height.clone() - one.clone();
         let refund_diff = height.clone() - cur[TIMEOUT].clone();
         let diff_expr = mode.clone() * redeem_diff + (one.clone() - mode.clone()) * refund_diff;
         builder.assert_zero(p[P_DIFF_SEED].clone() * nt.clone() * (cur[DIFF].clone() - diff_expr));
+        // v3 hardening (defense-in-depth — the node also pins/bounds height in applyHtlc): range-check
+        // the public current_height in-circuit (REM = height at its seed; shared decomposition + REM=0
+        // close), so the timeout compare is sound WITHOUT trusting the node for height < 2^BITS — closing
+        // the wrap-around forgery where a near-p height makes a refund DIFF spuriously small.
+        builder.assert_zero(p[P_HEIGHT_SEED].clone() * (cur[REM].clone() - pis[PI_HEIGHT].clone()));
+        // v3 hardening (defense-in-depth — the node also rejects mint ≠ 0 in applyHtlc): an HTLC spend
+        // never issues, so force mint = 0 in-circuit. Without this, the htlc_air verifier (reused in any
+        // context) would accept a value-inflating mint > 0.
+        builder.assert_zero(pis[PI_MINT].clone());
 
         // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
         let ca = p[P_COMMIT_A_IN].clone();
@@ -897,6 +918,8 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
 
     // ASSET is global-persistent (one hidden asset id for the whole tx); fill it on every row.
     fill_col(&mut t, 0, HEIGHT - 1, ASSET, w.inputs[0].asset);
+    // The single global current_height range window (defense-in-depth; see height_seed_row).
+    fill_range(&mut t, height_seed_row(), w.current_height);
 
     // --- inputs: ownership, commitment, membership, nullifier (+ local-persistent + pos_acc) ---
     for (i, inp) in w.inputs.iter().enumerate() {
@@ -1463,11 +1486,14 @@ mod tests {
     }
 
     #[test]
-    fn mint_issuance_verifies() {
-        // coinbase: dummy (zero-value) inputs, one output funded by issuance, no fee.
+    fn htlc_mint_issuance_is_rejected() {
+        // v3 hardening (defense-in-depth with the node's applyHtlc mint!=0 reject): an HTLC spend never
+        // issues, so the circuit forces mint==0. A balanced mint>0 witness (which the join-split AIR
+        // would accept as a coinbase) must NOT verify here.
         let mut w = witness_with([0, 0], [1000, 0], 0);
-        w.mint = 1000; // Σin(0) + mint(1000) = Σout(1000) + fee(0)
-        prove_verify(&w).expect("coinbase mint should verify");
+        w.mint = 1000; // Σin(0) + mint(1000) = Σout(1000) + fee(0) — balanced, but issuance is forbidden
+        let proof = prove_to_bytes(&w);
+        assert!(!verify_bytes(&proof, &public_values(&w)), "HTLC mint>0 must be rejected (no issuance)");
     }
 
     #[test]
@@ -1767,6 +1793,19 @@ mod tests {
     fn htlc_redeem_boundary_verifies() {
         let hl = [Val::from_u64(5), Val::from_u64(6), Val::from_u64(7), Val::from_u64(8)];
         prove_verify(&htlc_witness(true, 9, hl, 10)).expect("redeem at timeout-1 must verify");
+    }
+
+    /// v3 hardening: an out-of-range current_height (≥ 2^BITS) is rejected by the in-circuit height
+    /// range-check. A refund satisfies its timeout window for an arbitrarily large height (height ≥
+    /// timeout), so WITHOUT the height range-check a near-2^BITS height could wrap the field subtraction
+    /// in the DIFF compute; the range-check closes that.
+    #[test]
+    fn htlc_out_of_range_height_is_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        // refund (height ≥ timeout) with height = 2^BITS — native window OK, but height ∉ [0, 2^BITS).
+        let w = htlc_witness(false, 1u64 << BITS, hl, 10);
+        let proof = prove_to_bytes(&w);
+        assert!(!verify_bytes(&proof, &public_values(&w)), "current_height ≥ 2^BITS must be rejected");
     }
 
     #[test]
