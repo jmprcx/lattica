@@ -68,6 +68,12 @@ const W: usize = 8;
 pub const DOM_OWN: u64 = 1;
 pub const DOM_CM: u64 = 2;
 pub const DOM_NF: u64 = 3;
+pub const DOM_HTLC: u64 = 4; // htlc_root = MD-chain over (redeem_tag, refund_tag, hashlock, timeout)
+pub const DOM_NF_HTLC: u64 = 5; // nullifier of an HTLC note (owner-based, mode-independent)
+
+/// Note types (committed in commitment lane 7).
+pub const NOTE_PLAIN: u64 = 0;
+pub const NOTE_HTLC: u64 = 1;
 
 type Val = Goldilocks;
 
@@ -93,10 +99,13 @@ pub fn recipient_of(nk0: Val, nk1: Val, d: Val) -> [Val; DIGEST] {
 ///   cm = perm([H1(4), rcm0, rcm1, 0, 0])                      (Merkle-Damgård chain)
 /// rho/rcm are each two field elements ⇒ 128-bit note randomness + hiding (vs 64-bit before). The
 /// second block is merge-shaped; the chaining value (256-bit) gives 128-bit collision resistance.
-pub fn commit(recipient: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2], asset: Val) -> [Val; DIGEST] {
+/// `owner` is the recipient digest for a PLAIN note (`H(DOM_OWN‖nk‖div)`) or the `htlc_root` for an
+/// HTLC note; the commitment treats it uniformly (it's the 4-lane H1 owner slot). `note_type`
+/// (0=PLAIN, 1=HTLC) is committed in lane 7 so the spend can distinguish the two.
+pub fn commit(owner: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2], asset: Val, note_type: Val) -> [Val; DIGEST] {
     let mut a = [Val::ZERO; W];
     a[0] = Val::from_u64(DOM_CM);
-    a[1..1 + DIGEST].copy_from_slice(&recipient);
+    a[1..1 + DIGEST].copy_from_slice(&owner);
     a[1 + DIGEST] = value;
     a[1 + DIGEST + 1] = rho[0];
     a[1 + DIGEST + 2] = rho[1];
@@ -105,12 +114,45 @@ pub fn commit(recipient: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2]
     b[..DIGEST].copy_from_slice(&chain[..DIGEST]);
     b[DIGEST] = rcm[0];
     b[DIGEST + 1] = rcm[1];
-    b[DIGEST + 2] = asset; // lane 6: hidden asset id (lane 7 stays 0, reserved for note_type)
+    b[DIGEST + 2] = asset; // lane 6: hidden asset id
+    b[DIGEST + 3] = note_type; // lane 7: note type (0=PLAIN, 1=HTLC)
     native_permute(b)[..DIGEST].try_into().unwrap()
 }
 
 pub fn nullifier(nk0: Val, nk1: Val, rho: [Val; 2], pos: Val) -> [Val; DIGEST] {
     h(DOM_NF, &[nk0, nk1, rho[0], rho[1], pos])
+}
+
+/// HTLC owner = `htlc_root`: a domain-tagged Merkle-Damgård chain over the two party tags, the
+/// hashlock, and the timeout. Block 0 injects `DOM_HTLC` and absorbs `redeem_tag`; blocks 1-3 are
+/// merge-shaped (chain ‖ data) absorbing `refund_tag`, `hashlock`, then `[timeout,0,0,0]`. Binding all
+/// four into the committed owner means a spender can't substitute different terms (the cm wouldn't be
+/// in the tree).
+pub fn htlc_root(redeem_tag: [Val; DIGEST], refund_tag: [Val; DIGEST], hashlock: [Val; DIGEST], timeout: Val) -> [Val; DIGEST] {
+    let mut s0 = [Val::ZERO; W];
+    s0[0] = Val::from_u64(DOM_HTLC);
+    s0[DIGEST..].copy_from_slice(&redeem_tag);
+    let c0: [Val; DIGEST] = native_permute(s0)[..DIGEST].try_into().unwrap();
+    let mut s1 = [Val::ZERO; W];
+    s1[..DIGEST].copy_from_slice(&c0);
+    s1[DIGEST..].copy_from_slice(&refund_tag);
+    let c1: [Val; DIGEST] = native_permute(s1)[..DIGEST].try_into().unwrap();
+    let mut s2 = [Val::ZERO; W];
+    s2[..DIGEST].copy_from_slice(&c1);
+    s2[DIGEST..].copy_from_slice(&hashlock);
+    let c2: [Val; DIGEST] = native_permute(s2)[..DIGEST].try_into().unwrap();
+    let mut s3 = [Val::ZERO; W];
+    s3[..DIGEST].copy_from_slice(&c2);
+    s3[DIGEST] = timeout;
+    native_permute(s3)[..DIGEST].try_into().unwrap()
+}
+
+/// Nullifier of an HTLC note: derived from the note's `owner` (= `htlc_root`), NOT the claiming
+/// party's `nk`, so it is identical whether the note is redeemed or refunded — one note ⇒ one
+/// nullifier (else a note could be spent once per mode = double-spend). Layout `[DOM_NF_HTLC ‖
+/// owner(4) ‖ rho0 ‖ rho1 ‖ pos]`.
+pub fn nullifier_owner(owner: [Val; DIGEST], rho: [Val; 2], pos: Val) -> [Val; DIGEST] {
+    h(DOM_NF_HTLC, &[owner[0], owner[1], owner[2], owner[3], rho[0], rho[1], pos])
 }
 
 /// Untagged 2-to-1 Merkle compression `H(l ‖ r)` (fills all 8 lanes).
@@ -141,20 +183,30 @@ pub fn fold(leaf: [Val; DIGEST], sib: &[[Val; DIGEST]; DEPTH], bits: &[bool; DEP
 
 #[derive(Clone)]
 pub struct Input {
-    pub nk: [u64; 2], // 128-bit nullifier key / spend authority
+    pub nk: [u64; 2], // 128-bit nullifier key / spend authority (the claiming party for an HTLC note)
     pub div: Val, // diversifier of the address this note was sent to (recipient = H(nk ‖ div))
     pub asset: Val, // hidden asset id (all notes in a tx share one asset)
+    pub note_type: Val, // 0 = PLAIN, 1 = HTLC
     pub value: u64,
     pub rho: [Val; 2], // 128-bit note randomness
     pub rcm: [Val; 2], // 128-bit commitment trapdoor
     pub sib: [[Val; DIGEST]; DEPTH],
     pub bits: [bool; DEPTH],
+    // HTLC fields (note_type == HTLC): the owner is htlc_root = MD-chain(DOM_HTLC ‖ redeem_tag ‖
+    // refund_tag ‖ hashlock ‖ timeout); the claiming party proves nk owns redeem_tag (redeem) or
+    // refund_tag (refund). Ignored for PLAIN notes.
+    pub mode: Val, // 1 = redeem, 0 = refund
+    pub redeem_tag: [Val; DIGEST],
+    pub refund_tag: [Val; DIGEST],
+    pub hashlock: [Val; DIGEST], // SHA256(preimage) as 4 field limbs
+    pub timeout: u64,
 }
 
 #[derive(Clone, Copy)]
 pub struct Output {
-    pub recipient: [Val; DIGEST],
+    pub recipient: [Val; DIGEST], // the note owner: a recipient digest (PLAIN) or an htlc_root (HTLC)
     pub asset: Val, // hidden asset id (must equal the inputs' asset)
+    pub note_type: Val, // 0 = PLAIN, 1 = HTLC
     pub value: u64,
     pub rho: [Val; 2],
     pub rcm: [Val; 2],
@@ -167,6 +219,7 @@ pub struct Witness {
     pub fee: u64,
     pub mint: u64, // public issuance (0 for a normal tx; > 0 for coinbase)
     pub tx_binding: [Val; DIGEST],
+    pub current_height: u64, // public: the block height the tx is validated at (HTLC timeout compare)
 }
 
 pub struct PublicOutputs {
@@ -183,25 +236,46 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let mut nullifiers = [[Val::ZERO; DIGEST]; N_IN];
     let mut in_sum: u128 = 0;
     let asset = w.inputs[0].asset; // the single (hidden) asset of this tx
+    let htlc = Val::from_u64(NOTE_HTLC);
     for (i, inp) in w.inputs.iter().enumerate() {
         assert_eq!(inp.asset, asset, "input {i} uses a different asset (single-asset tx)");
         let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
-        let recipient = recipient_of(nk0, nk1, inp.div);
-        let cm = commit(recipient, Val::from_u64(inp.value), inp.rho, inp.rcm, inp.asset);
+        let claim_tag = recipient_of(nk0, nk1, inp.div); // the claiming party's ownership tag
+        let is_htlc = inp.note_type == htlc;
+        // owner = htlc_root (HTLC) or the claiming recipient tag (PLAIN).
+        let owner = if is_htlc {
+            htlc_root(inp.redeem_tag, inp.refund_tag, inp.hashlock, Val::from_u64(inp.timeout))
+        } else {
+            claim_tag
+        };
+        if is_htlc {
+            // The claiming party must own the tag selected by `mode`; and the timeout window must hold.
+            let redeeming = inp.mode == Val::from_u64(1);
+            let want = if redeeming { inp.redeem_tag } else { inp.refund_tag };
+            assert_eq!(claim_tag, want, "input {i}: claim does not match the selected HTLC party");
+            if redeeming {
+                assert!(w.current_height < inp.timeout, "input {i}: redeem requires height < timeout");
+            } else {
+                assert!(w.current_height >= inp.timeout, "input {i}: refund requires height >= timeout");
+            }
+        }
+        let cm = commit(owner, Val::from_u64(inp.value), inp.rho, inp.rcm, inp.asset, inp.note_type);
         let root = fold(cm, &inp.sib, &inp.bits);
         match anchor {
             None => anchor = Some(root),
             Some(a) => assert_eq!(a, root, "input {i} folds to a different anchor"),
         }
-        nullifiers[i] = nullifier(nk0, nk1, inp.rho, pos_of(&inp.bits));
+        // Nullifier: mode/party-independent for HTLC (owner-based), nk-based for PLAIN.
+        let pos = pos_of(&inp.bits);
+        nullifiers[i] = if is_htlc { nullifier_owner(owner, inp.rho, pos) } else { nullifier(nk0, nk1, inp.rho, pos) };
         in_sum += inp.value as u128;
     }
-    // per-output commitment
+    // per-output commitment (the output owner — a recipient digest or an htlc_root — is a free witness)
     let mut out_cms = [[Val::ZERO; DIGEST]; M_OUT];
     let mut out_sum: u128 = 0;
     for (j, out) in w.outputs.iter().enumerate() {
         assert_eq!(out.asset, asset, "output {j} uses a different asset (single-asset tx)");
-        out_cms[j] = commit(out.recipient, Val::from_u64(out.value), out.rho, out.rcm, out.asset);
+        out_cms[j] = commit(out.recipient, Val::from_u64(out.value), out.rho, out.rcm, out.asset, out.note_type);
         out_sum += out.value as u128;
     }
     // value balance (A3: all values range-bounded ⇒ no wraparound)
@@ -678,8 +752,9 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         b[DIGEST] = inp.rcm[0];
         b[DIGEST + 1] = inp.rcm[1];
         b[DIGEST + 2] = inp.asset;
+        b[DIGEST + 3] = inp.note_type;
         set_block(&mut t, base + 2, b);
-        let mut node = commit(recipient, value, inp.rho, inp.rcm, inp.asset); // = perm(b)[..DIGEST]
+        let mut node = commit(recipient, value, inp.rho, inp.rcm, inp.asset, inp.note_type); // = perm(b)[..DIGEST]
         for d in 0..DEPTH {
             let (l, r) = if inp.bits[d] { (inp.sib[d], node) } else { (node, inp.sib[d]) };
             let mut min = [Val::ZERO; 8];
@@ -739,6 +814,7 @@ fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         ob[DIGEST] = out.rcm[0];
         ob[DIGEST + 1] = out.rcm[1];
         ob[DIGEST + 2] = out.asset;
+        ob[DIGEST + 3] = out.note_type;
         set_block(&mut t, out_base(j) + 1, ob); // out_b: cm = perm(ob)[..DIGEST]
         let (lo, hi) = (out_in_row(j), out_in_row(j) + OUT_BLOCKS * BLOCK - 1);
         fill_col(&mut t, lo, hi, VAL, Val::from_u64(out.value));
@@ -854,6 +930,7 @@ pub fn demo_witness() -> Witness {
                 in_rho(i),
                 in_rcm(i),
                 asset,
+                Val::ZERO, // PLAIN
             )
         })
         .collect();
@@ -862,20 +939,27 @@ pub fn demo_witness() -> Witness {
         nk: nks[i],
         div: in_div(i),
         asset,
+        note_type: Val::ZERO,
         value: in_values[i],
         rho: in_rho(i),
         rcm: in_rcm(i),
         sib: paths[i].0,
         bits: paths[i].1,
+        mode: Val::ZERO,
+        redeem_tag: [Val::ZERO; DIGEST],
+        refund_tag: [Val::ZERO; DIGEST],
+        hashlock: [Val::ZERO; DIGEST],
+        timeout: 0,
     });
     let outputs = core::array::from_fn(|j| Output {
         recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
         asset,
+        note_type: Val::ZERO,
         value: [900u64, 500][j],
         rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
         rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
     });
-    Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+    Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: 0 }
 }
 
 /// (proof bytes, prove ms, verify ms, proven security bits) for a representative join-split.
@@ -986,26 +1070,32 @@ mod tests {
         let rcm2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 300)];
         let asset = Val::from_u64(42); // single hidden asset for the tx
         let cmf = |v: &(u64, [u64; 2], u64, u64, u64)| {
-            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1]), Val::from_u64(v.4)), Val::from_u64(v.0), rho2(v.2), rcm2(v.3), asset)
+            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1]), Val::from_u64(v.4)), Val::from_u64(v.0), rho2(v.2), rcm2(v.3), asset, Val::ZERO)
         };
         let (_, paths) = build_paths(&[cmf(&in0), cmf(&in1)]);
         let mk_in = |v: (u64, [u64; 2], u64, u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
             nk: v.1,
             div: Val::from_u64(v.4),
             asset,
+            note_type: Val::ZERO,
             value: v.0,
             rho: rho2(v.2),
             rcm: rcm2(v.3),
             sib: pth.0,
             bits: pth.1,
+            mode: Val::ZERO,
+            redeem_tag: [Val::ZERO; DIGEST],
+            refund_tag: [Val::ZERO; DIGEST],
+            hashlock: [Val::ZERO; DIGEST],
+            timeout: 0,
         };
         let inputs = [mk_in(in0, &paths[0]), mk_in(in1, &paths[1])];
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, value: 900, rho: rho2(21), rcm: rcm2(22) },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, value: 500, rho: rho2(23), rcm: rcm2(24) },
+            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: 900, rho: rho2(21), rcm: rcm2(22) },
+            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 500, rho: rho2(23), rcm: rcm2(24) },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
-        Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+        Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: 0 }
     }
 
     #[test]
@@ -1057,6 +1147,7 @@ mod tests {
                     in_rho(i),
                     in_rcm(i),
                     asset,
+                    Val::ZERO,
                 )
             })
             .collect();
@@ -1065,20 +1156,27 @@ mod tests {
             nk: nk(i),
             div: in_div(i),
             asset,
+            note_type: Val::ZERO,
             value: in_values[i],
             rho: in_rho(i),
             rcm: in_rcm(i),
             sib: paths[i].0,
             bits: paths[i].1,
+            mode: Val::ZERO,
+            redeem_tag: [Val::ZERO; DIGEST],
+            refund_tag: [Val::ZERO; DIGEST],
+            hashlock: [Val::ZERO; DIGEST],
+            timeout: 0,
         });
         let outputs = core::array::from_fn(|j| Output {
             recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
             asset,
+            note_type: Val::ZERO,
             value: out_values[j],
             rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
             rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
         });
-        Witness { inputs, outputs, fee, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+        Witness { inputs, outputs, fee, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: 0 }
     }
 
     #[test]
@@ -1259,10 +1357,110 @@ mod tests {
         ob[DIGEST] = out0.rcm[0];
         ob[DIGEST + 1] = out0.rcm[1];
         ob[DIGEST + 2] = alt;
+        ob[DIGEST + 3] = out0.note_type;
         set_block(&mut trace.values, out_base(0) + 1, ob);
         let new_cm: [Val; DIGEST] = native_permute(ob)[..DIGEST].try_into().unwrap();
         let mut pis = public_values(&w);
         pis[PI_OUTCM..PI_OUTCM + DIGEST].copy_from_slice(&new_cm);
         assert!(corrupt_trace_rejected(trace, pis), "a mismatched output asset must not verify");
+    }
+
+    // ---- HTLC native-oracle tests (the spec the htlc_air AIR will be differential-tested against) ----
+
+    /// Build a 2-in/2-out witness whose input 0 is an HTLC note (owner = htlc_root) claimed in
+    /// `redeem`/refund mode at `height`, and input 1 a zero-value PLAIN dummy owned by the claimer.
+    pub(crate) fn htlc_witness(redeem: bool, height: u64, hashlock: [Val; DIGEST], timeout: u64) -> Witness {
+        let asset = Val::from_u64(42);
+        let (nk_r, div_r) = ([7u64, 70u64], Val::from_u64(1));
+        let (nk_f, div_f) = ([9u64, 90u64], Val::from_u64(2));
+        let redeem_tag = recipient_of(Val::from_u64(nk_r[0]), Val::from_u64(nk_r[1]), div_r);
+        let refund_tag = recipient_of(Val::from_u64(nk_f[0]), Val::from_u64(nk_f[1]), div_f);
+        let owner = htlc_root(redeem_tag, refund_tag, hashlock, Val::from_u64(timeout));
+        let (v, rho, rcm) = (1000u64, [Val::from_u64(11), Val::from_u64(211)], [Val::from_u64(100), Val::from_u64(300)]);
+        let cm0 = commit(owner, Val::from_u64(v), rho, rcm, asset, Val::from_u64(NOTE_HTLC));
+        // claimer = redeem party (redeem) or refund party (refund); also owns the dummy input.
+        let (cnk, cdiv) = if redeem { (nk_r, div_r) } else { (nk_f, div_f) };
+        let (drho, drcm) = ([Val::from_u64(13), Val::from_u64(213)], [Val::from_u64(101), Val::from_u64(301)]);
+        let d_rcp = recipient_of(Val::from_u64(cnk[0]), Val::from_u64(cnk[1]), cdiv);
+        let cm1 = commit(d_rcp, Val::ZERO, drho, drcm, asset, Val::ZERO);
+        let (_, paths) = build_paths(&[cm0, cm1]);
+        let in0 = Input {
+            nk: cnk, div: cdiv, asset, note_type: Val::from_u64(NOTE_HTLC), value: v, rho, rcm,
+            sib: paths[0].0, bits: paths[0].1, mode: Val::from_u64(redeem as u64),
+            redeem_tag, refund_tag, hashlock, timeout,
+        };
+        let in1 = Input {
+            nk: cnk, div: cdiv, asset, note_type: Val::ZERO, value: 0, rho: drho, rcm: drcm,
+            sib: paths[1].0, bits: paths[1].1, mode: Val::ZERO,
+            redeem_tag: [Val::ZERO; DIGEST], refund_tag: [Val::ZERO; DIGEST], hashlock: [Val::ZERO; DIGEST], timeout: 0,
+        };
+        let outs = [
+            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: v, rho: [Val::from_u64(21), Val::from_u64(221)], rcm: [Val::from_u64(22), Val::from_u64(222)] },
+            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 0, rho: [Val::from_u64(23), Val::from_u64(223)], rcm: [Val::from_u64(24), Val::from_u64(224)] },
+        ];
+        Witness { inputs: [in0, in1], outputs: outs, fee: 0, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: height }
+    }
+
+    #[test]
+    fn htlc_redeem_and_refund_native_ok() {
+        let hl = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+        // redeem before timeout, refund at/after timeout — both must satisfy the oracle.
+        let r = native_outputs(&htlc_witness(true, 5, hl, 10));
+        let f = native_outputs(&htlc_witness(false, 10, hl, 10));
+        // input 0's nullifier is owner-based (htlc_root), not nk-based.
+        let owner = htlc_root(
+            recipient_of(Val::from_u64(7), Val::from_u64(70), Val::from_u64(1)),
+            recipient_of(Val::from_u64(9), Val::from_u64(90), Val::from_u64(2)),
+            hl, Val::from_u64(10),
+        );
+        let pos = pos_of(&htlc_witness(true, 5, hl, 10).inputs[0].bits);
+        assert_eq!(r.nullifiers[0], nullifier_owner(owner, [Val::from_u64(11), Val::from_u64(211)], pos));
+        let _ = f;
+    }
+
+    /// THE critical soundness property: the same HTLC note redeemed vs refunded yields the SAME
+    /// nullifier (mode/party-independent), so it can be spent at most once across both modes.
+    #[test]
+    fn htlc_nullifier_is_mode_independent() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let redeem = native_outputs(&htlc_witness(true, 5, hl, 10));
+        let refund = native_outputs(&htlc_witness(false, 10, hl, 10));
+        assert_eq!(redeem.nullifiers[0], refund.nullifiers[0], "HTLC nullifier must not depend on mode/party");
+    }
+
+    #[test]
+    fn htlc_root_binds_its_terms() {
+        let a = recipient_of(Val::from_u64(7), Val::from_u64(70), Val::from_u64(1));
+        let b = recipient_of(Val::from_u64(9), Val::from_u64(90), Val::from_u64(2));
+        let hl1 = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl2 = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(5)];
+        assert_ne!(htlc_root(a, b, hl1, Val::from_u64(10)), htlc_root(a, b, hl2, Val::from_u64(10)), "hashlock must bind");
+        assert_ne!(htlc_root(a, b, hl1, Val::from_u64(10)), htlc_root(a, b, hl1, Val::from_u64(11)), "timeout must bind");
+        assert_ne!(htlc_root(a, b, hl1, Val::from_u64(10)), htlc_root(b, a, hl1, Val::from_u64(10)), "party order must bind");
+    }
+
+    #[test]
+    #[should_panic(expected = "claim does not match")]
+    fn htlc_wrong_party_rejected() {
+        // redeem mode but claim with the refund party's key ⇒ claim_tag != redeem_tag ⇒ oracle rejects.
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let mut w = htlc_witness(true, 5, hl, 10);
+        w.inputs[0].nk = [9, 90]; // the refund party's nk, claiming the redeem branch
+        w.inputs[0].div = Val::from_u64(2);
+        let _ = native_outputs(&w);
+    }
+
+    #[test]
+    #[should_panic(expected = "redeem requires height < timeout")]
+    fn htlc_redeem_after_timeout_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let _ = native_outputs(&htlc_witness(true, 10, hl, 10)); // height == timeout, redeem ⇒ reject
+    }
+
+    #[test]
+    #[should_panic(expected = "refund requires height >= timeout")]
+    fn htlc_refund_before_timeout_rejected() {
+        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let _ = native_outputs(&htlc_witness(false, 9, hl, 10)); // height < timeout, refund ⇒ reject
     }
 }
