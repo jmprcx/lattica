@@ -71,6 +71,20 @@ pub const MerkleTree = struct {
         return pos;
     }
 
+    /// Reserve room for `n` more leaves so a subsequent `appendAssumeCapacity` cannot fail — used for
+    /// atomic state commit (audit H-03). Returns `error.TreeFull` if `n` exceeds remaining capacity.
+    pub fn ensureUnusedCapacity(self: *MerkleTree, n: usize) !void {
+        if (@as(u128, self.leaves.items.len) + n > self.capacity()) return error.TreeFull;
+        try self.leaves.ensureUnusedCapacity(self.allocator, n);
+    }
+
+    /// Append a leaf using capacity reserved by `ensureUnusedCapacity` (infallible). Returns its position.
+    pub fn appendAssumeCapacity(self: *MerkleTree, leaf: Hash32) u64 {
+        const pos: u64 = @intCast(self.leaves.items.len);
+        self.leaves.appendAssumeCapacity(leaf);
+        return pos;
+    }
+
     /// The current root (anchor).
     pub fn root(self: MerkleTree) Hash32 {
         return self.node(self.depth, 0);

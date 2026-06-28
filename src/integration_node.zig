@@ -56,8 +56,8 @@ fn run() !void {
     const bob = try tx.FullKey.fromSeed([_]u8{2} ** 32);
 
     // Alice holds a 1000 note + a zero-value padding note (both real tree members).
-    const m0 = try chain.mint(alice.address(), 1000, [_]u8{11} ** 32);
-    const m1 = try chain.mint(alice.address(), 0, [_]u8{12} ** 32);
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{11} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{12} ** 32);
     const inputs = [_]node.InputSpend{
         .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
         .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },

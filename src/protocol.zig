@@ -228,13 +228,20 @@ pub const SupplyState = struct {
         const burned: u128 = d.burned;
         const fee: u128 = d.fee;
 
-        self.issued = try add(self.issued, minted);
-        self.burned = try add(self.burned, burned);
-        self.fees_paid = try add(self.fees_paid, fee);
+        // Compute the complete candidate state in locals; assign `self.*` only after ALL checked
+        // arithmetic succeeds, so a failing op leaves the state unchanged (atomic; audit H-03).
+        const issued = try add(self.issued, minted);
+        const total_burned = try add(self.burned, burned);
+        const fees_paid = try add(self.fees_paid, fee);
         // pool += mint; pool -= burn; pool -= fee (fee leaves the pool).
-        self.shielded_pool = try add(self.shielded_pool, minted);
-        self.shielded_pool = try sub(self.shielded_pool, burned);
-        self.shielded_pool = try sub(self.shielded_pool, fee);
+        var pool = try add(self.shielded_pool, minted);
+        pool = try sub(pool, burned);
+        pool = try sub(pool, fee);
+
+        self.issued = issued;
+        self.burned = total_burned;
+        self.fees_paid = fees_paid;
+        self.shielded_pool = pool;
     }
 
     /// The audit invariant, recomputable by any full node.
@@ -341,4 +348,17 @@ test "protocol: supply rejects underflow (burn/fee exceeding pool)" {
     var s = SupplyState{};
     try s.apply(.{ .issued = 50, .burned = 0, .fee = 0 });
     try testing.expectError(Error.SupplyUnderflow, s.apply(.{ .issued = 0, .burned = 100, .fee = 0 }));
+}
+
+test "protocol: a failed supply.apply leaves the state unchanged (atomic; H-03)" {
+    var s = SupplyState{};
+    try s.apply(.{ .issued = 50, .burned = 0, .fee = 0 });
+    const before = s;
+    // An underflowing delta must not partially mutate any field.
+    try testing.expectError(Error.SupplyUnderflow, s.apply(.{ .issued = 10, .burned = 0, .fee = 100 }));
+    try testing.expectEqual(before.issued, s.issued);
+    try testing.expectEqual(before.burned, s.burned);
+    try testing.expectEqual(before.shielded_pool, s.shielded_pool);
+    try testing.expectEqual(before.fees_paid, s.fees_paid);
+    try testing.expect(s.invariantHolds());
 }

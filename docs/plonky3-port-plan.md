@@ -1,5 +1,8 @@
 # Plonky3 production port plan
 
+> **⚠ Historical / reference-only — not the v1 audit artifact.** The port (M1–M6) is complete; this is
+> the milestone record. Start at [`AUDITORS.md`](AUDITORS.md); current state is `remediation-status.md`.
+
 **Decision (see `docs/framework-decision.md`):** the production spend circuit is built on **Plonky3**
 — transparent, FRI/post-quantum, **zero-knowledge** (hiding PCS), **stable** Rust, **proven-security**
 accounting. Field = **Goldilocks** (64-bit, so `u64` note values fit directly — clean value-balance

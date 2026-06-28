@@ -1,5 +1,8 @@
 # Lattica — Soundness Argument and Gap Analysis
 
+> **⚠ Historical / reference-only — not the v1 audit artifact.** Superseded for the production stack by
+> `soundness-budget.md` (the C-04 ~103/127-bit accounting). Start at [`AUDITORS.md`](AUDITORS.md).
+
 **Status:** written argument for the *implemented* construction + design for the remaining work
 **Scope:** the zero-knowledge FRI-STARK in `src/stark.zig` and its use in `src/circuit.zig`
 

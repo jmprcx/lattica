@@ -122,8 +122,8 @@ fn demo(a: std.mem.Allocator) !void {
     std.debug.print("Alice and Bob each hold a post-quantum account (ML-KEM + ML-DSA keys).\n\n", .{});
 
     // 1. Mint funds to Alice: a 1000 note plus a zero-value note to pad the fixed 2-in shape.
-    const m0 = try chain.mint(alice.address(), 1000, [_]u8{11} ** 32);
-    const m1 = try chain.mint(alice.address(), 0, [_]u8{12} ** 32);
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{11} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{12} ** 32);
     std.debug.print("[mint]   1000 minted to Alice (+ a 0-value padding note); anchor now {s}…\n", .{hex6(&chain.anchor())});
     if (tx.tryDecrypt(a, alice, chain.transmitted.items[0])) |n| {
         std.debug.print("         Alice trial-decrypts her note: value = {d}.\n\n", .{n.value});

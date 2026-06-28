@@ -32,11 +32,24 @@ So the earlier "✅ in new stack (not live)" caveats are resolved: the new stack
 
 ## Implementation audit (`docs/lattica-implementation-audit.md`, Codex, 2026-06-27) — remediated
 
-All findings (C-01 critical ghost-coin binding; H-01 supply accumulator; H-02 validation order;
-M-01..M-04 hardening; L-01/L-02 docs + format consolidation) addressed on the audit branch. See the
-**Developer Remediation Response** table at the end of `docs/lattica-implementation-audit.md` for the
-finding-by-finding mapping. Re-validated: 30 Rust tests, full Zig suite, and the real cross-language
-integration (which rejects the C-01 ghost-coin attack through the real Rust verifier).
+**Round 1** — C-01 (critical ghost-coin binding), H-01 (supply accumulator), H-02 (validation order),
+M-01..M-04 (ABI/codec/alloc hardening), L-01/L-02 (docs + format). All addressed; the re-audit
+**verified** them.
+
+**Round 2** (re-audit new findings) — also addressed:
+- **H-03** atomic state on error — `SupplyState.apply` assigns only after all arithmetic succeeds;
+  `applyChecked`/`bootstrapMint` are two-phase (reserve capacity + copy, then infallible commit).
+- **H-04** transmitted-note ownership — chain deep-copies ciphertexts and frees them in `deinit`.
+- **M-05** verifier size limits — proof/ciphertext byte caps before verification.
+- **M-06** issuance API — `Chain.mint` → `bootstrapMint` (genesis/test-only contract).
+- **M-07** full-node consensus surface — lattica-layer parts done; block-level commitments/reorg/mempool
+  remain host-chain scope (see "Out of lattica's scope" below).
+- **L-01/L-02** — pre-Plonky3 docs banner'd reference-only; `AUDITORS.md` §4 lists canonical vs historical.
+
+See the **Developer Remediation Response** tables (Round 1 and Round 2) in
+`docs/lattica-implementation-audit.md` for the finding-by-finding mapping. Re-validated each round:
+30 Rust tests, full Zig suite, and the real cross-language integration (ghost-coin rejected through the
+real Rust verifier).
 
 ## Out of lattica's scope (host chain `rubble-node-zig`)
 

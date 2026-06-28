@@ -1,5 +1,8 @@
 # Lattica — Production-Readiness Assessment
 
+> **⚠ Historical / reference-only — not the v1 audit artifact.** Pre-cutover assessment. Start at
+> [`AUDITORS.md`](AUDITORS.md); current state is `remediation-status.md` and `lattica-implementation-audit.md`.
+
 **Audience:** CTO / technical diligence · **Subject:** Lattica quantum-safe shielded payment protocol (PoC)
 **Version assessed:** 0.1 (2026-06) · **Assessment date:** 2026-06-25
 **Basis:** Full source review of the `lattica` Cargo workspace, `SPEC.md`, `README.md`; tests and benchmarks re-run locally for this report.

@@ -1,5 +1,9 @@
 # Lattica Transaction Stack Production Audit
 
+> **⚠ Historical / reference-only — not the v1 audit artifact.** This is the earlier (2026-06-26)
+> pre-Plonky3 audit; its findings are tracked as closed/superseded in `remediation-status.md`. The
+> current implementation audit is `lattica-implementation-audit.md`. Start at [`AUDITORS.md`](AUDITORS.md).
+
 **Date:** 2026-06-26  
 **Basepoint:** `docs/audit-scope.md`  
 **Scope:** transaction validation, note/key primitives, Merkle state, live authorization STARK, and the standalone full-spend AIR direction.

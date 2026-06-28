@@ -83,6 +83,13 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
 4. **`docs/protocol-v1-decisions.md`** — the deliberate v1 parameter decisions + limitations
    (single-asset, key model, note randomness, issuance, the deterministic-encryption interaction).
 
+Also current: `docs/lattica-implementation-audit.md` (the implementation audit + remediation log) and
+`docs/remediation-status.md` (live status). `docs/full-node-security-integration.md` is the production
+full-node checklist (host-chain scope). **Everything else in `docs/` is historical / reference-only**
+(each carries a banner pointing back here) — `audit-scope.md`, `soundness.md`,
+`transaction-stack-audit.md`, `framework-decision.md`, `plonky3-port-plan.md`, `production-readiness.md`,
+and `parameters.md` predate the Plonky3 cutover and are not part of the audit artifact.
+
 ## 5. Known limitations / sign-off items (consolidated)
 
 - **Proven soundness ~103-bit** (~127 conjectured) — the Goldilocks F_p² ceiling; raising it needs a
@@ -102,12 +109,12 @@ fixed real bugs — a fixed-seed (non-CSPRNG) ZK-blinding RNG; a node-layer `min
 verifier **panic** across the C ABI; and a missing `rho1` **persistence** constraint that would have
 allowed a forged second nullifier per note. Each has a regression test.
 
-**Implementation audit + remediation (Codex, 2026-06-27):** see `docs/lattica-implementation-audit.md`.
-It found a **critical ghost-coin bug (C-01)** — the live node applied `outputs[j].cm` to the tree
-without binding it to the proof — plus hardening items (H-01/H-02, M-01..M-04, L-01/L-02). **All are
-remediated** (single-source output commitment, reordered validation, supply accumulator, ABI/codec
-hardening); the finding-by-finding response is the table at the end of that file. We still expect an
-independent re-review to find more — budget accordingly, especially in the areas below.
+**Implementation audit + remediation re-audit (Codex, 2026-06-27):** see
+`docs/lattica-implementation-audit.md` and read the current re-audit section first. The original
+**critical ghost-coin bug (C-01)** is verified remediated (single-source output commitment, reordered
+validation, supply accumulator, ABI/codec hardening). The re-audit still blocks production on
+state-update atomicity, transmitted-note ownership, verifier/input size limits, issuance API gating,
+and full-node consensus integration. Budget independent review especially in the areas below.
 
 ## 6. Highest-risk areas to focus
 

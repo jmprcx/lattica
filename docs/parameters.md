@@ -1,5 +1,8 @@
 # Lattica — Production Parameter Selection
 
+> **⚠ Reference-only — not the v1 audit artifact.** Design guidance that predates the Plonky3 cutover;
+> the live soundness/parameter accounting is `soundness-budget.md`. Start at [`AUDITORS.md`](AUDITORS.md).
+
 **Status:** design guidance · **Audience:** protocol engineers / reviewers
 
 This document records the cryptographic parameters of the Lattica reference and the values

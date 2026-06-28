@@ -15,10 +15,10 @@ This document turns the transaction-stack audit and supply-audit discussion into
 
 ## Current Repo Status
 
-- `node.zig` now uses checked `u64` addition and `TxError.ValueOverflow` in wallet construction and node validation.
-- `docs/remediation-status.md` marks reference-layer STARK non-canonical/trailing-byte proof rejection as done.
-- The live node still validates a PoC transaction format: membership, nullifier uniqueness, and balance are native node checks, while spend authority is not yet bound into a complete production spend proof.
-- Production work is planned around a vetted transparent post-quantum FRI-STARK framework and a full spend statement binding ownership, commitment opening, membership, nullifier, balance, range, and transaction context.
+- Live transaction validation now uses the Plonky3 join-split proof path end to end: ownership, commitment opening, Merkle membership, nullifier derivation, value range, balance, output commitments, `mint`, and `tx_binding` are proven by `lattica-prover-p3` and checked through the Rust C ABI.
+- The original C-01 ghost-coin output-commitment binding bug is remediated; see `docs/lattica-implementation-audit.md`.
+- The current production blockers are state-update atomicity, transmitted-note ownership, verifier/input size limits, issuance API gating, canonical live transaction/block encoding, state-root commitments, reorg undo logs, snapshot validation, and mempool proof-cache policy.
+- This document remains the full-node production checklist: `src/node.zig` is an in-memory shielded transaction state machine, not a complete production consensus node.
 
 ## Core Supply Invariant
 

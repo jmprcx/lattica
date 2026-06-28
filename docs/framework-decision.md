@@ -1,5 +1,8 @@
 # Phase-0 framework decision
 
+> **⚠ Historical / reference-only — not the v1 audit artifact.** Records the Phase-0 framework choice
+> (the project ultimately moved to Plonky3). Start at [`AUDITORS.md`](AUDITORS.md).
+
 **Decision:** adopt **Winterfell** (v0.13.1) as the production proving framework.
 
 ## Why Winterfell

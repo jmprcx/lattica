@@ -1,5 +1,9 @@
 # Lattica — Audit Scope & Reviewer Guide
 
+> **⚠ Historical / reference-only — not the v1 audit artifact.** Predates the Plonky3 join-split
+> cutover (earlier Winterfell/Rescue stack). Start at [`AUDITORS.md`](AUDITORS.md); current scope is
+> `audit-scope-p3.md`.
+
 This is a from-scratch, **unaudited**, PoC-grade cryptosystem written in Zig. Tests cover
 completeness and many soundness *rejections*, but cannot substitute for review. This document
 tells a reviewer where the soundness-critical surface is, what to verify, and what is a known

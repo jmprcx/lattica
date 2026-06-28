@@ -39,8 +39,15 @@ pub const TxError = error{
     IllegalIssuance,
     ValueOverflow,
     TreeFull,
+    OversizeProof,
+    OversizeOutput,
     Internal,
 };
+
+/// Upper bound on a single output's note ciphertext (a 120-byte note plaintext + AEAD overhead is
+/// ~136 bytes; this generous cap lets the node reject malformed/oversize outputs before the expensive
+/// proof verification — audit M-05). The proof size bound is `ffi.MAX_PROOF_LEN`.
+pub const MAX_NOTE_CIPHERTEXT_LEN: usize = 256;
 
 /// A note the wallet owns and is about to spend: the note, its tree position, and its membership
 /// path under the anchor being spent against.
@@ -278,6 +285,9 @@ pub const Chain = struct {
         self.tree.deinit();
         self.anchors.deinit();
         self.nullifiers.deinit();
+        // The chain owns every stored transmitted-note ciphertext (deep-copied on apply / allocated by
+        // the bootstrap mint), so it frees them here (audit H-04 — no leak / no dangling pointers).
+        for (self.transmitted.items) |tn| self.allocator.free(tn.ciphertext);
         self.transmitted.deinit(self.allocator);
     }
 
@@ -295,24 +305,32 @@ pub const Chain = struct {
         return self.tree.authenticationPath(allocator, position) catch return TxError.Internal;
     }
 
-    fn insertCommitment(self: *Chain, cm: Hash32) !u64 {
-        const pos = self.tree.append(cm) catch return TxError.TreeFull;
-        self.anchors.put(self.tree.root(), {}) catch return TxError.Internal;
-        return pos;
-    }
-
-    /// Mint funds directly into a shielded note (coinbase-style, to bootstrap the demo / pad inputs).
-    pub fn mint(self: *Chain, address: tx.Address, value: u64, seed: Hash32) !Minted {
+    /// **GENESIS / TEST-ONLY.** Mint value directly into a shielded note, bypassing the join-split
+    /// proof — used only to bootstrap the demo and pad inputs (audit M-06). Production issuance MUST go
+    /// through the proof- and consensus-gated coinbase path (`applyCoinbase`); host-chain/RPC code must
+    /// never call this. Atomic: all fallible work (reservation, candidate supply) precedes any state
+    /// mutation, so a failure leaves the chain unchanged (audit H-03).
+    pub fn bootstrapMint(self: *Chain, address: tx.Address, value: u64, seed: Hash32) !Minted {
         var value_le: [8]u8 = undefined;
         std.mem.writeInt(u64, &value_le, value, .little);
         const rho = p.hashDomain("lattica:v1:mint-rho", &.{ &seed, &value_le });
         const rcm = p.expand(&seed, "mint-rcm");
         const note = tx.Note{ .value = value, .recipient = address.recipientId(), .div = address.div, .rho = rho, .rcm = rcm };
         const tn = tx.encryptNote(self.allocator, address, note) catch return TxError.Internal;
-        // Bootstrap issuance: this value enters the shielded pool (coinbase-style).
-        self.supply.apply(.{ .issued = value, .burned = 0, .fee = 0 }) catch return TxError.ValueOverflow;
-        const pos = try self.insertCommitment(tn.cm);
-        self.transmitted.append(self.allocator, tn) catch return TxError.Internal;
+        errdefer self.allocator.free(tn.ciphertext); // freed unless ownership transfers to the chain below
+
+        // Fallible phase: candidate supply + capacity reservation (no state mutation yet).
+        var candidate_supply = self.supply;
+        candidate_supply.apply(.{ .issued = value, .burned = 0, .fee = 0 }) catch return TxError.ValueOverflow;
+        self.tree.ensureUnusedCapacity(1) catch return TxError.TreeFull;
+        self.anchors.ensureUnusedCapacity(1) catch return TxError.Internal;
+        self.transmitted.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal;
+
+        // Infallible commit.
+        self.supply = candidate_supply;
+        const pos = self.tree.appendAssumeCapacity(tn.cm);
+        self.anchors.putAssumeCapacity(self.tree.root(), {});
+        self.transmitted.appendAssumeCapacity(tn);
         return .{ .note = note, .pos = pos };
     }
 
@@ -335,20 +353,22 @@ pub const Chain = struct {
     /// Shared validation + application. `allowed_mint` is the only permitted issuance (0 for a normal
     /// tx; the block reward for a coinbase).
     fn applyChecked(self: *Chain, t: ShieldedTx, allowed_mint: u64) TxError!void {
-        // Cheap, deterministic consensus checks run FIRST so an invalid tx is rejected before the
-        // expensive proof verification (DoS hardening — audit H-02). Proof verification still runs
-        // before any state mutation.
+        // ---- Cheap, deterministic checks run FIRST so an invalid tx is rejected before the expensive
+        //      proof verification (DoS hardening — audit H-02). ----
 
-        // 1. Issuance gate. The circuit only proves balance *given* `mint`, so the node must pin
-        //    `mint` to the consensus-authorized amount — otherwise anyone could submit dummy inputs +
-        //    mint > 0 + a matching output and inflate the supply. Normal txs require mint == 0;
-        //    coinbase requires mint == reward.
+        // Issuance gate. The circuit only proves balance *given* `mint`, so the node pins `mint` to the
+        // consensus-authorized amount (normal txs: 0; coinbase: reward) — else dummy inputs + mint > 0 +
+        // a matching output would inflate supply.
         if (t.mint != allowed_mint) return TxError.IllegalIssuance;
 
-        // 2. The anchor must be one the chain published.
+        // The anchor must be one the chain published.
         if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
 
-        // 3. Nullifiers: reject any already spent, or duplicated within this transaction.
+        // Size limits before any heavy parsing/verification (DoS — audit M-05).
+        if (t.proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
+        for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
+
+        // Nullifiers: reject any already spent, or duplicated within this transaction.
         var seen = HashSet.init(self.allocator);
         defer seen.deinit();
         for (t.nullifiers) |nf| {
@@ -357,21 +377,41 @@ pub const Chain = struct {
             if (gop.found_existing) return TxError.DoubleSpend;
         }
 
-        // 4. The join-split proof is the sole authorization — fail-closed (no backend ⇒ reject). It
-        //    binds ownership, membership under the anchor, nullifier correctness, balance, and range;
-        //    its tx_binding == the public body (recomputed here, incl. every output commitment), and
-        //    `publicInputs().out_cms` is derived from `outputs[j].cm` (the value applied below), so the
-        //    proof binds exactly what is inserted into the tree — no unproven ghost commitment (C-01).
+        // ---- Proof verification: the sole authorization (fail-closed, panic-isolated). It binds
+        //      ownership, membership, nullifiers, balance, range, and the whole body — incl. every
+        //      output commitment, since `publicInputs().out_cms` derives from `outputs[j].cm` (the value
+        //      committed below), so the proof binds exactly what enters the tree (no ghost coin; C-01). ----
         if (!ffi.verifyJoinSplit(t.proof, t.publicInputs())) return TxError.BadAuthProof;
 
-        // 5. Apply (only after all checks pass). Update the public supply accounting FIRST: it uses
-        //    checked wide arithmetic on the public (mint, fee) delta, so a delta that would break the
-        //    invariant (e.g. fees exceeding the pool) rejects before any state mutation (audit H-01).
-        self.supply.apply(.{ .issued = t.mint, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
-        for (t.nullifiers) |nf| self.nullifiers.put(nf, {}) catch return TxError.Internal;
-        for (t.outputs) |o| {
-            _ = self.insertCommitment(o.cm) catch return TxError.Internal;
-            self.transmitted.append(self.allocator, o) catch return TxError.Internal;
+        // ---- Atomic two-phase apply (audit H-03): perform ALL fallible work (supply arithmetic,
+        //      capacity reservation, chain-owned ciphertext copies) before mutating any consensus state;
+        //      the commit phase is then infallible, so a rejected/erroring tx never leaves partial state. ----
+        // (a) candidate supply — atomic arithmetic on the public (mint, fee) delta (does not touch self).
+        var candidate_supply = self.supply;
+        candidate_supply.apply(.{ .issued = t.mint, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
+        // (b) reserve all capacity up front (so the commit-phase inserts/appends cannot fail).
+        self.nullifiers.ensureUnusedCapacity(@intCast(N_IN)) catch return TxError.Internal;
+        self.anchors.ensureUnusedCapacity(@intCast(M_OUT)) catch return TxError.Internal;
+        self.transmitted.ensureUnusedCapacity(self.allocator, M_OUT) catch return TxError.Internal;
+        self.tree.ensureUnusedCapacity(M_OUT) catch return TxError.TreeFull;
+        // (c) chain-own each output's ciphertext via deep copy (audit H-04); on any failure, free the
+        //     copies made so far (errdefer) and reject before mutating consensus state.
+        var owned: [M_OUT]tx.TransmittedNote = undefined;
+        var copied: usize = 0;
+        errdefer for (owned[0..copied]) |o| self.allocator.free(o.ciphertext);
+        for (&owned, t.outputs) |*dst, o| {
+            const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
+            dst.* = .{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct };
+            copied += 1;
+        }
+
+        // ---- Infallible commit. ----
+        self.supply = candidate_supply;
+        for (t.nullifiers) |nf| self.nullifiers.putAssumeCapacity(nf, {});
+        for (owned) |o| {
+            _ = self.tree.appendAssumeCapacity(o.cm);
+            self.anchors.putAssumeCapacity(self.tree.root(), {});
+            self.transmitted.appendAssumeCapacity(o);
         }
     }
 };
@@ -440,8 +480,8 @@ fn account(seed: u8) !tx.FullKey {
 /// Mint a real note + a zero-value padding note to `key`, returning both as `InputSpend`s under the
 /// current anchor (the join-split needs `N_IN` real tree members).
 fn fundTwoInputs(a: Allocator, chain: *Chain, key: tx.FullKey, value: u64, salt: u8) ![N_IN]InputSpend {
-    const m0 = try chain.mint(key.address(), value, [_]u8{salt} ** 32);
-    const m1 = try chain.mint(key.address(), 0, [_]u8{salt +% 1} ** 32);
+    const m0 = try chain.bootstrapMint(key.address(), value, [_]u8{salt} ** 32);
+    const m1 = try chain.bootstrapMint(key.address(), 0, [_]u8{salt +% 1} ** 32);
     return .{
         .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
         .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
@@ -563,6 +603,82 @@ test "H-01: public supply accounting tracks mint/fee and the invariant holds" {
     try testing.expectEqual(@as(u128, 1000), chain.supply.issued);
     try testing.expectEqual(@as(u128, 100), chain.supply.fees_paid);
     try testing.expectEqual(@as(u128, 900), chain.supply.shielded_pool);
+}
+
+test "H-03: a rejected transaction leaves chain state unchanged (atomic apply)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 5);
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    var t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    const supply_before = chain.supply;
+    const anchor_before = chain.anchor();
+    const nulls_before = chain.nullifiers.count();
+    const tx_before = chain.transmitted.items.len;
+    // Reject (tampered output ⇒ BadAuthProof). No supply/anchor/nullifier/transmitted mutation.
+    t.outputs[0].cm[0] +%= 1;
+    try testing.expectError(TxError.BadAuthProof, chain.verifyAndApply(t));
+    try testing.expectEqual(supply_before.issued, chain.supply.issued);
+    try testing.expectEqual(supply_before.shielded_pool, chain.supply.shielded_pool);
+    try testing.expectEqual(supply_before.fees_paid, chain.supply.fees_paid);
+    try testing.expectEqual(anchor_before, chain.anchor());
+    try testing.expectEqual(nulls_before, chain.nullifiers.count());
+    try testing.expectEqual(tx_before, chain.transmitted.items.len);
+}
+
+test "H-04: chain owns transmitted ciphertexts after the tx allocator is freed" {
+    // chain uses a persistent arena; the tx uses a temporary arena that we free after apply.
+    var chain_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer chain_arena.deinit();
+    const ca = chain_arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(ca);
+    const alice = try account(1);
+    const bob = try account(2);
+    const inputs = try fundTwoInputs(ca, &chain, alice, 1000, 5);
+    {
+        var tx_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        const ta = tx_arena.allocator();
+        const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+        const t = try buildTransfer(ta, alice, &inputs, &outs, 100, 0, chain.anchor());
+        try chain.verifyAndApply(t);
+        tx_arena.deinit(); // frees the tx's proof + its output ciphertext buffers
+    }
+    // The chain deep-copied Bob's ciphertext, so it still decrypts from chain history (no dangling ptr).
+    var bob_total: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (tx.tryDecrypt(ca, bob, tn)) |n| bob_total += n.value;
+    }
+    try testing.expectEqual(@as(u64, 900), bob_total);
+}
+
+test "M-05: oversize proof and oversize output ciphertext are rejected before verification" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    const inputs = try fundTwoInputs(a, &chain, alice, 1000, 5);
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    var t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    // Oversize proof ⇒ rejected before the verifier is even called.
+    const saved = t.proof;
+    t.proof = try a.alloc(u8, ffi.MAX_PROOF_LEN + 1);
+    try testing.expectError(TxError.OversizeProof, chain.verifyAndApply(t));
+    t.proof = saved;
+    // Oversize output ciphertext ⇒ rejected.
+    t.outputs[0].ciphertext = try a.alloc(u8, MAX_NOTE_CIPHERTEXT_LEN + 1);
+    try testing.expectError(TxError.OversizeOutput, chain.verifyAndApply(t));
 }
 
 test "unknown anchor rejected" {
