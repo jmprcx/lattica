@@ -342,7 +342,7 @@ pub fn buildTransfer(
         const rho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nfs[0], &jb });
         const rcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &jb });
         out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .div = recipient.div, .rho = rho, .rcm = rcm };
-        tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal; // tns[j].cm = out_notes[j].commitment()
+        tns[j] = tx.encryptNote(allocator, &sender.ovk, recipient, out_notes[j]) catch return TxError.Internal; // tns[j].cm = out_notes[j].commitment()
         built += 1;
     }
 
@@ -518,7 +518,7 @@ pub fn buildHtlcSpend(
         const orho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nf0, &jb });
         const orcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nf0, &jb });
         out_notes[j] = .{ .value = value, .recipient = recipient.recipientId(), .div = recipient.div, .asset = spend.note.asset, .rho = orho, .rcm = orcm };
-        tns[j] = tx.encryptNote(allocator, recipient, out_notes[j]) catch return TxError.Internal;
+        tns[j] = tx.encryptNote(allocator, &claimer.ovk, recipient, out_notes[j]) catch return TxError.Internal;
         built += 1;
     }
 
@@ -623,7 +623,7 @@ pub fn buildHtlcLock(
     const crho = p.hashDomain(OUT_RHO_DOMAIN, &.{ &nfs[0], &[_]u8{1} });
     const crcm = p.hashDomain(OUT_RCM_DOMAIN, &.{ &nfs[0], &[_]u8{1} });
     out_notes[1] = .{ .value = change, .recipient = locker.address().recipientId(), .div = locker.address().div, .asset = asset, .rho = crho, .rcm = crcm };
-    tns[1] = tx.encryptNote(allocator, locker.address(), out_notes[1]) catch return TxError.Internal;
+    tns[1] = tx.encryptNote(allocator, &locker.ovk, locker.address(), out_notes[1]) catch return TxError.Internal;
     errdefer allocator.free(tns[1].ciphertext); // free the change ciphertext on any later error (audit r2 F2)
 
     var t = ShieldedHtlcTx{
@@ -723,7 +723,8 @@ pub const Chain = struct {
         const rho = p.hashDomain("lattica:v1:mint-rho", &.{ &seed, &value_le });
         const rcm = p.expand(&seed, "mint-rcm");
         const note = tx.Note{ .value = value, .recipient = address.recipientId(), .div = address.div, .rho = rho, .rcm = rcm };
-        const tn = tx.encryptNote(self.allocator, address, note) catch return TxError.Internal;
+        const ovk = p.expand(&seed, "ovk"); // genesis/test sender-side ovk (deterministic from the mint seed)
+        const tn = tx.encryptNote(self.allocator, &ovk, address, note) catch return TxError.Internal;
         errdefer self.allocator.free(tn.ciphertext); // freed unless ownership transfers to the chain below
 
         // Fallible phase: candidate supply + capacity reservation (no state mutation yet).
@@ -1291,7 +1292,7 @@ test "node: a shielded HTLC redeem verifies and applies (mock backend)" {
         const rho = p.hashDomain("test:htlc-out-rho", &.{&jb});
         const rcm = p.hashDomain("test:htlc-out-rcm", &.{&jb});
         const note = tx.Note{ .value = values[j], .recipient = claimer.address().recipientId(), .div = claimer.address().div, .rho = rho, .rcm = rcm };
-        tns[j] = try tx.encryptNote(a, claimer.address(), note);
+        tns[j] = try tx.encryptNote(a, &claimer.ovk, claimer.address(), note);
     }
     var t = ShieldedHtlcTx{
         .anchor = chain.anchor(),
@@ -1331,7 +1332,7 @@ test "node: a tampered HTLC body (different preimage) is rejected" {
     for (0..M_OUT) |j| {
         const jb = [_]u8{@intCast(j)};
         const note = tx.Note{ .value = ovals[j], .recipient = claimer.address().recipientId(), .div = claimer.address().div, .rho = p.hashDomain("test:o-rho", &.{&jb}), .rcm = p.hashDomain("test:o-rcm", &.{&jb}) };
-        tns[j] = try tx.encryptNote(a, claimer.address(), note);
+        tns[j] = try tx.encryptNote(a, &claimer.ovk, claimer.address(), note);
     }
     var t = ShieldedHtlcTx{ .anchor = chain.anchor(), .nullifiers = .{ [_]u8{7} ** 32, [_]u8{8} ** 32 }, .fee = 0, .mint = 0, .current_height = 50, .redeem_preimage = [_]u8{0xAB} ** 32, .proof = &.{}, .outputs = tns };
     const binding = t.txBinding();
@@ -1408,7 +1409,7 @@ test "node: applyHtlc defense-in-depth rejects (height/fee bounds + non-canonica
     for (0..M_OUT) |j| {
         const jb = [_]u8{@intCast(j)};
         const note = tx.Note{ .value = 0, .recipient = claimer.address().recipientId(), .div = claimer.address().div, .rho = p.hashDomain("t:dr", &.{&jb}), .rcm = p.hashDomain("t:dc", &.{&jb}) };
-        tns[j] = try tx.encryptNote(a, claimer.address(), note);
+        tns[j] = try tx.encryptNote(a, &claimer.ovk, claimer.address(), note);
     }
     const base = ShieldedHtlcTx{ .anchor = chain.anchor(), .nullifiers = .{ [_]u8{7} ** 32, [_]u8{8} ** 32 }, .fee = 0, .mint = 0, .current_height = 50, .redeem_preimage = null, .proof = &.{}, .outputs = tns };
 

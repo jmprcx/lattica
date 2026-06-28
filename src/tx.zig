@@ -187,6 +187,11 @@ pub const FullKey = struct {
     nk: Hash32,
     div_master: Hash32,
     kem_master: Hash32,
+    /// Outgoing-viewing key. The note-encryption KEM coins are derived from `ovk ‖ cm` (not from `cm`
+    /// alone), so a third party holding only the recipient's public address CANNOT recompute `kem_ct`
+    /// and thereby deanonymize the recipient (audit r2 H-1). The sender still reconstructs sent notes
+    /// from its seed (it has `ovk`), preserving seed-restorability.
+    ovk: Hash32,
     sig: p.SigKeypair,
 
     /// Create a wallet account from a spending seed.
@@ -194,9 +199,10 @@ pub const FullKey = struct {
         const nk = p.expand(&seed, "nk");
         const div_master = p.expand(&seed, "div-master");
         const kem_master = p.expand(&seed, "kem-master");
+        const ovk = p.expand(&seed, "ovk");
         const dsa_seed = p.expand(&seed, "ml-dsa");
         const sig = try p.SigKeypair.fromSeed(dsa_seed);
-        return .{ .seed = seed, .nk = nk, .div_master = div_master, .kem_master = kem_master, .sig = sig };
+        return .{ .seed = seed, .nk = nk, .div_master = div_master, .kem_master = kem_master, .ovk = ovk, .sig = sig };
     }
 
     /// The diversified payment address at index `i` (distinct, unlinkable addresses for `i = 0,1,…`).
@@ -232,14 +238,16 @@ pub const TransmittedNote = struct {
     ciphertext: []u8,
 };
 
-/// Encrypt `note` to `address`, producing the on-chain transmitted note. The commitment is bound
-/// into the encapsulation coins, the KDF, and the AEAD associated data.
-pub fn encryptNote(allocator: Allocator, address: Address, note: Note) !TransmittedNote {
+/// Encrypt `note` to `address`, producing the on-chain transmitted note. `ovk` is the **sender's**
+/// outgoing-viewing key: the KEM encapsulation coins are `H(ovk ‖ cm)`, so `kem_ct` is reproducible by
+/// the sender (seed-restorability) but NOT by a third party holding only the recipient's public address
+/// (closing the H-1 deanonymization oracle). The commitment is also bound into the KDF + AEAD aad.
+pub fn encryptNote(allocator: Allocator, ovk: *const Hash32, address: Address, note: Note) !TransmittedNote {
     if (!std.mem.eql(u8, &note.recipient, &address.recipient_id) or note.div != address.div) {
         return error.RecipientMismatch;
     }
     const cm = note.commitment();
-    const coins = p.expand(&cm, "kem-encaps");
+    const coins = p.hashDomain("lattica:v1:kem-encaps", &.{ ovk, &cm });
     const enc = try p.encapsulate(&address.kem_ek, coins);
     const key = p.deriveNoteKey(&enc.ss, &enc.ct, &cm);
     const pt = note.toBytes();
@@ -301,7 +309,7 @@ test "encrypt decrypt round trip" {
     const a = testing.allocator;
     const alice = try account(1);
     const note = noteTo(alice.address(), 4242);
-    const tn = try encryptNote(a, alice.address(), note);
+    const tn = try encryptNote(a, &alice.ovk, alice.address(), note);
     defer a.free(tn.ciphertext);
     const recovered = tryDecrypt(a, alice, tn) orelse return error.TestUnexpectedNull;
     try testing.expect(recovered.eql(note));
@@ -312,7 +320,7 @@ test "non-recipient cannot decrypt" {
     const alice = try account(1);
     const bob = try account(2);
     const note = noteTo(alice.address(), 4242);
-    const tn = try encryptNote(a, alice.address(), note);
+    const tn = try encryptNote(a, &alice.ovk, alice.address(), note);
     defer a.free(tn.ciphertext);
     try testing.expect(tryDecrypt(a, bob, tn) == null);
 }
@@ -327,7 +335,8 @@ test "tryDecrypt re-derives div, ignoring an attacker-malleable wire div (audit 
     // reject the div mismatch, so we seal it directly).
     const note = Note{ .value = 500, .recipient = addr.recipient_id, .div = 0xDEAD_BEEF, .rho = [_]u8{3} ** 32, .rcm = [_]u8{4} ** 32 };
     const cm = note.commitment();
-    const coins = p.expand(&cm, "kem-encaps");
+    const attacker_ovk = [_]u8{0xAB} ** 32; // the hostile sender's own ovk (alice decrypts via sk regardless)
+    const coins = p.hashDomain("lattica:v1:kem-encaps", &.{ &attacker_ovk, &cm });
     const enc = try p.encapsulate(&addr.kem_ek, coins);
     const key = p.deriveNoteKey(&enc.ss, &enc.ct, &cm);
     const ct = try p.seal(a, key, &note.toBytes(), &cm);
@@ -342,6 +351,30 @@ test "tryDecrypt re-derives div, ignoring an attacker-malleable wire div (audit 
     try testing.expectEqualSlices(u8, &got.recipient, &recipientId(&alice.nk, got.div));
 }
 
+test "kem_ct is NOT recomputable from the public address — no deanonymization oracle (audit r2 H-1)" {
+    const a = testing.allocator;
+    const sender = try account(7);
+    const bob = try account(2);
+    const addr = bob.address(); // bob's PUBLIC address (recipient_id, div, kem_ek) — shareable
+    const note = noteTo(addr, 4242);
+    const tn = try encryptNote(a, &sender.ovk, addr, note);
+    defer a.free(tn.ciphertext);
+
+    // An attacker who knows bob's public address + the on-chain cm but NOT the sender's ovk cannot
+    // reproduce kem_ct — so they cannot test "was this output sent to bob?". (Pre-fix, coins=expand(cm)
+    // made this trivially recomputable.)
+    const wrong_ovk = [_]u8{0} ** 32;
+    const guess = try p.encapsulate(&addr.kem_ek, p.hashDomain("lattica:v1:kem-encaps", &.{ &wrong_ovk, &tn.cm }));
+    try testing.expect(!std.mem.eql(u8, &guess.ct, &tn.kem_ct));
+
+    // But the SENDER (holding its ovk) reproduces kem_ct deterministically — seed-restorability preserved.
+    const reproduced = try p.encapsulate(&addr.kem_ek, p.hashDomain("lattica:v1:kem-encaps", &.{ &sender.ovk, &tn.cm }));
+    try testing.expectEqualSlices(u8, &reproduced.ct, &tn.kem_ct);
+
+    // And bob still decrypts (sk-based, unaffected by the coins derivation).
+    try testing.expect(tryDecrypt(a, bob, tn) != null);
+}
+
 test "diversified addresses are distinct but same-wallet detectable + spendable" {
     const a = testing.allocator;
     const alice = try account(1);
@@ -353,7 +386,7 @@ test "diversified addresses are distinct but same-wallet detectable + spendable"
     try testing.expect(!std.mem.eql(u8, &a0.kem_ek, &a3.kem_ek));
     // A note to the diversified address a3 is detected + decrypted by the same wallet.
     const note = noteTo(a3, 777);
-    const tn = try encryptNote(a, a3, note);
+    const tn = try encryptNote(a, &alice.ovk, a3, note);
     defer a.free(tn.ciphertext);
     const got = tryDecrypt(a, alice, tn) orelse return error.TestUnexpectedNull;
     try testing.expect(got.eql(note));
@@ -367,7 +400,7 @@ test "incoming viewing key detects without the spend key" {
     const alice = try account(1);
     const a2 = try alice.addressAt(2);
     const note = noteTo(a2, 555);
-    const tn = try encryptNote(a, a2, note);
+    const tn = try encryptNote(a, &alice.ovk, a2, note);
     defer a.free(tn.ciphertext);
     // The viewing key (div_master + kem_master, NO nk) finds + decrypts the note and its index.
     const ivk = alice.viewingKey();
@@ -383,7 +416,7 @@ test "commitment in tree matches transmitted" {
     const a = testing.allocator;
     const alice = try account(1);
     const note = noteTo(alice.address(), 100);
-    const tn = try encryptNote(a, alice.address(), note);
+    const tn = try encryptNote(a, &alice.ovk, alice.address(), note);
     defer a.free(tn.ciphertext);
     try testing.expectEqualSlices(u8, &tn.cm, &note.commitment());
 }
