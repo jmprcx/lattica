@@ -108,6 +108,56 @@ differential-tested in-circuit spikes in `lattica-prover-p3/src/recursion/`:
   squaring point map `x→x²`, reaching the final-poly value; tampered sibling / wrong final rejected.
 
 The remaining work is the **integration** (B3-wire + B3-quotient + B4 + B5) — see `recursion-design.md`
-§10 for the precise roadmap. Feasibility unknowns (hashing scale, transcript fidelity, F_p² folding) are
-retired; what's left is faithful high-volume wiring against p3's exact proof format + the circuit-specific
-quotient/DEEP check.
+§10 for the roadmap. Feasibility unknowns (hashing scale, transcript fidelity, F_p² folding) are retired;
+what's left is faithful high-volume wiring against p3's exact proof format + the circuit-specific
+quotient/DEEP check. §9 below specifies that wiring concretely.
+
+## 9. B3-wire — the integration plan (how to build the full verifier AIR)
+The recommended order is **native re-verifier first, then port to an AIR** — build a from-scratch
+verifier composed ONLY from the validated primitives' native sides (`merge`-tree opening, `ModelChallenger`,
+`native_fold`/`native_fold_chain`, the quotient check), confirm it **accepts real p3 proofs and rejects
+tampered ones**, then translate each native step into the constraints already prototyped (B1/B2/B3b).
+Porting is mechanical once the native composition is proven correct; debugging native is far cheaper than
+debugging a circuit.
+
+### 9.1 Proof → trace columns
+Parse a `p3_uni_stark::Proof` into witness columns: `commitments{trace, quotient_chunks, random?}` (each a
+4-felt MerkleCap), `opened_values{trace_local, trace_next, quotient_chunks, …}` (F_p² vectors),
+`opening_proof` = the `FriProof` (`commit_phase_commits[]`, `query_proofs[]` with per-round
+`{log_arity, sibling_values, opening_proof}`, `final_poly[]`, PoW witnesses), and `degree_bits`.
+
+### 9.2 Transcript replay (use `ModelChallenger` as the executable spec — §8)
+Replay EXACTLY the native order (from `p3-uni-stark::verify`): observe degree bits + base degree bits +
+preprocessed width → observe trace commit → (observe preprocessed commit) → observe public values →
+**sample α** → observe quotient commit → (observe random commit) → **sample ζ** → for each FRI commit
+round: observe `commit_phase_commits[r]`, verify the commit PoW, **sample β_r** → **sample query indices**
+via `sample_bits(log_global_max_height)` (×`num_queries`), verify the query PoW. Every challenge the
+verifier uses is derived here; the in-circuit transcript (B2) must produce bit-identical values, which
+`ModelChallenger` pins.
+
+### 9.3 Per-query FRI check (compose B1 + the fold chain)
+For each of the 96 queries: (a) open the input (trace/quotient) commitment at the index — a Merkle-opening
+verification (**B1**); (b) run the commit-phase rounds — reconstruct each round's arity-`2^k` group from
+`sibling_values` + the running eval, verify the group's Merkle opening (**B1**) against
+`commit_phase_commits[r]`, and fold at β_r (**fold chain**, generalized to `max_log_arity = 4` via the
+documented arity-`2^k` = k sequential arity-2 folds with β, β², …); roll in reduced openings at matching
+heights; (c) evaluate `final_poly` at the final index point (Horner) and assert it equals the folded
+result.
+
+### 9.4 OOD / quotient (DEEP) check — the circuit-specific piece
+Recompose the quotient at ζ from its chunks (Lagrange), evaluate the INNER AIR's constraints at ζ using
+`trace_local`/`trace_next`/public values (combined with α), and assert
+`combined_constraints(ζ) == Z_H(ζ)·quotient(ζ)` (`Z_H` = trace-domain vanishing poly). This depends on the
+inner AIR's constraint set; for aggregating lattica spends the inner AIR is fixed
+(`joinsplit_air`/`htlc_air`), so its symbolic constraints can be compiled into the verifier once.
+
+### 9.5 Aggregation (B4) + tree (B5)
+Wrap B3-wire ×K (tiled) and fold each inner proof's per-tx statement digest into the block tx-root with
+the **existing `DOM_TXROOT` MD-chain** (`batch_*_air`) — emitting the SAME tx-root, so the node's
+`verifyBatch`/`batchRoot` seam is unchanged. Compose outer-as-inner for a log-depth tree; add the C ABI +
+Zig seam mirroring the batch seam; real cross-language integration.
+
+### 9.6 Effort + audit
+This is multi-month and audit-bearing (its own corrupted-trace suite + a constraint-by-constraint audit
+here). But every sub-operation is now a validated, real-prover-tested primitive; B3-wire is composition +
+faithful proof parsing, not new cryptography.
