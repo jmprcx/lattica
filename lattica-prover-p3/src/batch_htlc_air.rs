@@ -503,6 +503,16 @@ mod tests {
     }
 
     #[test]
+    fn htlc_batch_kat_dump() {
+        use p3_field::PrimeField64;
+        let seq: Vec<Val> = (1..=N_PUBLIC as u64).map(Val::from_u64).collect();
+        let s = tx_statement_digest(&seq);
+        let d = dummy_sk();
+        println!("htlc_seq_digest = {:?}", s.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>());
+        println!("htlc_dummy_sk = {:?}", d.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn htlc_batch_root_folds_in_order_with_padding() {
         let ws = [variant(1), variant(2), variant(3)];
         let mut expect = [Val::ZERO; DIGEST];

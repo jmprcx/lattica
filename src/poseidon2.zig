@@ -174,6 +174,22 @@ pub fn txStatementDigest(anchor: Digest, nfs: []const Digest, out_cms: []const D
 /// block to a power-of-two tile count.
 pub const DUMMY_SK: Digest = .{ 10093663321021608916, 18280800825645272076, 7712995835321977355, 5336904204250640364 };
 
+/// v3 HTLC batch: per-HTLC-transaction statement digest — the join-split chunks plus
+/// `[current_height,0,0,0]` and `redeem_hashlock` (must match `batch_htlc_air::tx_statement_digest`).
+pub fn htlcTxStatementDigest(anchor: Digest, nfs: []const Digest, out_cms: []const Digest, fee: Felt, mint: Felt, tx_binding: Digest, current_height: Felt, redeem_hashlock: Digest) Digest {
+    var c = merge(.{ DOM_TXROOT, 0, 0, 0 }, anchor);
+    for (nfs) |nf| c = merge(c, nf);
+    for (out_cms) |cm| c = merge(c, cm);
+    c = merge(c, .{ fee, mint, 0, 0 });
+    c = merge(c, tx_binding);
+    c = merge(c, .{ current_height, 0, 0, 0 });
+    c = merge(c, redeem_hashlock);
+    return c;
+}
+
+/// The padding-tile digest for HTLC batches — matches `batch_htlc_air::dummy_sk()`.
+pub const HTLC_DUMMY_SK: Digest = .{ 10539992321146962576, 13450880049652540131, 10286920310671709176, 6485382129692956089 };
+
 /// Reduce up to 8 little-endian bytes to a field element (mod p).
 pub fn feltLE(b: []const u8) Felt {
     var x: u64 = 0;
@@ -237,4 +253,18 @@ test "poseidon2: v3 batch tx-statement fold matches the circuit (KAT)" {
         txStatementDigest(anchor, &nfs, &ocs, 21, 22, txb),
     );
     // DUMMY_SK is pinned to batch_joinsplit_air::dummy_sk() and validated end-to-end in the real integration.
+}
+
+test "poseidon2: v3 HTLC batch tx-statement fold matches the circuit (KAT)" {
+    // seq statement 1..=31: …join-split chunks… ‖ current_height(27) ‖ redeem_hashlock(28..31).
+    const anchor = Digest{ 1, 2, 3, 4 };
+    const nfs = [_]Digest{ .{ 5, 6, 7, 8 }, .{ 9, 10, 11, 12 } };
+    const ocs = [_]Digest{ .{ 13, 14, 15, 16 }, .{ 17, 18, 19, 20 } };
+    const txb = Digest{ 23, 24, 25, 26 };
+    const hl = Digest{ 28, 29, 30, 31 };
+    // == batch_htlc_air::tx_statement_digest(&(1..=31)) (the htlc_batch_kat_dump test).
+    try testing.expectEqual(
+        Digest{ 12024734340241841742, 6068874100855730733, 14239999004995857547, 2452102150457936639 },
+        htlcTxStatementDigest(anchor, &nfs, &ocs, 21, 22, txb, 27, hl),
+    );
 }

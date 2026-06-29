@@ -288,6 +288,47 @@ pub fn proveBatch(allocator: std.mem.Allocator, witness: []const u8, n_tx: usize
     return .{ .proof = try allocator.dupe(u8, buf[0..proof_len]), .root = root };
 }
 
+// --- v3 HTLC batch seam (backend = Rust lattica_htlc_batch_*; same shapes as the join-split batch) ---
+
+var htlc_batch_backend: ?VerifyFn = null;
+
+pub fn setHtlcBatchBackend(f: VerifyFn) void {
+    htlc_batch_backend = f;
+}
+pub fn clearHtlcBatchBackend() void {
+    htlc_batch_backend = null;
+}
+
+/// Verify an HTLC batch proof against the 32-byte block tx-root (fail-closed + size-bounded).
+pub fn verifyHtlcBatch(proof: []const u8, root: Hash32) bool {
+    if (proof.len > MAX_PROOF_LEN) return false;
+    const f = htlc_batch_backend orelse return false;
+    return f(proof.ptr, proof.len, &root, root.len) == 0;
+}
+
+var htlc_batch_prove_backend: ?BatchProveFn = null;
+
+pub fn setHtlcBatchProveBackend(f: BatchProveFn) void {
+    htlc_batch_prove_backend = f;
+}
+pub fn clearHtlcBatchProveBackend() void {
+    htlc_batch_prove_backend = null;
+}
+
+/// Prove a batch of `n_tx` concatenated HTLC witnesses via the installed backend (Rust
+/// lattica_htlc_batch_prove). Returns the proof bytes (allocator-owned) + the 32-byte block tx-root.
+pub fn proveHtlcBatch(allocator: std.mem.Allocator, witness: []const u8, n_tx: usize) !struct { proof: []u8, root: Hash32 } {
+    const f = htlc_batch_prove_backend orelse return error.NoProveBackend;
+    const buf = try allocator.alloc(u8, MAX_PROOF_LEN);
+    defer allocator.free(buf);
+    var root: Hash32 = undefined;
+    var proof_len: usize = 0;
+    var root_len: usize = 0;
+    const rc = f(witness.ptr, witness.len, n_tx, buf.ptr, buf.len, &proof_len, &root, root.len, &root_len);
+    if (rc != 0 or proof_len > buf.len or root_len != 32) return error.ProveFailed;
+    return .{ .proof = try allocator.dupe(u8, buf[0..proof_len]), .root = root };
+}
+
 // ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------

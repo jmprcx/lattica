@@ -722,6 +722,28 @@ pub fn batchRoot(txs: []const ShieldedTx) Hash32 {
     return poseidon2.digestBytes(root);
 }
 
+/// The block tx-root for a batch of HTLC transactions (matches `batch_htlc_air::batch_root`): like
+/// `batchRoot` but each tile's statement also folds `current_height` + `redeem_hashlock`, and padding
+/// uses the HTLC dummy-tile digest.
+pub fn htlcBatchRoot(txs: []const ShieldedHtlcTx) Hash32 {
+    const n_padded = paddedTiles(txs.len);
+    var root = poseidon2.Digest{ 0, 0, 0, 0 }; // IV
+    for (txs) |t| {
+        const anchor = poseidon2.digestFromBytes(t.anchor);
+        var nfs: [N_IN]poseidon2.Digest = undefined;
+        for (t.nullifiers, 0..) |nf, i| nfs[i] = poseidon2.digestFromBytes(nf);
+        var ocs: [M_OUT]poseidon2.Digest = undefined;
+        for (t.outCms(), 0..) |cm, j| ocs[j] = poseidon2.digestFromBytes(cm);
+        const txb = poseidon2.digestFromBytes(t.txBinding());
+        const hl = poseidon2.digestFromBytes(t.redeemHashlock());
+        const s = poseidon2.htlcTxStatementDigest(anchor, &nfs, &ocs, t.fee, t.mint, txb, t.current_height, hl);
+        root = poseidon2.merge(root, s);
+    }
+    var i = txs.len;
+    while (i < n_padded) : (i += 1) root = poseidon2.merge(root, poseidon2.HTLC_DUMMY_SK);
+    return poseidon2.digestBytes(root);
+}
+
 pub const Chain = struct {
     allocator: Allocator,
     tree: tree.MerkleTree,
