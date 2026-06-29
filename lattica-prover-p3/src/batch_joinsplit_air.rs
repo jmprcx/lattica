@@ -31,10 +31,10 @@ use p3_uni_stark::{prove, verify, Proof, StarkConfig};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use crate::poseidon2_air::{ext_linear, int_linear, pow7};
+use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, pow7, BLOCK};
 use crate::joinsplit_air::{
     build_trace, merge, periodic, public_values, Witness, ASSET, BIT, DIGEST, DOM_CM, DOM_NF, DOM_OWN,
-    HEIGHT, M_OUT, N_IN, N_PERIODIC, N_PUBLIC, NK, NK1, NUM_PUBLIC_INPUTS, PI_ANCHOR, PI_FEE, PI_MINT,
+    HEIGHT, M_OUT, N_IN, N_PERIODIC, NK, NK1, NUM_PUBLIC_INPUTS, PI_ANCHOR, PI_FEE, PI_MINT,
     PI_NF, PI_OUTCM, PI_TXBIND, POSACC, P_CHAIN_LINK, P_COMMIT_A_IN, P_COMMIT_B, P_FEE_IN, P_FINAL, P_MEM_LINK,
     P_MINT_IN, P_NULLOUT, P_NULL_IN, P_OUTOUT, P_OUT_A_IN, P_OWN_IN, P_POS_COEFF, P_RANGE_ACTIVE,
     P_RANGE_CLOSE, P_RANGE_SEED, P_RECIP_LINK, P_REGION_LAST, P_ROOT, P_ROW0, REM, RBIT, RHO, RHO1, VAL,
@@ -106,8 +106,64 @@ pub fn padded_tiles(n: usize) -> usize {
 // =============================================================================================
 
 const TILE_HEIGHT: usize = HEIGHT;
-const P_TILE_LAST: usize = N_PERIODIC; // appended after joinsplit's N_PERIODIC columns
-const BATCH_N_PERIODIC: usize = N_PERIODIC + 1;
+const NUM_BLOCKS: usize = HEIGHT / BLOCK;
+
+// --- batch-only main columns (beyond joinsplit's WIDTH=19) ---
+// Staging columns are TILE-PERSISTENT: each holds a field of this tile's public statement, bound to the
+// genuinely-computed value at the existing selector row, so the fold can read them anywhere in the tile.
+const S_ANCHOR: usize = WIDTH; // 4
+const S_NF: usize = S_ANCHOR + DIGEST; // N_IN·4
+const S_OUTCM: usize = S_NF + N_IN * DIGEST; // M_OUT·4
+const S_FEE: usize = S_OUTCM + M_OUT * DIGEST;
+const S_MINT: usize = S_FEE + 1;
+const S_TXBIND: usize = S_MINT + 1; // 4 (free; bound transitively via the node's root recompute)
+const ROOT: usize = S_TXBIND + DIGEST; // 4 — running tx-root chain (GLOBAL-persistent across tiles)
+const BATCH_WIDTH: usize = ROOT + DIGEST;
+
+// --- the in-circuit fold, placed in the free padding at the END of the block space ---
+// s_k = MD-chain(DOM_TXROOT ‖ anchor ‖ nf ‖ out_cm ‖ [fee,mint] ‖ tx_binding); then root_k = H(root_{k-1} ‖ s_k).
+const FOLD_SK_BLOCKS: usize = 1 + N_IN + M_OUT + 2; // anchor block, then N_IN+M_OUT+2 merge blocks
+const FOLD_BLOCKS: usize = FOLD_SK_BLOCKS + 1; // + the root-chain block
+const FOLD_BASE: usize = NUM_BLOCKS - FOLD_BLOCKS; // robust: at the very end (joinsplit uses blocks 0..80)
+const ROOT_BLOCK: usize = FOLD_BASE + FOLD_SK_BLOCKS;
+
+const fn fold_in_row(bi: usize) -> usize {
+    (FOLD_BASE + bi) * BLOCK
+}
+const fn fold_out_row(bi: usize) -> usize {
+    (FOLD_BASE + bi) * BLOCK + BLOCK - 1
+}
+const fn root_in_row() -> usize {
+    ROOT_BLOCK * BLOCK
+}
+const fn root_out_row() -> usize {
+    ROOT_BLOCK * BLOCK + BLOCK - 1
+}
+
+// --- batch periodic selectors (appended after joinsplit's N_PERIODIC tile-periodic columns) ---
+const P_TILE_LAST: usize = N_PERIODIC; // 1 at each tile's last row (self-containment)
+const P_FOLD_IN: usize = P_TILE_LAST + 1; // FOLD_SK_BLOCKS one-hots: chunk injection at each s_k block input
+const P_SK_LINK: usize = P_FOLD_IN + FOLD_SK_BLOCKS; // s_k block output → next block input lanes 0..4
+const P_SK_TO_ROOT: usize = P_SK_LINK + 1; // last s_k block output → root block input lanes 4..8
+const P_ROOT_IN: usize = P_SK_TO_ROOT + 1; // root block input lanes 0..4 == ROOT column
+const P_ROOT_UPDATE: usize = P_ROOT_IN + 1; // root block output → ROOT column (the per-tile update)
+const BATCH_N_PERIODIC: usize = P_ROOT_UPDATE + 1;
+
+/// The 4-element staging column base for fold chunk `ci` (anchor, nf_i, out_cm_j, [fee,mint], tx_binding).
+/// Returns None for the fee/mint chunk (handled specially: [S_FEE, S_MINT, 0, 0]).
+const fn chunk_stage(ci: usize) -> Option<usize> {
+    if ci == 0 {
+        Some(S_ANCHOR)
+    } else if ci < 1 + N_IN {
+        Some(S_NF + (ci - 1) * DIGEST)
+    } else if ci < 1 + N_IN + M_OUT {
+        Some(S_OUTCM + (ci - 1 - N_IN) * DIGEST)
+    } else if ci == 1 + N_IN + M_OUT {
+        None // [fee, mint, 0, 0]
+    } else {
+        Some(S_TXBIND)
+    }
+}
 
 // FRI / ZK config — identical to joinsplit_air's (same production parameters). Copied (not imported) to
 // avoid exposing joinsplit_air's private config types; the trace height is runtime, so one config + one
@@ -145,9 +201,23 @@ fn make_config() -> MyConfig {
 /// Plonky3) plus `P_TILE_LAST` = a one-hot at the tile's last row (also repeated per tile).
 fn batch_periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic();
-    let mut tile_last = vec![Val::ZERO; TILE_HEIGHT];
-    tile_last[TILE_HEIGHT - 1] = Val::ONE;
-    cols.push(tile_last);
+    let oh = |rows: &[usize]| {
+        let mut c = vec![Val::ZERO; TILE_HEIGHT];
+        for &r in rows {
+            c[r] = Val::ONE;
+        }
+        c
+    };
+    // order MUST match the P_* indices above
+    cols.push(oh(&[TILE_HEIGHT - 1])); // P_TILE_LAST
+    for bi in 0..FOLD_SK_BLOCKS {
+        cols.push(oh(&[fold_in_row(bi)])); // P_FOLD_IN + bi
+    }
+    let sk_link: Vec<usize> = (0..FOLD_SK_BLOCKS - 1).map(fold_out_row).collect();
+    cols.push(oh(&sk_link)); // P_SK_LINK
+    cols.push(oh(&[fold_out_row(FOLD_SK_BLOCKS - 1)])); // P_SK_TO_ROOT
+    cols.push(oh(&[root_in_row()])); // P_ROOT_IN
+    cols.push(oh(&[root_out_row()])); // P_ROOT_UPDATE
     cols
 }
 
@@ -155,10 +225,10 @@ pub struct JoinSplitBatchAir;
 
 impl BaseAir<Goldilocks> for JoinSplitBatchAir {
     fn width(&self) -> usize {
-        WIDTH
+        BATCH_WIDTH
     }
     fn num_public_values(&self) -> usize {
-        N_PUBLIC // PHASE 2: global pis (identical tiles). Phase 3 changes this to the tx-root (DIGEST).
+        DIGEST // the single block tx-root (root_{n-1})
     }
     fn num_periodic_columns(&self) -> usize {
         BATCH_N_PERIODIC
@@ -280,10 +350,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
         }
         builder.when_transition().assert_zero(ml.clone() * (bit.clone() * (one.clone() - bit.clone())));
 
-        // ---- root: each tile folds to the public anchor (PHASE 2: global pis ⇒ identical tiles) ----
+        // ---- root: each tile folds to its OWN staged anchor (S_ANCHOR) ----
         let pr = p[P_ROOT].clone();
         for k in 0..DIGEST {
-            builder.assert_zero(pr.clone() * (cur[k].clone() - pis[PI_ANCHOR + k].clone()));
+            builder.assert_zero(pr.clone() * (cur[k].clone() - cur[S_ANCHOR + k].clone()));
         }
 
         // ---- nullifier input ----
@@ -300,7 +370,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
         for i in 0..N_IN {
             let sel = p[P_NULLOUT + i].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - pis[PI_NF + i * DIGEST + k].clone()));
+                builder.assert_zero(sel.clone() * (cur[k].clone() - cur[S_NF + i * DIGEST + k].clone()));
             }
         }
 
@@ -311,47 +381,212 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
         for j in 0..M_OUT {
             let sel = p[P_OUTOUT + j].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - pis[PI_OUTCM + j * DIGEST + k].clone()));
+                builder.assert_zero(sel.clone() * (cur[k].clone() - cur[S_OUTCM + j * DIGEST + k].clone()));
             }
         }
 
-        // ---- fee / mint ----
-        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - pis[PI_FEE].clone()));
-        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - pis[PI_MINT].clone()));
+        // ---- fee / mint (bound to the staged values) ----
+        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - cur[S_FEE].clone()));
+        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - cur[S_MINT].clone()));
+
+        // =====================================================================================
+        // Batch: per-tile staging + the in-circuit tx-root fold.
+        // =====================================================================================
+
+        // ---- staging columns are TILE-persistent (constant within a tile, free at the tile boundary) ----
+        let tile_persist = one.clone() - tile_last.clone();
+        let staged: Vec<usize> = {
+            let mut v = vec![S_FEE, S_MINT];
+            for k in 0..DIGEST {
+                v.push(S_ANCHOR + k);
+                v.push(S_TXBIND + k);
+            }
+            for i in 0..N_IN {
+                for k in 0..DIGEST {
+                    v.push(S_NF + i * DIGEST + k);
+                }
+            }
+            for j in 0..M_OUT {
+                for k in 0..DIGEST {
+                    v.push(S_OUTCM + j * DIGEST + k);
+                }
+            }
+            v
+        };
+        for &c in &staged {
+            builder.when_transition().assert_zero(tile_persist.clone() * (nxt[c].clone() - cur[c].clone()));
+        }
+
+        // ---- s_k MD-chain: block 0 = perm([DOM_TXROOT,0,0,0 ‖ anchor]); blocks 1.. absorb each chunk ----
+        let dom_txroot = AB::Expr::from(Goldilocks::from_u64(DOM_TXROOT));
+        // chunk injection: at fold block bi's input row, lanes 4..8 == the bi-th statement chunk.
+        for bi in 0..FOLD_SK_BLOCKS {
+            let sel = p[P_FOLD_IN + bi].clone();
+            match chunk_stage(bi) {
+                Some(base) => {
+                    for k in 0..DIGEST {
+                        builder.assert_zero(sel.clone() * (cur[DIGEST + k].clone() - cur[base + k].clone()));
+                    }
+                }
+                None => {
+                    // the [fee, mint, 0, 0] chunk
+                    builder.assert_zero(sel.clone() * (cur[DIGEST].clone() - cur[S_FEE].clone()));
+                    builder.assert_zero(sel.clone() * (cur[DIGEST + 1].clone() - cur[S_MINT].clone()));
+                    builder.assert_zero(sel.clone() * cur[DIGEST + 2].clone());
+                    builder.assert_zero(sel.clone() * cur[DIGEST + 3].clone());
+                }
+            }
+        }
+        // block 0 also pins the low lanes to [DOM_TXROOT, 0, 0, 0] (the chain start).
+        let sk0 = p[P_FOLD_IN].clone();
+        builder.assert_zero(sk0.clone() * (cur[0].clone() - dom_txroot.clone()));
+        for k in 1..DIGEST {
+            builder.assert_zero(sk0.clone() * cur[k].clone());
+        }
+        // s_k chain link: block bi output lanes 0..4 → block bi+1 input lanes 0..4.
+        let sl = p[P_SK_LINK].clone();
+        for k in 0..DIGEST {
+            builder.when_transition().assert_zero(sl.clone() * (nxt[k].clone() - cur[k].clone()));
+        }
+        // last s_k block output (= s_k) → root block input lanes 4..8.
+        let s2r = p[P_SK_TO_ROOT].clone();
+        for k in 0..DIGEST {
+            builder.when_transition().assert_zero(s2r.clone() * (nxt[DIGEST + k].clone() - cur[k].clone()));
+        }
+
+        // ---- root chain: root_k = perm([root_{k-1} ‖ s_k]); ROOT carries root across tiles ----
+        // root block input lanes 0..4 == the running ROOT column (root_{k-1}).
+        let ri = p[P_ROOT_IN].clone();
+        for k in 0..DIGEST {
+            builder.assert_zero(ri.clone() * (cur[k].clone() - cur[ROOT + k].clone()));
+        }
+        // IV: ROOT = 0 at the global first row.
+        for k in 0..DIGEST {
+            builder.when_first_row().assert_zero(cur[ROOT + k].clone());
+        }
+        // ROOT is constant except across the per-tile update transition (root block output row).
+        let ru = p[P_ROOT_UPDATE].clone();
+        for k in 0..DIGEST {
+            builder
+                .when_transition()
+                .assert_zero((one.clone() - ru.clone()) * (nxt[ROOT + k].clone() - cur[ROOT + k].clone()));
+            // at the update, ROOT becomes the root block's output (lanes 0..4 of root_out_row).
+            builder.when_transition().assert_zero(ru.clone() * (nxt[ROOT + k].clone() - cur[k].clone()));
+        }
+        // The root block is the LAST block, so on the global last row cur[0..4] IS the final tile's root
+        // block output (root_{n-1}) — the block tx-root. (The ROOT column's update lands on the *next*
+        // row, which doesn't exist for the last tile, so bind the fold output directly.)
+        for k in 0..DIGEST {
+            builder.when_last_row().assert_zero(cur[k].clone() - pis[k].clone());
+        }
     }
 }
 
-/// Tile `ws.len()` single-tile traces into one batch trace. PHASE 2 requires a power-of-two count (no
-/// dummy tiles yet — those arrive with the fold in Phase 3). Each tile reuses the audited
-/// `joinsplit_air::build_trace`.
+/// Write the Poseidon2 permutation of `input` into fold `block`'s state columns (cols 0..8), tile `toff`.
+fn set_fold_block(t: &mut [Val], toff: usize, block: usize, input: [Val; 8]) {
+    let rows = native_steps(input);
+    for (r, row) in rows.iter().enumerate() {
+        let base = (toff + block * BLOCK + r) * BATCH_WIDTH;
+        t[base..base + 8].copy_from_slice(row);
+    }
+}
+
+/// The 4-element statement chunk absorbed by s_k fold block `bi` (mirrors `chunk_stage` / the oracle's
+/// `tx_statement_digest` order: anchor, nf_i, out_cm_j, [fee,mint,0,0], tx_binding).
+fn chunk_vals(pv: &[Val], bi: usize) -> [Val; DIGEST] {
+    if bi == 0 {
+        pv[PI_ANCHOR..PI_ANCHOR + DIGEST].try_into().unwrap()
+    } else if bi < 1 + N_IN {
+        let i = bi - 1;
+        pv[PI_NF + i * DIGEST..PI_NF + (i + 1) * DIGEST].try_into().unwrap()
+    } else if bi < 1 + N_IN + M_OUT {
+        let j = bi - 1 - N_IN;
+        pv[PI_OUTCM + j * DIGEST..PI_OUTCM + (j + 1) * DIGEST].try_into().unwrap()
+    } else if bi == 1 + N_IN + M_OUT {
+        [pv[PI_FEE], pv[PI_MINT], Val::ZERO, Val::ZERO]
+    } else {
+        pv[PI_TXBIND..PI_TXBIND + DIGEST].try_into().unwrap()
+    }
+}
+
+/// Tile `ws.len()` single-tile traces into one batch trace, fill each tile's staging columns, run the
+/// in-circuit tx-root fold, and thread the running ROOT across tiles. Power-of-two count for now (dummy
+/// tiles arrive in Phase 4). Each tile reuses the audited `joinsplit_air::build_trace`.
 pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
     let n = padded_tiles(ws.len());
-    assert_eq!(ws.len(), n, "PHASE 2 batch requires a power-of-two tx count (dummy tiles arrive in Phase 3)");
-    let mut t = vec![Val::ZERO; n * HEIGHT * WIDTH];
+    assert_eq!(ws.len(), n, "power-of-two tx count for now (dummy tiles arrive in Phase 4)");
+    let mut t = vec![Val::ZERO; n * TILE_HEIGHT * BATCH_WIDTH];
+    let mut root = [Val::ZERO; DIGEST]; // IV
     for (tile, w) in ws.iter().enumerate() {
-        let single = build_trace(w);
-        let off = tile * HEIGHT * WIDTH;
-        t[off..off + HEIGHT * WIDTH].copy_from_slice(&single.values);
+        let single = build_trace(w); // HEIGHT × WIDTH(19)
+        let pv = public_values(w); // the 26-element statement
+        let toff = tile * TILE_HEIGHT;
+
+        // 1. copy joinsplit's 19 columns into this tile's first 19 columns
+        for r in 0..TILE_HEIGHT {
+            let dst = (toff + r) * BATCH_WIDTH;
+            let src = r * WIDTH;
+            t[dst..dst + WIDTH].copy_from_slice(&single.values[src..src + WIDTH]);
+        }
+        // 2. staging columns (tile-persistent — filled on every row of the tile)
+        for r in 0..TILE_HEIGHT {
+            let b = (toff + r) * BATCH_WIDTH;
+            t[b + S_ANCHOR..b + S_ANCHOR + DIGEST].copy_from_slice(&pv[PI_ANCHOR..PI_ANCHOR + DIGEST]);
+            t[b + S_NF..b + S_NF + N_IN * DIGEST].copy_from_slice(&pv[PI_NF..PI_NF + N_IN * DIGEST]);
+            t[b + S_OUTCM..b + S_OUTCM + M_OUT * DIGEST].copy_from_slice(&pv[PI_OUTCM..PI_OUTCM + M_OUT * DIGEST]);
+            t[b + S_FEE] = pv[PI_FEE];
+            t[b + S_MINT] = pv[PI_MINT];
+            t[b + S_TXBIND..b + S_TXBIND + DIGEST].copy_from_slice(&pv[PI_TXBIND..PI_TXBIND + DIGEST]);
+        }
+        // 3. fold blocks (overwrite the trailing padding blocks): s_k MD-chain, then root chain.
+        let mut inp = [Val::ZERO; 8];
+        inp[0] = Val::from_u64(DOM_TXROOT);
+        inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, 0));
+        set_fold_block(&mut t, toff, FOLD_BASE, inp);
+        let mut c: [Val; DIGEST] = native_permute(inp)[..DIGEST].try_into().unwrap();
+        for bi in 1..FOLD_SK_BLOCKS {
+            let mut inp = [Val::ZERO; 8];
+            inp[..DIGEST].copy_from_slice(&c);
+            inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, bi));
+            set_fold_block(&mut t, toff, FOLD_BASE + bi, inp);
+            c = native_permute(inp)[..DIGEST].try_into().unwrap();
+        }
+        // root block: perm([root_{k-1} ‖ s_k])
+        let mut rinp = [Val::ZERO; 8];
+        rinp[..DIGEST].copy_from_slice(&root);
+        rinp[DIGEST..].copy_from_slice(&c);
+        set_fold_block(&mut t, toff, ROOT_BLOCK, rinp);
+        let new_root: [Val; DIGEST] = native_permute(rinp)[..DIGEST].try_into().unwrap();
+        // 4. ROOT column: root_{k-1} up to (and incl.) the root block output row, then root_k onward.
+        let rout = root_out_row();
+        for r in 0..TILE_HEIGHT {
+            let b = (toff + r) * BATCH_WIDTH;
+            let val = if r <= rout { &root } else { &new_root };
+            t[b + ROOT..b + ROOT + DIGEST].copy_from_slice(val);
+        }
+        root = new_root;
     }
-    RowMajorMatrix::new(t, WIDTH)
+    RowMajorMatrix::new(t, BATCH_WIDTH)
 }
 
-/// Prove a batch (PHASE 2: identical tiles; the public inputs are the shared per-tile statement).
-pub fn prove_batch_to_bytes(ws: &[Witness], pis: &[Val]) -> Vec<u8> {
-    let proof = prove(&make_config(), &JoinSplitBatchAir, build_batch_trace(ws), pis);
+/// Prove a batch of transactions as one proof. Returns the proof bytes; the block tx-root (the single
+/// public input) is `batch_root(ws)`, which the verifier recomputes from the block's statements.
+pub fn prove_batch_to_bytes(ws: &[Witness]) -> Vec<u8> {
+    let pis = batch_root(ws);
+    let proof = prove(&make_config(), &JoinSplitBatchAir, build_batch_trace(ws), &pis);
     postcard::to_allocvec(&proof).expect("proof serialization is infallible")
 }
 
-/// Verify a batch proof against the public inputs.
-pub fn verify_batch_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
-    if pis.len() != N_PUBLIC {
+/// Verify a batch proof against the block tx-root (4 Goldilocks).
+pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
+    if root.len() != DIGEST {
         return false;
     }
     let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    verify(&make_config(), &JoinSplitBatchAir, &proof, pis).is_ok()
+    verify(&make_config(), &JoinSplitBatchAir, &proof, root).is_ok()
 }
 
 #[cfg(test)]
@@ -412,38 +647,36 @@ mod tests {
         );
     }
 
-    // ---- Phase 2: tiling + self-containment (identical tiles, global pis; real prover) ----
+    // ---- Phase 3: distinct tiles bound to the tx-root via staging + the in-circuit fold ----
 
     #[test]
-    fn batch_n1_verifies_like_a_single_spend() {
-        let w = demo_witness();
-        let pis = public_values(&w);
-        assert!(verify_batch_bytes(&prove_batch_to_bytes(std::slice::from_ref(&w), &pis), &pis));
+    fn batch_n1_verifies_under_txroot() {
+        let w = variant(1);
+        let root = batch_root(std::slice::from_ref(&w));
+        assert!(verify_batch_bytes(&prove_batch_to_bytes(std::slice::from_ref(&w)), &root));
     }
 
     #[test]
-    fn batch_two_identical_tiles_verify() {
-        let w = demo_witness();
-        let pis = public_values(&w);
-        let ws = [w.clone(), w];
-        assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws, &pis), &pis));
+    fn batch_distinct_tiles_verify_and_match_oracle_root() {
+        let ws = [variant(1), variant(2)];
+        let root = batch_root(&ws);
+        assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws), &root));
     }
 
     #[test]
-    fn batch_rejects_wrong_public_inputs() {
-        let w = demo_witness();
-        let proof = prove_batch_to_bytes(&[w.clone(), w.clone()], &public_values(&w));
-        let mut bad = public_values(&w);
-        bad[PI_ANCHOR] += Val::ONE;
+    fn batch_rejects_wrong_txroot() {
+        let ws = [variant(1), variant(2)];
+        let proof = prove_batch_to_bytes(&ws);
+        let mut bad = batch_root(&ws);
+        bad[0] += Val::ONE;
         assert!(!verify_batch_bytes(&proof, &bad));
     }
 
     #[test]
     #[ignore = "slow: proves a 4-tile batch"]
-    fn batch_four_tiles_verify() {
-        let w = demo_witness();
-        let pis = public_values(&w);
-        let ws: Vec<Witness> = (0..4).map(|_| w.clone()).collect();
-        assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws, &pis), &pis));
+    fn batch_four_distinct_tiles_verify() {
+        let ws: Vec<Witness> = (1..=4).map(variant).collect();
+        let root = batch_root(&ws);
+        assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws), &root));
     }
 }
