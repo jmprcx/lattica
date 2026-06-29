@@ -772,6 +772,20 @@ mod tests {
     }
 
     #[test]
+    fn batch_kat_dump() {
+        // KAT for the Zig node's txStatementDigest/batchRoot fold (poseidon2.zig). seq statement = 1..=26.
+        let seq: Vec<Val> = (1..=NUM_PUBLIC_INPUTS as u64).map(Val::from_u64).collect();
+        let s = tx_statement_digest(&seq);
+        let d = dummy_sk();
+        let p = |label: &str, x: &[Val; DIGEST]| {
+            use p3_field::PrimeField64;
+            println!("{label} = {:?}", x.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>());
+        };
+        p("seq_statement_digest", &s);
+        p("dummy_sk", &d);
+    }
+
+    #[test]
     fn batch_proven_security_floor() {
         // n=1 matches the single join-split (103 proven); the floor holds through MAX_BATCH_TILES and
         // 2·MAX_BATCH_TILES is the first size below 100 — pinning N_MAX as exactly the boundary.

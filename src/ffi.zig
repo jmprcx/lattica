@@ -226,6 +226,68 @@ pub fn proveHtlc(allocator: std.mem.Allocator, witness: []const u8) ![]u8 {
     return allocator.dupe(u8, buf[0..proof_len]);
 }
 
+// --- v3 batch aggregation seam (one proof per block; backend = Rust lattica_batch_* ) -----------
+
+/// Verify a **batch** proof against the 32-byte block tx-root. The verify backend shape is the shared
+/// `VerifyFn` (the "public inputs" are the 32-byte root). Fail-closed (no backend ⇒ reject) and
+/// proof-size-bounded at the seam (M-08).
+var batch_backend: ?VerifyFn = null;
+
+pub fn setBatchBackend(f: VerifyFn) void {
+    batch_backend = f;
+}
+pub fn clearBatchBackend() void {
+    batch_backend = null;
+}
+pub fn hasBatchBackend() bool {
+    return batch_backend != null;
+}
+
+pub fn verifyBatch(proof: []const u8, root: Hash32) bool {
+    if (proof.len > MAX_PROOF_LEN) return false;
+    const f = batch_backend orelse return false;
+    return f(proof.ptr, proof.len, &root, root.len) == 0;
+}
+
+/// The C ABI the batch prover implements (`lattica_batch_prove`): `n_tx` concatenated join-split
+/// witnesses → one proof + the 32-byte block tx-root. (A distinct shape from `ProveFn`: it takes `n_tx`
+/// and writes a fixed 32-byte root rather than a public-inputs struct.)
+pub const BatchProveFn = *const fn (
+    witness_ptr: [*]const u8,
+    witness_len: usize,
+    n_tx: usize,
+    proof_out: [*]u8,
+    proof_cap: usize,
+    proof_len: *usize,
+    root_out: [*]u8,
+    root_cap: usize,
+    root_len: *usize,
+) callconv(.c) i32;
+
+var batch_prove_backend: ?BatchProveFn = null;
+
+pub fn setBatchProveBackend(f: BatchProveFn) void {
+    batch_prove_backend = f;
+}
+pub fn clearBatchProveBackend() void {
+    batch_prove_backend = null;
+}
+
+/// Prove a batch of `n_tx` concatenated join-split witnesses via the installed backend (the Rust
+/// `lattica_batch_prove` in production). Returns the proof bytes (allocator-owned) + the 32-byte block
+/// tx-root the verifier checks against (the node recomputes the same root via `node.batchRoot`).
+pub fn proveBatch(allocator: std.mem.Allocator, witness: []const u8, n_tx: usize) !struct { proof: []u8, root: Hash32 } {
+    const f = batch_prove_backend orelse return error.NoProveBackend;
+    const buf = try allocator.alloc(u8, MAX_PROOF_LEN);
+    defer allocator.free(buf);
+    var root: Hash32 = undefined;
+    var proof_len: usize = 0;
+    var root_len: usize = 0;
+    const rc = f(witness.ptr, witness.len, n_tx, buf.ptr, buf.len, &proof_len, &root, root.len, &root_len);
+    if (rc != 0 or proof_len > buf.len or root_len != 32) return error.ProveFailed;
+    return .{ .proof = try allocator.dupe(u8, buf[0..proof_len]), .root = root };
+}
+
 // ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------
@@ -301,6 +363,27 @@ test "ffi: htlc public inputs encode + fail-closed + size-bound" {
     try testing.expect(!verifyHtlc(oversize, pi)); // oversize ⇒ rejected, backend not called
     try testing.expect(!Rec.called);
     try testing.expect(verifyHtlc("x", pi)); // normal-size reaches the backend
+    try testing.expect(Rec.called);
+}
+
+test "ffi: batch verify fail-closed + size-bound + backend plumbing" {
+    const root = [_]u8{7} ** 32;
+    try testing.expect(!verifyBatch("proof", root)); // fail-closed without a backend
+    const Rec = struct {
+        var called: bool = false;
+        fn vfn(_: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) i32 {
+            called = true;
+            return 0;
+        }
+    };
+    Rec.called = false;
+    setBatchBackend(&Rec.vfn);
+    defer clearBatchBackend();
+    const oversize = try testing.allocator.alloc(u8, MAX_PROOF_LEN + 1);
+    defer testing.allocator.free(oversize);
+    try testing.expect(!verifyBatch(oversize, root)); // oversize ⇒ rejected, backend not called
+    try testing.expect(!Rec.called);
+    try testing.expect(verifyBatch("x", root)); // normal-size reaches the backend
     try testing.expect(Rec.called);
 }
 

@@ -671,6 +671,35 @@ pub const HtlcRedeemEvent = struct {
     preimage: [32]u8,
 };
 
+/// The padded tile count for a batch of `n` transactions (a power of two, ≥ 1) — matches
+/// `batch_joinsplit_air::padded_tiles`.
+pub fn paddedTiles(n: usize) usize {
+    if (n <= 1) return 1;
+    return std.math.ceilPowerOfTwo(usize, n) catch unreachable;
+}
+
+/// The block **tx-root** for a batch of join-split transactions (matches `batch_joinsplit_air::batch_root`):
+/// fold each tx's statement digest into a running root (IV = 0), then pad to a power of two with the
+/// dummy-tile digest. The host chain binds this in a block header; a validator recomputes it here from
+/// the block's transactions — no witnesses — and checks ONE batch proof via `ffi.verifyBatch`.
+pub fn batchRoot(txs: []const ShieldedTx) Hash32 {
+    const n_padded = paddedTiles(txs.len);
+    var root = poseidon2.Digest{ 0, 0, 0, 0 }; // IV
+    for (txs) |t| {
+        const anchor = poseidon2.digestFromBytes(t.anchor);
+        var nfs: [N_IN]poseidon2.Digest = undefined;
+        for (t.nullifiers, 0..) |nf, i| nfs[i] = poseidon2.digestFromBytes(nf);
+        var ocs: [M_OUT]poseidon2.Digest = undefined;
+        for (t.outCms(), 0..) |cm, j| ocs[j] = poseidon2.digestFromBytes(cm);
+        const txb = poseidon2.digestFromBytes(t.txBinding());
+        const s = poseidon2.txStatementDigest(anchor, &nfs, &ocs, t.fee, t.mint, txb);
+        root = poseidon2.merge(root, s);
+    }
+    var i = txs.len;
+    while (i < n_padded) : (i += 1) root = poseidon2.merge(root, poseidon2.DUMMY_SK);
+    return poseidon2.digestBytes(root);
+}
+
 pub const Chain = struct {
     allocator: Allocator,
     tree: tree.MerkleTree,
@@ -1812,4 +1841,44 @@ test "node: cm index lets a watcher locate an HTLC note + redeem by commitment (
         if (tx.tryDecrypt(a, bob, tn)) |n| got += n.value;
     }
     try testing.expectEqual(@as(u64, 1000), got); // located + redeemed purely from the communicated lock
+}
+
+test "node: batchRoot folds tx statements + pads to a power of two (P-01 batch)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{2} ** 32);
+    const inputs = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    const t = try buildTransfer(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+
+    const txs = [_]ShieldedTx{t};
+    const r1 = batchRoot(&txs);
+    try testing.expectEqualSlices(u8, &r1, &batchRoot(&txs)); // deterministic
+
+    // a 1-tx batch (padded_tiles(1)=1, no dummy) == merge(IV, txStatementDigest(t's statement))
+    var nfs: [N_IN]poseidon2.Digest = undefined;
+    for (t.nullifiers, 0..) |nf, i| nfs[i] = poseidon2.digestFromBytes(nf);
+    var ocs: [M_OUT]poseidon2.Digest = undefined;
+    for (t.outCms(), 0..) |cm, j| ocs[j] = poseidon2.digestFromBytes(cm);
+    const s = poseidon2.txStatementDigest(poseidon2.digestFromBytes(t.anchor), &nfs, &ocs, t.fee, t.mint, poseidon2.digestFromBytes(t.txBinding()));
+    const expect = poseidon2.digestBytes(poseidon2.merge(.{ 0, 0, 0, 0 }, s));
+    try testing.expectEqualSlices(u8, &expect, &r1);
+
+    try testing.expectEqual(@as(usize, 1), paddedTiles(1));
+    try testing.expectEqual(@as(usize, 4), paddedTiles(3));
+    // a 3-tx batch pads with one dummy tile (root = the 3 statements folded, then one DUMMY_SK).
+    const txs3 = [_]ShieldedTx{ t, t, t };
+    var manual = poseidon2.merge(poseidon2.merge(poseidon2.merge(.{ 0, 0, 0, 0 }, s), s), s);
+    manual = poseidon2.merge(manual, poseidon2.DUMMY_SK);
+    try testing.expectEqualSlices(u8, &poseidon2.digestBytes(manual), &batchRoot(&txs3));
 }

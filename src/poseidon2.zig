@@ -23,6 +23,7 @@ pub const DOM_CM: u64 = 2;
 pub const DOM_NF: u64 = 3;
 pub const DOM_HTLC: u64 = 4; // v3: htlc_root MD-chain (must match htlc_air::DOM_HTLC)
 pub const DOM_NF_HTLC: u64 = 5; // v3: owner-based HTLC nullifier (must match htlc_air::DOM_NF_HTLC)
+pub const DOM_TXROOT: u64 = 6; // v3 batch: per-tx statement digest in the block tx-root (must match batch_joinsplit_air)
 
 pub const NOTE_PLAIN: u64 = 0;
 pub const NOTE_HTLC: u64 = 1;
@@ -154,6 +155,25 @@ pub fn merge(l: Digest, r: Digest) Digest {
     return s[0..4].*;
 }
 
+/// v3 batch: per-transaction statement digest `s_k` for the block tx-root fold (must match
+/// `batch_joinsplit_air::tx_statement_digest`). MD-chain under `DOM_TXROOT`: block 0 =
+/// `merge([DOM_TXROOT,0,0,0], anchor)`; then absorb each nullifier, each output commitment,
+/// `[fee,mint,0,0]`, and `tx_binding` as 4-element chunks. The node folds these into the root it binds
+/// in a block header (no witnesses needed).
+pub fn txStatementDigest(anchor: Digest, nfs: []const Digest, out_cms: []const Digest, fee: Felt, mint: Felt, tx_binding: Digest) Digest {
+    var c = merge(.{ DOM_TXROOT, 0, 0, 0 }, anchor);
+    for (nfs) |nf| c = merge(c, nf);
+    for (out_cms) |cm| c = merge(c, cm);
+    c = merge(c, .{ fee, mint, 0, 0 });
+    c = merge(c, tx_binding);
+    return c;
+}
+
+/// The statement digest of a padding tile — matches `batch_joinsplit_air::dummy_sk()` (the digest of the
+/// canonical 0-value dummy witness's statement). Pinned by the KAT below; the node folds it to pad a
+/// block to a power-of-two tile count.
+pub const DUMMY_SK: Digest = .{ 10093663321021608916, 18280800825645272076, 7712995835321977355, 5336904204250640364 };
+
 /// Reduce up to 8 little-endian bytes to a field element (mod p).
 pub fn feltLE(b: []const u8) Felt {
     var x: u64 = 0;
@@ -203,4 +223,18 @@ test "poseidon2: v3 HTLC hashing matches the circuit (KAT)" {
     try testing.expectEqual(Digest{ 15897177719484060033, 8361144046291395814, 17600889302656618771, 11272242158371267546 }, owner);
     try testing.expectEqual(Digest{ 6647950231430050009, 7373637167084619540, 13996079761633078941, 10314879934369199903 }, commitNote(owner, 1000, .{ 11, 211 }, .{ 100, 300 }, 9, 1));
     try testing.expectEqual(Digest{ 2979738625760449383, 13574316116928341014, 8042570794412156501, 16772505299821460388 }, nullifierHtlc(owner, .{ 11, 211 }, 9));
+}
+
+test "poseidon2: v3 batch tx-statement fold matches the circuit (KAT)" {
+    // seq statement 1..=26: anchor ‖ nf_0 ‖ nf_1 ‖ out_cm_0 ‖ out_cm_1 ‖ fee(21) ‖ mint(22) ‖ tx_binding.
+    const anchor = Digest{ 1, 2, 3, 4 };
+    const nfs = [_]Digest{ .{ 5, 6, 7, 8 }, .{ 9, 10, 11, 12 } };
+    const ocs = [_]Digest{ .{ 13, 14, 15, 16 }, .{ 17, 18, 19, 20 } };
+    const txb = Digest{ 23, 24, 25, 26 };
+    // == batch_joinsplit_air::tx_statement_digest(&(1..=26)) (the batch_kat_dump test).
+    try testing.expectEqual(
+        Digest{ 16413833029060099665, 4880920211288721702, 16696557975413361240, 12647866530414313287 },
+        txStatementDigest(anchor, &nfs, &ocs, 21, 22, txb),
+    );
+    // DUMMY_SK is pinned to batch_joinsplit_air::dummy_sk() and validated end-to-end in the real integration.
 }
