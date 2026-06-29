@@ -692,6 +692,10 @@ pub const Chain = struct {
     /// Incremental accumulator over `htlc_events` (`acc' = H(acc ‖ redeem_hashlock ‖ preimage)`), the
     /// genesis-replayable event root the host chain binds in a block header.
     event_acc: Hash32,
+    /// commitment → tree position index (P-01): lets a watcher/wallet that holds a note commitment
+    /// locate it on-chain and build its membership path. Required for HTLC notes, whose on-chain
+    /// ciphertext is a placeholder (so they can't be found by trial decryption).
+    cm_index: std.AutoHashMap(Hash32, u64),
     /// Incremental commitment to the spent-nullifier set, in canonical apply order:
     /// `acc' = H(acc ‖ nf)` as each nullifier is committed. A binding, genesis-replayable accumulator
     /// the host chain can bind in a block header so any node detects a divergent nullifier history
@@ -713,7 +717,20 @@ pub const Chain = struct {
             .htlc_events = .empty,
             .event_acc = [_]u8{0} ** 32, // no events yet
             .nullifier_acc = [_]u8{0} ** 32, // empty set
+            .cm_index = std.AutoHashMap(Hash32, u64).init(allocator),
         };
+    }
+
+    /// The tree position of a note commitment, or null if it isn't in the tree (P-01 watcher lookup).
+    pub fn positionOf(self: Chain, cm: Hash32) ?u64 {
+        return self.cm_index.get(cm);
+    }
+
+    /// Build the membership path for a note by its commitment (e.g. an HTLC note a watcher located from
+    /// the communicated lock). Returns `error.UnknownCommitment` if the cm isn't on-chain.
+    pub fn merklePathForCommitment(self: Chain, allocator: Allocator, cm: Hash32) !tree.MerklePath {
+        const pos = self.positionOf(cm) orelse return error.UnknownCommitment;
+        return self.merklePath(allocator, pos);
     }
 
     /// The cumulative HTLC redeem event-set root the host chain binds in a block header (P-01).
@@ -747,6 +764,7 @@ pub const Chain = struct {
         for (self.transmitted.items) |tn| self.allocator.free(tn.ciphertext);
         self.transmitted.deinit(self.allocator);
         self.htlc_events.deinit(self.allocator);
+        self.cm_index.deinit();
     }
 
     /// The current anchor (tree root).
@@ -783,12 +801,14 @@ pub const Chain = struct {
         var candidate_supply = self.supply;
         candidate_supply.apply(.{ .issued = value, .burned = 0, .fee = 0 }) catch return TxError.ValueOverflow;
         self.tree.ensureUnusedCapacity(1) catch return TxError.TreeFull;
+        self.cm_index.ensureUnusedCapacity(1) catch return TxError.Internal;
         self.anchors.ensureUnusedCapacity(1) catch return TxError.Internal;
         self.transmitted.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal;
 
         // Infallible commit.
         self.supply = candidate_supply;
         const pos = self.tree.appendAssumeCapacity(tn.cm);
+        self.cm_index.putAssumeCapacity(tn.cm, pos); // index cm → position for watcher lookups (P-01)
         self.anchors.putAssumeCapacity(self.tree.root(), {});
         self.transmitted.appendAssumeCapacity(tn);
         return .{ .note = note, .pos = pos };
@@ -805,10 +825,12 @@ pub const Chain = struct {
         var candidate_supply = self.supply;
         candidate_supply.apply(.{ .issued = note.value, .burned = 0, .fee = 0 }) catch return TxError.ValueOverflow;
         self.tree.ensureUnusedCapacity(1) catch return TxError.TreeFull;
+        self.cm_index.ensureUnusedCapacity(1) catch return TxError.Internal;
         self.anchors.ensureUnusedCapacity(1) catch return TxError.Internal;
         self.transmitted.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal;
         self.supply = candidate_supply;
         const pos = self.tree.appendAssumeCapacity(tn.cm);
+        self.cm_index.putAssumeCapacity(tn.cm, pos); // index cm → position for watcher lookups (P-01)
         self.anchors.putAssumeCapacity(self.tree.root(), {});
         self.transmitted.appendAssumeCapacity(tn);
         return .{ .note = note, .pos = pos };
@@ -879,6 +901,7 @@ pub const Chain = struct {
         self.anchors.ensureUnusedCapacity(@intCast(M_OUT)) catch return TxError.Internal;
         self.transmitted.ensureUnusedCapacity(self.allocator, M_OUT) catch return TxError.Internal;
         self.tree.ensureUnusedCapacity(M_OUT) catch return TxError.TreeFull;
+        self.cm_index.ensureUnusedCapacity(M_OUT) catch return TxError.Internal;
         // (c) chain-own each output's ciphertext via deep copy (audit H-04); on any failure, free the
         //     copies made so far (errdefer) and reject before mutating consensus state.
         var owned: [M_OUT]tx.TransmittedNote = undefined;
@@ -898,7 +921,8 @@ pub const Chain = struct {
             self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
         }
         for (owned) |o| {
-            _ = self.tree.appendAssumeCapacity(o.cm);
+            const pos = self.tree.appendAssumeCapacity(o.cm);
+            self.cm_index.putAssumeCapacity(o.cm, pos); // index cm → position for watcher lookups (P-01)
             self.anchors.putAssumeCapacity(self.tree.root(), {});
             self.transmitted.appendAssumeCapacity(o);
         }
@@ -946,6 +970,7 @@ pub const Chain = struct {
         self.anchors.ensureUnusedCapacity(@intCast(M_OUT)) catch return TxError.Internal;
         self.transmitted.ensureUnusedCapacity(self.allocator, M_OUT) catch return TxError.Internal;
         self.tree.ensureUnusedCapacity(M_OUT) catch return TxError.TreeFull;
+        self.cm_index.ensureUnusedCapacity(M_OUT) catch return TxError.Internal;
         self.htlc_events.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal; // ≤1 redeem event
         var owned: [M_OUT]tx.TransmittedNote = undefined;
         var copied: usize = 0;
@@ -963,7 +988,8 @@ pub const Chain = struct {
             self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
         }
         for (owned) |o| {
-            _ = self.tree.appendAssumeCapacity(o.cm);
+            const pos = self.tree.appendAssumeCapacity(o.cm);
+            self.cm_index.putAssumeCapacity(o.cm, pos); // index cm → position for watcher lookups (P-01)
             self.anchors.putAssumeCapacity(self.tree.root(), {});
             self.transmitted.appendAssumeCapacity(o);
         }
@@ -1739,4 +1765,51 @@ test "node: applyHtlc emits a redeem preimage event for cross-chain watchers (P-
     try testing.expectEqualSlices(u8, &preimage, &events[0].preimage);
     try testing.expectEqualSlices(u8, &hashlock, &events[0].redeem_hashlock);
     try testing.expect(!std.mem.eql(u8, &root_before, &chain.eventRoot()));
+}
+
+test "node: cm index lets a watcher locate an HTLC note + redeem by commitment (P-01)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1); // locker
+    const bob = try account(2); // redeem party
+    const preimage = [_]u8{0xAB} ** 32;
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&preimage, &sha, .{});
+    const hashlock = poseidon2.digestBytes(poseidon2.digestFromBytes(sha));
+    const redeem_tag = bob.address().recipientId();
+    const refund_tag = alice.address().recipientId();
+    const timeout: u64 = 100;
+
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{2} ** 32);
+    const li = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+    const lock = try buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, hashlock, timeout, 1000, 0, 50, chain.anchor());
+    try chain.applyHtlc(lock.tx, 50);
+
+    // A watcher holding only the communicated lock note LOCATES it on-chain by its commitment — no
+    // precomputed position, no trial decryption (the HTLC note's ciphertext is a placeholder).
+    const cm = lock.note.commitment();
+    const pos = chain.positionOf(cm) orelse return error.NotIndexed;
+    try testing.expectEqual(m1.pos + 1, pos); // the lock's output 0
+    try testing.expect(chain.positionOf([_]u8{0xFF} ** 32) == null); // an unknown cm has no position
+
+    // …and redeems using the index-derived position + path (the production watcher flow).
+    const bdummy = try chain.bootstrapMint(bob.address(), 0, [_]u8{3} ** 32);
+    const spend = HtlcSpend{ .note = lock.note, .position = pos, .path = try chain.merklePathForCommitment(a, cm), .claim_div = bob.address().div, .mode = 1, .redeem_tag = redeem_tag, .refund_tag = refund_tag, .hashlock = hashlock, .timeout = timeout, .preimage = preimage };
+    const sdummy = InputSpend{ .note = bdummy.note, .position = bdummy.pos, .path = try chain.merklePath(a, bdummy.pos) };
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 1000 }};
+    try chain.applyHtlc(try buildHtlcSpend(a, bob, spend, sdummy, &outs, 0, 60, chain.anchor()), 60);
+
+    var got: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (tx.tryDecrypt(a, bob, tn)) |n| got += n.value;
+    }
+    try testing.expectEqual(@as(u64, 1000), got); // located + redeemed purely from the communicated lock
 }
