@@ -75,7 +75,20 @@ v3 HTLC lock→redeem lifecycle).
 
 ## Out of lattica's scope (host chain `rubble-node-zig`)
 
-Block consensus / PoW / mempool / networking / emission schedule, and block-level commitments
-(state-root, nullifier-set-root, event-root, header) + reorg undo logs. lattica provides the
-shielded-tx + issuance *mechanisms* and the node-visible supply accumulator; the host chain owns
-block-level supply recomputation and commitments.
+Block consensus / PoW / mempool / networking / emission schedule, block/tx canonical encoding, reorg
+undo records, mempool duplicate-nullifier/anchor-window policy, and real-verifier startup attestation.
+
+**P-01 lattica-side enablers (built; the host chain wires them).** The node owns the shielded state, so
+the consensus-critical *state* surface is now exposed for the host chain to bind in block headers and
+recompute on genesis replay (`docs/lattica-implementation-audit.md` P-01 response):
+- `Chain.stateRoot()` = H(note-tree root ‖ nullifier-set accumulator ‖ `SupplyState.commitment()`) — a
+  binding, genesis-replayable shielded-state commitment (note set + nullifier set + public supply).
+- `Chain.eventRoot()` + `Chain.redeemEvents()` — the canonical HTLC redeem-preimage event stream (for
+  cross-chain watchers) and its committed root.
+- `Chain.positionOf(cm)` / `Chain.merklePathForCommitment(cm)` — the commitment index that locates the
+  placeholder-ciphertext HTLC note for watchers/wallets.
+- `applyHtlc` consensus-height pinning (`current_height == at_height`) + the deterministic supply +
+  nullifier accumulators.
+
+The host chain still owns block-structure commitments (tx root + per-block event root over block bytes),
+reorg undo, and the surrounding consensus pipeline.

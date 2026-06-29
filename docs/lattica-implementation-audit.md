@@ -6,7 +6,7 @@
 
 ## v3-audit Tag Re-Audit (2026-06-28)
 
-**Basepoint audited:** tag `v3-audit`, commit `61f66d520bf478c50d728c72fd549adb4d877728` (`git describe --tags --always --dirty` returned `v3-audit`; working tree was clean before this documentation update).
+**Basepoint audited:** annotated tag `v3-audit`; tag object `61f66d520bf478c50d728c72fd549adb4d877728`, tagged commit `1ab208a60c5a12ccc01998edba29b1e685d45fed` (`git describe --tags --always --dirty` returned `v3-audit`; working tree was clean before this documentation update).
 
 ### Verdict
 
@@ -91,7 +91,38 @@ The in-repo `Chain` remains an in-memory transaction-state component. A producti
 | Finding | Resolution |
 |---|---|
 | **M-11** legacy one-input spend FFI surface + stale comments | **Fixed.** Removed the pre-Plonky3 `SpendPublicInputs`, `verifySpend`, `setBackend`, `clearBackend`, and the `backend` var from `src/ffi.zig` (they were public but used nowhere outside the module's own tests; the live node uses `setJoinSplitBackend`/`verifyJoinSplit` + `setHtlcBackend`/`verifyHtlc`, both of which carry the `MAX_PROOF_LEN` guard). The shared `VerifyFn` is retained (used by the active seams). Rewrote the `ffi.zig` top-level comment to describe only the join-split + HTLC verify/prove boundary. Removed the legacy tests; the active wrappers' tests already cover encode / fail-closed / backend-reached / oversize-reject. Updated `docs/audit-scope-p3.md`: the trust-model now names `lattica_joinsplit_verify`/`lattica_htlc_verify`, the proof-serialization row gives the real `JoinSplitPublicInputs` (208 B) / `HtlcPublicInputs` (248 B) layouts, and the frozen-params note states the live circuit is the join-split + the v3 HTLC (the one-input spend path is removed). `zig build test`, `check-production`, and `scripts/run-real-integration.sh` green. |
-| **P-01** full-node consensus integration | **Out of lattica's scope; already documented.** This is the host-chain (`rubble-node-zig`) production blocker, not a defect in this package. The required machinery — incl. all five HTLC-specific items (consensus-only `at_height`, the canonical preimage event stream, the commitment/lock-descriptor index for the placeholder ciphertext, reorg timeout cushions + redeem/refund nullifier-conflict policy, and genesis replay of supply/nullifier state) — is specified in `docs/full-node-security-integration.md` ("HTLC Full-Node Requirements" + the consensus pipeline), and the boundary is restated in `AUDITORS.md` §7. The lattica node already enforces its half in-package (`applyHtlc` pins `current_height == at_height` and rejects a tx-supplied height; the supply accumulator + nullifier set are deterministic). No in-package code change; production use remains gated on the host-chain integration + the Phase-B xchain work. |
+| **P-01** full-node consensus integration | **Host-chain scope; lattica-side enablers now provided so the integration is wiring, not re-derivation.** The block-structure consensus machinery (canonical block encoding, reorg undo, mempool policy, emission schedule, verifier-startup attestation, snapshots) remains `rubble-node-zig`'s, specified in `docs/full-node-security-integration.md` + `AUDITORS.md` §7. But the node owns the shielded state, so the consensus-critical *state* surface is now exposed in-package for the host chain to bind in block headers and recompute on genesis replay: **`Chain.stateRoot()`** = H(note-tree root ‖ nullifier-set accumulator ‖ `SupplyState.commitment()`) (a binding, genesis-replayable shielded-state commitment); **`Chain.eventRoot()` + `Chain.redeemEvents()`** — the canonical HTLC redeem-preimage event stream (so cross-chain watchers claim the opposite leg) + its committed root; **`Chain.positionOf(cm)` / `merklePathForCommitment(cm)`** — the commitment index that lets a watcher locate the placeholder-ciphertext HTLC note; and the pre-existing `applyHtlc` consensus-height pinning + deterministic supply/nullifier accumulators. Remaining host-chain items: block/tx encoding + tx/event-root-over-block-structure, reorg undo records, mempool duplicate-nullifier/anchor-window policy, emission/fee schedule, real-verifier attestation. |
+
+### Remediation Recheck — current branch `v3` (2026-06-28)
+
+Current HEAD is `48599cdac6a1cdfd753ed68ef258878f403b8d8c`, two commits after the tagged commit `v3-audit^{commit}` (`1ab208a60c5a12ccc01998edba29b1e685d45fed`). The delta from the tag removes the legacy one-input FFI surface, updates stale verifier/proof-layout documentation, and leaves the live transaction code otherwise on the v3 audit path.
+
+Recheck result: **M-11 is remediated in code and docs.** `src/ffi.zig` no longer exports `SpendPublicInputs`, `verifySpend`, `setBackend`, or `clearBackend`; the active `verifyJoinSplit` and `verifyHtlc` wrappers still reject `proof.len > MAX_PROOF_LEN`. `docs/audit-scope-p3.md` now names `lattica_joinsplit_verify` / `lattica_htlc_verify` and documents the 208-byte join-split and 248-byte HTLC public-input layouts. P-01 remains an out-of-package production blocker.
+
+Additional remediation audit cleanup: active entry/scope docs still carried historical `spend_air` / `full_spend_air` / one-input wording in a few places even after M-11. This pass removed those from `docs/AUDITORS.md` and `docs/audit-scope-p3.md`, replaced the old one-input proof statement with the current `N_IN=2` / `M_OUT=2` join-split plus HTLC statement, and updated the audit-scope reproduction commands/counts. Remaining `spend_air` mentions are historical removal notes only.
+
+Verification rerun on the remediated current branch:
+
+```sh
+zig build test
+zig build check-production
+scripts/run-real-integration.sh
+```
+
+Results: `zig build test` passed; `zig build check-production` passed; `scripts/run-real-integration.sh` passed outside the sandbox after the known Zig stdlib sandbox read restriction. The integration run accepted valid join-split and HTLC proofs, rejected tampered anchor/output/hashlock cases, rejected replay/double spend, rejected refund-before-timeout, and completed the HTLC lock/redeem lifecycle.
+
+Full verification rerun for this remediation audit:
+
+```sh
+cd lattica-prover-p3 && cargo test --release
+cd lattica-prover-p3 && cargo test --release -- --ignored
+zig build test
+zig build check-production
+scripts/run-real-integration.sh
+cd lattica-prover-p3 && cargo run --release --bin dump_p2
+```
+
+Results: `cargo test --release` passed (**82 passed / 3 ignored**); `cargo test --release -- --ignored` passed (**3 passed / 82 filtered out**); `zig build test` passed; `zig build check-production` passed; `scripts/run-real-integration.sh` passed outside the sandbox after the known Zig stdlib sandbox read restriction; `dump_p2` completed. The integration run accepted valid join-split and HTLC proofs, rejected tampered anchor/output/hashlock cases, rejected replay/double spend, rejected refund-before-timeout, and completed the HTLC lock/redeem lifecycle.
 
 ## Current Re-Audit (post-round-3 remediation verification, 2026-06-28)
 
