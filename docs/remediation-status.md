@@ -10,9 +10,12 @@ The live node runs the **Plonky3 join-split** path end to end:
   `lattica_joinsplit_prove`.
 - On-chain hashing is Poseidon2-Goldilocks (`src/poseidon2.zig`), KAT-equal to the circuit, so the
   node-reconstructed public inputs equal the proof's.
-- The pre-Plonky3 cluster (`stark.zig`, `rescue.zig`, `circuit.zig`, the Winterfell `lattica-prover`,
-  `lattica_spend_verify`) has been **removed**. References to those in older revisions of this file
-  are obsolete.
+- The pre-Plonky3 Zig cluster (`src/stark.zig`, `src/rescue.zig`, `src/circuit.zig`) has been
+  **removed**, and the pre-Plonky3 one-input verify boundary (`SpendPublicInputs` / `verifySpend` /
+  `lattica_spend_verify`) is **off the live path** — `src/ffi.zig` exposes only the join-split + HTLC
+  seams (audit r3 / M-11). The Winterfell `lattica-prover/` crate is **retained as a reference-only
+  differential oracle** for the hashes (marked "not audited as production" in `docs/audit-scope-p3.md`),
+  not a production artifact; its internal `lattica_spend_verify` is that reference crate's own ABI.
 
 So the earlier "✅ in new stack (not live)" caveats are resolved: the new stack **is** the live path.
 

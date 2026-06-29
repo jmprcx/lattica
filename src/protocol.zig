@@ -16,11 +16,11 @@
 //! while the protocol layer only ever touches the **public** counters (mint, burn, fee). Note
 //! values stay private.
 //!
-//! Commitments (`cm`) and nullifiers (`nf`) are opaque 32-byte values here — they are produced by
-//! the production prover (`lattica-prover`, Rescue-Prime `Rp64_256` over the field) so the
-//! in-circuit hash and the on-chain value agree by construction. The tx-binding digest below is a
-//! SHA3 hash of the canonical bytes; it is fed to the spend proof as a public input (the proof
-//! binds to it — no in-circuit SHA3 is required).
+//! Commitments (`cm`) and nullifiers (`nf`) are opaque 32-byte values here — they are produced by the
+//! production circuit (`lattica-prover-p3`, Poseidon2-Goldilocks; on-chain hashing in `poseidon2.zig`
+//! is KAT-equal to it) so the in-circuit hash and the on-chain value agree by construction. The
+//! tx-binding digest below is a SHA3 hash of the canonical bytes; it is fed to the spend proof as a
+//! public input (the proof binds to it — no in-circuit SHA3 is required).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
