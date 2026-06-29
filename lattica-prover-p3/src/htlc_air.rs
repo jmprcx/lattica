@@ -383,15 +383,15 @@ const N_PERIODIC: usize = 39 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4) ‖
 //                current_height(1) ‖ redeem_hashlock(4)
-const PI_ANCHOR: usize = 0;
-const PI_NF: usize = 4;
-const PI_OUTCM: usize = 4 + N_IN * DIGEST;
-const PI_FEE: usize = 4 + N_IN * DIGEST + M_OUT * DIGEST;
-const PI_MINT: usize = PI_FEE + 1;
-const PI_TXBIND: usize = PI_MINT + 1;
-const PI_HEIGHT: usize = PI_TXBIND + DIGEST; // current block height (HTLC timeout compare)
-const PI_HASHLOCK: usize = PI_HEIGHT + 1; // SHA256(preimage) = the redeemed note's committed hashlock
-const N_PUBLIC: usize = PI_HASHLOCK + DIGEST;
+pub const PI_ANCHOR: usize = 0;
+pub const PI_NF: usize = 4;
+pub const PI_OUTCM: usize = 4 + N_IN * DIGEST;
+pub const PI_FEE: usize = 4 + N_IN * DIGEST + M_OUT * DIGEST;
+pub const PI_MINT: usize = PI_FEE + 1;
+pub const PI_TXBIND: usize = PI_MINT + 1;
+pub const PI_HEIGHT: usize = PI_TXBIND + DIGEST; // current block height (HTLC timeout compare)
+pub const PI_HASHLOCK: usize = PI_HEIGHT + 1; // SHA256(preimage) = the redeemed note's committed hashlock
+pub const N_PUBLIC: usize = PI_HASHLOCK + DIGEST;
 
 const fn input_base(i: usize) -> usize {
     i * SPAN_BLOCKS
