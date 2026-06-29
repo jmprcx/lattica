@@ -264,6 +264,14 @@ fn run() !void {
         bad[0] +%= 1;
         if (ffi.verifyBatch(r.proof, bad)) return Err.TamperAccepted;
         std.debug.print("batch verify vs tampered root: REJECT\n", .{});
+
+        // APPLY: ONE proof authorizes both txs; the node applies them atomically (no per-tx verify).
+        try chain.applyBatch(&txs, r.proof);
+        if (!chain.nullifiers.contains(ba.tx.nullifiers[0]) or !chain.nullifiers.contains(bb.tx.nullifiers[0])) return Err.BatchRejected;
+        std.debug.print("real batch APPLY: 2 txs applied via one proof\n", .{});
+        // re-applying is a double-spend (both txs' nullifiers are now in the set).
+        if (chain.applyBatch(&txs, r.proof)) |_| return Err.DoubleSpendAccepted else |e| if (e != node.TxError.DoubleSpend) return Err.WrongError;
+        std.debug.print("batch re-apply: REJECT (double-spend)\n", .{});
     }
 
     // --- v3: REAL HTLC batch — two HTLC redeems proven as ONE proof; the node recomputes the HTLC
@@ -325,6 +333,16 @@ fn run() !void {
         hbad[0] +%= 1;
         if (ffi.verifyHtlcBatch(hr.proof, hbad)) return Err.TamperAccepted;
         std.debug.print("HTLC batch verify vs tampered root: REJECT\n", .{});
+
+        // APPLY: ONE proof authorizes both redeems; the node applies them (pins height = 60) + emits the
+        // two redeem preimage events for cross-chain watchers.
+        const events_before = chain.redeemEvents().len;
+        try chain.applyHtlcBatch(&htxs, hr.proof, 60);
+        if (!chain.nullifiers.contains(hwa.tx.nullifiers[0]) or !chain.nullifiers.contains(hwb.tx.nullifiers[0])) return Err.BatchRejected;
+        if (chain.redeemEvents().len != events_before + 2) return Err.BatchRejected;
+        std.debug.print("real HTLC batch APPLY: 2 redeems applied (+2 preimage events) via one proof\n", .{});
+        if (chain.applyHtlcBatch(&htxs, hr.proof, 60)) |_| return Err.DoubleSpendAccepted else |e| if (e != node.TxError.DoubleSpend) return Err.WrongError;
+        std.debug.print("HTLC batch re-apply: REJECT (double-spend)\n", .{});
     }
 
     std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject (+ HTLC lock/redeem/refund-timelock + join-split & HTLC one-proof-per-block)\n", .{});

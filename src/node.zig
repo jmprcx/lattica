@@ -74,8 +74,14 @@ pub const TxError = error{
     HeightMismatch, // tx's current_height ≠ the consensus height the node is validating at
     NonCanonicalField, // a public 32-byte field has a limb ≥ p (non-canonical encoding)
     ProveFailed, // wallet-side: the prover rejected the witness (e.g. an unsatisfiable timelock)
+    EmptyBatch, // a batch with no transactions
+    BatchTooLarge, // batch tile count exceeds MAX_BATCH_TILES (the ≥100-bit proven-soundness floor)
     Internal,
 };
+
+/// Max transactions a single batch proof may cover at the ≥100-bit proven floor (must match
+/// `batch_joinsplit_air::MAX_BATCH_TILES`); a larger block emits multiple batch proofs.
+pub const MAX_BATCH_TILES: usize = 64;
 
 /// Upper bound on a single output's note ciphertext (the 128-byte note plaintext + AEAD tag is
 /// ~144 bytes; this generous cap lets the node reject malformed/oversize outputs before the expensive
@@ -1095,6 +1101,151 @@ pub const Chain = struct {
             self.event_acc = p.hashDomain("lattica:v1:event-acc", &.{ &self.event_acc, &hl, &pre });
         }
     }
+
+    /// Verify ONE batch proof for `txs` and apply them all — the consensus path for "one proof per
+    /// block" (join-split). The batch proof (checked against the recomputed `batchRoot`) is the sole
+    /// authorization for every tx's spend statement; the node still enforces the STATEFUL checks the
+    /// proof does not — anchor known, no nullifier already spent OR duplicated within the batch, fee/field
+    /// canonical, supply arithmetic. Issuance is forbidden in a batch (`mint == 0` per tx; coinbase uses
+    /// `applyCoinbase`). Atomic two-phase apply over all txs: a single invalid tx rejects the whole batch
+    /// with no state change. One proof verification replaces N per-tx verifications.
+    pub fn applyBatch(self: *Chain, txs: []const ShieldedTx, proof: []const u8) TxError!void {
+        if (txs.len == 0) return TxError.EmptyBatch;
+        if (paddedTiles(txs.len) > MAX_BATCH_TILES) return TxError.BatchTooLarge;
+
+        // ---- cheap per-tx checks first (DoS — audit H-02), incl. no double-spend within the batch ----
+        var seen = HashSet.init(self.allocator);
+        defer seen.deinit();
+        var candidate_supply = self.supply;
+        for (txs) |t| {
+            if (t.mint != 0) return TxError.IllegalIssuance; // batches are non-coinbase
+            if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
+            for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
+            if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
+            if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
+            for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
+            for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
+            for (t.nullifiers) |nf| {
+                if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
+                const gop = seen.getOrPut(nf) catch return TxError.Internal;
+                if (gop.found_existing) return TxError.DoubleSpend; // duplicate within the batch
+            }
+            candidate_supply.apply(.{ .issued = 0, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
+        }
+        if (proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
+
+        // ---- the SOLE authorization: ONE batch proof against the recomputed block tx-root ----
+        if (!ffi.verifyBatch(proof, batchRoot(txs))) return TxError.BadAuthProof;
+
+        // ---- atomic two-phase apply over ALL txs (audit H-03/H-04) ----
+        const out_cap = txs.len * M_OUT;
+        self.nullifiers.ensureUnusedCapacity(@intCast(txs.len * N_IN)) catch return TxError.Internal;
+        self.anchors.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
+        self.transmitted.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
+        self.tree.ensureUnusedCapacity(out_cap) catch return TxError.TreeFull;
+        self.cm_index.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
+        var owned: std.ArrayList(tx.TransmittedNote) = .empty;
+        defer owned.deinit(self.allocator); // frees the Vec backing; ciphertexts transfer to the chain on commit
+        owned.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
+        errdefer for (owned.items) |o| self.allocator.free(o.ciphertext);
+        for (txs) |t| {
+            for (t.outputs) |o| {
+                const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
+                owned.appendAssumeCapacity(.{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct });
+            }
+        }
+
+        // ---- infallible commit ----
+        self.supply = candidate_supply;
+        for (txs) |t| {
+            for (t.nullifiers) |nf| {
+                self.nullifiers.putAssumeCapacity(nf, {});
+                self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
+            }
+        }
+        for (owned.items) |o| {
+            const pos = self.tree.appendAssumeCapacity(o.cm);
+            self.cm_index.putAssumeCapacity(o.cm, pos);
+            self.anchors.putAssumeCapacity(self.tree.root(), {});
+            self.transmitted.appendAssumeCapacity(o);
+        }
+    }
+
+    /// Batch analog of `applyHtlc`: verify ONE HTLC batch proof and apply all redeems/refunds. Like
+    /// `applyBatch` plus the HTLC-specific pins — `mint == 0`, `current_height == at_height` (the
+    /// consensus height, never tx-supplied) bounded `< 2^RANGE_BITS` — and per-redeem preimage-event
+    /// emission, atomic over the batch.
+    pub fn applyHtlcBatch(self: *Chain, txs: []const ShieldedHtlcTx, proof: []const u8, at_height: u64) TxError!void {
+        if (txs.len == 0) return TxError.EmptyBatch;
+        if (paddedTiles(txs.len) > MAX_BATCH_TILES) return TxError.BatchTooLarge;
+
+        var seen = HashSet.init(self.allocator);
+        defer seen.deinit();
+        var candidate_supply = self.supply;
+        var n_events: usize = 0;
+        for (txs) |t| {
+            if (t.mint != 0) return TxError.IllegalIssuance;
+            if (t.current_height >= MAX_RANGE_VALUE) return TxError.OversizeHeight;
+            if (t.current_height != at_height) return TxError.HeightMismatch;
+            if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
+            for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
+            if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
+            if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
+            for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
+            for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
+            for (t.nullifiers) |nf| {
+                if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
+                const gop = seen.getOrPut(nf) catch return TxError.Internal;
+                if (gop.found_existing) return TxError.DoubleSpend;
+            }
+            candidate_supply.apply(.{ .issued = 0, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
+            if (t.redeem_preimage != null) n_events += 1;
+        }
+        if (proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
+        if (!ffi.verifyHtlcBatch(proof, htlcBatchRoot(txs))) return TxError.BadAuthProof;
+
+        const out_cap = txs.len * M_OUT;
+        self.nullifiers.ensureUnusedCapacity(@intCast(txs.len * N_IN)) catch return TxError.Internal;
+        self.anchors.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
+        self.transmitted.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
+        self.tree.ensureUnusedCapacity(out_cap) catch return TxError.TreeFull;
+        self.cm_index.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
+        self.htlc_events.ensureUnusedCapacity(self.allocator, n_events) catch return TxError.Internal;
+        var owned: std.ArrayList(tx.TransmittedNote) = .empty;
+        defer owned.deinit(self.allocator);
+        owned.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
+        errdefer for (owned.items) |o| self.allocator.free(o.ciphertext);
+        for (txs) |t| {
+            for (t.outputs) |o| {
+                const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
+                owned.appendAssumeCapacity(.{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct });
+            }
+        }
+
+        self.supply = candidate_supply;
+        for (txs) |t| {
+            for (t.nullifiers) |nf| {
+                self.nullifiers.putAssumeCapacity(nf, {});
+                self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
+            }
+        }
+        var oi: usize = 0;
+        for (txs) |t| {
+            for (t.outputs) |_| {
+                const o = owned.items[oi];
+                const pos = self.tree.appendAssumeCapacity(o.cm);
+                self.cm_index.putAssumeCapacity(o.cm, pos);
+                self.anchors.putAssumeCapacity(self.tree.root(), {});
+                self.transmitted.appendAssumeCapacity(o);
+                oi += 1;
+            }
+            if (t.redeem_preimage) |pre| {
+                const hl = t.redeemHashlock();
+                self.htlc_events.appendAssumeCapacity(.{ .redeem_hashlock = hl, .preimage = pre });
+                self.event_acc = p.hashDomain("lattica:v1:event-acc", &.{ &self.event_acc, &hl, &pre });
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------------------
@@ -1946,4 +2097,36 @@ test "node: batchRoot folds tx statements + pads to a power of two (P-01 batch)"
     var manual = poseidon2.merge(poseidon2.merge(poseidon2.merge(.{ 0, 0, 0, 0 }, s), s), s);
     manual = poseidon2.merge(manual, poseidon2.DUMMY_SK);
     try testing.expectEqualSlices(u8, &poseidon2.digestBytes(manual), &batchRoot(&txs3));
+}
+
+test "node: applyBatch enforces empty/size/double-spend + fail-closed (P-01 batch apply)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install(); // the per-tx mock backend — NOT a batch backend, so verifyBatch fails closed
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1);
+    const bob = try account(2);
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{2} ** 32);
+    const inputs = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 900 }};
+    const b = try buildTransferWitness(a, alice, &inputs, &outs, 100, 0, chain.anchor());
+    defer a.free(b.witness);
+    defer for (b.tx.outputs) |tn| a.free(tn.ciphertext);
+    const txs = [_]ShieldedTx{b.tx};
+
+    try testing.expectError(TxError.EmptyBatch, chain.applyBatch(&.{}, "x"));
+    try testing.expect(paddedTiles(MAX_BATCH_TILES + 1) > MAX_BATCH_TILES); // the size guard's premise
+    // a duplicate nullifier within the batch is rejected before the (expensive) proof verify…
+    const dup = [_]ShieldedTx{ b.tx, b.tx };
+    try testing.expectError(TxError.DoubleSpend, chain.applyBatch(&dup, "x"));
+    // …and with no batch backend installed, a well-formed batch fails closed (no unverified apply).
+    try testing.expectError(TxError.BadAuthProof, chain.applyBatch(&txs, "x"));
+    // nothing was applied (no nullifier spent, anchor unchanged).
+    try testing.expect(!chain.nullifiers.contains(b.tx.nullifiers[0]));
 }
