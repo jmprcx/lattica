@@ -205,54 +205,54 @@ const FEE_BLOCKS: usize = 2; // fee binding + range
 const MINT_BLOCKS: usize = 2; // mint (issuance) binding + range
 const USED_BLOCKS: usize = N_IN * SPAN_BLOCKS + M_OUT * OUT_BLOCKS + FEE_BLOCKS + MINT_BLOCKS;
 const NUM_BLOCKS: usize = USED_BLOCKS.next_power_of_two();
-const HEIGHT: usize = NUM_BLOCKS * BLOCK;
+pub const HEIGHT: usize = NUM_BLOCKS * BLOCK;
 
-// columns
-const BIT: usize = 8; // membership position bit
-const NK: usize = 9; // local-persistent within an input span
-const RHO: usize = 10; // rho limb 0 (local-persistent)
-const VAL: usize = 11; // value within input / output / fee / mint region
-const POSACC: usize = 12; // Σ bit_d·2^d within an input's membership (A1)
-const VALACC: usize = 13; // global balance accumulator: +in +mint −out −fee ⇒ 0
-const REM: usize = 14; // range running remainder
-const RBIT: usize = 15;
-const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
-const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
-const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant across the whole tx)
-const WIDTH: usize = 19;
+// columns (pub for reuse by batch_joinsplit_air; the constraint logic below is unchanged)
+pub const BIT: usize = 8; // membership position bit
+pub const NK: usize = 9; // local-persistent within an input span
+pub const RHO: usize = 10; // rho limb 0 (local-persistent)
+pub const VAL: usize = 11; // value within input / output / fee / mint region
+pub const POSACC: usize = 12; // Σ bit_d·2^d within an input's membership (A1)
+pub const VALACC: usize = 13; // global balance accumulator: +in +mint −out −fee ⇒ 0
+pub const REM: usize = 14; // range running remainder
+pub const RBIT: usize = 15;
+pub const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
+pub const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
+pub const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant across the whole tx)
+pub const WIDTH: usize = 19;
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
-const P_OWN_IN: usize = 11;
-const P_RECIP_LINK: usize = 12; // own.out -> commit_a.in recipient lanes
-const P_COMMIT_A_IN: usize = 13; // input commit_a: DOM_CM, value, rho0, rho1
-const P_CHAIN_LINK: usize = 14; // commit_a.out -> commit_b.in[0..4] (input & output commitments)
-const P_COMMIT_B: usize = 15; // commit_b.in pad lanes = 0 (input & output commitments)
-const P_MEM_LINK: usize = 16;
-const P_POS_COEFF: usize = 17; // 2^d at each membership link
-const P_ROOT: usize = 18;
-const P_NULL_IN: usize = 19;
-const P_OUT_A_IN: usize = 20; // output out_a: DOM_CM, out_value
-const P_FEE_IN: usize = 21;
-const P_MINT_IN: usize = 22; // issuance amount binding row
-const P_REGION_LAST: usize = 23; // last row of each region (gates local-persistent columns)
-const P_RANGE_SEED: usize = 24; // rem = VAL (each value's first range row)
-const P_RANGE_ACTIVE: usize = 25; // decomposition rows
-const P_RANGE_CLOSE: usize = 26; // rem = 0 (value < 2^BITS)
-const P_ROW0: usize = 27; // VALACC = 0
-const P_FINAL: usize = 28; // VALACC = 0 (balance)
-const P_NULLOUT: usize = 29; // N_IN one-hots: nf_i binding
-const P_OUTOUT: usize = 29 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 29 + N_IN + M_OUT;
+pub const P_OWN_IN: usize = 11;
+pub const P_RECIP_LINK: usize = 12; // own.out -> commit_a.in recipient lanes
+pub const P_COMMIT_A_IN: usize = 13; // input commit_a: DOM_CM, value, rho0, rho1
+pub const P_CHAIN_LINK: usize = 14; // commit_a.out -> commit_b.in[0..4] (input & output commitments)
+pub const P_COMMIT_B: usize = 15; // commit_b.in pad lanes = 0 (input & output commitments)
+pub const P_MEM_LINK: usize = 16;
+pub const P_POS_COEFF: usize = 17; // 2^d at each membership link
+pub const P_ROOT: usize = 18;
+pub const P_NULL_IN: usize = 19;
+pub const P_OUT_A_IN: usize = 20; // output out_a: DOM_CM, out_value
+pub const P_FEE_IN: usize = 21;
+pub const P_MINT_IN: usize = 22; // issuance amount binding row
+pub const P_REGION_LAST: usize = 23; // last row of each region (gates local-persistent columns)
+pub const P_RANGE_SEED: usize = 24; // rem = VAL (each value's first range row)
+pub const P_RANGE_ACTIVE: usize = 25; // decomposition rows
+pub const P_RANGE_CLOSE: usize = 26; // rem = 0 (value < 2^BITS)
+pub const P_ROW0: usize = 27; // VALACC = 0
+pub const P_FINAL: usize = 28; // VALACC = 0 (balance)
+pub const P_NULLOUT: usize = 29; // N_IN one-hots: nf_i binding
+pub const P_OUTOUT: usize = 29 + N_IN; // M_OUT one-hots: out_cm_j binding
+pub const N_PERIODIC: usize = 29 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
-const PI_ANCHOR: usize = 0;
-const PI_NF: usize = 4;
-const PI_OUTCM: usize = 4 + N_IN * DIGEST;
-const PI_FEE: usize = 4 + N_IN * DIGEST + M_OUT * DIGEST;
-const PI_MINT: usize = PI_FEE + 1;
-const PI_TXBIND: usize = PI_MINT + 1;
-const N_PUBLIC: usize = PI_TXBIND + DIGEST;
+pub const PI_ANCHOR: usize = 0;
+pub const PI_NF: usize = 4;
+pub const PI_OUTCM: usize = 4 + N_IN * DIGEST;
+pub const PI_FEE: usize = 4 + N_IN * DIGEST + M_OUT * DIGEST;
+pub const PI_MINT: usize = PI_FEE + 1;
+pub const PI_TXBIND: usize = PI_MINT + 1;
+pub const N_PUBLIC: usize = PI_TXBIND + DIGEST;
 
 const fn input_base(i: usize) -> usize {
     i * SPAN_BLOCKS
@@ -320,7 +320,7 @@ fn one_hot(rows: &[usize]) -> Vec<Val> {
     c
 }
 
-fn periodic() -> Vec<Vec<Val>> {
+pub fn periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic_table(); // 11 round-schedule columns, period 32
     let own_in: Vec<usize> = (0..N_IN).map(own_in_row).collect();
     let recip: Vec<usize> = (0..N_IN).map(own_out_row).collect(); // own output → commit_a recipient
@@ -629,7 +629,7 @@ fn fill_col(t: &mut [Val], lo: usize, hi: usize, col: usize, v: Val) {
     }
 }
 
-fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
+pub fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
     let mut t = vec![Val::ZERO; HEIGHT * WIDTH];
 
     // ASSET is global-persistent (one hidden asset id for the whole tx); fill it on every row.
