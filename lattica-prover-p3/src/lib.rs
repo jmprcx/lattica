@@ -611,6 +611,92 @@ pub unsafe extern "C" fn lattica_batch_prove(
     0
 }
 
+// --- HTLC batch aggregation C ABI (mirrors the join-split batch; HTLC witnesses + tx-root) ----
+
+/// C ABI: verify a serialized **HTLC batch** proof against the 32-byte block tx-root. Fail-closed +
+/// size-bounded + panic-isolated, exactly like `lattica_batch_verify`.
+///
+/// # Safety
+/// `proof_ptr`/`root_ptr` must point to `proof_len`/`root_len` readable bytes (or be null).
+#[no_mangle]
+pub unsafe extern "C" fn lattica_htlc_batch_verify(
+    proof_ptr: *const u8,
+    proof_len: usize,
+    root_ptr: *const u8,
+    root_len: usize,
+) -> i32 {
+    if proof_ptr.is_null() || root_ptr.is_null() || proof_len > MAX_PROOF_LEN || root_len != DIGEST_BYTES {
+        return 1;
+    }
+    let proof = slice::from_raw_parts(proof_ptr, proof_len);
+    let rb = slice::from_raw_parts(root_ptr, root_len);
+    let mut root = Vec::with_capacity(4);
+    if push_digest(rb, &mut root).is_none() {
+        return 1;
+    }
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch_htlc_air::verify_batch_bytes(proof, &root)));
+    if matches!(ok, Ok(true)) {
+        0
+    } else {
+        1
+    }
+}
+
+/// C ABI: prove `n_tx` concatenated **HTLC** witnesses (each `HTLC_WITNESS_LEN` bytes) as ONE batch
+/// proof; writes the proof + the 32-byte block tx-root. Returns 0 ok, 1 on bad input / oversize batch /
+/// panic, 2 if a buffer is too small.
+///
+/// # Safety
+/// As `lattica_batch_prove`.
+#[no_mangle]
+pub unsafe extern "C" fn lattica_htlc_batch_prove(
+    witness_ptr: *const u8,
+    witness_len: usize,
+    n_tx: usize,
+    proof_out: *mut u8,
+    proof_cap: usize,
+    proof_len: *mut usize,
+    root_out: *mut u8,
+    root_cap: usize,
+    root_len: *mut usize,
+) -> i32 {
+    if witness_ptr.is_null() || proof_out.is_null() || root_out.is_null() || proof_len.is_null() || root_len.is_null() {
+        return 1;
+    }
+    if n_tx == 0 || witness_len != n_tx.checked_mul(HTLC_WITNESS_LEN).unwrap_or(usize::MAX) {
+        return 1;
+    }
+    if batch_joinsplit_air::padded_tiles(n_tx) > batch_joinsplit_air::MAX_BATCH_TILES {
+        return 1;
+    }
+    let wb = slice::from_raw_parts(witness_ptr, witness_len);
+    let mut ws = Vec::with_capacity(n_tx);
+    for i in 0..n_tx {
+        match parse_htlc_witness(&wb[i * HTLC_WITNESS_LEN..(i + 1) * HTLC_WITNESS_LEN]) {
+            Some(w) => ws.push(w),
+            None => return 1,
+        }
+    }
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let root = batch_htlc_air::batch_root(&ws);
+        let proof = batch_htlc_air::prove_batch_to_bytes(&ws);
+        (proof, root)
+    }));
+    let (proof, root) = match built {
+        Ok(x) => x,
+        Err(_) => return 1,
+    };
+    let rb = encode_digest(&root);
+    if proof.len() > proof_cap || rb.len() > root_cap {
+        return 2;
+    }
+    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
+    *proof_len = proof.len();
+    core::ptr::copy_nonoverlapping(rb.as_ptr(), root_out, rb.len());
+    *root_len = rb.len();
+    0
+}
+
 // --- HTLC wallet-side prover ABI --------------------------------------------------------------
 
 /// Canonical wallet→prover **HTLC** witness layout = the join-split layout plus the HTLC fields.
@@ -1125,5 +1211,47 @@ mod tests {
         assert_ne!(unsafe { lattica_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) }, 0);
         // wrong root length ⇒ reject
         assert_ne!(unsafe { lattica_batch_verify(r.as_ptr(), 0, r.as_ptr(), 31) }, 0);
+    }
+
+    #[test]
+    #[ignore = "slow: HTLC batch prove (2 tiles) via the C ABI"]
+    fn htlc_batch_c_abi_roundtrip() {
+        let w0 = crate::htlc_air::demo_htlc_witness();
+        let mut w1 = crate::htlc_air::demo_htlc_witness();
+        w1.tx_binding[0] += Goldilocks::ONE;
+        let mut wb = encode_htlc_witness(&w0);
+        wb.extend_from_slice(&encode_htlc_witness(&w1));
+        assert_eq!(wb.len(), 2 * HTLC_WITNESS_LEN);
+        let mut proof = vec![0u8; 1 << 21];
+        let mut root = [0u8; 32];
+        let (mut pl, mut rl) = (0usize, 0usize);
+        let rc = unsafe {
+            lattica_htlc_batch_prove(wb.as_ptr(), wb.len(), 2, proof.as_mut_ptr(), proof.len(), &mut pl, root.as_mut_ptr(), root.len(), &mut rl)
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(rl, 32);
+        assert_eq!(unsafe { lattica_htlc_batch_verify(proof.as_ptr(), pl, root.as_ptr(), rl) }, 0);
+        let mut bad = root;
+        bad[0] ^= 1;
+        assert_ne!(unsafe { lattica_htlc_batch_verify(proof.as_ptr(), pl, bad.as_ptr(), 32) }, 0);
+    }
+
+    #[test]
+    fn htlc_batch_abi_fail_closed() {
+        let (mut pl, mut rl) = (0usize, 0usize);
+        let mut p = [0u8; 8];
+        let mut r = [0u8; 32];
+        assert_eq!(
+            unsafe { lattica_htlc_batch_prove(core::ptr::null(), 0, 1, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            1
+        );
+        assert_ne!(unsafe { lattica_htlc_batch_verify(core::ptr::null(), 0, r.as_ptr(), 32) }, 0);
+        let wb = vec![0u8; HTLC_WITNESS_LEN + 1];
+        assert_eq!(
+            unsafe { lattica_htlc_batch_prove(wb.as_ptr(), wb.len(), 1, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            1
+        );
+        assert_ne!(unsafe { lattica_htlc_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) }, 0);
+        assert_ne!(unsafe { lattica_htlc_batch_verify(r.as_ptr(), 0, r.as_ptr(), 31) }, 0);
     }
 }
