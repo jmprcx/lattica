@@ -165,7 +165,10 @@ tiled `n` times in one trace) at the production FRI params:
 **Conclusion:** the realized per-proof win is the FRI encoding (arity + cap, −49%, adopted). The
 field and trace levers don't help proof size (≤5% / ~4%). The structural lever — **batching toward
 one proof per block** — is the real headroom: measured ~log(n) growth ⇒ ~600× smaller and constant
-verify at block scale, at the cost of monolithic proving (which true recursion later removes).
+verify at block scale, at the cost of monolithic proving (which true recursion later removes). The
+batch is implemented (`batch_joinsplit_air`/`batch_htlc_air`, + the node `applyBatch`/`applyHtlcBatch`
+path); the trustless per-user-proving scale-out beyond it is designed in **`docs/recursion-design.md`**
+(deferred — it requires a recursive STARK verifier circuit, which Plonky3 0.6.1 does not provide).
 
 ## Parameter hardening (was demo-sized in M4c)
 
