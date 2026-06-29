@@ -55,6 +55,66 @@ pub fn native_sponge(blocks: &[[Val; RATE]]) -> [Val; RATE] {
     state_out[..RATE].try_into().unwrap()
 }
 
+/// A faithful Rust mirror of Plonky3's `DuplexChallenger` (width 8, rate 4). This is the executable
+/// SPEC the in-circuit transcript (B3-wire) must reproduce: it pins the exact duplexing semantics
+/// (overwrite the rate, keep the capacity, pad unused rate lanes to zero, fold the prefix-free count
+/// `state[RATE] += num_absorbed`, permute) and the squeeze order (`output_buffer` popped from the BACK).
+/// Validated equal to the real `DuplexChallenger` for representative observe/sample sequences.
+pub struct ModelChallenger {
+    state: [Val; W],
+    input_buf: Vec<Val>,
+    output_buf: Vec<Val>,
+}
+
+impl ModelChallenger {
+    pub fn new() -> Self {
+        Self { state: [Val::ZERO; W], input_buf: Vec::new(), output_buf: Vec::new() }
+    }
+    fn duplex(&mut self) {
+        let n = self.input_buf.len();
+        self.state[..n].copy_from_slice(&self.input_buf);
+        for s in self.state[n..RATE].iter_mut() {
+            *s = Val::ZERO;
+        }
+        self.state[CAP_LANE] += Val::from_u64(n as u64); // prefix-free count
+        self.state = native_permute(self.state);
+        self.input_buf.clear();
+        self.output_buf = self.state[..RATE].to_vec(); // squeezable rate lanes
+    }
+    pub fn observe(&mut self, x: Val) {
+        self.output_buf.clear();
+        self.input_buf.push(x);
+        if self.input_buf.len() == RATE {
+            self.duplex();
+        }
+    }
+    pub fn observe_slice(&mut self, xs: &[Val]) {
+        for &x in xs {
+            self.observe(x);
+        }
+    }
+    pub fn sample(&mut self) -> Val {
+        if !self.input_buf.is_empty() || self.output_buf.is_empty() {
+            self.duplex();
+        }
+        self.output_buf.pop().expect("non-empty after duplex") // pop from the BACK
+    }
+    /// F_p² challenge = (sample(), sample()) as the two basis coefficients (pops rate[3], rate[2]).
+    pub fn sample_ext(&mut self) -> [Val; 2] {
+        [self.sample(), self.sample()]
+    }
+    pub fn sample_bits(&mut self, bits: usize) -> usize {
+        use p3_field::PrimeField64;
+        (self.sample().as_canonical_u64() as usize) & ((1usize << bits) - 1)
+    }
+}
+
+impl Default for ModelChallenger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic_table();
     let mut block_last = vec![Val::ZERO; BLOCK];
@@ -243,6 +303,59 @@ mod tests {
             assert_eq!(coeffs.len(), 2);
             assert_eq!(coeffs[0], sq[3], "m={m}: challenge coeff0 != squeeze[3]");
             assert_eq!(coeffs[1], sq[2], "m={m}: challenge coeff1 != squeeze[2]");
+        }
+    }
+
+    #[test]
+    fn model_challenger_matches_native_across_patterns() {
+        // The faithful model must equal the real DuplexChallenger for the operations the verify
+        // transcript uses: variable-length observes, interleaved samples, sample_bits, commitment-sized
+        // observes. Each case runs the SAME sequence on both and asserts equal outputs.
+        let v = |i: u64| Val::from_u64(i);
+
+        // (a) variable-length absorb (5 elems, not a multiple of RATE) then an F_p² sample.
+        {
+            let xs: Vec<Val> = (1..=5).map(v).collect();
+            let mut m = ModelChallenger::new();
+            m.observe_slice(&xs);
+            let mut ch = Challenger::new(default_goldilocks_poseidon2_8());
+            for &x in &xs {
+                ch.observe(x);
+            }
+            let c: Challenge = ch.sample_algebra_element();
+            let coeffs = <Challenge as BasedVectorSpace<Val>>::as_basis_coefficients_slice(&c);
+            assert_eq!(m.sample_ext(), [coeffs[0], coeffs[1]], "variable-length absorb");
+        }
+
+        // (b) interleaved: observe, sample, observe more, sample again (state must thread through).
+        {
+            let mut m = ModelChallenger::new();
+            let mut ch = Challenger::new(default_goldilocks_poseidon2_8());
+            for r in 0..3u64 {
+                let blk: Vec<Val> = (0..3).map(|k| v(100 + r * 3 + k)).collect(); // 3 each (not RATE)
+                m.observe_slice(&blk);
+                for &x in &blk {
+                    ch.observe(x);
+                }
+                let c: Challenge = ch.sample_algebra_element();
+                let co = <Challenge as BasedVectorSpace<Val>>::as_basis_coefficients_slice(&c);
+                assert_eq!(m.sample_ext(), [co[0], co[1]], "interleaved round {r}");
+            }
+        }
+
+        // (c) sample_bits (query-index sampling) after a commitment-sized (4-felt) observe.
+        {
+            use p3_challenger::CanSampleBits;
+            let commit: Vec<Val> = (7..11).map(v).collect();
+            let mut m = ModelChallenger::new();
+            m.observe_slice(&commit);
+            let mut ch = Challenger::new(default_goldilocks_poseidon2_8());
+            for &x in &commit {
+                ch.observe(x);
+            }
+            for &bits in &[1usize, 8, 16, 20] {
+                assert_eq!(m.sample_bits(bits), CanSampleBits::<usize>::sample_bits(&mut ch, bits), "sample_bits({bits})");
+            }
         }
     }
 

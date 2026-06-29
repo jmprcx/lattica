@@ -97,8 +97,11 @@ The three operations a FRI-STARK verifier is composed of are each implemented as
 differential-tested in-circuit spikes in `lattica-prover-p3/src/recursion/`:
 - **Merkle openings** — `fri_merkle.rs` (B1): in-circuit FRI query-path verification via bit-controlled
   `merge`; matches the native `merge`-tree root; tampered path rejected.
-- **Fiat–Shamir transcript** — `transcript.rs` (B2): the `DuplexChallenger` duplex sponge; model pinned
-  to the real challenger (`sample` = `(rate[3], rate[2])`); in-circuit squeeze validated.
+- **Fiat–Shamir transcript** — `transcript.rs` (B2): the `DuplexChallenger` duplex sponge; in-circuit
+  squeeze validated. A faithful `ModelChallenger` (executable spec) is pinned equal to the real
+  challenger across the full operation set the verify-replay needs — variable-length absorbs, interleaved
+  observe/sample, `sample_algebra_element` (F_p² = `(rate[3], rate[2])`), and `sample_bits` (query-index
+  sampling). This is the reference B3-wire's in-circuit transcript must reproduce.
 - **F_p² arithmetic + the FRI fold** — `fri_fold.rs` (B3a/B3b): `X²=7`; the arity-2 fold
   `(e0+e1)/2 + (e0−e1)·β/(2s)` with an in-circuit `1/(2s)`; matches native; wrong fold rejected.
 
