@@ -33,8 +33,8 @@ use rand_chacha::ChaCha20Rng;
 
 use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, pow7, BLOCK};
 use crate::joinsplit_air::{
-    build_trace, merge, periodic, public_values, Witness, ASSET, BIT, DIGEST, DOM_CM, DOM_NF, DOM_OWN,
-    HEIGHT, M_OUT, N_IN, N_PERIODIC, NK, NK1, NUM_PUBLIC_INPUTS, PI_ANCHOR, PI_FEE, PI_MINT,
+    build_trace, merge, periodic, public_values, Input, Output, Witness, ASSET, BIT, DEPTH, DIGEST,
+    DOM_CM, DOM_NF, DOM_OWN, HEIGHT, M_OUT, N_IN, N_PERIODIC, NK, NK1, NUM_PUBLIC_INPUTS, PI_ANCHOR, PI_FEE, PI_MINT,
     PI_NF, PI_OUTCM, PI_TXBIND, POSACC, P_CHAIN_LINK, P_COMMIT_A_IN, P_COMMIT_B, P_FEE_IN, P_FINAL, P_MEM_LINK,
     P_MINT_IN, P_NULLOUT, P_NULL_IN, P_OUTOUT, P_OUT_A_IN, P_OWN_IN, P_POS_COEFF, P_RANGE_ACTIVE,
     P_RANGE_CLOSE, P_RANGE_SEED, P_RECIP_LINK, P_REGION_LAST, P_ROOT, P_ROW0, REM, RBIT, RHO, RHO1, VAL,
@@ -68,10 +68,36 @@ pub fn tx_statement_digest(pv: &[Val]) -> [Val; DIGEST] {
     c
 }
 
-/// The statement digest of a dummy (padding) tile = the digest of the all-zero statement. A real tx has
-/// a non-zero anchor and nullifiers, so a real `s_k` can never collide with this.
+/// The canonical padding tile: a VALID 0-value 2-in/2-out spend (two identical zero notes folding to a
+/// shared zero-derived anchor; 0 fee/mint). Using a real valid spend as padding means dummy tiles need
+/// no special-case gating — they satisfy every per-tile constraint exactly like a real tile, and their
+/// statement is a fixed constant both the prover and the node fold for padding.
+pub fn dummy_witness() -> Witness {
+    let z4 = [Val::ZERO; DIGEST];
+    let inp = Input {
+        nk: [0, 0],
+        div: Val::ZERO,
+        asset: Val::ZERO,
+        value: 0,
+        rho: [Val::ZERO; 2],
+        rcm: [Val::ZERO; 2],
+        sib: [z4; DEPTH],
+        bits: [false; DEPTH],
+    };
+    let out = Output { recipient: z4, asset: Val::ZERO, value: 0, rho: [Val::ZERO; 2], rcm: [Val::ZERO; 2] };
+    Witness {
+        inputs: core::array::from_fn(|_| inp.clone()),
+        outputs: [out; M_OUT],
+        fee: 0,
+        mint: 0,
+        tx_binding: z4,
+    }
+}
+
+/// The statement digest of a padding tile (the canonical `dummy_witness`). A real tx has a non-zero
+/// anchor/nullifiers, so a real `s_k` cannot collide with it.
 pub fn dummy_sk() -> [Val; DIGEST] {
-    tx_statement_digest(&[Val::ZERO; NUM_PUBLIC_INPUTS])
+    tx_statement_digest(&public_values(&dummy_witness()))
 }
 
 /// The block **tx-root**: fold each transaction's `s_k` into a running digest (IV = 0), then pad to a
@@ -514,10 +540,11 @@ fn chunk_vals(pv: &[Val], bi: usize) -> [Val; DIGEST] {
 /// tiles arrive in Phase 4). Each tile reuses the audited `joinsplit_air::build_trace`.
 pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
     let n = padded_tiles(ws.len());
-    assert_eq!(ws.len(), n, "power-of-two tx count for now (dummy tiles arrive in Phase 4)");
+    let dummy = dummy_witness();
     let mut t = vec![Val::ZERO; n * TILE_HEIGHT * BATCH_WIDTH];
     let mut root = [Val::ZERO; DIGEST]; // IV
-    for (tile, w) in ws.iter().enumerate() {
+    for tile in 0..n {
+        let w = if tile < ws.len() { &ws[tile] } else { &dummy };
         let single = build_trace(w); // HEIGHT × WIDTH(19)
         let pv = public_values(w); // the 26-element statement
         let toff = tile * TILE_HEIGHT;
@@ -678,5 +705,108 @@ mod tests {
         let ws: Vec<Witness> = (1..=4).map(variant).collect();
         let root = batch_root(&ws);
         assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws), &root));
+    }
+
+    // ---- Phase 4: dummy padding + corrupted-trace / cross-tile isolation (the audit gate) ----
+
+    // A valid balanced spend with a chosen hidden asset. Built on the dummy-witness shape (two IDENTICAL
+    // inputs ⇒ a shared anchor trivially), so changing the asset stays self-consistent — unlike
+    // demo_witness, whose two inputs use distinct Merkle paths tuned to one anchor.
+    fn variant_asset(a: u64) -> Witness {
+        let mut w = dummy_witness();
+        let av = Val::from_u64(a);
+        for inp in w.inputs.iter_mut() {
+            inp.asset = av;
+        }
+        for out in w.outputs.iter_mut() {
+            out.asset = av;
+        }
+        w
+    }
+
+    // Prove the (possibly corrupted) trace and verify; true iff rejected (verify=false or prover panics).
+    fn corrupt_batch_rejected(trace: RowMajorMatrix<Val>, root: &[Val]) -> bool {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let proof = prove(&make_config(), &JoinSplitBatchAir, trace, root);
+            verify_batch_bytes(&postcard::to_allocvec(&proof).unwrap(), root)
+        }));
+        matches!(outcome, Ok(false) | Err(_))
+    }
+
+    #[test]
+    fn batch_dummy_padding_fold_matches_oracle() {
+        // 3 real tiles → padded to 4 with one dummy tile; the in-circuit fold's final output (the trace's
+        // last-row root-block output, cols 0..4) must equal the native batch_root (which folds dummy_sk).
+        let ws = [variant(1), variant(2), variant(3)];
+        let trace = build_batch_trace(&ws);
+        let root = batch_root(&ws);
+        let h = trace.values.len() / BATCH_WIDTH;
+        for k in 0..DIGEST {
+            assert_eq!(trace.values[(h - 1) * BATCH_WIDTH + k], root[k], "fold limb {k} != oracle root");
+        }
+    }
+
+    #[test]
+    #[ignore = "slow: proves a 4-tile (3 real + 1 dummy) batch"]
+    fn batch_non_power_of_two_verifies() {
+        let ws = [variant(1), variant(2), variant(3)];
+        let root = batch_root(&ws);
+        assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws), &root));
+    }
+
+    #[test]
+    #[ignore = "slow: 2-tile prove"]
+    fn batch_per_tile_asset_isolation() {
+        // two tiles with DIFFERENT hidden assets verify — the per-tile ASSET gate allows it (a global
+        // ASSET would force one asset for the whole block).
+        let ws = [variant_asset(11), variant_asset(22)];
+        let root = batch_root(&ws);
+        assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws), &root));
+    }
+
+    #[test]
+    #[ignore = "slow: corrupted-trace prove"]
+    fn batch_corrupted_staged_anchor_is_rejected() {
+        let ws = [variant(1), variant(2)];
+        let root = batch_root(&ws);
+        let mut trace = build_batch_trace(&ws);
+        for r in 0..TILE_HEIGHT {
+            trace.values[r * BATCH_WIDTH + S_ANCHOR] += Val::ONE; // tile 0's staged anchor
+        }
+        assert!(corrupt_batch_rejected(trace, &root));
+    }
+
+    #[test]
+    #[ignore = "slow: corrupted-trace prove"]
+    fn batch_corrupted_staged_nullifier_is_rejected() {
+        let ws = [variant(1), variant(2)];
+        let root = batch_root(&ws);
+        let mut trace = build_batch_trace(&ws);
+        for r in 0..TILE_HEIGHT {
+            trace.values[(TILE_HEIGHT + r) * BATCH_WIDTH + S_NF] += Val::ONE; // tile 1's staged nf
+        }
+        assert!(corrupt_batch_rejected(trace, &root));
+    }
+
+    #[test]
+    #[ignore = "slow: corrupted-trace prove"]
+    fn batch_within_tile_asset_tamper_is_rejected() {
+        // change ASSET at a single mid-tile row ⇒ breaks the per-tile ASSET persistence (cross-tile
+        // isolation requires ASSET constant WITHIN a tile, free only at the boundary).
+        let ws = [variant(1), variant(2)];
+        let root = batch_root(&ws);
+        let mut trace = build_batch_trace(&ws);
+        trace.values[(TILE_HEIGHT / 2) * BATCH_WIDTH + ASSET] += Val::ONE;
+        assert!(corrupt_batch_rejected(trace, &root));
+    }
+
+    #[test]
+    #[ignore = "slow: corrupted-trace prove"]
+    fn batch_corrupted_fold_block_is_rejected() {
+        let ws = [variant(1), variant(2)];
+        let root = batch_root(&ws);
+        let mut trace = build_batch_trace(&ws);
+        trace.values[fold_in_row(1) * BATCH_WIDTH + DIGEST] += Val::ONE; // a data lane of an s_k fold block
+        assert!(corrupt_batch_rejected(trace, &root));
     }
 }
