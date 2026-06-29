@@ -315,7 +315,14 @@ fn encodeWitness(
 /// pad with owned zero-value notes), pay the `outputs` (padded to `M_OUT` with zero-value notes back
 /// to the sender), leaving `fee`, with public issuance `mint`. The proof is produced via the
 /// installed prover backend. Allocations are owned by `allocator`.
-pub fn buildTransfer(
+/// An unproven join-split tx + its prover witness (for batch aggregation).
+pub const TransferBuild = struct { tx: ShieldedTx, witness: []u8 };
+
+/// Build a join-split tx + its prover witness **without** proving — for batch aggregation, where many
+/// witnesses are concatenated and proven as ONE batch proof (each tx's `proof` stays empty; the batch
+/// proof + `batchRoot` bind them collectively). The caller owns the output ciphertexts
+/// (`tx.outputs[*].ciphertext`) AND the returned `witness` slice.
+pub fn buildTransferWitness(
     allocator: Allocator,
     sender: tx.FullKey,
     inputs: []const InputSpend,
@@ -323,7 +330,7 @@ pub fn buildTransfer(
     fee: u64,
     mint: u64,
     anchor: Hash32,
-) !ShieldedTx {
+) !TransferBuild {
     if (inputs.len != N_IN or outputs.len > M_OUT) return TxError.Internal;
 
     // Nullifiers for every input.
@@ -353,7 +360,7 @@ pub fn buildTransfer(
     for (out_notes) |o| out_sum = std.math.add(u64, out_sum, o.value) catch return TxError.ValueOverflow;
     if (in_sum != out_sum) return TxError.Unbalanced;
 
-    var t = ShieldedTx{
+    const t = ShieldedTx{
         .anchor = anchor,
         .nullifiers = nfs,
         .fee = fee,
@@ -361,10 +368,25 @@ pub fn buildTransfer(
         .proof = &.{},
         .outputs = tns,
     };
-    const binding = t.txBinding();
-    const witness = encodeWitness(allocator, sender, inputs, out_notes, fee, mint, binding) catch return TxError.Internal;
-    defer allocator.free(witness); // the prover only reads it; free it once proven (audit r2 F1)
-    t.proof = ffi.proveJoinSplit(allocator, witness) catch return TxError.ProveFailed;
+    const witness = encodeWitness(allocator, sender, inputs, out_notes, fee, mint, t.txBinding()) catch return TxError.Internal;
+    return .{ .tx = t, .witness = witness };
+}
+
+/// Build + prove a single join-split tx (the non-batch path).
+pub fn buildTransfer(
+    allocator: Allocator,
+    sender: tx.FullKey,
+    inputs: []const InputSpend,
+    outputs: []const OutputReq,
+    fee: u64,
+    mint: u64,
+    anchor: Hash32,
+) !ShieldedTx {
+    const b = try buildTransferWitness(allocator, sender, inputs, outputs, fee, mint, anchor);
+    defer allocator.free(b.witness); // the prover only reads it; free it once proven (audit r2 F1)
+    errdefer for (b.tx.outputs) |tn| allocator.free(tn.ciphertext); // free outputs if proving fails
+    var t = b.tx;
+    t.proof = ffi.proveJoinSplit(allocator, b.witness) catch return TxError.ProveFailed;
     return t;
 }
 

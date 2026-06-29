@@ -49,6 +49,23 @@ extern fn lattica_htlc_verify(
     pi: [*]const u8,
     pi_len: usize,
 ) callconv(.c) i32;
+extern fn lattica_batch_prove(
+    witness_ptr: [*]const u8,
+    witness_len: usize,
+    n_tx: usize,
+    proof_out: [*]u8,
+    proof_cap: usize,
+    proof_len: *usize,
+    root_out: [*]u8,
+    root_cap: usize,
+    root_len: *usize,
+) callconv(.c) i32;
+extern fn lattica_batch_verify(
+    proof: [*]const u8,
+    proof_len: usize,
+    root: [*]const u8,
+    root_len: usize,
+) callconv(.c) i32;
 
 export fn main() callconv(.c) c_int {
     run() catch |e| {
@@ -58,7 +75,7 @@ export fn main() callconv(.c) c_int {
     return 0;
 }
 
-const Err = error{ BobDidNotReceive, DoubleSpendAccepted, TamperAccepted, WrongError };
+const Err = error{ BobDidNotReceive, DoubleSpendAccepted, TamperAccepted, WrongError, BatchRootMismatch, BatchRejected };
 
 fn run() !void {
     const a = std.heap.c_allocator;
@@ -177,5 +194,60 @@ fn run() !void {
     if (carol_total != 1000) return Err.BobDidNotReceive;
     std.debug.print("carol redeemed (real htlc lifecycle): {d}\n", .{carol_total});
 
-    std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject (+ HTLC lock/redeem/refund-timelock)\n", .{});
+    // --- v3: REAL batch aggregation — TWO join-splits proven as ONE proof; the node recomputes the
+    //         block tx-root from the tx statements (no witnesses) and the real verifier checks the one
+    //         proof. This is the definitive Zig↔Rust byte-match for the batch fold. ---
+    ffi.setBatchProveBackend(&lattica_batch_prove);
+    ffi.setBatchBackend(&lattica_batch_verify);
+    {
+        const eve = try tx.FullKey.fromSeed([_]u8{6} ** 32);
+        const g0 = try chain.bootstrapMint(eve.address(), 500, [_]u8{30} ** 32);
+        const g1 = try chain.bootstrapMint(eve.address(), 0, [_]u8{31} ** 32);
+        const g2 = try chain.bootstrapMint(eve.address(), 700, [_]u8{32} ** 32);
+        const g3 = try chain.bootstrapMint(eve.address(), 0, [_]u8{33} ** 32);
+        const anchor = chain.anchor();
+        const inA = [_]node.InputSpend{
+            .{ .note = g0.note, .position = g0.pos, .path = try chain.merklePath(a, g0.pos) },
+            .{ .note = g1.note, .position = g1.pos, .path = try chain.merklePath(a, g1.pos) },
+        };
+        const inB = [_]node.InputSpend{
+            .{ .note = g2.note, .position = g2.pos, .path = try chain.merklePath(a, g2.pos) },
+            .{ .note = g3.note, .position = g3.pos, .path = try chain.merklePath(a, g3.pos) },
+        };
+        const outA = [_]node.OutputReq{.{ .recipient = bob.address(), .value = 450 }};
+        const outB = [_]node.OutputReq{.{ .recipient = bob.address(), .value = 650 }};
+        const ba = try node.buildTransferWitness(a, eve, &inA, &outA, 50, 0, anchor);
+        defer a.free(ba.witness);
+        defer for (ba.tx.outputs) |t_| a.free(t_.ciphertext);
+        const bb = try node.buildTransferWitness(a, eve, &inB, &outB, 50, 0, anchor);
+        defer a.free(bb.witness);
+        defer for (bb.tx.outputs) |t_| a.free(t_.ciphertext);
+
+        // concatenate the two prover witnesses and prove them as ONE batch proof (REAL prover)
+        const wcat = try a.alloc(u8, ba.witness.len + bb.witness.len);
+        defer a.free(wcat);
+        @memcpy(wcat[0..ba.witness.len], ba.witness);
+        @memcpy(wcat[ba.witness.len..], bb.witness);
+        const r = try ffi.proveBatch(a, wcat, 2);
+        defer a.free(r.proof);
+        std.debug.print("real batch prove: 2 txs -> {d}-byte proof\n", .{r.proof.len});
+
+        // the node recomputes the SAME tx-root from the two tx statements (no witnesses needed)
+        const txs = [_]node.ShieldedTx{ ba.tx, bb.tx };
+        const node_root = node.batchRoot(&txs);
+        if (!std.mem.eql(u8, &node_root, &r.root)) return Err.BatchRootMismatch;
+        std.debug.print("batch tx-root: Zig node == Rust circuit\n", .{});
+
+        // the real verifier accepts the single batch proof against that root…
+        if (!ffi.verifyBatch(r.proof, r.root)) return Err.BatchRejected;
+        std.debug.print("real batch verify: ACCEPT\n", .{});
+
+        // …and rejects a tampered root (any altered tx statement ⇒ a different root ⇒ reject)
+        var bad = r.root;
+        bad[0] +%= 1;
+        if (ffi.verifyBatch(r.proof, bad)) return Err.TamperAccepted;
+        std.debug.print("batch verify vs tampered root: REJECT\n", .{});
+    }
+
+    std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject (+ HTLC lock/redeem/refund-timelock + batch one-proof-per-block)\n", .{});
 }
