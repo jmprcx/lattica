@@ -600,11 +600,23 @@ impl BaseAir<Goldilocks> for HtlcAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
     fn eval(&self, builder: &mut AB) {
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        eval_spend(builder, &pis, AB::Expr::ZERO);
+    }
+}
+
+/// The HTLC spend constraints, parameterized over the **statement source** and a `tile_last` selector,
+/// so `batch_htlc_air` reuses this exact (audited) constraint body. `statement[PI_*]` is the public
+/// inputs for the single circuit, or the per-tile staging columns for the batch (which makes the
+/// `cur == statement[..]` bindings double as the staging bindings). `tile_last` is 0 for the single
+/// circuit, or the tile-boundary one-hot for the batch (it frees the per-tile-persistent columns + ASSET
+/// across tiles). Single-circuit behaviour is unchanged (statement = pis, tile_last = 0) — proven by this
+/// file's full suite, incl. the exhaustive corrupted-trace `--ignored` tests.
+pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(builder: &mut AB, statement: &[AB::Expr], tile_last: AB::Expr) {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
-        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
         let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
@@ -637,16 +649,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // RHO1 MUST be here: it is read at both commit_a (lane 7) and the nullifier (lane 4); without
         // persistence a prover could use one rho1 in the commitment and another in the nullifier,
         // minting a fresh nullifier for a real note ⇒ double-spend.
-        let not_last = one.clone() - p[P_REGION_LAST].clone();
+        // (batch) also free at the TILE boundary so tile k's keys/owner/mode/etc. don't bleed into k+1.
+        let not_last = one.clone() - p[P_REGION_LAST].clone() - tile_last.clone();
         for &c in &[
             NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3, NT,
             CLAIM0, CLAIM0 + 1, CLAIM0 + 2, CLAIM0 + 3, MODE, TIMEOUT,
         ] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
-        // ASSET is GLOBAL-persistent: constant across the whole trace (one hidden asset per tx), so
-        // every note's committed asset (bound at commit_b below) equals this single value.
-        builder.when_transition().assert_zero(nxt[ASSET].clone() - cur[ASSET].clone());
+        // ASSET is per-tx-persistent: constant within a tx (one hidden asset), free at the tile boundary
+        // (batch) so distinct txs may carry distinct assets. every note's committed asset (bound at
+        // commit_b below) equals this tx's single value.
+        builder.when_transition().assert_zero((one.clone() - tile_last.clone()) * (nxt[ASSET].clone() - cur[ASSET].clone()));
         // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
         let bit = nxt[BIT].clone();
         builder.when_transition().assert_zero(
@@ -737,7 +751,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // to it. Bound only on redeem (refund needs no preimage).
         let h2 = p[P_HTLC_IN2].clone();
         for k in 0..DIGEST {
-            builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - pis[PI_HASHLOCK + k].clone()));
+            builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - statement[PI_HASHLOCK + k].clone()));
         }
         // ---- redeem hashlock-nonzero backstop (audit r3): on a redeem, PI_HASHLOCK must be ≠ 0 ----
         // HLPROD = Π_k (1 − PI_HASHLOCK[k]·HLINV_k); it is 0 iff some limb is invertible (non-zero).
@@ -747,7 +761,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // the wallet/await_lock guards).
         let mut hlprod = one.clone();
         for k in 0..DIGEST {
-            hlprod = hlprod * (one.clone() - pis[PI_HASHLOCK + k].clone() * cur[HLINV0 + k].clone());
+            hlprod = hlprod * (one.clone() - statement[PI_HASHLOCK + k].clone() * cur[HLINV0 + k].clone());
         }
         builder.assert_zero(h2.clone() * (cur[HLPROD].clone() - hlprod));
         builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * cur[HLPROD].clone());
@@ -763,7 +777,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // DIFF compute (HTLC only): redeem ⇒ timeout-height-1 ; refund ⇒ height-timeout. With TIMEOUT,
         // DIFF, **and** current_height all range-bounded < 2^BITS (the height window just below), DIFF ≥ 0
         // holds iff the timeout window does — redeem ⟺ height < timeout, refund ⟺ height ≥ timeout.
-        let height = pis[PI_HEIGHT].clone();
+        let height = statement[PI_HEIGHT].clone();
         let redeem_diff = cur[TIMEOUT].clone() - height.clone() - one.clone();
         let refund_diff = height.clone() - cur[TIMEOUT].clone();
         let diff_expr = mode.clone() * redeem_diff + (one.clone() - mode.clone()) * refund_diff;
@@ -772,11 +786,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // the public current_height in-circuit (REM = height at its seed; shared decomposition + REM=0
         // close), so the timeout compare is sound WITHOUT trusting the node for height < 2^BITS — closing
         // the wrap-around forgery where a near-p height makes a refund DIFF spuriously small.
-        builder.assert_zero(p[P_HEIGHT_SEED].clone() * (cur[REM].clone() - pis[PI_HEIGHT].clone()));
+        builder.assert_zero(p[P_HEIGHT_SEED].clone() * (cur[REM].clone() - statement[PI_HEIGHT].clone()));
         // v3 hardening (defense-in-depth — the node also rejects mint ≠ 0 in applyHtlc): an HTLC spend
         // never issues, so force mint = 0 in-circuit. Without this, the htlc_air verifier (reused in any
         // context) would accept a value-inflating mint > 0.
-        builder.assert_zero(pis[PI_MINT].clone());
+        builder.assert_zero(statement[PI_MINT].clone());
 
         // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
         let ca = p[P_COMMIT_A_IN].clone();
@@ -813,7 +827,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         // ---- root: every input folds to the shared public anchor ----
         let pr = p[P_ROOT].clone();
         for k in 0..DIGEST {
-            builder.assert_zero(pr.clone() * (cur[k].clone() - pis[PI_ANCHOR + k].clone()));
+            builder.assert_zero(pr.clone() * (cur[k].clone() - statement[PI_ANCHOR + k].clone()));
         }
 
         // ---- nullifier input (A1: pos = pos_acc), note_type-gated ----
@@ -842,7 +856,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         for i in 0..N_IN {
             let sel = p[P_NULLOUT + i].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - pis[PI_NF + i * DIGEST + k].clone()));
+                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_NF + i * DIGEST + k].clone()));
             }
         }
 
@@ -855,18 +869,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
         for j in 0..M_OUT {
             let sel = p[P_OUTOUT + j].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - pis[PI_OUTCM + j * DIGEST + k].clone()));
+                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_OUTCM + j * DIGEST + k].clone()));
             }
         }
 
         // ---- fee region: VAL = public fee (range-checked like any value; A3) ----
-        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - pis[PI_FEE].clone()));
+        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - statement[PI_FEE].clone()));
 
         // ---- mint region: VAL = public mint (issuance; range-checked; added to the balance) ----
-        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - pis[PI_MINT].clone()));
+        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - statement[PI_MINT].clone()));
 
-        // tx_binding (pis[PI_TXBIND..]) is bound to the proof by Fiat–Shamir (observed public input).
-    }
+        // tx_binding (statement[PI_TXBIND..]) is bound to the proof by Fiat–Shamir (observed public input).
 }
 
 // --- trace + ZK config (stage 1) --------------------------------------------------------------
