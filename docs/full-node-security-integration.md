@@ -18,7 +18,19 @@ This document turns the transaction-stack audit and supply-audit discussion into
 - Live transaction validation now uses the Plonky3 join-split proof path end to end: ownership, commitment opening, Merkle membership, nullifier derivation, value range, balance, output commitments, `mint`, and `tx_binding` are proven by `lattica-prover-p3` and checked through the Rust C ABI.
 - The original C-01 ghost-coin output-commitment binding bug is remediated; see `docs/lattica-implementation-audit.md`.
 - Round 2 verified live-node state-update atomicity, transmitted-note ownership, and admission size checks. Round 3 added reusable verifier-boundary size limits (M-08), and **compile-gated** the genesis/test issuance API (`bootstrapMint`) and the mock backend out of production builds (M-09/M-10, via `lattica_production`; see `src/production_probe.zig` / `zig build check-production`). Remaining blockers are host-chain consensus integration: canonical live transaction/block encoding, state-root / nullifier-set-root / event-root commitments, reorg undo logs, snapshot validation, and mempool proof-cache policy.
+- The v3 HTLC layer adds `htlc_air` and `ShieldedHtlcTx`: HTLC note ownership, redeem/refund party tags, hashlock binding, timeout checks, hidden asset id, and mode-independent nullifier are proven in-circuit, while the node pins `current_height` to the consensus block height and derives `redeem_hashlock = SHA256(preimage)`.
 - This document remains the full-node production checklist: `src/node.zig` is an in-memory shielded transaction state machine, not a complete production consensus node.
+
+## HTLC Full-Node Requirements
+
+The v3 HTLC transaction stack is only safe in production if the full node supplies the off-circuit context deterministically:
+
+- `applyHtlc(tx, at_height)` must receive `at_height` from block consensus state, never from mempool or wallet input. Nodes should reject blocks whose HTLC transaction `current_height` does not equal the block height under the active consensus rules.
+- Mempool policy must treat redeem and refund attempts for the same HTLC nullifier as conflicts. A block may include at most one; replay/reorg handling must restore the nullifier set and note roots exactly.
+- Redeem preimages are public transaction data and should be indexed in a canonical event stream so cross-chain watchers can claim the opposite leg. The event root should commit preimage events, HTLC note commitments, and transaction ids.
+- HTLC lock output 0 intentionally uses a placeholder ciphertext; wallets and watch services need a lock-descriptor/commitment index instead of relying only on note trial decryption.
+- Timeout policy must define reorg cushions and cross-chain height/time conversion outside this package. Consensus should specify anchor windows and finality assumptions for accepting lock, redeem, and refund transactions.
+- Replay from genesis must recompute identical supply, note-root, nullifier-root, and event-root outcomes without wallet secrets.
 
 ## Core Supply Invariant
 
@@ -42,6 +54,29 @@ sum(input_values) + public_deposit + minted
 ```
 
 Private values stay private. The proof enforces the equation, and public counters track explicit issuance, burns, fees, deposits, and withdrawals.
+
+## Block Production & Miner Incentives
+
+Block production is host-chain (`rubble-node-zig`) scope; the agreed design is recorded in detail in
+**`block-production-consensus.md`**. Summary:
+
+- **Cadence:** a header-only **heartbeat block every 1.5 min** at uniform PoW difficulty, and a
+  **transaction block every 12 min** — each 12-min cycle = 7 heartbeats + 1 transaction block.
+  Heartbeats are ~240 B and carry no shielded-state delta (so shallow reorgs that land on them need no
+  per-block undo data — see Reorg and Snapshot Safety); transaction blocks carry one batch proof
+  (≤64 txs). Steady cadence keeps height a reliable proxy for time, which the height-denominated HTLC
+  timeouts and the anchor window depend on.
+- **Rewards:** heartbeats name a payout address in the PoW-committed header but mint no in-block note;
+  subsidies settle lazily in the next transaction block's coinbase via the gated `applyCoinbase` under
+  the supply invariant above.
+- **Fees:** a transaction block's fees + accrued subsidies are split **deterministically, weighted toward
+  the transaction-block producer**, remainder equally among the cycle's 7 heartbeat miners — a function
+  of the block + the committed heartbeat headers (anti-fee-sniping). Realized via a multi-payee coinbase
+  (8 payees ⇒ 4 outputs at `M_OUT = 2`); the recommended mechanism (coinbase tiles inside the batch) is a
+  noted future lattica-side change.
+- **Payout addresses:** the shared-KEM exchange-deposit scheme (O(1) detection) for pools/exchanges.
+- **Scaling:** baseline ~320 tx/hr (64 / 12 min); the scaling path is **recursion** (`recursion-design.md`),
+  not linear block growth.
 
 ## Consensus-Critical Full Node Pipeline
 

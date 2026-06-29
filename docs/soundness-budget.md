@@ -168,7 +168,9 @@ one proof per block** — is the real headroom: measured ~log(n) growth ⇒ ~600
 verify at block scale, at the cost of monolithic proving (which true recursion later removes). The
 batch is implemented (`batch_joinsplit_air`/`batch_htlc_air`, + the node `applyBatch`/`applyHtlcBatch`
 path); the trustless per-user-proving scale-out beyond it is designed in **`docs/recursion-design.md`**
-(deferred — it requires a recursive STARK verifier circuit, which Plonky3 0.6.1 does not provide).
+(deferred — it requires a recursive STARK verifier circuit, which Plonky3 0.6.1 does not provide). The
+chosen block cadence (one batch proof per 12-min transaction block ⇒ ~320 tx/hr baseline) and how
+recursion is the scaling path beyond it are documented in **`docs/block-production-consensus.md`**.
 
 ## Parameter hardening (was demo-sized in M4c)
 

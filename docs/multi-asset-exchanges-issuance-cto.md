@@ -118,6 +118,10 @@ what is actually committed on-chain (AEAD success alone proves nothing, since an
 the public shared `ek`). A note **memo** field would serve the same routing role; the diversifier already
 does. Demo: `zig build run -- exchange`. Threat model is recorded in `docs/audit-scope-p3.md` §2.
 
+This same shared-KEM scheme is **also reused for mining-reward payouts** (a pool/exchange detects its
+many small reward notes in O(1)) in the heartbeat block-production design — see
+`docs/block-production-consensus.md` §6.
+
 ### 3.4 Multi-asset interaction
 With M1/M2 the note carries `asset_id`; deposit detection credits `(asset, value, user)`; withdrawals
 select notes of the requested asset. Flow shape unchanged — gains an asset dimension.
