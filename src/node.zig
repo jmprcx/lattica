@@ -510,7 +510,12 @@ fn encodeHtlcLockWitness(
 /// Build a shielded HTLC spend (redeem or refund) for `spend` (input 0) padded with the owned
 /// zero-value `dummy` (input 1), paying `outputs`, leaving `fee`, validated at `current_height`. The
 /// proof is produced via the installed HTLC prover. The dummy's `asset` must equal the HTLC note's.
-pub fn buildHtlcSpend(
+/// An unproven HTLC spend tx + its prover witness (for batch aggregation).
+pub const HtlcSpendBuild = struct { tx: ShieldedHtlcTx, witness: []u8 };
+
+/// Build an HTLC spend tx + its prover witness **without** proving — for batch aggregation (the witnesses
+/// are concatenated and proven as one batch proof). Caller owns the output ciphertexts + the witness.
+pub fn buildHtlcSpendWitness(
     allocator: Allocator,
     claimer: tx.FullKey,
     spend: HtlcSpend,
@@ -519,7 +524,7 @@ pub fn buildHtlcSpend(
     fee: u64,
     current_height: u64,
     anchor: Hash32,
-) !ShieldedHtlcTx {
+) !HtlcSpendBuild {
     if (outputs.len > M_OUT) return TxError.Internal;
     if (dummy.note.asset != spend.note.asset) return TxError.Internal; // single hidden asset per tx
     // nf0 = owner-based HTLC nullifier (mode/party-independent); nf1 = the PLAIN dummy's nullifier.
@@ -550,7 +555,7 @@ pub fn buildHtlcSpend(
     for (out_notes) |o| out_sum = std.math.add(u64, out_sum, o.value) catch return TxError.ValueOverflow;
     if (in_sum != out_sum) return TxError.Unbalanced;
 
-    var t = ShieldedHtlcTx{
+    const t = ShieldedHtlcTx{
         .anchor = anchor,
         .nullifiers = nfs,
         .fee = fee,
@@ -560,10 +565,26 @@ pub fn buildHtlcSpend(
         .proof = &.{},
         .outputs = tns,
     };
-    const binding = t.txBinding();
-    const witness = encodeHtlcWitness(allocator, claimer, spend, dummy, out_notes, fee, 0, binding, current_height) catch return TxError.Internal;
-    defer allocator.free(witness); // the prover only reads it; free it once proven (audit r2 F1)
-    t.proof = ffi.proveHtlc(allocator, witness) catch return TxError.ProveFailed;
+    const witness = encodeHtlcWitness(allocator, claimer, spend, dummy, out_notes, fee, 0, t.txBinding(), current_height) catch return TxError.Internal;
+    return .{ .tx = t, .witness = witness };
+}
+
+/// Build + prove a single HTLC spend (the non-batch path).
+pub fn buildHtlcSpend(
+    allocator: Allocator,
+    claimer: tx.FullKey,
+    spend: HtlcSpend,
+    dummy: InputSpend,
+    outputs: []const OutputReq,
+    fee: u64,
+    current_height: u64,
+    anchor: Hash32,
+) !ShieldedHtlcTx {
+    const b = try buildHtlcSpendWitness(allocator, claimer, spend, dummy, outputs, fee, current_height, anchor);
+    defer allocator.free(b.witness); // the prover only reads it; free it once proven (audit r2 F1)
+    errdefer for (b.tx.outputs) |tn| allocator.free(tn.ciphertext); // free outputs if proving fails
+    var t = b.tx;
+    t.proof = ffi.proveHtlc(allocator, b.witness) catch return TxError.ProveFailed;
     return t;
 }
 

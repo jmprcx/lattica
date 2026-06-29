@@ -66,6 +66,23 @@ extern fn lattica_batch_verify(
     root: [*]const u8,
     root_len: usize,
 ) callconv(.c) i32;
+extern fn lattica_htlc_batch_prove(
+    witness_ptr: [*]const u8,
+    witness_len: usize,
+    n_tx: usize,
+    proof_out: [*]u8,
+    proof_cap: usize,
+    proof_len: *usize,
+    root_out: [*]u8,
+    root_cap: usize,
+    root_len: *usize,
+) callconv(.c) i32;
+extern fn lattica_htlc_batch_verify(
+    proof: [*]const u8,
+    proof_len: usize,
+    root: [*]const u8,
+    root_len: usize,
+) callconv(.c) i32;
 
 export fn main() callconv(.c) c_int {
     run() catch |e| {
@@ -249,5 +266,66 @@ fn run() !void {
         std.debug.print("batch verify vs tampered root: REJECT\n", .{});
     }
 
-    std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject (+ HTLC lock/redeem/refund-timelock + batch one-proof-per-block)\n", .{});
+    // --- v3: REAL HTLC batch — two HTLC redeems proven as ONE proof; the node recomputes the HTLC
+    //         tx-root (incl. current_height + redeem_hashlock) and the real verifier checks one proof. ---
+    ffi.setHtlcBatchProveBackend(&lattica_htlc_batch_prove);
+    ffi.setHtlcBatchBackend(&lattica_htlc_batch_verify);
+    {
+        // two fresh locks (dave → carol), then two redeem WITNESSES batched into one proof.
+        const ga = try chain.bootstrapMint(dave.address(), 300, [_]u8{40} ** 32);
+        const gb = try chain.bootstrapMint(dave.address(), 0, [_]u8{41} ** 32);
+        const lockA = try node.buildHtlcLock(a, dave, &[_]node.InputSpend{
+            .{ .note = ga.note, .position = ga.pos, .path = try chain.merklePath(a, ga.pos) },
+            .{ .note = gb.note, .position = gb.pos, .path = try chain.merklePath(a, gb.pos) },
+        }, redeem_tag, refund_tag, hashlock, timeout, 300, 0, 50, chain.anchor());
+        const posA = gb.pos + 1; // lock output 0 (the HTLC note)
+        try chain.applyHtlc(lockA.tx, 50);
+
+        const gc = try chain.bootstrapMint(dave.address(), 400, [_]u8{42} ** 32);
+        const gd = try chain.bootstrapMint(dave.address(), 0, [_]u8{43} ** 32);
+        const lockB = try node.buildHtlcLock(a, dave, &[_]node.InputSpend{
+            .{ .note = gc.note, .position = gc.pos, .path = try chain.merklePath(a, gc.pos) },
+            .{ .note = gd.note, .position = gd.pos, .path = try chain.merklePath(a, gd.pos) },
+        }, redeem_tag, refund_tag, hashlock, timeout, 400, 0, 50, chain.anchor());
+        const posB = gd.pos + 1;
+        try chain.applyHtlc(lockB.tx, 50);
+
+        // build the two redeem witnesses (no per-tx prove); carol redeems both before the timeout.
+        const da = try chain.bootstrapMint(carol.address(), 0, [_]u8{44} ** 32);
+        const db = try chain.bootstrapMint(carol.address(), 0, [_]u8{45} ** 32);
+        const anchor2 = chain.anchor();
+        const spendA = node.HtlcSpend{ .note = lockA.note, .position = posA, .path = try chain.merklePath(a, posA), .claim_div = carol.address().div, .mode = 1, .redeem_tag = redeem_tag, .refund_tag = refund_tag, .hashlock = hashlock, .timeout = timeout, .preimage = preimage };
+        const spendB = node.HtlcSpend{ .note = lockB.note, .position = posB, .path = try chain.merklePath(a, posB), .claim_div = carol.address().div, .mode = 1, .redeem_tag = redeem_tag, .refund_tag = refund_tag, .hashlock = hashlock, .timeout = timeout, .preimage = preimage };
+        const dummyA = node.InputSpend{ .note = da.note, .position = da.pos, .path = try chain.merklePath(a, da.pos) };
+        const dummyB = node.InputSpend{ .note = db.note, .position = db.pos, .path = try chain.merklePath(a, db.pos) };
+        const oA = [_]node.OutputReq{.{ .recipient = carol.address(), .value = 300 }};
+        const oB = [_]node.OutputReq{.{ .recipient = carol.address(), .value = 400 }};
+        const hwa = try node.buildHtlcSpendWitness(a, carol, spendA, dummyA, &oA, 0, 60, anchor2);
+        defer a.free(hwa.witness);
+        defer for (hwa.tx.outputs) |t_| a.free(t_.ciphertext);
+        const hwb = try node.buildHtlcSpendWitness(a, carol, spendB, dummyB, &oB, 0, 60, anchor2);
+        defer a.free(hwb.witness);
+        defer for (hwb.tx.outputs) |t_| a.free(t_.ciphertext);
+
+        const wcat = try a.alloc(u8, hwa.witness.len + hwb.witness.len);
+        defer a.free(wcat);
+        @memcpy(wcat[0..hwa.witness.len], hwa.witness);
+        @memcpy(wcat[hwa.witness.len..], hwb.witness);
+        const hr = try ffi.proveHtlcBatch(a, wcat, 2);
+        defer a.free(hr.proof);
+        std.debug.print("real HTLC batch prove: 2 redeems -> {d}-byte proof\n", .{hr.proof.len});
+
+        const htxs = [_]node.ShieldedHtlcTx{ hwa.tx, hwb.tx };
+        const node_hroot = node.htlcBatchRoot(&htxs);
+        if (!std.mem.eql(u8, &node_hroot, &hr.root)) return Err.BatchRootMismatch;
+        std.debug.print("HTLC batch tx-root: Zig node == Rust circuit\n", .{});
+        if (!ffi.verifyHtlcBatch(hr.proof, hr.root)) return Err.BatchRejected;
+        std.debug.print("real HTLC batch verify: ACCEPT\n", .{});
+        var hbad = hr.root;
+        hbad[0] +%= 1;
+        if (ffi.verifyHtlcBatch(hr.proof, hbad)) return Err.TamperAccepted;
+        std.debug.print("HTLC batch verify vs tampered root: REJECT\n", .{});
+    }
+
+    std.debug.print("OK: real in-node prove -> ghost-reject -> verify -> double-spend-reject (+ HTLC lock/redeem/refund-timelock + join-split & HTLC one-proof-per-block)\n", .{});
 }
