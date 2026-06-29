@@ -339,6 +339,44 @@ mod tests {
     }
 
     #[test]
+    fn native_fold_matches_p3_fold_row() {
+        // Bulletproof differential: native_fold (the formula the in-circuit AIR + chain implement) equals
+        // p3's ACTUAL TwoAdicFriFolding::fold_row for arity 2, using p3's own point derivation
+        // (s = two_adic_generator(log_height+1)^reverse_bits(index, log_height)).
+        use core::marker::PhantomData;
+        use p3_field::TwoAdicField;
+        use p3_fri::{FriFoldingStrategy, TwoAdicFriFolding};
+
+        fn reverse_bits(mut x: usize, bits: usize) -> usize {
+            let mut r = 0;
+            for _ in 0..bits {
+                r = (r << 1) | (x & 1);
+                x >>= 1;
+            }
+            r
+        }
+
+        let folding = TwoAdicFriFolding::<(), ()>(PhantomData);
+        let e0 = c(2, 7);
+        let e1 = c(9, 4);
+        let beta = c(5, 6);
+        for (index, log_height) in [(0usize, 3usize), (3, 3), (5, 4), (1, 2), (13, 4)] {
+            let g = Goldilocks::two_adic_generator(log_height + 1);
+            let s = g.exp_u64(reverse_bits(index, log_height) as u64);
+            let mine = native_fold(e0, e1, beta, s);
+            let p3: Challenge = <TwoAdicFriFolding<(), ()> as FriFoldingStrategy<Goldilocks, Challenge>>::fold_row(
+                &folding,
+                index,
+                log_height,
+                1,
+                beta,
+                [e0, e1].into_iter(),
+            );
+            assert_eq!(mine, p3, "index={index} log_height={log_height}");
+        }
+    }
+
+    #[test]
     fn in_circuit_formula_matches_native() {
         // The plain-Rust mirror of the AIR's expressions equals native_fold (fast, no prover).
         let (e0, e1, beta, s) = (c(3, 5), c(11, 13), c(17, 19), Val::from_u64(23));
