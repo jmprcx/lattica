@@ -677,6 +677,12 @@ pub const Chain = struct {
     /// the node-visible aggregate a full node recomputes from genesis and a consensus layer compares
     /// against the emission schedule.
     supply: protocol.SupplyState,
+    /// Incremental commitment to the spent-nullifier set, in canonical apply order:
+    /// `acc' = H(acc ‖ nf)` as each nullifier is committed. A binding, genesis-replayable accumulator
+    /// the host chain can bind in a block header so any node detects a divergent nullifier history
+    /// (P-01). Empty set ⇒ all-zero. (A sparse-Merkle set root — supporting light-client non-membership
+    /// proofs — is the production upgrade; this hash-chain gives the header-commitment + replay check.)
+    nullifier_acc: Hash32,
 
     pub fn init(allocator: Allocator) !Chain {
         var t = try tree.MerkleTree.init(allocator, TREE_DEPTH);
@@ -689,7 +695,20 @@ pub const Chain = struct {
             .nullifiers = HashSet.init(allocator),
             .transmitted = .empty,
             .supply = .{},
+            .nullifier_acc = [_]u8{0} ** 32, // empty set
         };
+    }
+
+    /// Consensus state commitment: a deterministic root over the shielded state the host chain binds in
+    /// a block header and recomputes on genesis replay (P-01). Components: the note-commitment tree root
+    /// (`anchor`), the nullifier-set accumulator, and the public supply commitment. Two nodes that
+    /// applied the same canonical transaction sequence have the same `stateRoot`. (The host chain adds
+    /// the tx root + event root over the block's transactions/events; those are block-structure
+    /// commitments outside this in-memory state machine.)
+    pub fn stateRoot(self: Chain) Hash32 {
+        const note_root = self.tree.root();
+        const supply_commit = self.supply.commitment();
+        return p.hashDomain("lattica:v1:state-root", &.{ &note_root, &self.nullifier_acc, &supply_commit });
     }
 
     pub fn deinit(self: *Chain) void {
@@ -845,7 +864,11 @@ pub const Chain = struct {
 
         // ---- Infallible commit. ----
         self.supply = candidate_supply;
-        for (t.nullifiers) |nf| self.nullifiers.putAssumeCapacity(nf, {});
+        for (t.nullifiers) |nf| {
+            self.nullifiers.putAssumeCapacity(nf, {});
+            // fold the nullifier into the genesis-replayable accumulator (P-01). Infallible (a hash).
+            self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
+        }
         for (owned) |o| {
             _ = self.tree.appendAssumeCapacity(o.cm);
             self.anchors.putAssumeCapacity(self.tree.root(), {});
@@ -905,7 +928,11 @@ pub const Chain = struct {
         }
 
         self.supply = candidate_supply;
-        for (t.nullifiers) |nf| self.nullifiers.putAssumeCapacity(nf, {});
+        for (t.nullifiers) |nf| {
+            self.nullifiers.putAssumeCapacity(nf, {});
+            // fold the nullifier into the genesis-replayable accumulator (P-01). Infallible (a hash).
+            self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
+        }
         for (owned) |o| {
             _ = self.tree.appendAssumeCapacity(o.cm);
             self.anchors.putAssumeCapacity(self.tree.root(), {});
@@ -1567,4 +1594,67 @@ test "node: buildHtlcLock rejects a non-canonical (in-field-zero) hashlock (audi
     try testing.expectError(TxError.Internal, buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, [_]u8{0} ** 32, 100, 900, 0, 50, chain.anchor()));
     // …while a canonical, non-zero hashlock is accepted.
     _ = try buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, [_]u8{7} ** 32, 100, 900, 0, 50, chain.anchor());
+}
+
+// Apply a fixed mint→spend history (genesis-deterministic) to `c` — used to check stateRoot replay.
+fn mintAndSpend(a: Allocator, c: *Chain, sender: tx.FullKey, payee: tx.FullKey) !void {
+    const m0 = try c.bootstrapMint(sender.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try c.bootstrapMint(sender.address(), 0, [_]u8{2} ** 32);
+    const inputs = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try c.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try c.merklePath(a, m1.pos) },
+    };
+    const outs = [_]OutputReq{.{ .recipient = payee.address(), .value = 900 }};
+    const t = try buildTransfer(a, sender, &inputs, &outs, 100, 0, c.anchor());
+    try c.verifyAndApply(t);
+}
+
+test "node: stateRoot binds note-tree/nullifier/supply + is replay-deterministic (P-01)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    const alice = try account(1);
+    const bob = try account(2);
+
+    // Genesis: two fresh chains agree.
+    var c1 = try Chain.init(a);
+    var c2 = try Chain.init(a);
+    const genesis = c1.stateRoot();
+    try testing.expectEqualSlices(u8, &genesis, &c2.stateRoot());
+
+    // Replay-determinism: the same canonical history ⇒ identical stateRoot (note tree + nullifier
+    // accumulator + supply all match).
+    try mintAndSpend(a, &c1, alice, bob);
+    try mintAndSpend(a, &c2, alice, bob);
+    try testing.expectEqualSlices(u8, &c1.stateRoot(), &c2.stateRoot());
+    try testing.expect(!std.mem.eql(u8, &genesis, &c1.stateRoot())); // history moved the root
+
+    // Sensitivity — each component binds:
+    {
+        // different SUPPLY (different mint amount) ⇒ different stateRoot
+        var c = try Chain.init(a);
+        _ = try c.bootstrapMint(alice.address(), 999, [_]u8{1} ** 32);
+        var c_same = try Chain.init(a);
+        _ = try c_same.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+        try testing.expect(!std.mem.eql(u8, &c.stateRoot(), &c_same.stateRoot()));
+    }
+    {
+        // a SPEND (adds a nullifier) moves the root even though it conserves value: capture pre/post.
+        var c = try Chain.init(a);
+        const m0 = try c.bootstrapMint(alice.address(), 1000, [_]u8{5} ** 32);
+        const m1 = try c.bootstrapMint(alice.address(), 0, [_]u8{6} ** 32);
+        const pre = c.stateRoot();
+        const inputs = [_]InputSpend{
+            .{ .note = m0.note, .position = m0.pos, .path = try c.merklePath(a, m0.pos) },
+            .{ .note = m1.note, .position = m1.pos, .path = try c.merklePath(a, m1.pos) },
+        };
+        const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 1000 }};
+        const t = try buildTransfer(a, alice, &inputs, &outs, 0, 0, c.anchor());
+        const acc_before = c.nullifier_acc;
+        try c.verifyAndApply(t);
+        try testing.expect(!std.mem.eql(u8, &acc_before, &c.nullifier_acc)); // nullifier accumulator advanced
+        try testing.expect(!std.mem.eql(u8, &pre, &c.stateRoot()));
+    }
 }

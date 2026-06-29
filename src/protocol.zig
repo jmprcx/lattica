@@ -251,6 +251,18 @@ pub const SupplyState = struct {
         const rhs = std.math.add(u128, self.shielded_pool, self.fees_paid) catch return false;
         return lhs == rhs;
     }
+
+    /// A canonical commitment to the public supply accounting, for the host chain to bind in a block
+    /// header (a component of `Chain.stateRoot`). Deterministic: a genesis replay that produces the same
+    /// `(issued, burned, shielded_pool, fees_paid)` produces the same commitment (P-01).
+    pub fn commitment(self: SupplyState) p.Hash32 {
+        var buf: [64]u8 = undefined;
+        std.mem.writeInt(u128, buf[0..16], self.issued, .little);
+        std.mem.writeInt(u128, buf[16..32], self.burned, .little);
+        std.mem.writeInt(u128, buf[32..48], self.shielded_pool, .little);
+        std.mem.writeInt(u128, buf[48..64], self.fees_paid, .little);
+        return p.hashDomain("lattica:v1:supply-commit", &.{&buf});
+    }
 };
 
 fn add(x: u128, y: u128) Error!u128 {
