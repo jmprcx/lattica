@@ -91,5 +91,78 @@ so recursion can be slotted underneath without touching the node when it is buil
 4. Treat it as a new audited circuit (its own constraint-audit doc + corrupted-trace suite), like
    `joinsplit_air`/`htlc_air`.
 
-See also: `docs/soundness-budget.md` (the batch measurements + the "batching → recursion" conclusion),
+## 7. B1 spike result — **GO (on the p3 path)**
+Built and validated `lattica-prover-p3/src/recursion/fri_merkle.rs` — an in-circuit FRI-query
+Merkle-opening verifier (the dominant, most-repeated FRI operation). Findings:
+- **Correctness / reuse proven.** `merge` is bit-identical to the FRI MMCS compression
+  (`TruncatedPermutation<Perm,2,4,8>`); the AIR recomputes a Merkle root by bit-controlled `merge` up a
+  path (each level = one `poseidon2_air` permutation block) and the in-circuit root **matches the native
+  `merge`-tree opening** (differential test). Tampered sibling / wrong root are rejected
+  (corrupted-trace). So the size-dominant FRI operation verifies in-circuit using gadgets lattica already
+  proves at depth 32 (the membership fold).
+- **Measured cost.** A depth-16 opening (a realistic FRI input-opening depth) = **512 rows (2⁹)**,
+  32 rows per `merge`, proving in ~0.5 s (dominated by FRI fixed overhead at this tiny size).
+- **Extrapolation (see `recursion-verifier-audit.md` §5).** A full single-inner-proof verifier ≈ 96
+  queries × ~3 openings × ~16-level paths ≈ **~2^18 rows — batch-circuit scale**, which the existing
+  prover already handles in tens of seconds. Size is therefore **not** the blocker.
+- **Decision: proceed on the p3 path (§4 option 1).** No framework migration needed for feasibility.
+  The residual risk is **correctness** of the in-circuit FRI *folding* (F_p² Lagrange) + the
+  OOD/quotient/DEEP check — that is what B3 retires, not scale.
+
+## 8. B2 result — in-circuit transcript validated
+Built `lattica-prover-p3/src/recursion/transcript.rs` — the Fiat–Shamir transcript (`DuplexChallenger`
+duplex sponge, Poseidon2 w8/rate4) as chained `poseidon2_air` blocks with the capacity carried + the
+prefix-free count (`state[CAP_LANE] += RATE`) linked across blocks. Findings:
+- **Model fidelity pinned (fast, no proving):** a native sponge over `native_permute` reproduces the real
+  `DuplexChallenger`'s squeeze for the observe-(RATE·m)-then-sample case; `sample` pops from the back, so
+  the F_p² challenge = `(rate[3], rate[2])`. Asserted for m∈{1,2,3}.
+- **In-circuit validated:** the AIR's bound squeeze matches the native sponge (real prover); a tampered
+  absorb / wrong squeeze is rejected.
+- Scope: absorb-multiple-of-RATE-then-sample (the core mechanic); variable-length buffering +
+  `sample_bits` (index sampling) are follow-ons folded into B3.
+
+## 9. B3a/B3b result — in-circuit F_p² fold validated
+Built `lattica-prover-p3/src/recursion/fri_fold.rs` — in-circuit F_p² arithmetic + the arity-2 FRI
+commit-phase fold step (the residual-risk primitive from B1). Findings:
+- **Field model confirmed:** `Challenge = BinomialExtensionField<Goldilocks,2>`, `X² = W = 7`; the
+  in-circuit `mul = (a0·b0 + 7·a1·b1, a0·b1 + a1·b0)` (KAT: `X² == 7`).
+- **Fold formula pinned to p3:** `folded = (e0+e1)/2 + (e0−e1)·β/(2s)` (from `p3_fri`'s
+  `fold_matrix`/`lagrange_interpolate_at`); the in-circuit AIR supplies `inv2s = 1/(2s)` as witness +
+  constrains `inv2s·2s = 1`, then checks the relation. The plain-Rust mirror equals `native_fold`, and
+  the real prover accepts the correct fold + rejects a wrong claimed result.
+- So the in-circuit FRI folding over F_p² is correct + cheap (arithmetic, not hashing).
+
+## 10. Status — the three core primitives are built; integration remains
+**Built + validated as standalone in-circuit spikes (all green, real-prover differential vs native):**
+1. **Merkle openings** (`fri_merkle.rs`, B1) — the FRI query-path hashing.
+2. **Fiat–Shamir transcript** (`transcript.rs`, B2) — the `DuplexChallenger` duplex sponge.
+3. **F_p² arithmetic + the FRI fold** (`fri_fold.rs`, B3a/B3b) — the commit-phase folding.
+
+These are the three operations a FRI-STARK verifier is made of; each is now proven to be in-circuit-ready
+on the existing Plonky3 prover, reusing `poseidon2_air` + lattica's `merge`/membership gadgets.
+
+**Remaining — the large-scale integration (the genuine multi-month bulk; NOT built):**
+- **B3-wire:** one AIR that parses a real `p3` `Proof`, replays the EXACT `p3-uni-stark::verify`
+  transcript order (observe degree bits → trace commit → public values → sample α → observe quotient
+  commit → sample ζ → FRI commit-phase observes/`β_i` → query-index `sample_bits`), then runs all 96
+  queries (input opening + per-round fold + Merkle openings + "roll in reduced openings") and the final
+  `final_poly` check. Requires extending B2 with `sample_bits` (index sampling) and the variable-length
+  absorb, and parsing p3's proof structures into trace columns. This is the bulk of the effort + its own
+  audit.
+- **B3-quotient (OOD/DEEP):** evaluate the INNER AIR's constraint polynomial at ζ in-circuit, combine
+  with α, recompose the quotient from its chunks, and check `constraints(ζ) == Z_H(ζ)·quotient(ζ)`.
+  Circuit-specific (depends on the inner AIR); substantial.
+- **B4 — aggregation:** verify K inner proofs (B3-wire ×K, tiled) + fold their per-tx statement digests
+  into the existing block tx-root (reuse the `DOM_TXROOT` fold), emitting the SAME tx-root so the node
+  seam is unchanged.
+- **B5 — tree aggregation + seam:** compose outer-as-inner (log-depth) + C ABI + Zig seam + real
+  integration.
+
+The honest read: the unknowns that could have killed the p3 path (in-circuit hashing scale, transcript
+fidelity, F_p² folding correctness) are now **retired** — each primitive verifies in-circuit and matches
+native. What remains is faithful, high-volume *wiring* against p3's exact proof format + the
+circuit-specific quotient check — large and audit-bearing, but no longer a feasibility question.
+
+See also: `docs/recursion-verifier-audit.md` (the in-circuit verifier spec + constraint budget),
+`docs/soundness-budget.md` (the batch measurements + the "batching → recursion" conclusion),
 `batch_joinsplit_air` / `batch_htlc_air` (the implemented aggregation + the reusable tx-root fold).

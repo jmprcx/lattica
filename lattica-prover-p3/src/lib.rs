@@ -9,6 +9,7 @@ pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsp
 pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-split tiling + tx-root fold)
 pub mod batch_htlc_air; // batch aggregation for the v3 shielded-HTLC spend (mirrors batch_joinsplit_air)
 pub mod poseidon2_air;
+pub mod recursion; // Phase B: recursive STARK verifier (B1 spike = in-circuit FRI Merkle-opening verifier)
 
 use core::slice;
 use p3_field::PrimeField64;
