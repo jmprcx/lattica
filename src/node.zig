@@ -663,6 +663,14 @@ pub const Minted = struct {
     pos: u64,
 };
 
+/// A canonical HTLC redeem event (P-01): emitted when a redeem is applied. `redeem_hashlock` is the
+/// public `SHA256(preimage)` digest a cross-chain watcher matches against its swap; `preimage` is the
+/// revealed secret it uses to claim the opposite leg.
+pub const HtlcRedeemEvent = struct {
+    redeem_hashlock: Hash32,
+    preimage: [32]u8,
+};
+
 pub const Chain = struct {
     allocator: Allocator,
     tree: tree.MerkleTree,
@@ -677,6 +685,13 @@ pub const Chain = struct {
     /// the node-visible aggregate a full node recomputes from genesis and a consensus layer compares
     /// against the emission schedule.
     supply: protocol.SupplyState,
+    /// Canonical HTLC redeem-preimage event log (P-01): every applied redeem appends `{redeem_hashlock,
+    /// preimage}` so a cross-chain watcher can learn the secret and claim the opposite swap leg. The
+    /// node owns this (it sees the revealed preimage); the host chain surfaces it + commits `eventRoot`.
+    htlc_events: std.ArrayList(HtlcRedeemEvent),
+    /// Incremental accumulator over `htlc_events` (`acc' = H(acc ‖ redeem_hashlock ‖ preimage)`), the
+    /// genesis-replayable event root the host chain binds in a block header.
+    event_acc: Hash32,
     /// Incremental commitment to the spent-nullifier set, in canonical apply order:
     /// `acc' = H(acc ‖ nf)` as each nullifier is committed. A binding, genesis-replayable accumulator
     /// the host chain can bind in a block header so any node detects a divergent nullifier history
@@ -695,8 +710,20 @@ pub const Chain = struct {
             .nullifiers = HashSet.init(allocator),
             .transmitted = .empty,
             .supply = .{},
+            .htlc_events = .empty,
+            .event_acc = [_]u8{0} ** 32, // no events yet
             .nullifier_acc = [_]u8{0} ** 32, // empty set
         };
+    }
+
+    /// The cumulative HTLC redeem event-set root the host chain binds in a block header (P-01).
+    pub fn eventRoot(self: Chain) Hash32 {
+        return self.event_acc;
+    }
+
+    /// The full HTLC redeem-preimage event log, for cross-chain watchers / wallet indexing (P-01).
+    pub fn redeemEvents(self: Chain) []const HtlcRedeemEvent {
+        return self.htlc_events.items;
     }
 
     /// Consensus state commitment: a deterministic root over the shielded state the host chain binds in
@@ -719,6 +746,7 @@ pub const Chain = struct {
         // the bootstrap mint), so it frees them here (audit H-04 — no leak / no dangling pointers).
         for (self.transmitted.items) |tn| self.allocator.free(tn.ciphertext);
         self.transmitted.deinit(self.allocator);
+        self.htlc_events.deinit(self.allocator);
     }
 
     /// The current anchor (tree root).
@@ -918,6 +946,7 @@ pub const Chain = struct {
         self.anchors.ensureUnusedCapacity(@intCast(M_OUT)) catch return TxError.Internal;
         self.transmitted.ensureUnusedCapacity(self.allocator, M_OUT) catch return TxError.Internal;
         self.tree.ensureUnusedCapacity(M_OUT) catch return TxError.TreeFull;
+        self.htlc_events.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal; // ≤1 redeem event
         var owned: [M_OUT]tx.TransmittedNote = undefined;
         var copied: usize = 0;
         errdefer for (owned[0..copied]) |o| self.allocator.free(o.ciphertext);
@@ -937,6 +966,13 @@ pub const Chain = struct {
             _ = self.tree.appendAssumeCapacity(o.cm);
             self.anchors.putAssumeCapacity(self.tree.root(), {});
             self.transmitted.appendAssumeCapacity(o);
+        }
+        // Emit the redeem preimage event (P-01): a redeem reveals the preimage, so record it for
+        // cross-chain watchers + fold it into the event root. A refund carries no preimage ⇒ no event.
+        if (t.redeem_preimage) |pre| {
+            const hl = t.redeemHashlock();
+            self.htlc_events.appendAssumeCapacity(.{ .redeem_hashlock = hl, .preimage = pre });
+            self.event_acc = p.hashDomain("lattica:v1:event-acc", &.{ &self.event_acc, &hl, &pre });
         }
     }
 };
@@ -1657,4 +1693,50 @@ test "node: stateRoot binds note-tree/nullifier/supply + is replay-deterministic
         try testing.expect(!std.mem.eql(u8, &acc_before, &c.nullifier_acc)); // nullifier accumulator advanced
         try testing.expect(!std.mem.eql(u8, &pre, &c.stateRoot()));
     }
+}
+
+test "node: applyHtlc emits a redeem preimage event for cross-chain watchers (P-01)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    mock.install();
+    defer mock.uninstall();
+    var chain = try Chain.init(a);
+    const alice = try account(1); // locker
+    const bob = try account(2); // redeem party
+    const preimage = [_]u8{0xAB} ** 32;
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&preimage, &sha, .{});
+    const hashlock = poseidon2.digestBytes(poseidon2.digestFromBytes(sha));
+    const redeem_tag = bob.address().recipientId();
+    const refund_tag = alice.address().recipientId();
+    const timeout: u64 = 100;
+
+    const m0 = try chain.bootstrapMint(alice.address(), 1000, [_]u8{1} ** 32);
+    const m1 = try chain.bootstrapMint(alice.address(), 0, [_]u8{2} ** 32);
+    const li = [_]InputSpend{
+        .{ .note = m0.note, .position = m0.pos, .path = try chain.merklePath(a, m0.pos) },
+        .{ .note = m1.note, .position = m1.pos, .path = try chain.merklePath(a, m1.pos) },
+    };
+    const lock = try buildHtlcLock(a, alice, &li, redeem_tag, refund_tag, hashlock, timeout, 1000, 0, 50, chain.anchor());
+    const htlc_pos = m1.pos + 1;
+    const root_before = chain.eventRoot();
+    try chain.applyHtlc(lock.tx, 50);
+    try testing.expectEqual(@as(usize, 0), chain.redeemEvents().len); // a lock emits no event
+    try testing.expectEqualSlices(u8, &root_before, &chain.eventRoot());
+
+    const bdummy = try chain.bootstrapMint(bob.address(), 0, [_]u8{3} ** 32);
+    const spend = HtlcSpend{ .note = lock.note, .position = htlc_pos, .path = try chain.merklePath(a, htlc_pos), .claim_div = bob.address().div, .mode = 1, .redeem_tag = redeem_tag, .refund_tag = refund_tag, .hashlock = hashlock, .timeout = timeout, .preimage = preimage };
+    const sdummy = InputSpend{ .note = bdummy.note, .position = bdummy.pos, .path = try chain.merklePath(a, bdummy.pos) };
+    const outs = [_]OutputReq{.{ .recipient = bob.address(), .value = 1000 }};
+    const rtx = try buildHtlcSpend(a, bob, spend, sdummy, &outs, 0, 60, chain.anchor());
+    try chain.applyHtlc(rtx, 60);
+
+    // the redeem emitted exactly one event carrying the revealed preimage — a watcher reads it to claim
+    // the opposite leg — and the event root advanced.
+    const events = chain.redeemEvents();
+    try testing.expectEqual(@as(usize, 1), events.len);
+    try testing.expectEqualSlices(u8, &preimage, &events[0].preimage);
+    try testing.expectEqualSlices(u8, &hashlock, &events[0].redeem_hashlock);
+    try testing.expect(!std.mem.eql(u8, &root_before, &chain.eventRoot()));
 }
