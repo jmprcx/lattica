@@ -16,6 +16,7 @@
 //! in-circuit fold (a later phase) is differential-tested against this oracle, and the node's
 //! `poseidon2.zig` recompute is KAT-tested against it.
 
+use p3_air::symbolic::AirLayout;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
@@ -27,7 +28,7 @@ use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilo
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, Proof, StarkConfig};
+use p3_uni_stark::{prove, verify, Proof, ProvenSecurity, StarkConfig, StarkSecurityParams};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -599,9 +600,46 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
 /// Prove a batch of transactions as one proof. Returns the proof bytes; the block tx-root (the single
 /// public input) is `batch_root(ws)`, which the verifier recomputes from the block's statements.
 pub fn prove_batch_to_bytes(ws: &[Witness]) -> Vec<u8> {
+    assert!(
+        padded_tiles(ws.len()) <= MAX_BATCH_TILES,
+        "batch exceeds MAX_BATCH_TILES ({MAX_BATCH_TILES}); split the block into multiple batch proofs"
+    );
     let pis = batch_root(ws);
     let proof = prove(&make_config(), &JoinSplitBatchAir, build_batch_trace(ws), &pis);
     postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+}
+
+/// The largest batch (in tiles) that holds the ≥100-bit proven-soundness floor: measured 100 bits at
+/// n=64 (height 2^18), 99 at n=128. A block needing more transactions emits **multiple** batch proofs of
+/// ≤ `MAX_BATCH_TILES` tiles each (or a future config raises `num_queries`). See `batch_proven_security_floor`.
+pub const MAX_BATCH_TILES: usize = 64;
+
+/// Proven (UDR) security bits at a batch of `n` transactions (trace height = `padded_tiles(n)·TILE_HEIGHT`).
+/// Mirrors `joinsplit_air::measure`'s computation; the batch grows the height ~log(n), slowly lowering the
+/// proven floor. The largest size holding ≥100 bits is `MAX_BATCH_TILES`.
+pub fn proven_security_bits(n: usize) -> usize {
+    let perm = default_goldilocks_poseidon2_8();
+    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, ChaCha20Rng::seed_from_u64(1));
+    let fri = FriParameters {
+        log_blowup: 4,
+        log_final_poly_len: 0,
+        max_log_arity: 4,
+        num_queries: 96,
+        commit_proof_of_work_bits: 0,
+        query_proof_of_work_bits: 16,
+        mmcs: ChallengeMmcs::new(vm),
+    };
+    let layout = AirLayout::from_air::<Goldilocks>(&JoinSplitBatchAir);
+    let params = StarkSecurityParams::from_air::<Val, Challenge, JoinSplitBatchAir, ChallengeMmcs>(
+        &fri,
+        &JoinSplitBatchAir,
+        layout,
+        127,
+        128,
+        2,
+    );
+    let height = padded_tiles(n) * TILE_HEIGHT;
+    ProvenSecurity::compute(&params, 1usize << (height.trailing_zeros() as usize + 1)).security_bits()
 }
 
 /// Verify a batch proof against the block tx-root (4 Goldilocks).
@@ -731,6 +769,18 @@ mod tests {
             verify_batch_bytes(&postcard::to_allocvec(&proof).unwrap(), root)
         }));
         matches!(outcome, Ok(false) | Err(_))
+    }
+
+    #[test]
+    fn batch_proven_security_floor() {
+        // n=1 matches the single join-split (103 proven); the floor holds through MAX_BATCH_TILES and
+        // 2·MAX_BATCH_TILES is the first size below 100 — pinning N_MAX as exactly the boundary.
+        assert_eq!(proven_security_bits(1), 103);
+        assert!(proven_security_bits(MAX_BATCH_TILES) >= 100, "MAX_BATCH_TILES must hold the ≥100-bit floor");
+        assert!(
+            proven_security_bits(MAX_BATCH_TILES * 2) < 100,
+            "MAX_BATCH_TILES is the boundary: 2× drops below the 100-bit floor"
+        );
     }
 
     #[test]

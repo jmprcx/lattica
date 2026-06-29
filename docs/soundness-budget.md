@@ -123,7 +123,20 @@ Poseidon2 is **width 16** (298 cols vs 180); (2) the **extension field is ~16 by
 Net ~4% for a full circuit rewrite plus multi-limb `u64` value/range/balance arithmetic. **Not
 worth it** — Goldilocks stays.
 
-## Batch aggregation — one proof per block (measured)
+## Batch aggregation — one proof per block (implemented: `batch_joinsplit_air`)
+
+The production batch circuit `lattica-prover-p3::batch_joinsplit_air` proves `n` **distinct** join-split
+transactions as a **single** proof (the spend AIR tiled `n` times, per-tile self-contained, with an
+in-circuit fold of each tile's statement into one **block tx-root** public input). The table below is
+the original size/verify measurement (identical tiles, size-representative); the production circuit adds
+the staging columns + the fold (a few extra columns + the trailing free padding blocks — the tile stays
+2^12 rows, so the sizes are unchanged).
+
+**Proven-soundness floor ⇒ `MAX_BATCH_TILES = 64`.** Recomputed at batch height (`batch_proven_security_bits`):
+103 bits through n=8, 102 @ n=16, 101 @ n=32, **100 @ n=64 (height 2^18)**, 99 @ n=128. So one proof
+covers up to **64** transactions at the ≥100-bit floor; a larger block emits **multiple** batch proofs of
+≤64 tiles each (or a future config raises `num_queries`). Enforced by `prove_batch_to_bytes` + the
+`batch_proven_security_floor` test.
 
 `cargo run --release --bin batch` proves a batch of `n` spends as a **single** proof (the spend AIR
 tiled `n` times in one trace) at the production FRI params:
