@@ -103,7 +103,9 @@ differential-tested in-circuit spikes in `lattica-prover-p3/src/recursion/`:
   observe/sample, `sample_algebra_element` (F_p² = `(rate[3], rate[2])`), and `sample_bits` (query-index
   sampling). This is the reference B3-wire's in-circuit transcript must reproduce.
 - **F_p² arithmetic + the FRI fold** — `fri_fold.rs` (B3a/B3b): `X²=7`; the arity-2 fold
-  `(e0+e1)/2 + (e0−e1)·β/(2s)` with an in-circuit `1/(2s)`; matches native; wrong fold rejected.
+  `(e0+e1)/2 + (e0−e1)·β/(2s)` with an in-circuit `1/(2s)`; matches native; wrong fold rejected. Also
+  the **commit-phase fold chain** (`FoldChainAir`): the running eval folded round-by-round with the FRI
+  squaring point map `x→x²`, reaching the final-poly value; tampered sibling / wrong final rejected.
 
 The remaining work is the **integration** (B3-wire + B3-quotient + B4 + B5) — see `recursion-design.md`
 §10 for the precise roadmap. Feasibility unknowns (hashing scale, transcript fidelity, F_p² folding) are
