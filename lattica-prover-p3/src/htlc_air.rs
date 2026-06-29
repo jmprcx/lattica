@@ -313,7 +313,7 @@ const FEE_BLOCKS: usize = 2; // fee binding + range
 const MINT_BLOCKS: usize = 2; // mint (issuance) binding + range
 const USED_BLOCKS: usize = N_IN * SPAN_BLOCKS + M_OUT * OUT_BLOCKS + FEE_BLOCKS + MINT_BLOCKS;
 const NUM_BLOCKS: usize = USED_BLOCKS.next_power_of_two();
-const HEIGHT: usize = NUM_BLOCKS * BLOCK;
+pub const HEIGHT: usize = NUM_BLOCKS * BLOCK;
 
 // columns
 const BIT: usize = 8; // membership position bit
@@ -345,7 +345,7 @@ const DIFF: usize = 30; // redeem: timeout-height-1 ; refund: height-timeout ; r
 // some limb is invertible (non-zero). Used only at the htlc block-2 rows.
 const HLINV0: usize = 31; // HLINV0..3 = 31..35
 const HLPROD: usize = 35;
-const WIDTH: usize = 36; // …, TIMEOUT=29, DIFF=30, HLINV0..3=31..35, HLPROD=35
+pub const WIDTH: usize = 36; // …, TIMEOUT=29, DIFF=30, HLINV0..3=31..35, HLPROD=35
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
@@ -379,7 +379,7 @@ const P_DIFF_SEED: usize = 37; // diff range seed (REM = DIFF) + the height/time
 const P_HEIGHT_SEED: usize = 38; // current_height range seed (REM = pis[PI_HEIGHT]); single global window
 const P_NULLOUT: usize = 39; // N_IN one-hots: nf_i binding
 const P_OUTOUT: usize = 39 + N_IN; // M_OUT one-hots: out_cm_j binding
-const N_PERIODIC: usize = 39 + N_IN + M_OUT;
+pub const N_PERIODIC: usize = 39 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4) ‖
 //                current_height(1) ‖ redeem_hashlock(4)
@@ -477,7 +477,7 @@ fn one_hot(rows: &[usize]) -> Vec<Val> {
     c
 }
 
-fn periodic() -> Vec<Vec<Val>> {
+pub fn periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic_table(); // 11 round-schedule columns, period 32
     let own_in: Vec<usize> = (0..N_IN).map(own_in_row).collect();
     let recip: Vec<usize> = (0..N_IN).map(own_out_row).collect(); // own output → commit_a recipient
@@ -944,7 +944,7 @@ fn fill_col(t: &mut [Val], lo: usize, hi: usize, col: usize, v: Val) {
     }
 }
 
-fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
+pub fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
     let mut t = vec![Val::ZERO; HEIGHT * WIDTH];
 
     // ASSET is global-persistent (one hidden asset id for the whole tx); fill it on every row.
