@@ -87,8 +87,9 @@ exchange must **scan every block and trial-decrypt** to find them. This is the w
   notes, **cannot spend** → safe online.
 - **Cold spend key** = offline; only for withdrawals.
 
-**Deposit flow:** user gets deposit address `i` → sends a note → scanner trial-decrypts → recovers
-`(value, asset, diversifier dᵢ)` → `dᵢ` identifies user `i` → credit after N confirmations.
+**Deposit flow:** user gets deposit address `i` → sends a note → scanner decrypts → recovers
+`(value, asset, recipient)` → the cm-bound **`recipient` (= H(nk‖dᵢ))** identifies user `i` (NOT the
+malleable wire `dᵢ` — see below) → credit after N confirmations.
 
 **Withdrawal flow:** spend the exchange's notes with the cold key → a join-split paying users. Proving
 needs the spend key (offline/HSM proving step, not the hot scanner) and costs ~seconds + ~0.5 MB/proof
@@ -100,15 +101,22 @@ Our diversified addresses derive a **separate ML-KEM keypair per address**, so d
 counts (100k users ⇒ 100k decaps per note). The PQ tax: Zcash's `ivk` is O(1) per note via
 `pk_d = ivk·g_d`; ML-KEM has no analog.
 
-| | **Per-diversifier KEM (current)** | **Shared-KEM exchange addresses (recommended for CEX)** |
+| | **Per-diversifier KEM (wallet mode)** | **Shared-KEM exchange mode** |
 |---|---|---|
-| Detection | O(users) decaps/output — wallet-scale only | **O(1)** decap/output, then route by `dᵢ` |
-| Unlinkability | full (distinct KEM key per address) | exchange's deposit addresses share `kem_ek` (never on-chain; `cm` still hiding) — fine for an exchange |
+| Detection | O(users) decaps/output — wallet-scale only | **O(1)** decap/output, then route by the cm-bound recipient |
+| Unlinkability | full + unconditional (distinct KEM key per address) | exchange's deposit addresses share `kem_ek` (never on-chain; `cm` still hiding) — rests on ML-KEM **ciphertext anonymity (IK-CCA)** |
 | Pattern | privacy-max personal wallet | Monero integrated-address / payment-ID |
 
-A small, contained `tx.zig` addition (exchange-mode address derivation: one KEM key + the diversifier
-as routing tag) gives exchanges O(1) detection. A note **memo** field would serve the same routing
-role; today the diversifier already does.
+**Status: IMPLEMENTED — both modes coexist in `src/tx.zig`.** Wallet mode is `addressAt` /
+`IncomingViewingKey`; exchange mode is `exchangeAddressAt(index, epoch)` + `ExchangeViewingKey`
+(`FullKey.exchangeViewingKey(allocator, n_users, epoch)` to build it; `addRecipient` for nk-free
+onboarding; `detect` for O(1) scanning). Same `nk`/`div`/circuit — only the KEM key is shared, off-chain.
+The scanner routes by the **cm-bound `recipient_id`** (re-deriving `dᵢ` from the matched index), *not*
+the wire diversifier, so a hostile sender cannot misattribute or brick a deposit (audit M-3). The
+`detect` path's `note.commitment() == cm` check is load-bearing — it binds the credited value/asset to
+what is actually committed on-chain (AEAD success alone proves nothing, since anyone can encapsulate to
+the public shared `ek`). A note **memo** field would serve the same routing role; the diversifier already
+does. Demo: `zig build run -- exchange`. Threat model is recorded in `docs/audit-scope-p3.md` §2.
 
 ### 3.4 Multi-asset interaction
 With M1/M2 the note carries `asset_id`; deposit detection credits `(asset, value, user)`; withdrawals

@@ -20,6 +20,16 @@
 //! unlinkable (the tags/keys share no observable structure), yet all are spendable by `nk` and
 //! detectable by the viewing key. (ML-KEM has no "one secret, many public keys" structure, so the
 //! KEM key is derived per diversifier rather than shared as in Sapling's `ivk·g_d`.)
+//!
+//! Two address/scan modes coexist:
+//!   * **Wallet mode** (`addressAt` / `IncomingViewingKey`) — privacy-max: a distinct KEM key per
+//!     address; detection is O(addresses) decaps/note. For personal wallets.
+//!   * **Exchange mode** (`exchangeAddressAt` / `ExchangeViewingKey`) — one SHARED KEM key across a
+//!     wallet's deposit addresses, so a hot scanner detects deposits in **O(1)** decap/note and routes
+//!     to the user by the committed recipient. Same `nk`/`div`/circuit (only `kem_ek` is shared). The
+//!     tradeoff: cross-deposit unlinkability for third parties now rests on ML-KEM ciphertext anonymity
+//!     (IK-CCA), and the shared hot KEM secret, if leaked, deanonymizes that epoch's deposits (never
+//!     spends — `nk` stays cold). See `ExchangeViewingKey`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -146,6 +156,24 @@ fn deriveKem(kem_master: *const Hash32, index: u32) !p.KemKeypair {
     return p.KemKeypair.fromSeed(ks);
 }
 
+/// The wallet's single SHARED ML-KEM keypair for exchange/deposit mode, under rotation `epoch`. Unlike
+/// `deriveKem` (one key per address index), ONE key serves all of an exchange's deposit addresses, so a
+/// hot scanner detects deposits in O(1) decap/note (then routes by the cm-bound recipient). Domain-
+/// separated from the per-index keys ("lat-xk*" vs "lat-km*"); the ML-KEM seed is 64 bytes, so two
+/// `expand` calls (d-half ‖ z-half), mirroring `deriveKem`.
+fn exchangeKem(kem_master: *const Hash32, epoch: u32) !p.KemKeypair {
+    var ks: [64]u8 = undefined;
+    var lbl: [11]u8 = undefined;
+    @memcpy(lbl[0..7], "lat-xkd");
+    std.mem.writeInt(u32, lbl[7..11], epoch, .little);
+    const d = p.expand(kem_master, &lbl);
+    @memcpy(lbl[0..7], "lat-xkz");
+    const z = p.expand(kem_master, &lbl);
+    @memcpy(ks[0..32], &d);
+    @memcpy(ks[32..64], &z);
+    return p.KemKeypair.fromSeed(ks);
+}
+
 /// `recipient_id = H(DOM_OWN ‖ nk ‖ div)` from the 128-bit `nk` and a diversifier.
 fn recipientId(nk: *const Hash32, div: u64) Hash32 {
     return poseidon2.digestBytes(poseidon2.recipient(
@@ -217,12 +245,78 @@ pub const FullKey = struct {
         return self.addressAt(0) catch unreachable;
     }
 
+    /// An EXCHANGE deposit address at index `i` under rotation `epoch`. Same `recipient_id`/`div` as the
+    /// wallet-mode address (so it's spendable by the same `nk` and the circuit is unchanged), but the
+    /// `kem_ek` is the wallet's SHARED exchange key — enabling O(1) deposit detection (see
+    /// `ExchangeViewingKey`). Hand a distinct index to each depositing user.
+    pub fn exchangeAddressAt(self: FullKey, index: u32, epoch: u32) !Address {
+        const div = deriveDiv(&self.div_master, index);
+        const kem = try exchangeKem(&self.kem_master, epoch);
+        return .{ .recipient_id = recipientId(&self.nk, div), .div = div, .kem_ek = kem.ekBytes() };
+    }
+
     /// The delegatable incoming viewing key for this wallet.
     pub fn viewingKey(self: FullKey) IncomingViewingKey {
         var rids: [SCAN_WINDOW]Hash32 = undefined;
         var i: u32 = 0;
         while (i < SCAN_WINDOW) : (i += 1) rids[i] = recipientId(&self.nk, deriveDiv(&self.div_master, i));
         return .{ .div_master = self.div_master, .kem_master = self.kem_master, .recipient_ids = rids };
+    }
+
+    /// Build the hot deposit scanner for `n_users` exchange addresses under rotation `epoch`. Uses `nk`
+    /// ONCE here (cold setup) to precompute the deposit `recipient_id`s; the returned scanner holds the
+    /// shared KEM secret + a recipient→index map but NO `nk`/`div_master`, so it can run online and
+    /// detect/attribute deposits without spend authority. Fails on a `recipient_id` collision (the
+    /// diversifier is 64-bit, so distinct indices collide with prob ~n²/2⁶⁴ — negligible below ~2²⁰ users).
+    /// Caller owns the result; `deinit` it.
+    pub fn exchangeViewingKey(self: FullKey, allocator: Allocator, n_users: u32, epoch: u32) !ExchangeViewingKey {
+        const kem = try exchangeKem(&self.kem_master, epoch);
+        var evk = ExchangeViewingKey{ .kem = kem, .index_by_rid = std.AutoHashMap(Hash32, ExchangeViewingKey.Entry).init(allocator) };
+        errdefer evk.deinit();
+        try evk.index_by_rid.ensureTotalCapacity(n_users);
+        var i: u32 = 0;
+        while (i < n_users) : (i += 1) {
+            const div = deriveDiv(&self.div_master, i);
+            try evk.addRecipient(i, recipientId(&self.nk, div), div);
+        }
+        return evk;
+    }
+};
+
+/// The hot deposit scanner for EXCHANGE mode. Holds the wallet's single shared KEM secret + a
+/// recipient→(index, div) map; it detects + attributes deposits to many users in **O(1)** decap/note,
+/// without `nk` (cannot spend). Build it via `FullKey.exchangeViewingKey`, or assemble incrementally with
+/// `addRecipient` from cold-precomputed triples. Attribution keys off the cm-bound `recipient` (authentic,
+/// committed), never the malleable wire `div` — preserving audit M-3.
+pub const ExchangeViewingKey = struct {
+    pub const Entry = struct { index: u32, div: u64 };
+    kem: p.KemKeypair,
+    index_by_rid: std.AutoHashMap(Hash32, Entry),
+
+    pub fn deinit(self: *ExchangeViewingKey) void {
+        self.index_by_rid.deinit();
+    }
+
+    /// Register one deposit address (cold→hot onboarding without `nk`): the cold signer precomputes
+    /// `(index, rid, div)` and pushes it to the running scanner, so the exchange can add users past the
+    /// initial `n_users` without taking `nk` online. Rejects a duplicate `recipient_id`.
+    pub fn addRecipient(self: *ExchangeViewingKey, index: u32, rid: Hash32, div: u64) !void {
+        const gop = try self.index_by_rid.getOrPut(rid);
+        if (gop.found_existing) return error.DiversifierCollision;
+        gop.value_ptr.* = .{ .index = index, .div = div };
+    }
+
+    /// Scan a transmitted note with the SHARED exchange key: ONE decap + ONE AEAD-open, then route by the
+    /// cm-bound recipient — O(1)/note regardless of user count. Returns the decrypted PLAIN note (with its
+    /// cold-derived diversifier) + the depositing user's index, or null (not ours / unknown recipient /
+    /// not a PLAIN note).
+    pub fn detect(self: ExchangeViewingKey, allocator: Allocator, tn: TransmittedNote) ?struct { note: Note, index: u32 } {
+        const note = openNote(allocator, self.kem.sk, tn) orelse return null;
+        if (note.note_type != 0) return null; // PLAIN deposits only (HTLC notes are watched by commitment)
+        const entry = self.index_by_rid.get(note.recipient) orelse return null;
+        var n = note;
+        n.div = entry.div; // the cold-derived diversifier; discard the malleable wire value (audit M-3)
+        return .{ .note = n, .index = entry.index };
     }
 };
 
@@ -255,9 +349,14 @@ pub fn encryptNote(allocator: Allocator, ovk: *const Hash32, address: Address, n
     return .{ .cm = cm, .kem_ct = enc.ct, .ciphertext = ciphertext };
 }
 
-/// Decrypt with a specific KEM secret + expected recipient id. Returns the note iff it authenticates,
-/// commits to `cm`, and is addressed to `expected_rid`.
-fn decryptWith(allocator: Allocator, kem_sk: anytype, expected_rid: *const Hash32, tn: TransmittedNote) ?Note {
+/// Lower-level: decapsulate, AEAD-open, and parse a transmitted note, returning it iff it authenticates
+/// and its commitment equals `tn.cm`. The cm-match is **load-bearing**: ML-KEM has implicit rejection
+/// (decap always returns a secret) and anyone can encapsulate to a *public* `ek` and seal arbitrary
+/// plaintext under a key derived from a real `cm`, so AEAD success alone proves nothing — only
+/// `note.commitment() == tn.cm` binds the decrypted value/asset/recipient to what is actually committed
+/// on-chain. Does NOT check ownership; callers confirm the recipient (wallet mode: `== expected_rid`;
+/// exchange mode: `recipient ∈ deposit set`).
+fn openNote(allocator: Allocator, kem_sk: anytype, tn: TransmittedNote) ?Note {
     const ss = p.decapsulate(kem_sk, &tn.kem_ct) catch return null;
     const note_key = p.deriveNoteKey(&ss, &tn.kem_ct, &tn.cm);
     const pt = p.open(allocator, note_key, tn.ciphertext, &tn.cm) catch return null;
@@ -265,6 +364,13 @@ fn decryptWith(allocator: Allocator, kem_sk: anytype, expected_rid: *const Hash3
     const note = Note.fromBytes(pt) catch return null;
     const cm = note.commitment();
     if (!std.mem.eql(u8, &cm, &tn.cm)) return null;
+    return note;
+}
+
+/// Decrypt with a specific KEM secret + expected recipient id. Returns the note iff it authenticates,
+/// commits to `cm`, and is addressed to `expected_rid`.
+fn decryptWith(allocator: Allocator, kem_sk: anytype, expected_rid: *const Hash32, tn: TransmittedNote) ?Note {
+    const note = openNote(allocator, kem_sk, tn) orelse return null;
     if (!std.mem.eql(u8, &note.recipient, expected_rid)) return null;
     return note;
 }
@@ -435,4 +541,195 @@ test "note serialization round trip" {
     const note = noteTo(try alice.addressAt(5), 999);
     const parsed = try Note.fromBytes(&note.toBytes());
     try testing.expect(parsed.eql(note));
+}
+
+// ---------------------------------------------------------------------------------------
+// Exchange mode (shared-KEM deposit addresses, O(1) detection)
+// ---------------------------------------------------------------------------------------
+
+test "exchange mode: shared-KEM scanner attributes a deposit to its user index + asset" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const sender = try account(7);
+    const addr = try exch.exchangeAddressAt(5, 0);
+    const note = Note{ .value = 4242, .recipient = addr.recipient_id, .div = addr.div, .asset = 3, .rho = [_]u8{9} ** 32, .rcm = [_]u8{3} ** 32 };
+    const tn = try encryptNote(a, &sender.ovk, addr, note);
+    defer a.free(tn.ciphertext);
+    var evk = try exch.exchangeViewingKey(a, 16, 0);
+    defer evk.deinit();
+    const found = evk.detect(a, tn) orelse return error.NotDetected;
+    try testing.expectEqual(@as(u32, 5), found.index);
+    try testing.expectEqual(@as(u64, 4242), found.note.value);
+    try testing.expectEqual(@as(u64, 3), found.note.asset);
+    try testing.expectEqual(addr.div, found.note.div);
+}
+
+test "exchange mode: scanner re-derives div, ignoring an attacker-malleable wire div (audit M-3)" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const addr = try exch.exchangeAddressAt(3, 0);
+    // correct recipient (addr's rid), GARBAGE wire div — hand-sealed by a hostile sender (cm binds only
+    // recipient = H(nk‖div_3), not the wire div).
+    const note = Note{ .value = 500, .recipient = addr.recipient_id, .div = 0xDEAD_BEEF, .rho = [_]u8{3} ** 32, .rcm = [_]u8{4} ** 32 };
+    const cm = note.commitment();
+    const attacker_ovk = [_]u8{0xAB} ** 32;
+    const enc = try p.encapsulate(&addr.kem_ek, p.hashDomain("lattica:v1:kem-encaps", &.{ &attacker_ovk, &cm }));
+    const key = p.deriveNoteKey(&enc.ss, &enc.ct, &cm);
+    const ct = try p.seal(a, key, &note.toBytes(), &cm);
+    defer a.free(ct);
+    const tn = TransmittedNote{ .cm = cm, .kem_ct = enc.ct, .ciphertext = ct };
+    var evk = try exch.exchangeViewingKey(a, 8, 0);
+    defer evk.deinit();
+    const found = evk.detect(a, tn) orelse return error.NotDetected;
+    try testing.expectEqual(@as(u32, 3), found.index);
+    try testing.expectEqual(addr.div, found.note.div); // re-derived, not the wire garbage
+    try testing.expect(found.note.div != 0xDEAD_BEEF);
+    // spendable: H(nk ‖ re-derived div) == the committed recipient (what the circuit recomputes)
+    try testing.expectEqualSlices(u8, &found.note.recipient, &recipientId(&exch.nk, found.note.div));
+}
+
+test "exchange mode: cm-match rejects a note whose plaintext != the on-chain commitment (no over-credit)" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const addr = try exch.exchangeAddressAt(2, 0);
+    // an attacker wants a huge value credited, addressed to a real deposit address, but the on-chain cm
+    // is some OTHER value. AEAD is sealed with aad = real_cm so `open` SUCCEEDS — only the cm-match stops it.
+    const fake = Note{ .value = 1_000_000_000, .recipient = addr.recipient_id, .div = addr.div, .rho = [_]u8{1} ** 32, .rcm = [_]u8{2} ** 32 };
+    const real_cm = [_]u8{0x55} ** 32; // an on-chain cm that is NOT fake.commitment()
+    const attacker_ovk = [_]u8{0xAB} ** 32;
+    const enc = try p.encapsulate(&addr.kem_ek, p.hashDomain("lattica:v1:kem-encaps", &.{ &attacker_ovk, &real_cm }));
+    const key = p.deriveNoteKey(&enc.ss, &enc.ct, &real_cm);
+    const ct = try p.seal(a, key, &fake.toBytes(), &real_cm);
+    defer a.free(ct);
+    const tn = TransmittedNote{ .cm = real_cm, .kem_ct = enc.ct, .ciphertext = ct };
+    var evk = try exch.exchangeViewingKey(a, 8, 0);
+    defer evk.deinit();
+    try testing.expect(evk.detect(a, tn) == null); // fake.commitment() != real_cm ⇒ rejected
+}
+
+test "exchange mode: isolation from wallet mode (neither scanner detects the other's notes)" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const sender = try account(7);
+
+    // (a) an exchange-mode note is NOT detected by wallet-mode scanning (per-index KEM keys ≠ shared key).
+    const xaddr = try exch.exchangeAddressAt(1, 0);
+    const xnote = noteTo(xaddr, 70);
+    const xtn = try encryptNote(a, &sender.ovk, xaddr, xnote);
+    defer a.free(xtn.ciphertext);
+    try testing.expect(tryDecrypt(a, exch, xtn) == null);
+    try testing.expect(exch.viewingKey().detect(a, xtn) == null);
+
+    // (b) a wallet-mode note (same recipient index, per-index KEM key) is NOT opened by the exchange scanner.
+    const waddr = try exch.addressAt(2);
+    const wnote = noteTo(waddr, 80);
+    const wtn = try encryptNote(a, &sender.ovk, waddr, wnote);
+    defer a.free(wtn.ciphertext);
+    var evk = try exch.exchangeViewingKey(a, 8, 0);
+    defer evk.deinit();
+    try testing.expect(evk.detect(a, wtn) == null);
+}
+
+test "exchange mode: a deposit to an out-of-range index opens but is unattributed (map miss)" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const sender = try account(7);
+    const addr = try exch.exchangeAddressAt(100, 0); // beyond the scanner's range
+    const note = noteTo(addr, 50);
+    const tn = try encryptNote(a, &sender.ovk, addr, note);
+    defer a.free(tn.ciphertext);
+    var evk = try exch.exchangeViewingKey(a, 8, 0); // indices 0..8 only
+    defer evk.deinit();
+    try testing.expect(evk.detect(a, tn) == null); // AEAD opens (shared key) but recipient not in the map
+}
+
+test "exchange mode: distinct users get distinct unlinkable addresses, each credited correctly" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const s1 = try account(7);
+    const s2 = try account(8);
+    const user3 = try exch.exchangeAddressAt(3, 0);
+    const user4 = try exch.exchangeAddressAt(4, 0);
+    // distinct recipient ids + divs, but SHARED kem_ek (the exchange-mode property)
+    try testing.expect(!std.mem.eql(u8, &user3.recipient_id, &user4.recipient_id));
+    try testing.expect(user3.div != user4.div);
+    try testing.expectEqualSlices(u8, &user3.kem_ek, &user4.kem_ek);
+    const t3 = try encryptNote(a, &s1.ovk, user3, noteTo(user3, 300));
+    defer a.free(t3.ciphertext);
+    const t4 = try encryptNote(a, &s2.ovk, user4, noteTo(user4, 400));
+    defer a.free(t4.ciphertext);
+    try testing.expect(!std.mem.eql(u8, &t3.cm, &t4.cm)); // on-chain unlinkable
+    var evk = try exch.exchangeViewingKey(a, 16, 0);
+    defer evk.deinit();
+    const f3 = evk.detect(a, t3) orelse return error.NotDetected;
+    const f4 = evk.detect(a, t4) orelse return error.NotDetected;
+    try testing.expectEqual(@as(u32, 3), f3.index);
+    try testing.expectEqual(@as(u64, 300), f3.note.value);
+    try testing.expectEqual(@as(u32, 4), f4.index);
+    try testing.expectEqual(@as(u64, 400), f4.note.value);
+    try testing.expectEqualSlices(u8, &f3.note.recipient, &recipientId(&exch.nk, f3.note.div)); // spendable by nk
+}
+
+test "exchange mode: an HTLC-typed note is not attributed as a deposit" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const addr = try exch.exchangeAddressAt(2, 0);
+    const note = Note{ .value = 10, .recipient = addr.recipient_id, .div = addr.div, .note_type = 1, .rho = [_]u8{5} ** 32, .rcm = [_]u8{6} ** 32 };
+    const cm = note.commitment();
+    const ovk = [_]u8{0xCD} ** 32;
+    const enc = try p.encapsulate(&addr.kem_ek, p.hashDomain("lattica:v1:kem-encaps", &.{ &ovk, &cm }));
+    const key = p.deriveNoteKey(&enc.ss, &enc.ct, &cm);
+    const ct = try p.seal(a, key, &note.toBytes(), &cm);
+    defer a.free(ct);
+    const tn = TransmittedNote{ .cm = cm, .kem_ct = enc.ct, .ciphertext = ct };
+    var evk = try exch.exchangeViewingKey(a, 8, 0);
+    defer evk.deinit();
+    try testing.expect(evk.detect(a, tn) == null); // note_type != PLAIN ⇒ skipped
+}
+
+test "exchange mode: KEM rotation epochs isolate deposit detection" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const sender = try account(7);
+    const addr_e0 = try exch.exchangeAddressAt(2, 0);
+    const tn = try encryptNote(a, &sender.ovk, addr_e0, noteTo(addr_e0, 99));
+    defer a.free(tn.ciphertext);
+    // an epoch-1 scanner cannot detect an epoch-0 deposit (different shared KEM key)…
+    var evk1 = try exch.exchangeViewingKey(a, 8, 1);
+    defer evk1.deinit();
+    try testing.expect(evk1.detect(a, tn) == null);
+    // …the epoch-0 scanner does.
+    var evk0 = try exch.exchangeViewingKey(a, 8, 0);
+    defer evk0.deinit();
+    try testing.expect(evk0.detect(a, tn) != null);
+    // epochs change the deposit-address KEM key but not the recipient (div/nk are epoch-independent).
+    const addr_e1 = try exch.exchangeAddressAt(2, 1);
+    try testing.expect(!std.mem.eql(u8, &addr_e0.kem_ek, &addr_e1.kem_ek));
+    try testing.expectEqualSlices(u8, &addr_e0.recipient_id, &addr_e1.recipient_id);
+}
+
+test "exchange mode: addRecipient onboards a user past n_users without nk" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    const sender = try account(7);
+    const addr = try exch.exchangeAddressAt(20, 0); // beyond the initial range
+    const tn = try encryptNote(a, &sender.ovk, addr, noteTo(addr, 60));
+    defer a.free(tn.ciphertext);
+    var evk = try exch.exchangeViewingKey(a, 8, 0);
+    defer evk.deinit();
+    try testing.expect(evk.detect(a, tn) == null); // not yet onboarded
+    // the cold side precomputes (index, rid, div) and pushes it — no nk on the hot side.
+    try evk.addRecipient(20, addr.recipient_id, addr.div);
+    const found = evk.detect(a, tn) orelse return error.NotDetected;
+    try testing.expectEqual(@as(u32, 20), found.index);
+}
+
+test "exchange mode: duplicate recipient_id is rejected (diversifier-collision guard)" {
+    const a = testing.allocator;
+    const exch = try account(1);
+    var evk = try exch.exchangeViewingKey(a, 4, 0); // indices 0..4 already mapped
+    defer evk.deinit();
+    const a0 = try exch.exchangeAddressAt(0, 0);
+    // re-adding an existing recipient id must fail (the build-time guard for a 64-bit div collision)
+    try testing.expectError(error.DiversifierCollision, evk.addRecipient(99, a0.recipient_id, a0.div));
 }

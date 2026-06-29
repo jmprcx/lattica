@@ -20,7 +20,7 @@ docs in §4.
   now with the substrate's hidden `asset`) **and `htlc_air.rs` (v3: the shielded-HTLC spend — a superset
   of join-split adding the HTLC note type, `htlc_root` owner, redeem/refund modes, the time-lock, the
   hashlock binding, and the mode-independent nullifier)**, with building blocks `poseidon2_air.rs` (the
-  Poseidon2-Goldilocks permutation AIR) and `spend_air.rs`. The verify/prove **C ABI** + (de)serialization
+  Poseidon2-Goldilocks permutation AIR). The verify/prove **C ABI** + (de)serialization
   + canonical field parsing in `lattica-prover-p3/src/lib.rs` (both the `joinsplit_*` and `htlc_*` ABIs).
 - **The Zig protocol seam** — `src/poseidon2.zig` (on-chain hashing incl. `htlcRoot`/`nullifierHtlc` +
   the `note_type` lane, must equal the circuit), `src/{tx,tree,primitives}.zig` (note model + the
@@ -52,7 +52,10 @@ forward-looking roadmap docs (§6).
   (Fiat-Shamir), so outputs/anchor can't be swapped; the verifier is **fail-closed** (no backend ⇒
   reject) and **panic-isolated** (malformed proofs reject, never UB across the C ABI).
 - **Keys** — diversified addresses (unlinkable per-payment) + a delegatable **incoming viewing key**
-  (detect/decrypt without spend authority).
+  (detect/decrypt without spend authority). Two scan modes: privacy-max **wallet mode** (per-address KEM
+  key, O(addresses) detection) and **exchange mode** (one shared KEM key across deposit addresses,
+  O(1) detection, routes by the cm-bound recipient) — both wallet-layer, same `recipient = H(nk‖div)` and
+  circuit; exchange mode adds an ML-KEM anonymity (IK-CCA) assumption (see `audit-scope-p3.md` §2).
 - **v3 shielded HTLC** (`htlc_air`) — an HTLC note's owner is `htlc_root = H(DOM_HTLC ‖ redeem_tag ‖
   refund_tag ‖ hashlock ‖ timeout)`, committed (so the terms are immutable). A spend proves: the
   correct **party** for the mode (redeem ⇒ owns `redeem_tag`, refund ⇒ owns `refund_tag`); the
@@ -70,8 +73,11 @@ here) for the cross-language link.
 
 ```sh
 # 1. Circuit + ABI tests (incl. adversarial corrupted-trace soundness tests, the htlc_air redeem/
-#    refund + negative tests, and the htlc prove/verify C-ABI round-trips). 66 tests.
+#    refund + negative tests, and the htlc prove/verify C-ABI round-trips). v3-audit: 82 passed, 3 ignored.
 cd lattica-prover-p3 && cargo test --release
+
+# 1b. Slower ignored audit tests (exhaustive/fuzz-style HTLC checks). v3-audit: 3 passed.
+cd lattica-prover-p3 && cargo test --release -- --ignored
 
 # 2. The Zig protocol suite — incl. the Poseidon2 KATs that pin on-chain == circuit byte-for-byte.
 zig build test            # (from the repo root)

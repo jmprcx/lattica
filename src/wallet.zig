@@ -1,7 +1,8 @@
 //! Lattica wallet CLI.
 //!
 //! `lattica-wallet demo` runs a complete post-quantum shielded transfer end to end against an
-//! in-memory chain and narrates every step. `keygen` prints a deterministic account, and
+//! in-memory chain and narrates every step. `exchange` demos the shared-KEM exchange deposit-address
+//! flow (per-user deposit addresses, O(1) detection). `keygen` prints a deterministic account, and
 //! `bench` times the (stub) authorization proof alongside the real PQ primitive sizes.
 
 const std = @import("std");
@@ -31,12 +32,14 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "demo")) {
         try demo(a);
+    } else if (std.mem.eql(u8, cmd, "exchange")) {
+        try exchangeDemo(a);
     } else if (std.mem.eql(u8, cmd, "keygen")) {
         try keygen();
     } else if (std.mem.eql(u8, cmd, "bench")) {
         try bench(init.io);
     } else {
-        std.debug.print("unknown command: {s}\nusage: lattica-wallet [demo|keygen|bench]\n", .{cmd});
+        std.debug.print("unknown command: {s}\nusage: lattica-wallet [demo|exchange|keygen|bench]\n", .{cmd});
         std.process.exit(2);
     }
 }
@@ -172,4 +175,48 @@ fn demo(a: std.mem.Allocator) !void {
 
     std.debug.print("\nEvery cryptographic step above relies only on hash and lattice hardness —\n", .{});
     std.debug.print("no elliptic-curve discrete log anywhere. Quantum-safe by construction.\n", .{});
+}
+
+fn exchangeDemo(a: std.mem.Allocator) !void {
+    std.debug.print("=== Lattica: exchange deposit-address demo (shared-KEM, O(1) detection) ===\n\n", .{});
+
+    node.mock.install();
+    defer node.mock.uninstall();
+
+    var chain = try node.Chain.init(a);
+    const exch = try tx.FullKey.fromSeed([_]u8{42} ** 32);
+    const epoch: u32 = 0;
+    const n_users: u32 = 4;
+    std.debug.print("One exchange wallet hands each user a distinct diversified DEPOSIT address (indices\n", .{});
+    std.debug.print("0..{d}) that all share ONE ML-KEM key — so the hot scanner needs one decap per note,\n", .{n_users});
+    std.debug.print("not one per user. The spend key stays offline.\n\n", .{});
+
+    // Three users deposit (simulated here as mints straight to their deposit addresses).
+    const deposits = [_]struct { user: u32, value: u64 }{
+        .{ .user = 0, .value = 500 },
+        .{ .user = 2, .value = 1200 },
+        .{ .user = 3, .value = 75 },
+    };
+    for (deposits) |d| {
+        const addr = try exch.exchangeAddressAt(d.user, epoch);
+        var seed: [32]u8 = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, seed[0..4], d.user, .little);
+        _ = try chain.bootstrapMint(addr, d.value, seed);
+        std.debug.print("[deposit] user #{d} ← {d}; deposit address {s}… (shared KEM key)\n", .{ d.user, d.value, hex6(&addr.recipient_id) });
+    }
+    std.debug.print("\n", .{});
+
+    // The hot deposit scanner: shared KEM secret + a recipient→user map, NO spend key.
+    var evk = try exch.exchangeViewingKey(a, n_users, epoch);
+    defer evk.deinit();
+    std.debug.print("[scan]    scanning {d} on-chain notes with the exchange viewing key (one decap each)…\n", .{chain.transmitted.items.len});
+    var credited: u64 = 0;
+    for (chain.transmitted.items) |tn| {
+        if (evk.detect(a, tn)) |hit| {
+            credited += hit.note.value;
+            std.debug.print("          credit user #{d}: {d} (asset {d})\n", .{ hit.index, hit.note.value, hit.note.asset });
+        }
+    }
+    std.debug.print("\nTotal credited: {d}. Each deposit is attributed to its user by the committed\n", .{credited});
+    std.debug.print("recipient — not the malleable wire diversifier — and the spend key never came online.\n", .{});
 }

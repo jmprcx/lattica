@@ -32,9 +32,9 @@ older *Winterfell* reviewer guide — reference only; superseded by this for pro
 ## 1. Scope
 
 **In scope (to be audited):**
-- The circuit: `lattica-prover-p3/src/{joinsplit_air,poseidon2_air,spend_air}.rs` — the AIR
+- The circuit: `lattica-prover-p3/src/{joinsplit_air,htlc_air,poseidon2_air}.rs` — the AIR
   constraints, trace generation, periodic columns, and the cross-region binding (`joinsplit_air` is
-  the production circuit; `poseidon2_air`/`spend_air` are its building blocks).
+  the production circuits; `poseidon2_air` is their Poseidon2 permutation building block).
 - The verifier/prover boundary: `lattica-prover-p3/src/lib.rs` — `lattica_joinsplit_verify` /
   `lattica_joinsplit_prove` C ABI, the `JoinSplitPublicInputs` + witness parsing, canonical
   field-element checks, fail-closed + panic-isolated behavior, proof (de)serialization.
@@ -66,30 +66,49 @@ differential oracle for the hashes, not a production artifact.
     Fiat–Shamir in the ROM. Soundness level **≈103-bit proven / ~127-bit conjectured**, machine-
     checked (`docs/soundness-budget.md`, `production_security_budget` test).
   - **Transparency:** no trusted setup. **Post-quantum:** no elliptic curves / pairings. Stable Rust.
-- **What the proof guarantees** (for one spend, current 1-in/1-out — generalized in §6): there exist
-  hidden `(nk, value, rho, rcm, path)` such that the spent note `cm = H(recipient,value,rho,rcm)`
-  with `recipient = H(nk)` is a leaf at the proven path under the public `anchor`; the revealed `nf`
-  is its nullifier; the public `out_cm` commits to `out_value`; `value = out_value + fee`;
-  `value, out_value < 2^BITS`; and the proof is bound to the public `tx_binding`.
+  - **ML-KEM (note encryption).** IND-CCA for note secrecy. **Exchange mode additionally assumes ML-KEM
+    ciphertext anonymity / key-privacy (IK-CCA)** — that a `kem_ct` is unlinkable to its `ek` — for
+    cross-deposit unlinkability when many deposit addresses share one KEM key (Grubbs–Maram–Paterson,
+    EUROCRYPT 2022). Wallet mode does **not** rely on this (distinct keys ⇒ unconditional). No forward
+    secrecy: on-chain `kem_ct`s are permanent, so a shared-key compromise opens that epoch's deposit
+    history — deanonymization only (`nk` stays cold). This is **wallet-layer, not consensus**: both modes
+    use the same `recipient = H(nk‖div)`, commitment, nullifier, and circuit, so consensus soundness is
+    unaffected by the choice of address mode.
+- **What the join-split proof guarantees:** for each of `N=2` inputs there exist hidden note
+  openings `(nk, div, asset, value, rho, rcm, path)` whose commitments are members under the public
+  `anchor`, whose public nullifiers bind the note position, and whose notes all share the hidden
+  asset id. For each of `M=2` outputs, the proof binds the public output commitment. It enforces
+  `Σ input_value + mint = Σ output_value + fee`, value/range bounds `< 2^BITS`, and the public
+  `tx_binding`.
+- **What the HTLC proof adds:** `note_type` distinguishes PLAIN vs HTLC notes, HTLC notes commit
+  `owner = htlc_root(redeem_tag, refund_tag, hashlock, timeout)`, redeem/refund party tags are
+  mode-selected, redeem binds the note hashlock to public `redeem_hashlock`, timeout comparison uses
+  public `current_height`, `mint` is forced to zero, and the HTLC nullifier is owner-based and
+  mode-independent.
 - **What the proof does NOT guarantee (node's responsibility):** `nf` not already spent; `anchor` is
   a valid historical root; `fee` matches policy; transaction-level authorization/signatures outside
   the shielded statement.
 
 ## 3. The statement under audit (current artifact)
 
-Eight Poseidon2 blocks, height 2048, hiding (ZK) FRI PCS. Public inputs (17 field elements):
-`root(4) ‖ nf(4) ‖ out_cm(4) ‖ fee(1) ‖ tx_binding(4)`.
+The production artifact is `joinsplit_air` (`N_IN=2`, `M_OUT=2`) plus the v3 `htlc_air`
+extension. Both use Poseidon2-Goldilocks, depth-32 membership paths, hiding (ZK) FRI PCS, and the
+same transaction binding model.
 
-| # | Region | Constraint |
+Join-split public inputs are 26 Goldilocks field elements:
+`anchor(4) ‖ nf_0(4) ‖ nf_1(4) ‖ out_cm_0(4) ‖ out_cm_1(4) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)`.
+HTLC public inputs append `current_height(1) ‖ redeem_hashlock(4)` for 31 field elements.
+
+| Region | Join-split constraint | HTLC delta |
 |---|---|---|
-| 0 | ownership | `recipient = H(nk)` (4-element digest) |
-| 1 | commitment | `cm = H(recipient, value, rho, rcm)` |
-| 2..5 | membership | `cm` folds up a **general-position** depth-`DEPTH` path to the public `root` |
-| 6 | nullifier | `nf = H(nk, rho, pos)` (public) |
-| 7 | output | `out_cm = H(out_recipient, out_value, out_rho, out_rcm)` (public) |
-| — | balance | `value = out_value + fee` |
-| — | range | `value, out_value < 2^BITS` (running-remainder; no wraparound mod p) |
-| — | tx-binding | bound via Fiat–Shamir (public input) |
+| ownership | `recipient = H(DOM_OWN, nk0, nk1, div)` | PLAIN uses recipient; HTLC uses `htlc_root` owner |
+| commitment | two-permutation note commitment binds owner, value, rho, rcm, hidden `asset`, `note_type` | `note_type` boolean selects PLAIN/HTLC |
+| membership | each input commitment folds up a general-position depth-`DEPTH` path to public `anchor` | unchanged |
+| nullifier | PLAIN `nf = H(DOM_NF, nk, rho, pos)` | HTLC `nf = H(DOM_NF_HTLC, owner, rho, pos)` mode/party-independent |
+| outputs | output commitments are public inputs and the single source for node tree insertion | output asset matches hidden transaction asset |
+| balance/range | `Σin + mint = Σout + fee`, values/fee/mint range-checked `< 2^BITS` | HTLC forces `mint = 0`; also range-checks `current_height`/timeout slack |
+| HTLC access | not applicable | mode-selected party tag, redeem hashlock binding, timeout comparison |
+| tx-binding | public `tx_binding` bound by Fiat-Shamir | additionally binds `current_height`, reduced hashlock, and raw redeem preimage in node body |
 
 Cross-region binding uses **persistent columns** (`nk, rho, value, out_value`, constant across the
 trace, pinned per block) and **period-256 one-hot boundary selectors**; within-block Poseidon2 rounds
@@ -164,8 +183,8 @@ modeled as a random oracle. Properties:
 
 ## 6. Join-split (N-in / M-out) — **landed** *(decision 2026-06-26; built)*
 
-`joinsplit_air` implements the audit-target shape (the 1-in/1-out `full_spend_air` is kept as the
-simpler reference):
+`joinsplit_air` implements the audit-target N-in/M-out shape. The v3 `htlc_air` circuit extends the
+same transaction substrate with HTLC owner, mode, hashlock, timeout, and owner-nullifier constraints:
 - **N input notes** (`N_IN`), each: ownership `recipient = H(DOM_OWN ‖ nk)`, commitment
   `cm = H(DOM_CM ‖ recipient ‖ value ‖ rho ‖ rcm)`, general-position membership to a **shared public
   `anchor`**, and a revealed nullifier `nf_i = H(DOM_NF ‖ nk ‖ rho ‖ pos)` (A1).
@@ -221,7 +240,7 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | ABI fuzz / adversarial tests (beyond fail-closed) | ❌ |
 | Threat model + scope + frozen params (this doc) | ✅ |
 | ZK blinding from a CSPRNG, fresh per proof | ✅ (`ChaCha20Rng`; re-randomization tested) |
-| Consolidate to ONE production circuit (`full_spend_air` + spend ABI + bins removed) | ✅ joinsplit_air only |
+| Remove pre-Plonky3 / one-input production surfaces | ✅ join-split + HTLC only; legacy spend surface removed |
 | Protocol completeness decisions (asset/keys/randomness/issuance) | ✅ (`docs/protocol-v1-decisions.md`) |
 | Mint (shielded issuance) in the circuit | ✅ (`Σin + mint = Σout + fee`, range-checked, ABI+ffi) |
 | 128-bit spend authority (`nk` = 2 field elements) | ✅ (M6 §2a; found+fixed during cutover) |
@@ -234,19 +253,23 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | Constraint self-audit current (covers `mint`, 128-bit `nk`) | ✅ (`docs/joinsplit-constraint-audit.md`; re-audited pass 3, no gaps) |
 | ≥128-bit note randomness (`rho`/`rcm`) | ✅ two-permutation commitment (128-bit; rho1-persistence soundness fix + regression test) |
 | Diversified addresses + delegatable incoming viewing key | ✅ (`tx.zig` hierarchy; circuit recipient = H(nk‖d); unlinkable addresses, watch-only viewing) |
+| Exchange deposit mode (shared-KEM, O(1) detection) | ✅ (`tx.zig`: `exchangeAddressAt` / `ExchangeViewingKey`; wallet-layer only, no circuit change; routes by cm-bound recipient (M-3-safe); new IK-CCA assumption + hot-scanner threat model in §2) |
 | ≥128-bit *proven* soundness | ⏳ ~103 proven / ~127 conjectured = Goldilocks ceiling (larger field needed) — auditor sign-off |
 
 > **Self-review note (2026-06-26):** a recheck found the prover was seeding the hiding-PCS / Merkle
 > salt RNG with a *fixed* non-cryptographic `SmallRng` — so the "zero-knowledge" proofs were not
 > re-randomized (identical blinding every proof), defeating privacy. Fixed in `joinsplit_air` to a
 > ChaCha20 CSPRNG seeded from the OS per proof, with a `zk_blinding_is_fresh_per_proof` test. The
-> reference `full_spend_air` still uses the dev RNG and should be dropped or gated before audit.
+> The old one-input reference circuit has since been removed; the production surfaces are
+> `joinsplit_air` and `htlc_air`.
 
 ## 8. Reproduce / verify
 
-- `cd lattica-prover-p3 && cargo test --release` — 22 tests (circuit, ABI, security budget).
-- `cargo run --release --bin lattica-prover-p3` — end-to-end demo (M1/M2 + M4a/b/c + C-04 report).
-- `cargo run --release --bin sweep` / `--bin batch` / `--bin field_compare` — parameter / batch /
-  field measurements behind `docs/soundness-budget.md`.
-- `production_security_budget` test gates proven ≥ 100, conjectured ≥ 128.
-- Native-hash differential checks: the `native_*` tests in each circuit module.
+- `cd lattica-prover-p3 && cargo test --release` — v3-audit: 82 passed, 3 ignored.
+- `cd lattica-prover-p3 && cargo test --release -- --ignored` — slower exhaustive/fuzz-style HTLC
+  audit checks; v3-audit: 3 passed.
+- `zig build test` and `zig build check-production` — Zig protocol suite plus production-mode compile
+  gate.
+- `scripts/run-real-integration.sh` — real Rust prover/verifier integration for join-split and HTLC
+  lifecycle; may require running outside a filesystem sandbox so Zig can read its stdlib.
+- `cd lattica-prover-p3 && cargo run --release --bin dump_p2` — regenerate Poseidon2 constants/KATs.
