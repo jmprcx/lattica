@@ -6,6 +6,7 @@
 
 pub mod joinsplit_air;
 pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsplit_air, extended
+pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-split tiling + tx-root fold)
 pub mod poseidon2_air;
 
 use core::slice;
