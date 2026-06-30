@@ -659,7 +659,7 @@ pub(crate) fn query_commit_merkle(
     proof: &Proof<MyConfig>,
     pvs: &[Val],
     q: usize,
-) -> ([Val; 4], Vec<([Val; 4], bool)>, [Val; 4]) {
+) -> ([Val; 4], [Val; 4], Vec<([Val; 4], bool)>, [Val; 4]) {
     use p3_field::{BasedVectorSpace, PrimeField64};
     use p3_symmetric::CryptographicHasher;
     let (_, _, _, _, index_felts) = full_transcript_challenges(config, proof, pvs);
@@ -679,6 +679,7 @@ pub(crate) fn query_commit_merkle(
     let sibling = step1.sibling_values[0];
     let (g0, g1) = if bit1 == 0 { (e1, sibling) } else { (sibling, e1) };
     let flat: Vec<Val> = [g0, g1].iter().flat_map(|x| x.as_basis_coefficients_slice().to_vec()).collect();
+    let group: [Val; 4] = flat.clone().try_into().unwrap(); // the leaf preimage (the arity-2 group)
     let leaf: [Val; 4] = MyHash::new(default_goldilocks_poseidon2_8()).hash_iter(flat);
 
     // path: parent index = index >> 2 (after rounds 0,1), at the round-1 folded height 2^8.
@@ -687,7 +688,7 @@ pub(crate) fn query_commit_merkle(
     let path: Vec<([Val; 4], bool)> = path_siblings.iter().enumerate().map(|(lvl, &s)| (s, (parent >> lvl) & 1 == 1)).collect();
     let depth = path_siblings.len();
     let cap_entry = fri.commit_phase_commits[1].roots()[parent >> depth];
-    (leaf, path, cap_entry)
+    (leaf, group, path, cap_entry)
 }
 
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)

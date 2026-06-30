@@ -2692,6 +2692,161 @@ pub(crate) fn st_build_trace(
     RowMajorMatrix::new(t, ST_W)
 }
 
+// =================================================================================================
+// Phase 4.B — the COMMIT-PHASE Merkle opening inline (the other opening type): the reconstructed arity-2
+// fold group {e_r, sib_r} is hashed to a leaf (4-felt preimage = the group flattened) and authenticated up
+// to the round's commitment cap. Same structure as the input-Merkle but the leaf absorbs the 4-felt group
+// and the path is shorter (round 1: depth 2). This binds the fold's SIBLINGS to the committed FRI codeword.
+// Validated vs the real proof (query_commit_merkle, round 1).
+// =================================================================================================
+
+const CMT_SIB: usize = 8;
+const CMT_BIT: usize = 12;
+const CMT_W: usize = 13;
+const CMT_DEPTH: usize = 2; // round-1 commit-phase path depth (log_folded − cap_height = 8 − 6)
+const CMT_NBLOCKS: usize = 1 + CMT_DEPTH; // leaf + 2 merges
+const CMT_NBLOCKS_PAD: usize = 4; // pow2 (already 2^7 = 128 rows)
+const CMT_P_BLOCK_LAST: usize = 11;
+const CMT_P_TERM: usize = 12;
+
+#[allow(dead_code)]
+pub(crate) struct CommitMerkleTileAir;
+
+impl CommitMerkleTileAir {
+    fn height(&self) -> usize {
+        CMT_NBLOCKS_PAD * BLOCK
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table();
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..CMT_NBLOCKS_PAD {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl);
+        let mut term = vec![Val::ZERO; h];
+        term[(CMT_NBLOCKS - 1) * BLOCK + BLOCK - 1] = Val::ONE;
+        cols.push(term);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for CommitMerkleTileAir {
+    fn width(&self) -> usize {
+        CMT_W
+    }
+    fn num_public_values(&self) -> usize {
+        4 + 4 // the group (leaf preimage, 4 felts) + the cap entry (4)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        CMT_P_TERM + 1
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CommitMerkleTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(step);
+        }
+        let bit = cur[CMT_BIT].clone();
+        builder.assert_zero(bit.clone() * (one.clone() - bit));
+
+        // block 0 = the leaf hash: absorb the 4-felt group → state = [group, 0,0,0,0].
+        {
+            let mut fr = builder.when_first_row();
+            for k in 0..4 {
+                fr.assert_zero(cur[k].clone() - pis[k].clone());
+            }
+            for i in 4..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // bit-ordered block link (block i output → block i+1).
+        {
+            let bl = p[CMT_P_BLOCK_LAST].clone();
+            let nb = nxt[CMT_BIT].clone();
+            for k in 0..4 {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[CMT_SIB + k].clone())));
+                builder.when_transition().assert_zero(bl.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[CMT_SIB + k].clone() + nb.clone() * cur[k].clone())));
+            }
+        }
+        // terminal: the last active block's output == the committed cap entry.
+        let term = p[CMT_P_TERM].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[4 + k].clone()));
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn cm2_build_trace(group: [Val; 4], path: &[([Val; 4], bool)]) -> (RowMajorMatrix<Val>, [Val; 4]) {
+    let air = CommitMerkleTileAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * CMT_W];
+    let mut input = [Val::ZERO; W];
+    input[..4].copy_from_slice(&group); // the leaf preimage in the rate lanes
+    let rows = native_steps(input);
+    for r in 0..BLOCK {
+        t[r * CMT_W..r * CMT_W + W].copy_from_slice(&rows[r]);
+    }
+    let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+    for (l, &(sib, b)) in path.iter().enumerate() {
+        let blk = 1 + l;
+        let mut inp = [Val::ZERO; W];
+        if b {
+            inp[..4].copy_from_slice(&sib);
+            inp[4..].copy_from_slice(&node);
+        } else {
+            inp[..4].copy_from_slice(&node);
+            inp[4..].copy_from_slice(&sib);
+        }
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * CMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+            t[base + CMT_SIB..base + CMT_SIB + 4].copy_from_slice(&sib);
+            t[base + CMT_BIT] = if b { Val::ONE } else { Val::ZERO };
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    let terminal = node;
+    for blk in CMT_NBLOCKS..CMT_NBLOCKS_PAD {
+        let mut inp = [Val::ZERO; W];
+        inp[..4].copy_from_slice(&node);
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * CMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    (RowMajorMatrix::new(t, CMT_W), terminal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -3197,7 +3352,7 @@ mod tests {
         let (proof, pvs) = gen_const_proof(&config, 42, 6);
         let mut depth = 0;
         for q in [0usize, 1, MILESTONE_QUERIES - 1] {
-            let (leaf, path, cap_entry) = query_commit_merkle(&config, &proof, &pvs, q);
+            let (leaf, _group, path, cap_entry) = query_commit_merkle(&config, &proof, &pvs, q);
             depth = path.len();
             let prf = prove_opening(leaf, &path, cap_entry);
             assert!(verify_opening(&prf, leaf, cap_entry), "commit-phase Merkle path must reach the committed cap entry (q {q})");
@@ -3519,6 +3674,31 @@ mod tests {
             assert!(verify(&config, &air, &prf, &bad2).is_err(), "tampered cap entry ⇒ reject");
         }
         println!("Phase 4.B super-tile: arith (query verify) + inline input-Merkle (opened value → leaf → path → cap), bound, validated");
+    }
+
+    /// Phase 4.B: the inline COMMIT-PHASE Merkle opening (round 1) — the fold group hashes to a leaf and
+    /// authenticates to the round-1 commitment cap. The other opening type, validated vs the real proof.
+    #[test]
+    #[ignore = "slow: Phase 4.B inline commit-phase Merkle (round 1) vs the real proof"]
+    fn phase4b_commit_merkle_tile_matches_native() {
+        use super::{cm2_build_trace, CommitMerkleTileAir};
+        use crate::recursion::native_fri::query_commit_merkle;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let air = CommitMerkleTileAir;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (_leaf, group, path, cap_entry) = query_commit_merkle(&config, &proof, &pvs, q);
+            let (trace, terminal) = cm2_build_trace(group, &path);
+            assert_eq!(terminal, cap_entry, "in-circuit commit-phase terminal == committed cap entry (q {q})");
+            let mut pis = group.to_vec();
+            pis.extend_from_slice(&cap_entry);
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "inline commit-phase Merkle must authenticate (q {q})");
+            let mut bad = pis.clone();
+            bad[0] += Val::ONE; // tamper the group ⇒ leaf changes ⇒ terminal ≠ cap entry
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered fold group ⇒ reject");
+        }
+        println!("Phase 4.B inline commit-phase Merkle: fold group → leaf → path → committed cap entry, validated per query");
     }
 
     /// Phase 4.B (structural scaling COMPLETE): all 32 super-tiles in ONE AIR — every query's arith verifies
