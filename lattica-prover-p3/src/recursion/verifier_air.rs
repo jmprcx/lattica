@@ -221,6 +221,128 @@ pub fn verify_transcript(proof_bytes: &[u8], alpha: [Val; 2], zeta: [Val; 2]) ->
 }
 
 // =================================================================================================
+// Component 3b-i — in-circuit MMCS leaf hash (PaddingFreeSponge).
+// A FRI query opens a committed matrix ROW; the MMCS hashes that row to a 4-felt leaf digest via
+// `MyHash = PaddingFreeSponge<Perm,8,4,4>`, then merges up the path (the validated `fri_merkle` gadget).
+// This builds the leaf hash in-circuit: a Poseidon2 sponge that OVERWRITES the rate lanes, CARRIES the
+// capacity, and (unlike the challenger) folds in NO prefix-free count. Validated vs native `MyHash`.
+// Worked example: a length-8 row → 2 sponge blocks → the 4-felt leaf digest.
+// =================================================================================================
+
+const LH_LEN: usize = 8; // row length (a multiple of RATE)
+const LH_BLOCKS: usize = LH_LEN / RATE; // 2
+const LH_HEIGHT: usize = LH_BLOCKS * BLOCK;
+const LH_P_BLOCK_LAST: usize = 11;
+const LH_N_PERIODIC: usize = 12;
+
+fn lh_periodic() -> Vec<Vec<Val>> {
+    let mut cols = periodic_table();
+    let mut block_last = vec![Val::ZERO; BLOCK];
+    block_last[BLOCK - 1] = Val::ONE;
+    cols.push(block_last);
+    cols
+}
+
+pub struct LeafHashAir;
+
+impl BaseAir<Goldilocks> for LeafHashAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        4 // the leaf digest
+    }
+    fn num_periodic_columns(&self) -> usize {
+        LH_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        lh_periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for LeafHashAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+
+        // Poseidon2 rounds (reused).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(c);
+        }
+
+        // block 0 starts from the all-zero capacity (NO prefix-free count) ...
+        {
+            let mut fr = builder.when_first_row();
+            for i in RATE..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // ... capacity carries unchanged across blocks (rate lanes free = the next row chunk) ...
+        {
+            let bl = p[LH_P_BLOCK_LAST].clone();
+            for i in RATE..W {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+        }
+        // ... the final block's rate lanes are the leaf digest.
+        {
+            let mut lr = builder.when_last_row();
+            for k in 0..4 {
+                lr.assert_zero(cur[k].clone() - pis[k].clone());
+            }
+        }
+    }
+}
+
+fn lh_build_trace(row: &[Val]) -> RowMajorMatrix<Val> {
+    assert_eq!(row.len(), LH_LEN);
+    let mut t = vec![Val::ZERO; LH_HEIGHT * W];
+    let mut cap = [Val::ZERO; W - RATE];
+    for blk in 0..LH_BLOCKS {
+        let mut input = [Val::ZERO; W];
+        input[..RATE].copy_from_slice(&row[blk * RATE..blk * RATE + RATE]);
+        input[RATE..].copy_from_slice(&cap); // capacity carries; no count
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        cap.copy_from_slice(&native_permute(input)[RATE..]);
+    }
+    RowMajorMatrix::new(t, W)
+}
+
+/// Prove that `MyHash(row) == digest` (the leaf hash), with the digest as public output.
+pub fn prove_leaf_hash(row: &[Val], digest: [Val; 4]) -> Vec<u8> {
+    postcard::to_allocvec(&prove(&make_config(), &LeafHashAir, lh_build_trace(row), &digest.to_vec())).expect("serialize")
+}
+
+pub fn verify_leaf_hash(proof_bytes: &[u8], digest: [Val; 4]) -> bool {
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), &LeafHashAir, &proof, &digest.to_vec()).is_ok()
+}
+
+// =================================================================================================
 // Component 4 — in-circuit domain selectors at ζ.
 // Computes the LagrangeSelectors p3 uses in verify_constraints, in-circuit, from ζ + the domain
 // parameters: for the trace domain (shift = 1 ⇒ u = ζ),
@@ -687,6 +809,19 @@ mod tests {
             verify_transcript(&p, alpha, zeta)
         }));
         assert!(matches!(outcome, Ok(false) | Err(_)));
+    }
+
+    #[test]
+    #[ignore = "slow: in-circuit MMCS leaf hash vs native MyHash"]
+    fn leaf_hash_matches_native() {
+        use p3_symmetric::CryptographicHasher;
+        let row = felts(7, LH_LEN);
+        let digest: [Val; 4] = MyHash::new(default_goldilocks_poseidon2_8()).hash_iter(row.iter().copied());
+        let proof = prove_leaf_hash(&row, digest);
+        assert!(verify_leaf_hash(&proof, digest), "in-circuit leaf hash must match native MyHash");
+        let mut bad = digest;
+        bad[0] += Val::ONE;
+        assert!(!verify_leaf_hash(&proof, bad));
     }
 
     #[test]

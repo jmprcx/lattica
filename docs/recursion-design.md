@@ -168,10 +168,13 @@ constraints) + re-implementing the FRI query-loop orchestration in-circuit.
   - **3a — FRI commit-phase challenge derivation: DONE + validated (`FriTranscriptAir`).** Extends the
     transcript past ζ to observe each FRI round commitment and squeeze every β_r (with α, ζ); the
     in-circuit challenges match the native `ModelChallenger` for R=4 rounds; tampered absorb rejected.
-  - **3b — the query loop proper (remaining bulk):** parse a real `p3` `Proof` into trace columns, add
-    the query-index `sample_bits` + variable-length absorb, then run all 96 queries (input opening +
-    per-round Merkle openings via the `fri_merkle` gadget + folds via `fri_fold` + "roll in reduced
-    openings" / the DEEP combination) and the `final_poly` check.
+  - **3b-i — in-circuit MMCS leaf hash: DONE + validated (`LeafHashAir`).** Hashes a committed matrix row
+    to a 4-felt leaf digest via the `PaddingFreeSponge` (rate-overwrite + capacity-carry, no prefix-free
+    count) in-circuit; validated vs native `MyHash`. The leaf level beneath the `fri_merkle` path-merge.
+  - **3b — the query loop proper (remaining bulk):** wire it up — add the query-index `sample_bits` + the
+    reduced-opening / DEEP combination, then run all 96 queries (leaf hash [3b-i] → path merge
+    [`fri_merkle`] → fold [`fri_fold`], with reduced-opening roll-ins) + the `final_poly` check, against a
+    real proof's columns, validated end-to-end vs `pcs.verify`. This wiring is the multi-week core.
 - **Component 4 — in-circuit domain selectors at ζ: DONE + validated (`DomainSelectorsAir`).** Computes
   `z_h = ζ^(2^log_size)−1` (a squaring chain), `is_first = z_h/(ζ−1)`, `is_last = z_h/(ζ−g⁻¹)`,
   `is_transition = ζ−g⁻¹`, `inv_vanishing = z_h⁻¹` in-circuit (F_p², in-circuit inverses), validated to
