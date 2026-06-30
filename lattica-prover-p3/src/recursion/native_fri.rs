@@ -178,7 +178,7 @@ pub fn final_query_point(domain_index: usize, log_global_max_height: usize) -> C
     Challenge::from(Val::two_adic_generator(log_global_max_height).exp_u64(rev as u64))
 }
 
-fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
+pub(crate) fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
     let mut r = 0;
     for _ in 0..bits {
         r = (r << 1) | (x & 1);

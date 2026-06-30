@@ -18,7 +18,7 @@
 //! the native challenger (`preamble_challenges`); its eval is composed into the full MonolithAir in Phase 4.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_field::PrimeCharacteristicRing;
+use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 
@@ -343,6 +343,77 @@ pub(crate) fn ft_build_trace(block_inputs: &[[Val; W]]) -> RowMajorMatrix<Val> {
         last_out = native_permute(input);
     }
     RowMajorMatrix::new(t, W)
+}
+
+// =================================================================================================
+// Phase 3 (part 1) — the DEEP query point: x = GENERATOR · g^reverse_bits(index, log_height), where
+// g = two_adic_generator(log_height). Computed in-circuit from the query index BITS as a product chain
+// over the bit-reversed powers (x = GENERATOR · Π_i (b_i ? g^(2^(N-1-i)) : 1)), since the bit at
+// position i of the index becomes bit (N-1-i) of the reversed exponent. Base-field arithmetic.
+// Validated vs native_fri's `x` (open_input). The index bits come from the validated SampleBitsAir.
+// =================================================================================================
+
+const DP_LOG_HEIGHT: usize = 10; // milestone log_global_max_height (= degree_bits 6 + log_blowup 4)
+const DP_BITS: usize = 0; // index bits b_0..b_{N-1}
+const DP_ACC: usize = DP_LOG_HEIGHT; // product-chain accumulators acc_1..acc_N
+const DP_WIDTH: usize = 2 * DP_LOG_HEIGHT;
+
+#[allow(dead_code)] // standalone-validated in Phase 3; composed into MonolithAir's query region in Phase 4
+pub(crate) struct DeepPointAir;
+
+impl BaseAir<Goldilocks> for DeepPointAir {
+    fn width(&self) -> usize {
+        DP_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        1 // the DEEP point x
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for DeepPointAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let mut fr = builder.when_first_row();
+
+        // index bits are boolean
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[DP_BITS + i].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        // product chain: acc_{i+1} = acc_i · (1 + b_i·(c_i − 1)),  c_i = g^(2^(N-1-i)),  acc_0 = 1.
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[DP_BITS + i].clone() * (ci - one.clone());
+            fr.assert_zero(cur[DP_ACC + i].clone() - prev * factor);
+            prev = cur[DP_ACC + i].clone();
+        }
+        // x = GENERATOR · acc_N
+        let gen = AB::Expr::from(<Goldilocks as Field>::GENERATOR);
+        fr.assert_zero(gen * cur[DP_ACC + DP_LOG_HEIGHT - 1].clone() - pis[0].clone());
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn dp_build_trace(index: usize) -> RowMajorMatrix<Val> {
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let mut r = [Val::ZERO; DP_WIDTH];
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (index >> i) & 1;
+        r[DP_BITS + i] = Val::from_u64(bit as u64);
+        let ci = g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i);
+        acc *= if bit == 1 { ci } else { Val::ONE };
+        r[DP_ACC + i] = acc;
+    }
+    let mut vals = Vec::with_capacity(8 * DP_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, DP_WIDTH)
 }
 
 #[cfg(test)]
@@ -690,5 +761,22 @@ mod tests {
         let mut bad2 = pis.clone();
         *bad2.last_mut().unwrap() += Val::ONE;
         assert!(verify(&config, &air, &prf, &bad2).is_err(), "wrong index felt ⇒ reject");
+    }
+
+    /// Phase 3 (part 1): the in-circuit DEEP query point matches native_fri's `x = GENERATOR·g^rev(index)`.
+    #[test]
+    #[ignore = "slow: Phase 3 DEEP query point vs native"]
+    fn phase3_deep_point_matches_native() {
+        use super::{dp_build_trace, DeepPointAir, DP_LOG_HEIGHT};
+        use crate::recursion::native_fri::reverse_bits_len;
+        use p3_field::{Field, TwoAdicField};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let g = Val::two_adic_generator(DP_LOG_HEIGHT);
+        for index in [0b1011010011usize, 0, 1, (1 << DP_LOG_HEIGHT) - 1, 0b0110100101] {
+            let x = <Val as Field>::GENERATOR * g.exp_u64(reverse_bits_len(index, DP_LOG_HEIGHT) as u64);
+            let prf = prove(&config, &DeepPointAir, dp_build_trace(index), &vec![x]);
+            assert!(verify(&config, &DeepPointAir, &prf, &vec![x]).is_ok(), "in-circuit DEEP point must match native (index {index})");
+            assert!(verify(&config, &DeepPointAir, &prf, &vec![x + Val::ONE]).is_err());
+        }
     }
 }
