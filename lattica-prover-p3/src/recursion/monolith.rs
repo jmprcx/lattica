@@ -1508,4 +1508,26 @@ mod tests {
         }
         println!("Phase 4 input Merkle: trace leaf → {depth} levels → committed cap entry, validated per query");
     }
+
+    /// Phase 4 (part 3b): the commit-phase Merkle opening (round 0) — the arity-2 group hashes +
+    /// authenticates to the round-0 commitment's cap entry. Validated vs the REAL proof.
+    #[test]
+    #[ignore = "slow: Phase 4 commit-phase Merkle opening vs the real proof"]
+    fn phase4_commit_merkle_matches_proof() {
+        use crate::recursion::fri_merkle::{prove_opening, verify_opening};
+        use crate::recursion::native_fri::query_commit_merkle;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let mut depth = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (leaf, path, cap_entry) = query_commit_merkle(&config, &proof, &pvs, q);
+            depth = path.len();
+            let prf = prove_opening(leaf, &path, cap_entry);
+            assert!(verify_opening(&prf, leaf, cap_entry), "commit-phase Merkle path must reach the committed cap entry (q {q})");
+            let mut bad = cap_entry;
+            bad[0] += Val::ONE;
+            assert!(!verify_opening(&prf, leaf, bad), "wrong cap entry ⇒ reject");
+        }
+        println!("Phase 4 commit-phase Merkle: round-1 group leaf → {depth} levels → committed cap entry, validated per query");
+    }
 }

@@ -647,6 +647,49 @@ pub(crate) fn query_input_merkle(
     (leaf, path, cap_entry)
 }
 
+/// Per-query commit-phase Merkle oracle (Phase 4), round 1: the reconstructed arity-2 group
+/// {e_1, sibling} (e_1 = running eval after round 0's fold; ordered by the index bit) hashes to a leaf,
+/// then authenticates up to the round-1 commitment's cap entry. Mirrors `verify_query`'s per-round
+/// `mmcs.verify_batch`. (Round 1's folded height 2^8 gives a depth-2 path = 64 rows = a power of two, the
+/// FriMerkleAir trace shape; round 0's depth-3 path would need a padded variant.)
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn query_commit_merkle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> ([Val; 4], Vec<([Val; 4], bool)>, [Val; 4]) {
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_symmetric::CryptographicHasher;
+    let (_, _, _, _, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let (ro, rounds, _, _) = query_fold_data(config, proof, pvs, q);
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+
+    // running eval after round 0's fold: e_1 = fold({ro, sib_0} by bit_0, β_0, s_0).
+    let (sib0, beta0, bit0, s0) = rounds[0];
+    let (a, b) = if bit0 { (sib0, ro) } else { (ro, sib0) };
+    let e1 = crate::recursion::fri_fold::native_fold(a, b, beta0, s0);
+
+    // round 1: group = {e_1, sibling_1} ordered by the round-1 index bit.
+    let step1 = &fri.query_proofs[q].commit_phase_openings[1];
+    let bit1 = (index >> 1) & 1;
+    let sibling = step1.sibling_values[0];
+    let (g0, g1) = if bit1 == 0 { (e1, sibling) } else { (sibling, e1) };
+    let flat: Vec<Val> = [g0, g1].iter().flat_map(|x| x.as_basis_coefficients_slice().to_vec()).collect();
+    let leaf: [Val; 4] = MyHash::new(default_goldilocks_poseidon2_8()).hash_iter(flat);
+
+    // path: parent index = index >> 2 (after rounds 0,1), at the round-1 folded height 2^8.
+    let parent = index >> 2;
+    let path_siblings = &step1.opening_proof;
+    let path: Vec<([Val; 4], bool)> = path_siblings.iter().enumerate().map(|(lvl, &s)| (s, (parent >> lvl) & 1 == 1)).collect();
+    let depth = path_siblings.len();
+    let cap_entry = fri.commit_phase_commits[1].roots()[parent >> depth];
+    (leaf, path, cap_entry)
+}
+
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
 /// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
 /// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify
