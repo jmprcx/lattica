@@ -356,15 +356,17 @@ fn verify_fri_native(
 
 /// Rebuild the input MMCS + FRI parameters deterministically (identical to the config's, since Poseidon2
 /// + the literals are fixed) — `TwoAdicFriPcs` doesn't expose them, and my FRI verify needs both.
-/// `max_log_arity` selects the FRI folding arity (1 ⇒ arity-2 FRI, the monolith's first-milestone config).
-pub(crate) fn build_mmcs_and_params(max_log_arity: usize) -> (Perm, InputMmcs, FriParameters<ChallengeMmcs>) {
+/// `max_log_arity` selects the FRI folding arity (1 ⇒ arity-2 FRI, the monolith's first-milestone config);
+/// `num_queries` selects the FRI query count (the production config is 96; the monolith milestone uses a
+/// reduced count to fit the 8 GB budget — the construction is query-count-agnostic, production restores 96).
+pub(crate) fn build_mmcs_and_params(max_log_arity: usize, num_queries: usize) -> (Perm, InputMmcs, FriParameters<ChallengeMmcs>) {
     let perm = default_goldilocks_poseidon2_8();
     let input_mmcs = InputMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6);
     let params = FriParameters {
         log_blowup: 4,
         log_final_poly_len: 0,
         max_log_arity,
-        num_queries: 96,
+        num_queries,
         commit_proof_of_work_bits: 0,
         query_proof_of_work_bits: 16,
         mmcs: ChallengeMmcs::new(input_mmcs.clone()),
@@ -372,12 +374,11 @@ pub(crate) fn build_mmcs_and_params(max_log_arity: usize) -> (Perm, InputMmcs, F
     (perm, input_mmcs, params)
 }
 
-/// Build a StarkConfig for the given FRI folding `max_log_arity` (1 = arity-2 FRI). `verify_proof`'s
-/// reconstructed params use max_log_arity=4 as an upper bound, so it validates either arity.
+/// Build a StarkConfig for the given FRI folding `max_log_arity` (1 = arity-2 FRI) + `num_queries`.
 /// (Test/oracle helper: the aggregator receives inner proofs; only tests build configs + generate them.)
 #[cfg(test)]
-pub(crate) fn make_config(max_log_arity: usize) -> MyConfig {
-    let (perm, input_mmcs, params) = build_mmcs_and_params(max_log_arity);
+pub(crate) fn make_config(max_log_arity: usize, num_queries: usize) -> MyConfig {
+    let (perm, input_mmcs, params) = build_mmcs_and_params(max_log_arity, num_queries);
     let pcs = MyPcs::new(Dft::default(), input_mmcs, params);
     MyConfig::new(pcs, Chal::new(perm))
 }
@@ -463,7 +464,7 @@ pub fn verify_proof(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &
 
     // ---- MY native FRI verify (the wiring), in place of pcs.verify ----
     // max_log_arity=4 is an upper bound in verify_query, so this validates arity-2 milestone proofs too.
-    let (_perm, input_mmcs, params) = build_mmcs_and_params(4);
+    let (_perm, input_mmcs, params) = build_mmcs_and_params(4, 96);
     verify_fri_native(&params, opening_proof, &mut challenger, &coms_to_verify, &input_mmcs)?;
 
     // ---- recompose the quotient + check the constraint relation at ζ ----
@@ -501,7 +502,7 @@ mod tests {
     #[test]
     #[ignore = "slow: COMPLETE native FRI verify (the wiring) vs p3::verify"]
     fn native_fri_verify_agrees_with_p3() {
-        let config = make_config(4);
+        let config = make_config(4, 96);
         let (mut proof, pvs) = gen_const_proof(&config, 42, 6);
 
         // p3 accepts the proof.

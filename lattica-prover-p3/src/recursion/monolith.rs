@@ -15,7 +15,7 @@
 #[cfg(test)]
 mod tests {
     use crate::poseidon2_air::BLOCK;
-    use crate::recursion::native_fri::{gen_const_proof, make_config, verify_proof, MyConfig};
+    use crate::recursion::native_fri::{gen_const_proof, make_config, MyConfig};
     use crate::recursion::native_verify::ConstAir;
     use p3_uni_stark::{verify, Proof};
 
@@ -24,6 +24,11 @@ mod tests {
     const LOG_BLOWUP: usize = 4;
     const LOG_FINAL_POLY_LEN: usize = 0;
     const EIGHT_GB: u64 = 8u64 << 30;
+    // The milestone uses a REDUCED query count: at the production 96 queries the (cap-dominated)
+    // verifier AIR is ~2^18, which exceeds 8 GB once realistic columns + the 16× LDE blowup are counted.
+    // The construction is query-count-agnostic (more queries = more identical tiles); production restores
+    // 96 via the tree (Phase 5/6). 32 queries lands the milestone at ~2^16 with comfortable 8 GB margin.
+    const MILESTONE_QUERIES: usize = 32;
 
     /// The pinned shape of an inner proof, introspected from a real proof — the inputs the monolith
     /// verifier AIR is sized around.
@@ -60,35 +65,53 @@ mod tests {
         }
     }
 
+    const DIGEST: usize = 4; // Poseidon2 hash output width
+
     /// Generous estimate of the monolith trace height (rows) for this inner proof, from the per-region
     /// block budget the AIR phases will fill. Each Poseidon2 permutation = `BLOCK` rows; each Merkle
-    /// level = one compression = one block; the leaf hash = ceil(width/RATE) blocks.
+    /// level = one compression = one block; the leaf hash + every commitment-cap absorb = ceil(felts/RATE)
+    /// blocks. NOTE: a commitment is a `MerkleCap` of `2^min(cap_height, log_height)` digests (= that many
+    /// × DIGEST felts), absorbed IN FULL into the transcript — the transcript is cap-dominated.
     fn monolith_trace_height(g: &InnerGeometry) -> usize {
         let merkle_depth = |log_h: usize| log_h.saturating_sub(g.cap_height); // levels above the cap
-        let leaf_blocks = |width: usize| width.div_ceil(RATE).max(1);
+        let absorb_blocks = |felts: usize| felts.div_ceil(RATE).max(1);
+        let cap_felts = |log_h: usize| (1usize << g.cap_height.min(log_h)) * DIGEST;
 
-        // Input opening: the trace batch (width = trace_width) + the quotient batch (num_quotient_chunks
-        // ext columns = 2× base felts), each one Merkle opening at ~the global max height.
+        // ---- transcript region (cap-dominated): preamble (instance scalars + trace cap + quotient cap)
+        //      + per-round commit caps + final_poly + arities + the squeeze-only index tail ----
+        let instance_scalar_felts = 3 + g.trace_width; // degree_bits, base_degree_bits, preprocessed_width, PVs
+        let preamble_blocks = absorb_blocks(instance_scalar_felts)
+            + absorb_blocks(cap_felts(g.log_global_max_height)) // trace cap → α
+            + absorb_blocks(cap_felts(g.log_global_max_height)); // quotient cap → ζ
+        let mut commit_cap_blocks = 0usize;
+        let mut h = g.log_global_max_height;
+        for &la in &g.log_arities {
+            h -= la;
+            commit_cap_blocks += absorb_blocks(cap_felts(h)); // each round's commit cap
+        }
+        let index_blocks = g.num_queries; // squeeze + SampleBitsAir per query (generous ~1 block/query)
+        let transcript_blocks = preamble_blocks + commit_cap_blocks + absorb_blocks(2) /*final_poly*/
+            + absorb_blocks(g.num_rounds) /*arities*/ + index_blocks;
+
+        // ---- per-query region ----
+        let leaf_blocks = |width: usize| width.div_ceil(RATE).max(1);
         let input_blocks = {
             let depth = merkle_depth(g.log_global_max_height);
-            let trace_batch = leaf_blocks(g.trace_width) + depth;
-            let quot_batch = leaf_blocks(g.num_quotient_chunks * 2) + depth;
+            let trace_batch = leaf_blocks(g.trace_width) + depth + 1 /* cap membership */;
+            let quot_batch = leaf_blocks(g.num_quotient_chunks * 2) + depth + 1;
             trace_batch + quot_batch
         };
-        // Commit phase: per round, leaf-hash the arity group + Merkle path at the folded height + the fold.
         let mut commit_blocks = 0usize;
         let mut h = g.log_global_max_height;
         for &la in &g.log_arities {
             let folded_h = h - la;
             let arity = 1usize << la;
-            commit_blocks += leaf_blocks(arity * 2) + merkle_depth(folded_h) + 1 /* fold */;
+            commit_blocks += leaf_blocks(arity * 2) + merkle_depth(folded_h) + 1 /* fold */ + 1 /* cap membership */;
             h = folded_h;
         }
-        // DEEP reduced-opening + roll-ins (generous).
         let deep_blocks = 4 + g.num_rounds;
         let per_query_blocks = input_blocks + commit_blocks + deep_blocks;
 
-        let transcript_blocks = 24; // preamble + FRI rounds + squeeze-only index tail (Phase 1-2)
         let epilogue_blocks = 8; // selectors + quotient recompose + constraint fold
         let total_rows = (transcript_blocks + g.num_queries * per_query_blocks + epilogue_blocks) * BLOCK;
         total_rows.next_power_of_two()
@@ -112,13 +135,14 @@ mod tests {
     #[test]
     #[ignore = "slow: Phase 0 geometry pin + 8 GB / 2^18 budget oracle"]
     fn phase0_geometry_pin_and_budget() {
-        // Arity-2 FRI milestone config (max_log_arity = 1) so the per-query fold maps onto FoldChainAir.
-        let config = make_config(1);
+        // Arity-2 FRI milestone config (max_log_arity = 1) so the per-query fold maps onto FoldChainAir;
+        // reduced query count so the verifier AIR fits 8 GB with margin.
+        let config = make_config(1, MILESTONE_QUERIES);
         let (proof, pvs) = gen_const_proof(&config, 42, 6);
 
-        // The inner proof is real: p3 + the validated native verifier both accept it.
+        // The inner proof is real: p3::verify (config-matched) accepts it. The monolith AIR validates
+        // against p3::verify (not the 96-query native verify_proof), so the reduced query count is fine.
         assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "p3::verify should accept the inner proof");
-        assert!(verify_proof(&config, &proof, &pvs).is_ok(), "native verify_proof should accept the inner proof");
 
         let g = introspect_geometry(&proof);
         // Pin the arity-2 milestone shape.
@@ -126,14 +150,20 @@ mod tests {
         assert!(g.log_arities.iter().all(|&a| a == 1), "arity-2 FRI: every round folds by 1 bit");
         assert_eq!(g.log_global_max_height, 10, "Σlog_arities(6) + log_blowup(4) + 0");
         assert_eq!(g.num_rounds, 6, "fold 2^10 → 2^4 in arity-2 steps");
-        assert_eq!(g.num_queries, 96);
+        assert_eq!(g.num_queries, MILESTONE_QUERIES);
 
         let height = monolith_trace_height(&g);
-        println!("Phase 0 geometry: {g:?}\n  -> monolith trace height ~2^{} ({height} rows)", height.trailing_zeros());
-        assert!(height <= (1 << 18), "monolith trace height {height} must fit ≤ 2^18 (got 2^{})", height.trailing_zeros());
+        let log_h = height.trailing_zeros() as usize;
+        // 8 GB column ceiling: committed LDE = height × cols × 16(blowup) × 8 B; allow ~4× prover overhead.
+        let max_cols = EIGHT_GB / (height as u64 * (1 << LOG_BLOWUP) * 8 * 4);
+        println!("Phase 0 geometry: {g:?}");
+        println!("  -> monolith trace height ~2^{log_h} ({height} rows); 8 GB column ceiling ~{max_cols} cols");
+        assert!(height <= (1 << 18), "monolith trace height {height} must fit ≤ 2^18 (got 2^{log_h})");
+        assert!(log_h <= 17, "milestone should land ≤ 2^17 with the reduced query count (got 2^{log_h})");
+        assert!(max_cols >= 150, "8 GB budget must leave room for a realistic verifier column count (got {max_cols})");
 
         let rss = peak_rss_bytes();
-        println!("  -> peak RSS {} MiB", rss / (1 << 20));
+        println!("  -> peak RSS {} MiB (inner-proof gen+verify; monolith proving measured from Phase 4)", rss / (1 << 20));
         assert!(rss <= EIGHT_GB, "peak RSS {rss} must stay ≤ 8 GB");
     }
 }
