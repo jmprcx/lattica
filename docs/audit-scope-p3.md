@@ -41,14 +41,28 @@ older *Winterfell* reviewer guide — reference only; superseded by this for pro
 - The Zig protocol seam: `src/ffi.zig` (ABI shape), `src/protocol.zig` (tx encoding, supply model,
   tx-binding digest), `src/codec.zig` (canonical encoding) — **specifically the requirement that the
   on-chain hashes equal the in-circuit hashes** (see §5 / C-03).
+- **Batch aggregation (one proof per block)** — `lattica-prover-p3/src/{batch_joinsplit_air,batch_htlc_air}.rs`
+  + the C ABI (`lattica_batch_*` / `lattica_htlc_batch_*` in `lib.rs`) + the Zig seam/apply path
+  (`node.batchRoot`/`htlcBatchRoot`, `Chain.applyBatch`/`applyHtlcBatch`, `ffi.verifyBatch`/`proveBatch`).
+  Reviewer guide — the batch reuses each tile's audited per-tx constraints (proven byte-frozen via the
+  unchanged corrupted-trace suites) and adds only: (1) **tile self-containment** (the `P_TILE_LAST`
+  one-hot frees per-tile-persistent columns + ASSET at the boundary; each tile must independently
+  balance via the tile-periodic `P_ROW0`/`P_FINAL`); (2) **per-tile staging columns** bound to the
+  computed statement, redirecting the per-tx public-input bindings; (3) the **in-circuit tx-root fold**
+  (`DOM_TXROOT` MD-chain over each tile's statement → one running root → the single block-tx-root public
+  input) with **dummy-tile padding** to a power of two; (4) node-side, the **intra-batch double-spend
+  check** (a nullifier may not repeat across the batch) + the proven-soundness floor
+  `MAX_BATCH_TILES = 64`. Key property to confirm: the single tx-root public input binds exactly the set
+  of per-tx statements the node applies — no tile can borrow value/keys/asset from another, and a dummy
+  tile cannot stand in for a real tx. See `docs/soundness-budget.md` (batch section) for the floor.
 - The frozen parameter set and proof format (§4).
 
 **Implemented since this doc was first written (status update for the auditor):**
 - **Batch aggregation is now production + validated** (no longer a prototype): `batch_joinsplit_air` /
   `batch_htlc_air` (one proof per block, bound to a single tx-root public input) + the node
   `applyBatch` / `applyHtlcBatch` path. Real-prover-validated end-to-end; proven-soundness floor
-  `MAX_BATCH_TILES = 64` (see `docs/soundness-budget.md`). If this audit round covers the batch path,
-  add these files + the soundness-budget batch section to the in-scope list.
+  `MAX_BATCH_TILES = 64` (see `docs/soundness-budget.md`). **Now formally in scope** — see the batch
+  entry + reviewer guide in the In-scope list above.
 
 **Out of scope (this round):**
 - **Recursion (`lattica-prover-p3/src/recursion/`) — RESEARCH, NOT PRODUCTION, NOT SOUND, NOT a circuit
