@@ -56,8 +56,8 @@ use super::native_verify::ConstAir;
 
 extern crate alloc;
 
-type Val = Goldilocks;
-type Challenge = BinomialExtensionField<Val, 2>;
+pub(crate) type Val = Goldilocks;
+pub(crate) type Challenge = BinomialExtensionField<Val, 2>;
 
 /// log2 of a power of two (replaces `p3_util::log2_strict`, which isn't a direct dependency).
 fn log2_strict(n: usize) -> usize {
@@ -188,24 +188,24 @@ fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
 }
 
 // --- non-ZK config (standard TwoAdicFriPcs — `verify_fri` applies exactly, no hiding randomization) ---
-type Perm = Poseidon2Goldilocks<8>;
+pub(crate) type Perm = Poseidon2Goldilocks<8>;
 type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type InputMmcs = MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, InputMmcs>;
-type Chal = DuplexChallenger<Val, Perm, 8, 4>;
-type Dft = Radix2DitParallel<Val>;
-type MyPcs = TwoAdicFriPcs<Val, Dft, InputMmcs, ChallengeMmcs>;
+pub(crate) type InputMmcs = MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
+pub(crate) type ChallengeMmcs = ExtensionMmcs<Val, Challenge, InputMmcs>;
+pub(crate) type Chal = DuplexChallenger<Val, Perm, 8, 4>;
+pub(crate) type Dft = Radix2DitParallel<Val>;
+pub(crate) type MyPcs = TwoAdicFriPcs<Val, Dft, InputMmcs, ChallengeMmcs>;
 pub type MyConfig = p3_uni_stark::StarkConfig<MyPcs, Challenge, Chal>;
-type Domain = <MyPcs as Pcs<Challenge, Chal>>::Domain;
-type InputCommit = <InputMmcs as Mmcs<Val>>::Commitment;
-type ComOpenings = Vec<(InputCommit, Vec<(Domain, Vec<(Challenge, Vec<Challenge>)>)>)>;
+pub(crate) type Domain = <MyPcs as Pcs<Challenge, Chal>>::Domain;
+pub(crate) type InputCommit = <InputMmcs as Mmcs<Val>>::Commitment;
+pub(crate) type ComOpenings = Vec<(InputCommit, Vec<(Domain, Vec<(Challenge, Vec<Challenge>)>)>)>;
 
 /// `open_input` — per-query reduced openings (faithful port of `p3-fri::open_input`): MMCS-verify each
 /// committed batch's opened rows, then reduce to `ro[log_height] = Σ α^k·(p_z − p_x)/(z − x)` with
 /// `x = GENERATOR·g^reverse_bits(index >> bits_reduced, log_height)`, accumulating the α-power per height.
 #[allow(clippy::type_complexity)]
-fn open_input(
+pub(crate) fn open_input(
     params: &FriParameters<ChallengeMmcs>,
     log_global_max_height: usize,
     index: usize,
@@ -356,19 +356,41 @@ fn verify_fri_native(
 
 /// Rebuild the input MMCS + FRI parameters deterministically (identical to the config's, since Poseidon2
 /// + the literals are fixed) — `TwoAdicFriPcs` doesn't expose them, and my FRI verify needs both.
-fn build_mmcs_and_params() -> (Perm, InputMmcs, FriParameters<ChallengeMmcs>) {
+/// `max_log_arity` selects the FRI folding arity (1 ⇒ arity-2 FRI, the monolith's first-milestone config).
+pub(crate) fn build_mmcs_and_params(max_log_arity: usize) -> (Perm, InputMmcs, FriParameters<ChallengeMmcs>) {
     let perm = default_goldilocks_poseidon2_8();
     let input_mmcs = InputMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6);
     let params = FriParameters {
         log_blowup: 4,
         log_final_poly_len: 0,
-        max_log_arity: 4,
+        max_log_arity,
         num_queries: 96,
         commit_proof_of_work_bits: 0,
         query_proof_of_work_bits: 16,
         mmcs: ChallengeMmcs::new(input_mmcs.clone()),
     };
     (perm, input_mmcs, params)
+}
+
+/// Build a StarkConfig for the given FRI folding `max_log_arity` (1 = arity-2 FRI). `verify_proof`'s
+/// reconstructed params use max_log_arity=4 as an upper bound, so it validates either arity.
+/// (Test/oracle helper: the aggregator receives inner proofs; only tests build configs + generate them.)
+#[cfg(test)]
+pub(crate) fn make_config(max_log_arity: usize) -> MyConfig {
+    let (perm, input_mmcs, params) = build_mmcs_and_params(max_log_arity);
+    let pcs = MyPcs::new(Dft::default(), input_mmcs, params);
+    MyConfig::new(pcs, Chal::new(perm))
+}
+
+/// Generate a real inner proof for the minimal `ConstAir` (one column = a public constant), at the given
+/// trace `log_height`. The inner proof the monolith verifier AIR consumes (test/oracle helper).
+#[cfg(test)]
+pub(crate) fn gen_const_proof(config: &MyConfig, value: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use p3_matrix::dense::RowMajorMatrix;
+    let v = Val::from_u64(value);
+    let trace = RowMajorMatrix::new(vec![v; 1 << log_height], 1);
+    let pvs = vec![v];
+    (p3_uni_stark::prove(config, &ConstAir, trace, &pvs), pvs)
 }
 
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
@@ -440,7 +462,8 @@ pub fn verify_proof(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &
     }
 
     // ---- MY native FRI verify (the wiring), in place of pcs.verify ----
-    let (_perm, input_mmcs, params) = build_mmcs_and_params();
+    // max_log_arity=4 is an upper bound in verify_query, so this validates arity-2 milestone proofs too.
+    let (_perm, input_mmcs, params) = build_mmcs_and_params(4);
     verify_fri_native(&params, opening_proof, &mut challenger, &coms_to_verify, &input_mmcs)?;
 
     // ---- recompose the quotient + check the constraint relation at ζ ----
@@ -473,27 +496,13 @@ pub fn verify_proof(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p3_matrix::dense::RowMajorMatrix;
-    use p3_uni_stark::{prove, verify};
-
-    fn make_config() -> MyConfig {
-        let (perm, input_mmcs, params) = build_mmcs_and_params();
-        let pcs = MyPcs::new(Dft::default(), input_mmcs, params);
-        MyConfig::new(pcs, Chal::new(perm))
-    }
-
-    fn gen_proof(config: &MyConfig, value: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
-        let v = Val::from_u64(value);
-        let trace = RowMajorMatrix::new(vec![v; 1 << log_height], 1);
-        let pvs = vec![v];
-        (prove(config, &ConstAir, trace, &pvs), pvs)
-    }
+    use p3_uni_stark::verify;
 
     #[test]
     #[ignore = "slow: COMPLETE native FRI verify (the wiring) vs p3::verify"]
     fn native_fri_verify_agrees_with_p3() {
-        let config = make_config();
-        let (mut proof, pvs) = gen_proof(&config, 42, 6);
+        let config = make_config(4);
+        let (mut proof, pvs) = gen_const_proof(&config, 42, 6);
 
         // p3 accepts the proof.
         assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "p3::verify should accept");
@@ -508,7 +517,7 @@ mod tests {
 
         // corrupt a query's commit-phase sibling ⇒ reject (proves verify_query's MMCS/fold actually checks).
         // (Non-ZK proving is deterministic, so this is the same proof generated fresh.)
-        let (mut p2, _) = gen_proof(&config, 42, 6);
+        let (mut p2, _) = gen_const_proof(&config, 42, 6);
         p2.opening_proof.query_proofs[0].commit_phase_openings[0].sibling_values[0] += Challenge::ONE;
         assert!(verify_proof(&config, &p2, &pvs).is_err(), "should reject tampered commit-phase sibling");
 

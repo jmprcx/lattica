@@ -17,6 +17,7 @@
 
 pub mod fri_fold;
 pub mod fri_merkle;
+pub mod monolith; // AIR PORT (work in progress): the monolithic in-circuit verifier AIR
 pub mod native_fri; // B3b WIRING (work in progress): native FRI verify, the in-circuit-port blueprint
 pub mod native_verify;
 pub mod transcript;
