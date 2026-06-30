@@ -394,6 +394,47 @@ pub(crate) fn gen_const_proof(config: &MyConfig, value: u64, log_height: usize) 
     (p3_uni_stark::prove(config, &ConstAir, trace, &pvs), pvs)
 }
 
+/// A `MerkleCap` commitment flattened to its felt sequence (roots in order) — EXACTLY the felts the
+/// challenger observes via `observe(cap)`. The monolith transcript region must absorb this same sequence.
+#[cfg(test)]
+pub(crate) fn cap_felts(commit: &InputCommit) -> Vec<Val> {
+    commit.roots().iter().flatten().copied().collect()
+}
+
+/// Oracle for the monolith's transcript PREAMBLE (Phase 1): replays the real challenger exactly as
+/// `verify_proof` does up to ζ, returning the absorbed felt sequences + the ground-truth (α, ζ). The
+/// in-circuit preamble must absorb `(instance ‖ commitment)` and reproduce this (α, ζ).
+/// Returns `(instance_felts, commitment_felts, α, ζ)` with α/ζ as `[Val; 2]` coefficient pairs.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn preamble_challenges(config: &MyConfig, proof: &Proof<MyConfig>, pvs: &[Val]) -> (Vec<Val>, Vec<Val>, [Val; 2], [Val; 2]) {
+    use p3_field::BasedVectorSpace;
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (base_degree_bits, _degree) =
+        validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).expect("degree bits");
+    let preprocessed_width = 0usize;
+    let pair = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+
+    // Ground truth: the REAL challenger, observing exactly verify_proof's preamble sequence.
+    let mut ch = config.initialise_challenger();
+    ch.observe(Val::from_usize(degree_bits));
+    ch.observe(Val::from_usize(base_degree_bits));
+    ch.observe(Val::from_usize(preprocessed_width));
+    ch.observe(proof.commitments.trace.clone());
+    ch.observe_slice(pvs);
+    let alpha: Challenge = ch.sample_algebra_element();
+    ch.observe(proof.commitments.quotient_chunks.clone());
+    let zeta: Challenge = ch.sample_algebra_element();
+
+    // The same felts the in-circuit sponge absorbs (instance → α, commitment → ζ).
+    let mut instance = vec![Val::from_usize(degree_bits), Val::from_usize(base_degree_bits), Val::from_usize(preprocessed_width)];
+    instance.extend(cap_felts(&proof.commitments.trace));
+    instance.extend_from_slice(pvs);
+    let commitment = cap_felts(&proof.commitments.quotient_chunks);
+    (instance, commitment, pair(alpha), pair(zeta))
+}
+
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
 /// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
 /// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify
