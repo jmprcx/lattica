@@ -172,8 +172,11 @@ constraints) + re-implementing the FRI query-loop orchestration in-circuit.
     the query-index `sample_bits` + variable-length absorb, then run all 96 queries (input opening +
     per-round Merkle openings via the `fri_merkle` gadget + folds via `fri_fold` + "roll in reduced
     openings" / the DEEP combination) and the `final_poly` check.
-- **Component 4 — in-circuit domain selectors** at ζ (`is_first`/`is_transition`/`inv_vanishing` from the
-  domain generator + ζ), feeding component 2 instead of witness.
+- **Component 4 — in-circuit domain selectors at ζ: DONE + validated (`DomainSelectorsAir`).** Computes
+  `z_h = ζ^(2^log_size)−1` (a squaring chain), `is_first = z_h/(ζ−1)`, `is_last = z_h/(ζ−g⁻¹)`,
+  `is_transition = ζ−g⁻¹`, `inv_vanishing = z_h⁻¹` in-circuit (F_p², in-circuit inverses), validated to
+  match the real `domain.selectors_at_point(ζ)`. Feeds component 2 (which currently takes selectors as
+  witness) once wired.
 - **Wiring:** compose components 1–4 into one AIR that verifies a real inner proof end-to-end (agrees with
   `p3::verify`); add the ZK/hiding in-circuit branches.
 - **B4 — aggregation:** verify K inner proofs (the verifier AIR ×K, tiled) + fold their per-tx statement

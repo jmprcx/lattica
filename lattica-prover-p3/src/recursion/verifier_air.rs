@@ -221,6 +221,151 @@ pub fn verify_transcript(proof_bytes: &[u8], alpha: [Val; 2], zeta: [Val; 2]) ->
 }
 
 // =================================================================================================
+// Component 4 — in-circuit domain selectors at ζ.
+// Computes the LagrangeSelectors p3 uses in verify_constraints, in-circuit, from ζ + the domain
+// parameters: for the trace domain (shift = 1 ⇒ u = ζ),
+//   z_h = ζ^(2^log_size) − 1,  is_first = z_h/(ζ−1),  is_last = z_h/(ζ−g⁻¹),
+//   is_transition = ζ − g⁻¹,   inv_vanishing = z_h⁻¹,   g = two_adic_generator(log_size).
+// Validated against the real `domain.selectors_at_point(ζ)`. This is the sub-component that feeds
+// component 2's selectors in-circuit (instead of as witness). All arithmetic over F_p².
+// =================================================================================================
+
+const DS_LOG_SIZE: usize = 4; // domain size 2^4 = 16 (the squaring-chain length)
+const DS_ZETA: usize = 0;
+// squaring chain S_1..S_{LOG_SIZE} at offsets 2*i (S_0 = ζ at offset 0)
+const DS_INV_UM1: usize = 2 * (DS_LOG_SIZE + 1); // inv(ζ − 1)
+const DS_INV_UMG: usize = DS_INV_UM1 + 2; // inv(ζ − g⁻¹)
+const DS_INV_ZH: usize = DS_INV_UMG + 2; // inv(z_h)
+const DS_WIDTH: usize = DS_INV_ZH + 2;
+
+fn ds_g_inv() -> Val {
+    use p3_field::TwoAdicField;
+    Goldilocks::two_adic_generator(DS_LOG_SIZE).inverse()
+}
+
+/// Native reference for the squaring chain + inverses (shift = 1). Returns
+/// (chain[1..=LOG_SIZE], inv_um1, inv_umg, inv_zh) so the trace can be filled.
+fn ds_native(zeta: Challenge) -> (Vec<Challenge>, Challenge, Challenge, Challenge) {
+    let mut chain = Vec::with_capacity(DS_LOG_SIZE);
+    let mut s = zeta;
+    for _ in 0..DS_LOG_SIZE {
+        s = s * s;
+        chain.push(s);
+    }
+    let z_h = *chain.last().unwrap() - Challenge::ONE;
+    let g_inv = Challenge::from(ds_g_inv());
+    let inv_um1 = (zeta - Challenge::ONE).inverse();
+    let inv_umg = (zeta - g_inv).inverse();
+    let inv_zh = z_h.inverse();
+    (chain, inv_um1, inv_umg, inv_zh)
+}
+
+pub struct DomainSelectorsAir;
+
+impl BaseAir<Goldilocks> for DomainSelectorsAir {
+    fn width(&self) -> usize {
+        DS_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        8 // is_first(2) ‖ is_last(2) ‖ is_transition(2) ‖ inv_vanishing(2)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for DomainSelectorsAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let g_inv = AB::Expr::from(ds_g_inv());
+        let w = AB::Expr::from(Goldilocks::from_u64(W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
+        };
+        let g = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+
+        let mut fr = builder.when_first_row();
+        // squaring chain: S_i == (S_{i-1})², S_0 = ζ
+        for i in 1..=DS_LOG_SIZE {
+            let sq = emul(g(2 * (i - 1)), g(2 * (i - 1)));
+            fr.assert_zero(cur[2 * i].clone() - sq.0);
+            fr.assert_zero(cur[2 * i + 1].clone() - sq.1);
+        }
+        let u = g(DS_ZETA);
+        let z_h = (cur[2 * DS_LOG_SIZE].clone() - one.clone(), cur[2 * DS_LOG_SIZE + 1].clone());
+        let u_m1 = (u.0.clone() - one.clone(), u.1.clone());
+        let u_mg = (u.0.clone() - g_inv, u.1.clone());
+
+        // inverse witnesses are genuine inverses (⊗ == (1, 0))
+        let p1 = emul(g(DS_INV_UM1), u_m1.clone());
+        fr.assert_zero(p1.0 - one.clone());
+        fr.assert_zero(p1.1);
+        let p2 = emul(g(DS_INV_UMG), u_mg.clone());
+        fr.assert_zero(p2.0 - one.clone());
+        fr.assert_zero(p2.1);
+        let p3 = emul(g(DS_INV_ZH), z_h.clone());
+        fr.assert_zero(p3.0 - one.clone());
+        fr.assert_zero(p3.1);
+
+        // selectors → public
+        let is_first = emul(z_h.clone(), g(DS_INV_UM1));
+        let is_last = emul(z_h, g(DS_INV_UMG));
+        fr.assert_zero(is_first.0 - pis[0].clone());
+        fr.assert_zero(is_first.1 - pis[1].clone());
+        fr.assert_zero(is_last.0 - pis[2].clone());
+        fr.assert_zero(is_last.1 - pis[3].clone());
+        fr.assert_zero(u_mg.0 - pis[4].clone()); // is_transition = ζ − g⁻¹
+        fr.assert_zero(u_mg.1 - pis[5].clone());
+        fr.assert_zero(cur[DS_INV_ZH].clone() - pis[6].clone()); // inv_vanishing = z_h⁻¹
+        fr.assert_zero(cur[DS_INV_ZH + 1].clone() - pis[7].clone());
+    }
+}
+
+fn ds_build_trace(zeta: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let (chain, inv_um1, inv_umg, inv_zh) = ds_native(zeta);
+    let mut r = [Val::ZERO; DS_WIDTH];
+    let zc = c(zeta);
+    r[DS_ZETA] = zc[0];
+    r[DS_ZETA + 1] = zc[1];
+    for (i, s) in chain.iter().enumerate() {
+        let sc = c(*s);
+        r[2 * (i + 1)] = sc[0];
+        r[2 * (i + 1) + 1] = sc[1];
+    }
+    for (off, v) in [(DS_INV_UM1, inv_um1), (DS_INV_UMG, inv_umg), (DS_INV_ZH, inv_zh)] {
+        let vc = c(v);
+        r[off] = vc[0];
+        r[off + 1] = vc[1];
+    }
+    let mut vals = Vec::with_capacity(8 * DS_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, DS_WIDTH)
+}
+
+/// Prove the in-circuit domain selectors at ζ; the 4 selectors are the public output.
+pub fn prove_domain_selectors(zeta: Challenge, selectors: [Challenge; 4]) -> Vec<u8> {
+    use p3_field::BasedVectorSpace;
+    let pis: Vec<Val> = selectors.iter().flat_map(|s| s.as_basis_coefficients_slice().to_vec()).collect();
+    postcard::to_allocvec(&prove(&make_config(), &DomainSelectorsAir, ds_build_trace(zeta), &pis)).expect("serialize")
+}
+
+pub fn verify_domain_selectors(proof_bytes: &[u8], selectors: [Challenge; 4]) -> bool {
+    use p3_field::BasedVectorSpace;
+    let pis: Vec<Val> = selectors.iter().flat_map(|s| s.as_basis_coefficients_slice().to_vec()).collect();
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), &DomainSelectorsAir, &proof, &pis).is_ok()
+}
+
+// =================================================================================================
 // Component 3a — in-circuit FRI commit-phase challenge derivation.
 // The first slice of the FRI query loop's prerequisites: extend the transcript past ζ to observe each
 // FRI round commitment and squeeze every round challenge β_r (alongside α, ζ). Validated against the
@@ -542,6 +687,26 @@ mod tests {
             verify_transcript(&p, alpha, zeta)
         }));
         assert!(matches!(outcome, Ok(false) | Err(_)));
+    }
+
+    #[test]
+    #[ignore = "slow: in-circuit domain selectors vs native selectors_at_point"]
+    fn domain_selectors_match_native() {
+        use p3_commit::{Pcs, PolynomialSpace};
+        use p3_field::BasedVectorSpace;
+        use p3_uni_stark::StarkGenericConfig;
+        let config = make_config();
+        let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(config.pcs(), 1 << DS_LOG_SIZE);
+        let zeta = Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { 9_999 } else { 12_345 }));
+        let sels = domain.selectors_at_point(zeta);
+        let selectors = [sels.is_first_row, sels.is_last_row, sels.is_transition, sels.inv_vanishing];
+
+        let proof = prove_domain_selectors(zeta, selectors);
+        assert!(verify_domain_selectors(&proof, selectors), "in-circuit selectors must match native selectors_at_point");
+        // a wrong selector ⇒ reject
+        let mut bad = selectors;
+        bad[0] += Challenge::ONE;
+        assert!(!verify_domain_selectors(&proof, bad));
     }
 
     #[test]
