@@ -189,7 +189,7 @@ pub(crate) fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
 
 // --- non-ZK config (standard TwoAdicFriPcs — `verify_fri` applies exactly, no hiding randomization) ---
 pub(crate) type Perm = Poseidon2Goldilocks<8>;
-type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
+pub(crate) type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
 pub(crate) type InputMmcs = MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
 pub(crate) type ChallengeMmcs = ExtensionMmcs<Val, Challenge, InputMmcs>;
@@ -612,6 +612,39 @@ pub(crate) fn query_fold_data(
     }
     let final0 = fri.final_poly[0];
     (ro, rounds, e, final0)
+}
+
+/// Per-query input-Merkle oracle (Phase 4): for query `q`, the trace batch's opening — the leaf
+/// `MyHash(opened row)`, the authentication path `(sibling, bit)` (bit = index bit per level, binary tree),
+/// and the committed cap entry `commit.roots()[index >> depth]` the path must reach. Mirrors the MMCS
+/// `verify_batch` (leaf-hash → binary-compress up to the cap_height=6 cap → cap membership).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn query_input_merkle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> ([Val; 4], Vec<([Val; 4], bool)>, [Val; 4]) {
+    use p3_field::PrimeField64;
+    use p3_symmetric::CryptographicHasher;
+    let (_, _, _, _, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+
+    // trace batch (batch 0), matrix 0 — the trace is committed at height 2^log_global (= max), so the
+    // reduced index is `index` and the binary path has (log_global − cap_height) levels to the cap.
+    let batch = &fri.query_proofs[q].input_proof[0];
+    let row = &batch.opened_values[0];
+    let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+    let leaf: [Val; 4] = hasher.hash_iter(row.iter().copied());
+    let siblings = &batch.opening_proof; // Vec<[Val; 4]>, one per level
+    let path: Vec<([Val; 4], bool)> = siblings.iter().enumerate().map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1)).collect();
+    let depth = siblings.len();
+    let cap = proof.commitments.trace.roots();
+    let cap_entry = cap[index >> depth];
+    (leaf, path, cap_entry)
 }
 
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)

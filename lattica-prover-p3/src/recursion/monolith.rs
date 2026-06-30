@@ -1486,4 +1486,26 @@ mod tests {
         }
         println!("Phase 4 query tile: index → x → ro → fold → folded_eval == final_poly[0] (validated end-to-end per query)");
     }
+
+    /// Phase 4 (part 3): the input Merkle opening — the opened trace row's leaf hashes + authenticates up
+    /// the path to the committed cap entry (`cap_height=6`). Validated vs the REAL proof's MMCS opening.
+    #[test]
+    #[ignore = "slow: Phase 4 input Merkle opening vs the real proof (cap-aware)"]
+    fn phase4_input_merkle_matches_proof() {
+        use crate::recursion::fri_merkle::{prove_opening, verify_opening};
+        use crate::recursion::native_fri::query_input_merkle;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let mut depth = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            depth = path.len();
+            let prf = prove_opening(leaf, &path, cap_entry);
+            assert!(verify_opening(&prf, leaf, cap_entry), "in-circuit Merkle path must reach the committed cap entry (q {q})");
+            let mut bad = cap_entry;
+            bad[0] += Val::ONE;
+            assert!(!verify_opening(&prf, leaf, bad), "wrong cap entry ⇒ reject");
+        }
+        println!("Phase 4 input Merkle: trace leaf → {depth} levels → committed cap entry, validated per query");
+    }
 }
