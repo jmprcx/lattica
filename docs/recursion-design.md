@@ -178,12 +178,17 @@ constraints) + re-implementing the FRI query-loop orchestration in-circuit.
     squeezed challenge into 64 boolean bits, reconstructs `x = Σ b_i·2^i`, enforces CANONICAL (`< p`) via
     `q₃₁·lo == 0` (q₃₁ = Π high 32 bits, lo = low 32 bits), and outputs the low `bits` as the index.
     Validated vs the native challenger's `sample_bits` (canonical-boundary case included).
-  - **3b — the query loop proper (remaining = ONLY the WIRING, the multi-week core):** **all building
-    blocks are now built + individually validated** — challenge derivation [3a], `sample_bits` [3b-iii],
-    leaf hash [3b-i] → path merge [`fri_merkle`] → reduced opening [3b-ii] → fold/fold-chain [`fri_fold`].
-    What remains is **wiring them into the per-query loop over a real proof's columns** (multi-matrix /
-    multi-point accumulation + roll-ins + the `final_poly` check), validated end-to-end vs `pcs.verify`.
-    This composition is the bulk that can only be validated as a whole — the remaining multi-week core.
+  - **3b — the query loop proper: WIRING STARTED (`native_fri.rs`, WIP).** All building blocks are built +
+    individually validated — challenge derivation [3a], `sample_bits` [3b-iii], leaf hash [3b-i] → path
+    merge [`fri_merkle`] → reduced opening [3b-ii] → fold/fold-chain [`fri_fold`]. The wiring re-implements
+    `p3-fri::verify_fri` natively (the blueprint to port to the AIR); the module doc maps every step to
+    its validated gadget. **Done so far:** `verify_query` (the commit-phase fold loop — reconstruct the
+    arity group, MMCS-verify it, fold at β_r, roll in openings) implemented mirroring p3 (uses
+    `mmcs.verify_batch` + `fold_row`, the latter == our validated `native_fold`); plus the `final_poly`
+    Horner evaluation + the final-domain point. **Remaining:** `open_input` (the reduced-openings with the
+    GENERATOR shift + bit-reversal + α-by-height accumulation) and the `verify_fri` driver, then
+    **end-to-end validation vs `pcs.verify`** (accept real / reject tampered) — this whole composition is
+    validatable only as a unit, the remaining multi-week core — then the AIR port.
 - **Component 4 — in-circuit domain selectors at ζ: DONE + validated (`DomainSelectorsAir`).** Computes
   `z_h = ζ^(2^log_size)−1` (a squaring chain), `is_first = z_h/(ζ−1)`, `is_last = z_h/(ζ−g⁻¹)`,
   `is_transition = ζ−g⁻¹`, `inv_vanishing = z_h⁻¹` in-circuit (F_p², in-circuit inverses), validated to
