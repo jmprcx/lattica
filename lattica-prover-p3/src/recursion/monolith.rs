@@ -2369,10 +2369,14 @@ const ST_P_ROUND0: usize = 14; // P_ROUND_0..5 at block 0 rows 0..5 (fold)
 const ST_P_TL: usize = 20; // arith accept (block 0 row 7)
 const ST_P_LEAF: usize = 21; // leaf-hash head (block 1 row 0)
 const ST_P_TERM: usize = 22; // Merkle terminal (block 5 row 31)
-const ST_N_PERIODIC: usize = 23;
+const ST_P_ST_LAST: usize = 23; // super-tile last row (carrier boundary, for the ×K tiling)
+const ST_N_PERIODIC: usize = 24;
+const ST_PERIOD: usize = ST_NBLOCKS_PAD * BLOCK; // rows per super-tile (256)
 
 #[allow(dead_code)]
-pub(crate) struct SuperTileAir;
+pub(crate) struct SuperTileAir {
+    pub n_queries: usize,
+}
 
 impl SuperTileAir {
     fn z(&self, k: usize) -> usize {
@@ -2391,33 +2395,39 @@ impl SuperTileAir {
         self.z(k) + 7
     }
     fn height(&self) -> usize {
-        ST_NBLOCKS_PAD * BLOCK
+        self.n_queries * ST_PERIOD
     }
     fn periodic(&self) -> Vec<Vec<Val>> {
         let h = self.height();
-        let mut cols = periodic_table(); // 11 round
-        let onehot = |row: usize| -> Vec<Val> {
+        let mut cols = periodic_table(); // 11 round (period BLOCK, repeats across the whole trace)
+        // each of these is full-height with a 1 at the given within-super-tile offset of EVERY super-tile.
+        let tiled = |offset: usize| -> Vec<Val> {
             let mut c = vec![Val::ZERO; h];
-            c[row] = Val::ONE;
+            for q in 0..self.n_queries {
+                c[q * ST_PERIOD + offset] = Val::ONE;
+            }
             c
         };
         let mut bl = vec![Val::ZERO; h];
-        for blk in 0..ST_NBLOCKS_PAD {
+        for blk in 0..ST_NBLOCKS_PAD * self.n_queries {
             bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
         }
-        cols.push(bl); // P_BLOCK_LAST
+        cols.push(bl); // P_BLOCK_LAST (every block of every super-tile)
         let mut spos = vec![Val::ZERO; h];
-        for r in BLOCK..h {
-            spos[r] = Val::ONE; // blocks 1..7 (the Merkle region)
+        for q in 0..self.n_queries {
+            for r in BLOCK..ST_PERIOD {
+                spos[q * ST_PERIOD + r] = Val::ONE; // blocks 1..7 (the Merkle region) of each super-tile
+            }
         }
         cols.push(spos); // S_POSEIDON
-        cols.push(onehot(0)); // P_TF (block 0 row 0)
+        cols.push(tiled(0)); // P_TF (block 0 row 0)
         for r in 0..6 {
-            cols.push(onehot(r)); // P_ROUND_0..5 (block 0 rows 0..5)
+            cols.push(tiled(r)); // P_ROUND_0..5 (block 0 rows 0..5)
         }
-        cols.push(onehot(6)); // P_TL — accept at the folded_eval row (E_6, after the 6 fold rounds)
-        cols.push(onehot(ST_LEAF_BLOCK * BLOCK)); // P_LEAF (block 1 row 0)
-        cols.push(onehot(ST_TERMINAL_BLOCK * BLOCK + BLOCK - 1)); // P_TERMINAL (block 5 row 31)
+        cols.push(tiled(6)); // P_TL — accept at the folded_eval row
+        cols.push(tiled(ST_LEAF_BLOCK * BLOCK)); // P_LEAF (block 1 row 0)
+        cols.push(tiled(ST_TERMINAL_BLOCK * BLOCK + BLOCK - 1)); // P_TERMINAL (block 5 row 31)
+        cols.push(tiled(ST_PERIOD - 1)); // P_ST_LAST (super-tile last row — carrier boundary)
         cols
     }
 }
@@ -2517,8 +2527,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         builder.assert_zero(tl.clone() * (cur[QT_E].clone() - pis[0].clone()));
         builder.assert_zero(tl * (cur[QT_E + 1].clone() - pis[1].clone()));
 
-        // ---------------- opened-value carrier: held; == QT_px(term 0) at the arith head; the leaf preimage.
-        builder.when_transition().assert_zero(nxt[ST_CARRY].clone() - cur[ST_CARRY].clone());
+        // ---------------- opened-value carrier: tile-persistent (held within a super-tile, free at its
+        // boundary so each query carries its own value); == QT_px(term 0) at the arith head; leaf preimage.
+        let not_st_last = one.clone() - p[ST_P_ST_LAST].clone();
+        builder.when_transition().assert_zero(not_st_last * (nxt[ST_CARRY].clone() - cur[ST_CARRY].clone()));
         builder.assert_zero(tf.clone() * (cur[ST_CARRY].clone() - cur[self.px(0)].clone()));
 
         // ---------------- input-Merkle (blocks 1..5): leaf-hash + binary merges → terminal == cap entry ----
@@ -2548,7 +2560,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         // merge bit boolean (on Merkle blocks), and the bit-ordered block link (block i output → block i+1).
         builder.assert_zero(spos.clone() * (cur[ST_BIT].clone() * (one.clone() - cur[ST_BIT].clone())));
         {
-            let link = spos.clone() * p[ST_P_BLOCK_LAST].clone(); // Merkle block-last only (not block 0→1)
+            // Merkle block-last only (not block 0→1, since S_POSEIDON=0 on block 0), AND not the super-tile
+            // boundary (1 - P_ST_LAST), so super-tile q's last block doesn't merge into q+1's arith block.
+            let link = spos.clone() * p[ST_P_BLOCK_LAST].clone() * (one.clone() - p[ST_P_ST_LAST].clone());
             let nb = nxt[ST_BIT].clone();
             for k in 0..4 {
                 builder.when_transition().assert_zero(link.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[ST_SIB + k].clone())));
@@ -2566,111 +2580,114 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
 #[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn st_build_trace(
-    query: &(usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>),
-    v: Val,
-    path: &[([Val; 4], bool)],
+    per_query: &[(
+        (usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>),
+        Val,
+        Vec<([Val; 4], bool)>,
+    )],
 ) -> RowMajorMatrix<Val> {
     use crate::recursion::fri_fold::native_fold;
     use p3_field::BasedVectorSpace;
     let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
-    let air = SuperTileAir;
+    let air = SuperTileAir { n_queries: per_query.len() };
     let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
     let h = air.height();
     let mut t = vec![Val::ZERO; h * ST_W];
-    let (index, terms, alpha, ro, rounds) = query;
-
-    // block 0: the arith. fold chain E_0..E_6 (rows 0..6); DEEP+reduced on row 0.
-    let mut e = *ro;
-    for r in 0..=6 {
-        let base = r * ST_W;
-        let ec = c(e);
-        t[base + QT_E] = ec[0];
-        t[base + QT_E + 1] = ec[1];
-        if r < rounds.len() {
-            let (sib, beta, bit, s) = rounds[r];
-            let (sc, bc) = (c(sib), c(beta));
-            t[base + QT_S] = sc[0];
-            t[base + QT_S + 1] = sc[1];
-            t[base + QT_B] = bc[0];
-            t[base + QT_B + 1] = bc[1];
-            t[base + QT_BIT] = if bit { Val::ONE } else { Val::ZERO };
-            t[base + QT_SPT] = s;
-            t[base + QT_I2S] = (Val::TWO * s).inverse();
-            let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
-            e = native_fold(e0, e1, beta, s);
+    for (q, ((index, terms, alpha, ro, rounds), v, path)) in per_query.iter().enumerate() {
+        let off = q * ST_PERIOD; // this super-tile's first row
+        let v = *v;
+        // block 0: the arith. fold chain E_0..E_6 (rows 0..6); DEEP+reduced on row 0.
+        let mut e = *ro;
+        for r in 0..=6 {
+            let base = (off + r) * ST_W;
+            let ec = c(e);
+            t[base + QT_E] = ec[0];
+            t[base + QT_E + 1] = ec[1];
+            if r < rounds.len() {
+                let (sib, beta, bit, s) = rounds[r];
+                let (sc, bc) = (c(sib), c(beta));
+                t[base + QT_S] = sc[0];
+                t[base + QT_S + 1] = sc[1];
+                t[base + QT_B] = bc[0];
+                t[base + QT_B + 1] = bc[1];
+                t[base + QT_BIT] = if bit { Val::ONE } else { Val::ZERO };
+                t[base + QT_SPT] = s;
+                t[base + QT_I2S] = (Val::TWO * s).inverse();
+                let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+                e = native_fold(e0, e1, beta, s);
+            }
         }
-    }
-    let base0 = 0;
-    let mut acc = Val::ONE;
-    for i in 0..DP_LOG_HEIGHT {
-        let bit = (index >> i) & 1;
-        t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
-        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
-        t[base0 + QT_ACC + i] = acc;
-    }
-    let x = <Goldilocks as Field>::GENERATOR * acc;
-    let ac = c(*alpha);
-    t[base0 + QT_ALPHA] = ac[0];
-    t[base0 + QT_ALPHA + 1] = ac[1];
-    let mut apow = Challenge::ONE;
-    for (k, &(z, pz, px)) in terms.iter().enumerate() {
-        let (zc, pzc) = (c(z), c(pz));
-        t[base0 + air.z(k)] = zc[0];
-        t[base0 + air.z(k) + 1] = zc[1];
-        t[base0 + air.pz(k)] = pzc[0];
-        t[base0 + air.pz(k) + 1] = pzc[1];
-        t[base0 + air.px(k)] = px;
-        let inv = c((z - Challenge::from(x)).inverse());
-        t[base0 + air.inv(k)] = inv[0];
-        t[base0 + air.inv(k) + 1] = inv[1];
-        let ap = c(apow);
-        t[base0 + air.apow(k)] = ap[0];
-        t[base0 + air.apow(k) + 1] = ap[1];
-        apow *= *alpha;
-    }
-
-    // blocks 1..5: the input-Merkle. leaf-hash (block 1) absorbs v; 4 merges (blocks 2..5).
-    let mut input = [Val::ZERO; W];
-    input[0] = v;
-    let rows = native_steps(input);
-    for r in 0..BLOCK {
-        let base = (ST_LEAF_BLOCK * BLOCK + r) * ST_W;
-        t[base..base + W].copy_from_slice(&rows[r]);
-    }
-    let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
-    for (l, &(sib, b)) in path.iter().enumerate() {
-        let blk = ST_LEAF_BLOCK + 1 + l;
-        let mut inp = [Val::ZERO; W];
-        if b {
-            inp[..4].copy_from_slice(&sib);
-            inp[4..].copy_from_slice(&node);
-        } else {
+        let base0 = off * ST_W;
+        let mut acc = Val::ONE;
+        for i in 0..DP_LOG_HEIGHT {
+            let bit = (index >> i) & 1;
+            t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
+            acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+            t[base0 + QT_ACC + i] = acc;
+        }
+        let x = <Goldilocks as Field>::GENERATOR * acc;
+        let ac = c(*alpha);
+        t[base0 + QT_ALPHA] = ac[0];
+        t[base0 + QT_ALPHA + 1] = ac[1];
+        let mut apow = Challenge::ONE;
+        for (k, &(z, pz, px)) in terms.iter().enumerate() {
+            let (zc, pzc) = (c(z), c(pz));
+            t[base0 + air.z(k)] = zc[0];
+            t[base0 + air.z(k) + 1] = zc[1];
+            t[base0 + air.pz(k)] = pzc[0];
+            t[base0 + air.pz(k) + 1] = pzc[1];
+            t[base0 + air.px(k)] = px;
+            let inv = c((z - Challenge::from(x)).inverse());
+            t[base0 + air.inv(k)] = inv[0];
+            t[base0 + air.inv(k) + 1] = inv[1];
+            let ap = c(apow);
+            t[base0 + air.apow(k)] = ap[0];
+            t[base0 + air.apow(k) + 1] = ap[1];
+            apow *= *alpha;
+        }
+        // blocks 1..5: the input-Merkle. leaf-hash (block 1) absorbs v; 4 merges (blocks 2..5).
+        let mut input = [Val::ZERO; W];
+        input[0] = v;
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (off + ST_LEAF_BLOCK * BLOCK + r) * ST_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+        for (l, &(sib, b)) in path.iter().enumerate() {
+            let blk = ST_LEAF_BLOCK + 1 + l;
+            let mut inp = [Val::ZERO; W];
+            if b {
+                inp[..4].copy_from_slice(&sib);
+                inp[4..].copy_from_slice(&node);
+            } else {
+                inp[..4].copy_from_slice(&node);
+                inp[4..].copy_from_slice(&sib);
+            }
+            let rows = native_steps(inp);
+            for r in 0..BLOCK {
+                let base = (off + blk * BLOCK + r) * ST_W;
+                t[base..base + W].copy_from_slice(&rows[r]);
+                t[base + ST_SIB..base + ST_SIB + 4].copy_from_slice(&sib);
+                t[base + ST_BIT] = if b { Val::ONE } else { Val::ZERO };
+            }
+            node = native_permute(inp)[..4].try_into().unwrap();
+        }
+        // padding blocks (6..8): continue valid Poseidon so the round constraints hold to the pow2 height.
+        for blk in (ST_TERMINAL_BLOCK + 1)..ST_NBLOCKS_PAD {
+            let mut inp = [Val::ZERO; W];
             inp[..4].copy_from_slice(&node);
-            inp[4..].copy_from_slice(&sib);
+            let rows = native_steps(inp);
+            for r in 0..BLOCK {
+                let base = (off + blk * BLOCK + r) * ST_W;
+                t[base..base + W].copy_from_slice(&rows[r]);
+            }
+            node = native_permute(inp)[..4].try_into().unwrap();
         }
-        let rows = native_steps(inp);
-        for r in 0..BLOCK {
-            let base = (blk * BLOCK + r) * ST_W;
-            t[base..base + W].copy_from_slice(&rows[r]);
-            t[base + ST_SIB..base + ST_SIB + 4].copy_from_slice(&sib);
-            t[base + ST_BIT] = if b { Val::ONE } else { Val::ZERO };
+        // opened-value carrier: held = v within this super-tile.
+        for r in 0..ST_PERIOD {
+            t[(off + r) * ST_W + ST_CARRY] = v;
         }
-        node = native_permute(inp)[..4].try_into().unwrap();
-    }
-    // padding blocks (6..8): continue valid Poseidon so the round constraints hold to the pow2 height.
-    for blk in (ST_TERMINAL_BLOCK + 1)..ST_NBLOCKS_PAD {
-        let mut inp = [Val::ZERO; W];
-        inp[..4].copy_from_slice(&node);
-        let rows = native_steps(inp);
-        for r in 0..BLOCK {
-            let base = (blk * BLOCK + r) * ST_W;
-            t[base..base + W].copy_from_slice(&rows[r]);
-        }
-        node = native_permute(inp)[..4].try_into().unwrap();
-    }
-    // opened-value carrier: held = v across the whole trace.
-    for r in 0..h {
-        t[r * ST_W + ST_CARRY] = v;
     }
     RowMajorMatrix::new(t, ST_W)
 }
@@ -3481,7 +3498,7 @@ mod tests {
         let (proof, pvs) = gen_const_proof(&config, 42, 6);
         let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
         let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
-        let air = SuperTileAir;
+        let air = SuperTileAir { n_queries: 1 };
         for q in [0usize, 1, MILESTONE_QUERIES - 1] {
             let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
             let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
@@ -3489,8 +3506,7 @@ mod tests {
             let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
             assert_eq!(terms[0].2, v, "reduced-opening term 0's p_x == the trace opened value (q {q})");
             let (_leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
-            let query = (index, terms, alpha, ro, rounds);
-            let trace = st_build_trace(&query, v, &path);
+            let trace = st_build_trace(&[((index, terms, alpha, ro, rounds), v, path)]);
             let mut pis: Vec<Val> = f0.as_basis_coefficients_slice().to_vec();
             pis.extend_from_slice(&cap_entry);
             let prf = prove(&config, &air, trace, &pis);
@@ -3503,5 +3519,52 @@ mod tests {
             assert!(verify(&config, &air, &prf, &bad2).is_err(), "tampered cap entry ⇒ reject");
         }
         println!("Phase 4.B super-tile: arith (query verify) + inline input-Merkle (opened value → leaf → path → cap), bound, validated");
+    }
+
+    /// Phase 4.B (structural scaling COMPLETE): all 32 super-tiles in ONE AIR — every query's arith verifies
+    /// AND its opened value authenticates to the committed cap, tiled ×32 (tile-persistent opened-value
+    /// carrier). One proof for the whole per-query region with inline Merkle. Validated vs the real proof.
+    #[test]
+    #[ignore = "slow: Phase 4.B tiled super-tiles (all 32, arith + inline Merkle) vs native"]
+    fn phase4b_tiled_super_tile_matches_native() {
+        use super::{st_build_trace, SuperTileAir, ST_W};
+        use crate::recursion::native_fri::{full_transcript_challenges, query_fold_data, query_input_merkle, query_terms};
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let mut per_query = Vec::new();
+        let mut final0 = Challenge::ZERO;
+        let mut cap_entry0 = [Val::ZERO; 4];
+        for q in 0..MILESTONE_QUERIES {
+            let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+            let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
+            let (_leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            // milestone: the constant proof's trace cap has equal entries, so all super-tiles share one cap entry.
+            if q == 0 {
+                cap_entry0 = cap_entry;
+                final0 = f0;
+            } else {
+                assert_eq!(cap_entry, cap_entry0, "constant-proof cap entries are equal across queries");
+            }
+            per_query.push(((index, terms, alpha, ro, rounds), v, path));
+        }
+        let air = SuperTileAir { n_queries: MILESTONE_QUERIES };
+        let trace = st_build_trace(&per_query);
+        let mut pis: Vec<Val> = final0.as_basis_coefficients_slice().to_vec();
+        pis.extend_from_slice(&cap_entry0);
+        let h = air.height();
+        println!("Phase 4.B tiled super-tiles: 2^{} rows ({} super-tiles, width {})", h.trailing_zeros(), MILESTONE_QUERIES, ST_W);
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "all {MILESTONE_QUERIES} super-tiles verify + authenticate in ONE AIR");
+        let mut bad = pis.clone();
+        bad[0] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered final_poly ⇒ reject");
+        let rss = peak_rss_bytes();
+        println!("  -> peak RSS {} MiB", rss / (1 << 20));
+        assert!(rss <= EIGHT_GB, "tiled super-tiles peak RSS ≤ 8 GB");
     }
 }
