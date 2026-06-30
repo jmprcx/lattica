@@ -197,3 +197,12 @@ P2P swap protocol/versioning that drive a rubble↔BTC swap over `htlc_air`) and
 **future / separate-repo work**, not part of this artifact. `docs/multi-asset-exchanges-issuance-cto.md`
 (exchange integration, issuance/bridging beyond the single-hidden-asset substrate) is also future
 design. The v3 audit gate covers the lattica side: `htlc_air` + `ShieldedHtlcTx` + their seam.
+
+**Recursion (`lattica-prover-p3/src/recursion/`) is RESEARCH — NOT production, NOT sound, NOT audited.**
+It holds validated in-circuit *primitives* (FRI Merkle openings, the Fiat–Shamir transcript, the F_p²
+fold — each differential-tested against the real Plonky3 functions) plus a *native* re-verifier
+(`native_verify.rs`) that re-implements `p3-uni-stark::verify`'s orchestration and agrees with
+`p3::verify`. **The in-circuit recursive verifier is NOT built** — these are feasibility spikes + a
+porting blueprint (`docs/recursion-design.md` §10, `docs/recursion-verifier-audit.md`), multi-week from a
+production artifact. **Batch aggregation, by contrast, IS production + validated** (`batch_joinsplit_air`/
+`batch_htlc_air` + the node `applyBatch` path); include it in scope if this round covers the batch path.

@@ -43,9 +43,23 @@ older *Winterfell* reviewer guide — reference only; superseded by this for pro
   on-chain hashes equal the in-circuit hashes** (see §5 / C-03).
 - The frozen parameter set and proof format (§4).
 
+**Implemented since this doc was first written (status update for the auditor):**
+- **Batch aggregation is now production + validated** (no longer a prototype): `batch_joinsplit_air` /
+  `batch_htlc_air` (one proof per block, bound to a single tx-root public input) + the node
+  `applyBatch` / `applyHtlcBatch` path. Real-prover-validated end-to-end; proven-soundness floor
+  `MAX_BATCH_TILES = 64` (see `docs/soundness-budget.md`). If this audit round covers the batch path,
+  add these files + the soundness-budget batch section to the in-scope list.
+
 **Out of scope (this round):**
-- Recursive / batch aggregation (`batch_measure` is a measurement prototype, not production).
-- The live consensus node (`rubble-node-zig`) beyond the verify seam; networking; mempool; P2P.
+- **Recursion (`lattica-prover-p3/src/recursion/`) — RESEARCH, NOT PRODUCTION, NOT SOUND, NOT a circuit
+  yet.** It contains validated in-circuit *primitives* (FRI Merkle openings, the Fiat–Shamir transcript,
+  the F_p² fold — each differential-tested against the real p3 functions) and a *native* re-verifier
+  (`native_verify.rs`) that re-implements `p3-uni-stark::verify`'s orchestration and agrees with
+  `p3::verify`. **The in-circuit recursive verifier itself is NOT built** — these are feasibility spikes +
+  a porting blueprint, multi-week from a production artifact. Do **not** audit as production; status in
+  `docs/recursion-design.md` §10 + `docs/recursion-verifier-audit.md`.
+- The live consensus node (`rubble-node-zig`) beyond the verify seam; networking; mempool; P2P; the
+  heartbeat block-production design (`docs/block-production-consensus.md`, host-chain scope).
 - The wallet/prover key management and note-discovery.
 - Performance (covered by `docs/soundness-budget.md`; not a security gate).
 
