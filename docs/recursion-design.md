@@ -144,12 +144,13 @@ on the existing Plonky3 prover, reusing `poseidon2_air` + lattica's `merge`/memb
 **B3-wire native skeleton — DONE (`native_verify.rs`):** a from-scratch re-implementation of the
 `p3-uni-stark::verify` orchestration — transcript replay (observe → sample α → observe → sample ζ), the
 opening-rounds construction, quotient recomposition, and the constraint/OOD check — **validated to agree
-with `p3::verify`** (accepts a valid proof, rejects a tampered public value) on a minimal `ConstAir` under
-a non-ZK FRI config. The FRI low-degree test is delegated to `pcs.verify` (its internals = the validated
-`fri_merkle`/`transcript`/`fri_fold` primitives). This is the porting blueprint: each step maps to an
-in-circuit gadget. Remaining for B3-wire: the ZK/hiding branches (random commitment + hiding opening
-structure) and the actual in-circuit AIR port (replace `pcs.verify` with the primitives + the constraint
-folder as constraints).
+with `p3::verify`** (accepts a valid proof, rejects a tampered public value) on a minimal `ConstAir`, now
+under the **production hiding (ZK) FRI config** (the `is_zk=1` path: random commitment observed,
+`init_trace_domain = degree >> is_zk`, quotient-chunk count `1 << (log + is_zk)`). The FRI low-degree test
+is delegated to `pcs.verify` (its internals = the validated `fri_merkle`/`transcript`/`fri_fold`
+primitives). This is the porting blueprint: each step maps to an in-circuit gadget. Remaining for B3-wire:
+the actual in-circuit AIR port (replace `pcs.verify` with the primitives + the constraint folder as
+constraints) + re-implementing the FRI query-loop orchestration in-circuit.
 
 **Remaining — the large-scale integration (the genuine multi-month bulk):**
 - **B3-wire (in-circuit):** one AIR that parses a real `p3` `Proof`, replays the EXACT `p3-uni-stark::verify`

@@ -112,9 +112,10 @@ differential-tested in-circuit spikes in `lattica-prover-p3/src/recursion/`:
 - **Native re-verifier (B3-wire skeleton)** — `native_verify.rs`: a from-scratch re-implementation of the
   `p3-uni-stark::verify` orchestration (transcript replay → opening rounds → quotient recomposition →
   constraint/OOD check), **validated to agree with `p3::verify`** (accepts valid, rejects a tampered
-  public value) on a minimal `ConstAir`, non-ZK config. The FRI test is delegated to `pcs.verify` (= the
-  validated primitives). This is the §9 plan, executed natively — the porting blueprint for the
-  in-circuit verifier.
+  public value) on a minimal `ConstAir` under the **production hiding (ZK) config** (the `is_zk=1` path:
+  random commitment, `degree >> is_zk` domain, quotient-chunk count `1 << (log + is_zk)`). The FRI test is
+  delegated to `pcs.verify` (= the validated primitives). This is the §9 plan, executed natively — the
+  porting blueprint for the in-circuit verifier.
 
 The remaining work is the **in-circuit integration** (port the native skeleton to an AIR: replace
 `pcs.verify` with the `fri_merkle`/`transcript`/`fri_fold` gadgets + the constraint folder as

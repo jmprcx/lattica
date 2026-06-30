@@ -6,9 +6,9 @@
 //! primitives `fri_merkle`/`transcript`/`fri_fold`).
 //!
 //! Built against a minimal `ConstAir` (one column, constant) to keep the AIR-specific quotient logic
-//! small, under a non-ZK FRI config. The ZK/hiding wrinkle (the random commitment + the hiding opening
-//! structure) is a noted follow-on; the orchestration here — transcript, openings, quotient, constraints
-//! — is otherwise complete and `is_zk`-parameterized.
+//! small, under the **production hiding (ZK) FRI config** — so the orchestration is validated against the
+//! real ZK path (random commitment + the hiding opening structure + the `is_zk`-adjusted quotient-chunk
+//! count). Transcript, openings, quotient, constraints are all exercised end-to-end.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::{CanObserve, DuplexChallenger, FieldChallenger};
@@ -16,9 +16,10 @@ use p3_commit::{ExtensionMmcs, Pcs, PolynomialSpace};
 use p3_dft::Radix2DitParallel;
 use p3_field::extension::BinomialExtensionField;
 use p3_field::{Field, PrimeCharacteristicRing};
-use p3_fri::TwoAdicFriPcs;
+use p3_fri::HidingFriPcs;
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
-use p3_merkle_tree::MerkleTreeMmcs;
+use p3_merkle_tree::MerkleTreeHidingMmcs;
+use rand_chacha::ChaCha20Rng;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_uni_stark::{
     get_log_num_quotient_chunks, recompose_quotient_from_chunks, validate_degree_bits, verify_constraints,
@@ -51,19 +52,22 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstAir {
     }
 }
 
-// --- non-ZK FRI config (TwoAdicFriPcs) — same hash/Merkle family as lattica, ZK disabled for the spike
+// --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
+//     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;
 type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs = MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
+type ValMmcs =
+    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
 type Dft = Radix2DitParallel<Val>;
-type MyPcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
+type MyPcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
 type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
 
-/// Native re-verifier: re-implements `verify`'s orchestration step-by-step (non-ZK config; the `is_zk=0`
-/// path), delegating only the FRI low-degree test to `pcs.verify`. Returns Ok iff the proof verifies.
+/// Native re-verifier: re-implements `verify`'s orchestration step-by-step (production hiding/ZK config;
+/// the `is_zk=1` path — random commitment observed, `init_trace_domain = degree >> is_zk`, quotient-chunk
+/// count `1 << (log + is_zk)`), delegating only the FRI low-degree test to `pcs.verify`.
 pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val]) -> Result<(), String> {
     let air = ConstAir;
     let Proof { commitments, opened_values, opening_proof, degree_bits } = proof;
@@ -78,7 +82,7 @@ pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val
 
     let layout = AirLayout::from_air::<Val>(&air);
     let log_num_quotient_chunks = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, is_zk);
-    let num_quotient_chunks = 1usize << log_num_quotient_chunks;
+    let num_quotient_chunks = 1usize << (log_num_quotient_chunks + is_zk); // checked_log_size_sum(log, is_zk)
 
     let mut challenger = config.initialise_challenger();
     let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
@@ -181,10 +185,11 @@ mod tests {
     use p3_goldilocks::default_goldilocks_poseidon2_8;
     use p3_matrix::dense::RowMajorMatrix;
     use p3_uni_stark::{prove, verify};
+    use rand::SeedableRng;
 
     fn make_config() -> MyConfig {
         let perm = default_goldilocks_poseidon2_8();
-        let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0);
+        let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
         let fri = FriParameters {
             log_blowup: 4,
@@ -195,7 +200,7 @@ mod tests {
             query_proof_of_work_bits: 16,
             mmcs: challenge_mmcs,
         };
-        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri);
+        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
         MyConfig::new(pcs, Challenger::new(perm))
     }
 
