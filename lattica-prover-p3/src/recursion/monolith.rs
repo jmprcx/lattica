@@ -2177,6 +2177,172 @@ pub(crate) fn cm_build_trace(index_high: usize) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(vals, CM_CAP_HEIGHT)
 }
 
+// =================================================================================================
+// Phase 4.B (heavy restructure) — the INLINE input-Merkle super-tile: the opened value is hashed to a leaf
+// and authenticated up to the committed cap, all in ONE AIR. Block 0 is a leaf-hash (absorbs the width-1
+// opened row [v,0,0,0] → leaf = MyHash([v])); blocks 1..DEPTH are the binary merges (FriMerkleAir's
+// bit-ordered Poseidon compress, reused verbatim); the terminal == the committed cap entry. The crucial
+// structural step vs the standalone FriMerkleAir: the leaf is COMPUTED from the opened value, not a free
+// public — so the value used in the reduced opening is the one authenticated to the trace commitment.
+// Validated vs the real proof (query_input_merkle). DEPTH = log_global − cap_height = 4 for the milestone.
+// =================================================================================================
+
+const IMT_SIB: usize = W; // 8..12 sibling digest
+const IMT_BIT: usize = IMT_SIB + 4; // 12 merge direction
+const IMT_W: usize = IMT_BIT + 1; // 13 (= FriMerkleAir width)
+const IMT_DEPTH: usize = 4; // input-opening path depth (log_global − cap_height)
+const IMT_NBLOCKS: usize = 1 + IMT_DEPTH; // leaf block + DEPTH merge blocks (5 active)
+const IMT_NBLOCKS_PAD: usize = 8; // padded to a power-of-two block count (every block is valid Poseidon)
+const IMT_P_BLOCK_LAST: usize = 11;
+const IMT_P_TERMINAL: usize = 12; // one-hot at the last ACTIVE block's output row (block IMT_NBLOCKS-1)
+
+#[allow(dead_code)]
+pub(crate) struct InputMerkleTileAir;
+
+impl InputMerkleTileAir {
+    fn height(&self) -> usize {
+        IMT_NBLOCKS_PAD * BLOCK // 256 (power of two)
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..IMT_NBLOCKS_PAD {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl);
+        let mut term = vec![Val::ZERO; h];
+        term[(IMT_NBLOCKS - 1) * BLOCK + BLOCK - 1] = Val::ONE; // block 4's output row (the cap terminal)
+        cols.push(term);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for InputMerkleTileAir {
+    fn width(&self) -> usize {
+        IMT_W
+    }
+    fn num_public_values(&self) -> usize {
+        1 + 4 // opened value v, cap entry (4)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        IMT_P_TERMINAL + 1
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for InputMerkleTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+
+        // Poseidon2 rounds (every block; reused verbatim from FriMerkleAir/poseidon2_air).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(c);
+        }
+
+        let bit = cur[IMT_BIT].clone();
+        builder.assert_zero(bit.clone() * (one.clone() - bit));
+
+        // block 0 = the LEAF HASH: absorb the width-1 opened row → state = [v, 0, …]. leaf = block-0 output.
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[0].clone() - pis[0].clone()); // v
+            for i in 1..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+
+        // block-to-block link (bit-ordered merge into the next block) — reused from FriMerkleAir. Block 0's
+        // output (the leaf) folds into block 1 with sibling_0; block i output → block i+1, etc.
+        {
+            let bl = p[IMT_P_BLOCK_LAST].clone();
+            let nb = nxt[IMT_BIT].clone();
+            for k in 0..4 {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[IMT_SIB + k].clone())));
+                builder.when_transition().assert_zero(bl.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[IMT_SIB + k].clone() + nb.clone() * cur[k].clone())));
+            }
+        }
+
+        // terminal: the last ACTIVE block's output (block IMT_NBLOCKS-1, via the one-hot) == the cap entry.
+        // (Trailing padding blocks continue valid Poseidon so the round constraints hold to the pow2 height.)
+        let term = p[IMT_P_TERMINAL].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[1 + k].clone()));
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn im_build_trace(v: Val, path: &[([Val; 4], bool)]) -> (RowMajorMatrix<Val>, [Val; 4]) {
+    let air = InputMerkleTileAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * IMT_W];
+    // block 0: leaf hash. input = [v, 0, …]; output[0..4] = leaf.
+    let mut input = [Val::ZERO; W];
+    input[0] = v;
+    let rows = native_steps(input);
+    for r in 0..BLOCK {
+        t[r * IMT_W..r * IMT_W + W].copy_from_slice(&rows[r]);
+    }
+    let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+    // blocks 1..=DEPTH: the binary merges.
+    for (l, &(sib, b)) in path.iter().enumerate() {
+        let blk = 1 + l;
+        let mut inp = [Val::ZERO; W];
+        if b {
+            inp[..4].copy_from_slice(&sib);
+            inp[4..].copy_from_slice(&node);
+        } else {
+            inp[..4].copy_from_slice(&node);
+            inp[4..].copy_from_slice(&sib);
+        }
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * IMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+            t[base + IMT_SIB..base + IMT_SIB + 4].copy_from_slice(&sib);
+            t[base + IMT_BIT] = if b { Val::ONE } else { Val::ZERO };
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    let terminal = node;
+    // padding blocks (IMT_NBLOCKS..IMT_NBLOCKS_PAD): continue valid Poseidon (merge node with 0, bit 0) so
+    // every block satisfies the round + link constraints up to the power-of-two height. The terminal binding
+    // is at block IMT_NBLOCKS-1's output (a one-hot), so these blocks don't affect the result.
+    for blk in IMT_NBLOCKS..IMT_NBLOCKS_PAD {
+        let mut inp = [Val::ZERO; W];
+        inp[..4].copy_from_slice(&node); // bit 0, sibling 0 ⇒ input = [node, 0]
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * IMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    (RowMajorMatrix::new(t, IMT_W), terminal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -2940,5 +3106,33 @@ mod tests {
             assert!(verify(&config, &air, &bad_prf, &pis).is_err(), "wrong high index bit ⇒ wrong cap entry ⇒ reject");
         }
         println!("Phase 4.B #7: cap-mux selects commit.roots()[index>>{depth}] via a {CM_CAP_HEIGHT}-bit selector (real index matches; selector discriminates), validated");
+    }
+
+    /// Phase 4.B (heavy restructure): the INLINE input-Merkle — the opened value is hashed to a leaf and
+    /// authenticated up the path to the committed cap entry, in ONE AIR. The leaf is COMPUTED (not a free
+    /// public), so the opened value is bound to the trace commitment. Validated vs the real proof.
+    #[test]
+    #[ignore = "slow: Phase 4.B inline input-Merkle (leaf-hash + path → cap) vs the real proof"]
+    fn phase4b_input_merkle_tile_matches_native() {
+        use super::{im_build_trace, InputMerkleTileAir, IMT_DEPTH};
+        use crate::recursion::native_fri::query_input_merkle;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let air = InputMerkleTileAir;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
+            let (_leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            assert_eq!(path.len(), IMT_DEPTH, "input-opening depth (q {q})");
+            let (trace, terminal) = im_build_trace(v, &path);
+            assert_eq!(terminal, cap_entry, "in-circuit terminal == committed cap entry (q {q})");
+            let mut pis = vec![v];
+            pis.extend_from_slice(&cap_entry);
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "inline input-Merkle must authenticate the opened value (q {q})");
+            let mut bad = pis.clone();
+            bad[0] += Val::ONE; // tamper the opened value ⇒ leaf changes ⇒ terminal ≠ cap entry
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered opened value ⇒ reject");
+        }
+        println!("Phase 4.B inline input-Merkle: opened value → leaf → {IMT_DEPTH}-level path → committed cap entry, validated per query");
     }
 }
