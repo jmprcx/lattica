@@ -178,17 +178,265 @@ pub(crate) fn preamble_build_trace(i_blocks: usize, c_blocks: usize, instance: &
     RowMajorMatrix::new(t, W)
 }
 
+// =================================================================================================
+// Phase 2 — the full transcript: a GENERAL schedule-driven duplex sponge that derives α_stark, ζ,
+// α_fri, and every β_r (and, with the squeeze tail, the query indices). Each permutation block has a
+// per-block prefix-free count (`count_b` = num_absorbed: 4 for full absorbs, the remainder before a
+// sample, 0 for squeezes) folded into the capacity lane, and absorb blocks overwrite the rate while
+// squeeze blocks carry it. Driven by the recorded schedule; bindings read (rate[3], rate[2]) at each
+// challenge's block-output row (the duplex challenger pops from the back). Composed into MonolithAir later.
+// =================================================================================================
+
+const FT_P_BLOCK_LAST: usize = 11;
+const FT_COUNT: usize = 12; // count_b at block b's rows (for the first-row capacity init)
+const FT_COUNT_NEXT: usize = 13; // count_{b+1} at block b's rows (for the carry into the next block)
+const FT_IS_SQ_NEXT: usize = 14; // 1 if block b+1 is a squeeze (count 0 ⇒ rate carries)
+const FT_BIND_START: usize = 15; // one one-hot per bound challenge follows
+
+/// The full-transcript duplex AIR. `counts[b]` = the prefix-free count for block b; `binds[j]` = the block
+/// whose output row carries the j-th challenge (bound to public[2j], public[2j+1] = rate[3], rate[2]).
+#[allow(dead_code)] // standalone-validated in Phase 2; composed into MonolithAir in Phase 4
+pub(crate) struct FullTranscriptAir {
+    pub counts: Vec<u8>,
+    pub binds: Vec<usize>,
+}
+
+#[allow(dead_code)]
+impl FullTranscriptAir {
+    fn n_blocks(&self) -> usize {
+        self.counts.len()
+    }
+    fn height(&self) -> usize {
+        self.n_blocks().next_power_of_two() * BLOCK
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let nb = self.counts.len();
+        let count_of = |b: usize| -> Val { if b < nb { Val::from_u64(self.counts[b] as u64) } else { Val::ZERO } };
+        let mut cols = periodic_table(); // 11 round cols
+        let mut block_last = vec![Val::ZERO; BLOCK];
+        block_last[BLOCK - 1] = Val::ONE;
+        cols.push(block_last);
+        let mut count = vec![Val::ZERO; h];
+        let mut count_next = vec![Val::ZERO; h];
+        let mut is_sq_next = vec![Val::ZERO; h];
+        for r in 0..h {
+            let b = r / BLOCK;
+            count[r] = count_of(b);
+            count_next[r] = count_of(b + 1);
+            is_sq_next[r] = if (b + 1 >= nb) || self.counts[b + 1] == 0 { Val::ONE } else { Val::ZERO };
+        }
+        cols.push(count);
+        cols.push(count_next);
+        cols.push(is_sq_next);
+        for &blk in &self.binds {
+            let mut col = vec![Val::ZERO; h];
+            col[blk * BLOCK + BLOCK - 1] = Val::ONE; // the block's output row
+            cols.push(col);
+        }
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for FullTranscriptAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        2 * self.binds.len()
+    }
+    fn num_periodic_columns(&self) -> usize {
+        FT_BIND_START + self.binds.len()
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullTranscriptAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+
+        // Poseidon2 round constraints (periodic_table zeroes the selectors at the block-boundary row).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(c);
+        }
+
+        // first block: capacity lane = count_0; other capacity lanes = 0.
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[CAP_LANE].clone() - p[FT_COUNT].clone());
+            for i in (CAP_LANE + 1)..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // block linkage at P_BLOCK_LAST: capacity carries (+count_next on the count lane); rate carries
+        // only on squeeze blocks (absorb blocks' rate is free = the next absorbed felts).
+        {
+            let bl = p[FT_P_BLOCK_LAST].clone();
+            builder.when_transition().assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()));
+            for i in (CAP_LANE + 1)..W {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+            for i in 0..RATE {
+                builder.when_transition().assert_zero(bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+        }
+        // challenge bindings: at each bind block's output row, (rate[3], rate[2]) = the public challenge.
+        for j in 0..self.binds.len() {
+            let b = p[FT_BIND_START + j].clone();
+            builder.assert_zero(b.clone() * (cur[3].clone() - pis[2 * j].clone()));
+            builder.assert_zero(b * (cur[2].clone() - pis[2 * j + 1].clone()));
+        }
+    }
+}
+
+/// Fill the full-transcript trace from the recorded per-block input states (each = the 8-lane state going
+/// into that block's permute), padding to a power-of-two block count with squeeze (carry) continuation.
+#[allow(dead_code)]
+pub(crate) fn ft_build_trace(block_inputs: &[[Val; W]]) -> RowMajorMatrix<Val> {
+    let n = block_inputs.len();
+    let padded = n.next_power_of_two();
+    let mut t = vec![Val::ZERO; padded * BLOCK * W];
+    let mut last_out = [Val::ZERO; W];
+    for b in 0..padded {
+        let input = if b < n { block_inputs[b] } else { last_out }; // padding: squeeze (carry prev output)
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (b * BLOCK + r) * W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        last_out = native_permute(input);
+    }
+    RowMajorMatrix::new(t, W)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{preamble_build_trace, PreambleAir};
-    use crate::poseidon2_air::BLOCK;
-    use crate::recursion::native_fri::{gen_const_proof, make_config, preamble_challenges, MyConfig, Val};
+    use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
+    use crate::poseidon2_air::{native_permute, BLOCK, W};
+    use crate::recursion::native_fri::{cap_felts, full_transcript_challenges, gen_const_proof, make_config, preamble_challenges, Challenge, MyConfig, Val};
     use crate::recursion::native_verify::ConstAir;
-    use p3_field::PrimeCharacteristicRing;
+    use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
     use p3_uni_stark::{prove, verify, Proof};
 
+    /// A faithful `DuplexChallenger` mirror that also RECORDS the per-block schedule (each permute's input
+    /// state + prefix-free count) and which block each sampled challenge reads — the schedule that drives
+    /// `FullTranscriptAir` + `ft_build_trace`. Mirrors observe/duplex/sample exactly (incl. +num_absorbed
+    /// counts, output cleared on observe, sample pops from the back, re-permute when drained).
+    struct Sim {
+        state: [Val; W],
+        input: Vec<Val>,
+        output: Vec<Val>,
+        block_inputs: Vec<[Val; W]>,
+        counts: Vec<u8>,
+    }
+    impl Sim {
+        fn new() -> Self {
+            Self { state: [Val::ZERO; W], input: vec![], output: vec![], block_inputs: vec![], counts: vec![] }
+        }
+        fn duplex(&mut self) {
+            let num = self.input.len();
+            for (i, v) in self.input.drain(..).enumerate() {
+                self.state[i] = v;
+            }
+            if num > 0 {
+                for i in num..RATE {
+                    self.state[i] = Val::ZERO;
+                }
+                self.state[CAP_LANE] += Val::from_u64(num as u64);
+            }
+            self.block_inputs.push(self.state);
+            self.counts.push(num as u8);
+            self.state = native_permute(self.state);
+            self.output = self.state[..RATE].to_vec();
+        }
+        fn observe(&mut self, v: Val) {
+            self.output.clear();
+            self.input.push(v);
+            if self.input.len() == RATE {
+                self.duplex();
+            }
+        }
+        fn observe_ext(&mut self, x: Challenge) {
+            for &c in x.as_basis_coefficients_slice() {
+                self.observe(c);
+            }
+        }
+        fn sample_base(&mut self) -> (Val, usize) {
+            if !self.input.is_empty() || self.output.is_empty() {
+                self.duplex();
+            }
+            let blk = self.block_inputs.len() - 1;
+            (self.output.pop().unwrap(), blk) // pop from the back
+        }
+        fn sample_ext(&mut self) -> ([Val; 2], usize) {
+            let (c0, blk) = self.sample_base();
+            let (c1, _) = self.sample_base();
+            ([c0, c1], blk)
+        }
+    }
+
+    /// Replay the transcript through the β_r (α_stark, ζ, α_fri, β_0..β_{R-1}), recording the schedule.
+    /// Returns (per-block input states, counts, bind block per challenge, challenge values as [Val;2]).
+    #[allow(clippy::type_complexity)]
+    fn sim_through_betas(config: &MyConfig, proof: &Proof<MyConfig>, pvs: &[Val]) -> (Vec<[Val; W]>, Vec<u8>, Vec<usize>, Vec<[Val; 2]>) {
+        let (instance, commitment, _, _) = preamble_challenges(config, proof, pvs);
+        let mut s = Sim::new();
+        for &f in &instance {
+            s.observe(f);
+        }
+        let (a_stark, b0) = s.sample_ext();
+        for &f in &commitment {
+            s.observe(f);
+        }
+        let (zeta, b1) = s.sample_ext();
+        for &x in &proof.opened_values.trace_local {
+            s.observe_ext(x);
+        }
+        if let Some(tn) = &proof.opened_values.trace_next {
+            for &x in tn {
+                s.observe_ext(x);
+            }
+        }
+        for c in &proof.opened_values.quotient_chunks {
+            for &x in c {
+                s.observe_ext(x);
+            }
+        }
+        let (a_fri, b2) = s.sample_ext();
+        let mut binds = vec![b0, b1, b2];
+        let mut chs = vec![a_stark, zeta, a_fri];
+        for comm in &proof.opening_proof.commit_phase_commits {
+            for f in cap_felts(comm) {
+                s.observe(f);
+            }
+            let (beta, bb) = s.sample_ext();
+            binds.push(bb);
+            chs.push(beta);
+        }
+        (s.block_inputs, s.counts, binds, chs)
+    }
+
     const CAP_HEIGHT: usize = 6; // MerkleTreeMmcs cap (build_mmcs_and_params)
-    const RATE: usize = 4; // PaddingFreeSponge rate
     const LOG_BLOWUP: usize = 4;
     const LOG_FINAL_POLY_LEN: usize = 0;
     const EIGHT_GB: u64 = 8u64 << 30;
@@ -355,5 +603,39 @@ mod tests {
         let mut bad = pis.clone();
         bad[0] += Val::ONE;
         assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong α ⇒ reject");
+    }
+
+    /// Phase 2: the in-circuit full transcript reproduces α_stark, ζ, α_fri, and every β_r.
+    #[test]
+    #[ignore = "slow: Phase 2 full transcript (α_fri, β_r) vs native challenger"]
+    fn phase2_full_transcript_matches_native() {
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (a_stark, zeta, a_fri, betas, _indices) = full_transcript_challenges(&config, &proof, &pvs);
+
+        // The recording sim reproduces the native challenger's α_stark, ζ, α_fri, β_r.
+        let (block_inputs, counts, binds, chs) = sim_through_betas(&config, &proof, &pvs);
+        assert_eq!(chs[0], a_stark, "α_stark");
+        assert_eq!(chs[1], zeta, "ζ");
+        assert_eq!(chs[2], a_fri, "α_fri");
+        for (i, b) in betas.iter().enumerate() {
+            assert_eq!(chs[3 + i], *b, "β_{i}");
+        }
+        println!(
+            "Phase 2: {} transcript blocks → α_stark, ζ, α_fri, {} betas (all match native)",
+            counts.len(),
+            betas.len()
+        );
+
+        // The in-circuit FullTranscriptAir reproduces them all.
+        let air = FullTranscriptAir { counts, binds };
+        let trace = ft_build_trace(&block_inputs);
+        let pis: Vec<Val> = chs.iter().flatten().copied().collect();
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "in-circuit full transcript α_fri/β_r must match native");
+        // tamper α_fri ⇒ reject
+        let mut bad = pis.clone();
+        bad[4] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong α_fri ⇒ reject");
     }
 }

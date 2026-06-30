@@ -435,6 +435,69 @@ pub(crate) fn preamble_challenges(config: &MyConfig, proof: &Proof<MyConfig>, pv
     (instance, commitment, pair(alpha), pair(zeta))
 }
 
+/// Oracle for the FULL monolith transcript (Phase 2): replays the real challenger through the entire
+/// FRI-STARK verify, returning the ground-truth challenges the in-circuit transcript must reproduce —
+/// (α_stark, ζ, α_fri, β_0..β_{R-1}, query indices). Mirrors verify_proof + verify_fri_native's challenger
+/// calls exactly (incl. the +num_absorbed duplex counts, the opened-value partial absorb, commit-PoW
+/// early-return at 0 bits, the query-PoW witness observe, and the squeeze-only index tail).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn full_transcript_challenges(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+) -> ([Val; 2], [Val; 2], [Val; 2], Vec<[Val; 2]>, Vec<usize>) {
+    use p3_challenger::{CanSampleBits, GrindingChallenger};
+    use p3_field::BasedVectorSpace;
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (base_degree_bits, _) =
+        validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).expect("degree bits");
+    let pair = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let mut ch = config.initialise_challenger();
+
+    // preamble → α_stark, ζ
+    ch.observe(Val::from_usize(degree_bits));
+    ch.observe(Val::from_usize(base_degree_bits));
+    ch.observe(Val::from_usize(0));
+    ch.observe(proof.commitments.trace.clone());
+    ch.observe_slice(pvs);
+    let alpha_stark: Challenge = ch.sample_algebra_element();
+    ch.observe(proof.commitments.quotient_chunks.clone());
+    let zeta: Challenge = ch.sample_algebra_element();
+
+    // opened values → α_fri
+    ch.observe_algebra_slice(&proof.opened_values.trace_local);
+    if let Some(tn) = &proof.opened_values.trace_next {
+        ch.observe_algebra_slice(tn);
+    }
+    for c in &proof.opened_values.quotient_chunks {
+        ch.observe_algebra_slice(c);
+    }
+    let alpha_fri: Challenge = ch.sample_algebra_element();
+
+    // per commit round → β_r (commit PoW is 0 bits ⇒ check_witness returns early, no observe)
+    let fri = &proof.opening_proof;
+    let mut betas = Vec::new();
+    for (comm, w) in fri.commit_phase_commits.iter().zip(&fri.commit_pow_witnesses) {
+        ch.observe(comm.clone());
+        assert!(ch.check_witness(0, *w), "commit pow (0 bits)"); // build_mmcs_and_params: commit_proof_of_work_bits = 0
+        betas.push(ch.sample_algebra_element::<Challenge>());
+    }
+
+    // final_poly + arities + query-PoW, then the query indices
+    ch.observe_algebra_slice(&fri.final_poly);
+    let log_arities: Vec<usize> = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+    for &la in &log_arities {
+        ch.observe(Val::from_usize(la));
+    }
+    assert!(ch.check_witness(16, fri.query_pow_witness), "query pow");
+    let log_global = log_arities.iter().sum::<usize>() + 4;
+    let indices: Vec<usize> = (0..fri.query_proofs.len()).map(|_| ch.sample_bits(log_global)).collect();
+
+    (pair(alpha_stark), pair(zeta), pair(alpha_fri), betas.iter().map(|b| pair(*b)).collect(), indices)
+}
+
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
 /// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
 /// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify
