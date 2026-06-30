@@ -164,10 +164,14 @@ constraints) + re-implementing the FRI query-loop orchestration in-circuit.
   sub-component, below.)
 
 **Remaining — the large-scale integration (the genuine multi-month bulk):**
-- **Component 3 — in-circuit FRI query loop (the middle, the biggest piece):** parse a real `p3` `Proof`
-  into trace columns, extend the transcript to the FRI commit-phase (`β_i`) + query-index `sample_bits` +
-  variable-length absorb, then run all 96 queries (input opening + per-round Merkle openings via the
-  `fri_merkle` gadget + folds via `fri_fold` + "roll in reduced openings") and the `final_poly` check.
+- **Component 3 — in-circuit FRI query loop (the middle, the biggest piece):**
+  - **3a — FRI commit-phase challenge derivation: DONE + validated (`FriTranscriptAir`).** Extends the
+    transcript past ζ to observe each FRI round commitment and squeeze every β_r (with α, ζ); the
+    in-circuit challenges match the native `ModelChallenger` for R=4 rounds; tampered absorb rejected.
+  - **3b — the query loop proper (remaining bulk):** parse a real `p3` `Proof` into trace columns, add
+    the query-index `sample_bits` + variable-length absorb, then run all 96 queries (input opening +
+    per-round Merkle openings via the `fri_merkle` gadget + folds via `fri_fold` + "roll in reduced
+    openings" / the DEEP combination) and the `final_poly` check.
 - **Component 4 — in-circuit domain selectors** at ζ (`is_first`/`is_transition`/`inv_vanishing` from the
   domain generator + ζ), feeding component 2 instead of witness.
 - **Wiring:** compose components 1–4 into one AIR that verifies a real inner proof end-to-end (agrees with

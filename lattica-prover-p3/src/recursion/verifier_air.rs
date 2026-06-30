@@ -221,6 +221,170 @@ pub fn verify_transcript(proof_bytes: &[u8], alpha: [Val; 2], zeta: [Val; 2]) ->
 }
 
 // =================================================================================================
+// Component 3a — in-circuit FRI commit-phase challenge derivation.
+// The first slice of the FRI query loop's prerequisites: extend the transcript past ζ to observe each
+// FRI round commitment and squeeze every round challenge β_r (alongside α, ζ). Validated against the
+// native ModelChallenger. (The query loop proper — per-query Merkle openings + folds + reduced openings
+// — is the remaining bulk of component 3.) Worked with R = 4 FRI rounds: 2 instance blocks → α,
+// 2 commitment blocks → ζ, then 4 round blocks → β_0..β_3 = 8 sponge blocks (256 rows).
+// =================================================================================================
+
+const FRI_ROUNDS: usize = 4;
+const FT_BLOCKS: usize = 4 + FRI_ROUNDS; // 8
+const FT_HEIGHT: usize = FT_BLOCKS * BLOCK; // 256
+
+// periodic: rounds (11) + P_BLOCK_LAST (12) + one-hots binding α, ζ, β_0, β_1, β_2 at their block-output
+// rows (β_3 is bound at the last row). Each one-hot is a full-height (256) period ⇒ fires once.
+const FT_P_BLOCK_LAST: usize = 11;
+const FT_P_FIRST_BIND: usize = 12; // 5 binding one-hots: α, ζ, β_0, β_1, β_2
+const FT_N_PERIODIC: usize = FT_P_FIRST_BIND + 5;
+
+/// Output rows of the blocks whose squeeze is bound by a periodic one-hot: α@block1, ζ@block3,
+/// β_0@block4, β_1@block5, β_2@block6 (β_3@block7 = the last row).
+const FT_BIND_BLOCKS: [usize; 5] = [1, 3, 4, 5, 6];
+
+fn ft_periodic() -> Vec<Vec<Val>> {
+    let mut cols = periodic_table();
+    let mut block_last = vec![Val::ZERO; BLOCK];
+    block_last[BLOCK - 1] = Val::ONE;
+    cols.push(block_last);
+    for blk in FT_BIND_BLOCKS {
+        let mut sel = vec![Val::ZERO; FT_HEIGHT];
+        sel[(blk + 1) * BLOCK - 1] = Val::ONE; // that block's output row
+        cols.push(sel);
+    }
+    cols
+}
+
+/// Native reference: α, ζ, then β_0..β_{R-1}, via the validated ModelChallenger.
+pub fn native_fri_challenges(instance: &[Val], zeta_commits: &[Val], round_commits: &[[Val; RATE]]) -> Vec<[Val; 2]> {
+    let mut ch = crate::recursion::transcript::ModelChallenger::new();
+    ch.observe_slice(instance);
+    let mut out = vec![ch.sample_ext()]; // α
+    ch.observe_slice(zeta_commits);
+    out.push(ch.sample_ext()); // ζ
+    for rc in round_commits {
+        ch.observe_slice(rc);
+        out.push(ch.sample_ext()); // β_r
+    }
+    out
+}
+
+pub struct FriTranscriptAir;
+
+impl BaseAir<Goldilocks> for FriTranscriptAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        2 * (2 + FRI_ROUNDS) // α, ζ, β_0..β_{R-1}
+    }
+    fn num_periodic_columns(&self) -> usize {
+        FT_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        ft_periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriTranscriptAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let rate = AB::Expr::from(Goldilocks::from_u64(RATE as u64));
+
+        // Poseidon2 rounds per block (reused).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(c);
+        }
+
+        // capacity init + carry (+RATE), same sponge mechanics as TranscriptAir.
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[CAP_LANE].clone() - rate.clone());
+            for i in (CAP_LANE + 1)..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        {
+            let bl = p[FT_P_BLOCK_LAST].clone();
+            builder
+                .when_transition()
+                .assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())));
+            for i in (CAP_LANE + 1)..W {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+        }
+
+        // squeeze bindings: α, ζ, β_0, β_1, β_2 at their block-output rows; β_3 at the last row.
+        // each challenge = (rate[3], rate[2]).
+        for (k, _blk) in FT_BIND_BLOCKS.iter().enumerate() {
+            let sel = p[FT_P_FIRST_BIND + k].clone();
+            builder.assert_zero(sel.clone() * (cur[3].clone() - pis[2 * k].clone()));
+            builder.assert_zero(sel.clone() * (cur[2].clone() - pis[2 * k + 1].clone()));
+        }
+        {
+            let last = 2 + FRI_ROUNDS - 1; // index of β_{R-1}
+            let mut lr = builder.when_last_row();
+            lr.assert_zero(cur[3].clone() - pis[2 * last].clone());
+            lr.assert_zero(cur[2].clone() - pis[2 * last + 1].clone());
+        }
+    }
+}
+
+fn ft_build_trace(felts: &[Val]) -> RowMajorMatrix<Val> {
+    assert_eq!(felts.len(), FT_BLOCKS * RATE);
+    let mut t = vec![Val::ZERO; FT_HEIGHT * W];
+    let mut cap = [Val::ZERO; W - RATE];
+    for blk in 0..FT_BLOCKS {
+        let mut input = [Val::ZERO; W];
+        input[..RATE].copy_from_slice(&felts[blk * RATE..blk * RATE + RATE]);
+        input[RATE..].copy_from_slice(&cap);
+        input[CAP_LANE] += Val::from_u64(RATE as u64);
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        cap.copy_from_slice(&native_permute(input)[RATE..]);
+    }
+    RowMajorMatrix::new(t, W)
+}
+
+/// Prove that the transcript over (instance ‖ ζ-commits ‖ round-commits) squeezes the public challenges
+/// (α, ζ, β_0..β_{R-1}), each a 2-coefficient F_p² value.
+pub fn prove_fri_transcript(felts: &[Val], challenges: &[[Val; 2]]) -> Vec<u8> {
+    let pis: Vec<Val> = challenges.iter().flat_map(|c| [c[0], c[1]]).collect();
+    postcard::to_allocvec(&prove(&make_config(), &FriTranscriptAir, ft_build_trace(felts), &pis)).expect("serialize")
+}
+
+pub fn verify_fri_transcript(proof_bytes: &[u8], challenges: &[[Val; 2]]) -> bool {
+    let pis: Vec<Val> = challenges.iter().flat_map(|c| [c[0], c[1]]).collect();
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), &FriTranscriptAir, &proof, &pis).is_ok()
+}
+
+// =================================================================================================
 // Component 2 — in-circuit OOD / constraint check (the "constraint folder as constraints").
 // Evaluates the INNER AIR's constraints at ζ in-circuit, combined with α (Horner), and checks
 // folded(ζ) == Z_H(ζ)·quotient (i.e. folded·inv_vanishing == quotient) — the verifier's exit step.
@@ -376,6 +540,30 @@ mod tests {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let p = prove_transcript(&tinstance, &commitments, alpha, zeta);
             verify_transcript(&p, alpha, zeta)
+        }));
+        assert!(matches!(outcome, Ok(false) | Err(_)));
+    }
+
+    #[test]
+    #[ignore = "slow: in-circuit FRI commit-phase challenge derivation vs native challenger"]
+    fn fri_transcript_binds_all_challenges() {
+        let felts = felts(1, FT_BLOCKS * RATE); // 32 felts
+        let instance = &felts[0..8];
+        let zeta_commits = &felts[8..16];
+        let round_commits: Vec<[Val; RATE]> =
+            (0..FRI_ROUNDS).map(|r| felts[16 + 4 * r..20 + 4 * r].try_into().unwrap()).collect();
+        let challenges = native_fri_challenges(instance, zeta_commits, &round_commits);
+        assert_eq!(challenges.len(), 2 + FRI_ROUNDS); // α, ζ, β_0..β_3
+
+        let proof = prove_fri_transcript(&felts, &challenges);
+        assert!(verify_fri_transcript(&proof, &challenges), "in-circuit α/ζ/β_r must match the native challenger");
+
+        // a tampered absorb ⇒ different challenges ⇒ unsatisfiable against the original public set.
+        let mut tfelts = felts.clone();
+        tfelts[20] += Val::ONE; // perturb a β-round commitment felt
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = prove_fri_transcript(&tfelts, &challenges);
+            verify_fri_transcript(&p, &challenges)
         }));
         assert!(matches!(outcome, Ok(false) | Err(_)));
     }
