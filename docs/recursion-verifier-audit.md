@@ -109,7 +109,16 @@ differential-tested in-circuit spikes in `lattica-prover-p3/src/recursion/`:
   (`FoldChainAir`): the running eval folded round-by-round with the FRI squaring point map `x→x²`,
   reaching the final-poly value; tampered sibling / wrong final rejected.
 
-The remaining work is the **integration** (B3-wire + B3-quotient + B4 + B5) — see `recursion-design.md`
+- **Native re-verifier (B3-wire skeleton)** — `native_verify.rs`: a from-scratch re-implementation of the
+  `p3-uni-stark::verify` orchestration (transcript replay → opening rounds → quotient recomposition →
+  constraint/OOD check), **validated to agree with `p3::verify`** (accepts valid, rejects a tampered
+  public value) on a minimal `ConstAir`, non-ZK config. The FRI test is delegated to `pcs.verify` (= the
+  validated primitives). This is the §9 plan, executed natively — the porting blueprint for the
+  in-circuit verifier.
+
+The remaining work is the **in-circuit integration** (port the native skeleton to an AIR: replace
+`pcs.verify` with the `fri_merkle`/`transcript`/`fri_fold` gadgets + the constraint folder as
+constraints; add the ZK/hiding branches; B4 aggregation; B5 seam) — see `recursion-design.md`
 §10 for the roadmap. Feasibility unknowns (hashing scale, transcript fidelity, F_p² folding) are retired;
 what's left is faithful high-volume wiring against p3's exact proof format + the circuit-specific
 quotient/DEEP check. §9 below specifies that wiring concretely.

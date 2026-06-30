@@ -10,4 +10,5 @@
 
 pub mod fri_fold;
 pub mod fri_merkle;
+pub mod native_verify;
 pub mod transcript;
