@@ -176,3 +176,41 @@ Zig seam mirroring the batch seam; real cross-language integration.
 This is multi-month and audit-bearing (its own corrupted-trace suite + a constraint-by-constraint audit
 here). But every sub-operation is now a validated, real-prover-tested primitive; B3-wire is composition +
 faithful proof parsing, not new cryptography.
+
+## 10. The AIR port — concrete construction plan (the remaining multi-month build)
+
+The native verify (`native_fri.rs::verify_proof`) is COMPLETE + validated vs `p3::verify` and is now the
+exact algorithm to port. The port turns that native Rust into ONE verifier AIR whose trace, when the inner
+proof verifies, satisfies the constraints — and is satisfiable **iff `p3::verify` accepts** (the only
+end-state validation; there is no sound partial-accept). Status + the construction:
+
+**Done — port step 1 (`ConstraintCheckWithSelectorsAir`, validated):** the first *wired multi-gadget
+fragment* — component 4 (in-circuit domain selectors at ζ) composed INTO component 2 (the constraint
+folder), so the constraint/OOD region derives `is_first`/`is_transition`/`inv_vanishing` from ζ in-circuit
+and folds with α, checking `folded·inv_van == quotient`. Validated vs the real `selectors_at_point(ζ)` +
+the folded relation. This is the constraint-check half of `verify_proof`'s tail, as one AIR.
+
+**The monolithic verifier AIR — region layout** (trace ≈ 2²⁰ rows; the inner proof is laid into columns):
+1. **Transcript region** — the full Fiat-Shamir sponge (component 1 generalized): absorb degree bits, the
+   trace/quotient commitments, the public values, the FRI batch α, each round's commit + β_r, the
+   `final_poly`, the opened evaluations — producing α (constraint), ζ, the FRI α, the β_r, and the query
+   indices via `SampleBitsAir` (3b-iii). Variable-length absorbs ⇒ a long sponge sub-trace.
+2. **Per-query regions × num_queries(96)** — each unrolls `open_input` + `verify_query` for one query:
+   `LeafHashAir` (3b-i, the MMCS leaf) → `fri_merkle` path-merge (the input opening) → `ReducedOpeningAir`
+   (3b-ii, the DEEP reduce, accumulated by height) → the commit-phase `fri_fold` chain with per-round
+   `fri_merkle` openings → the `final_poly` Horner check. ~50k+ rows (96 × path-depth × Poseidon2 width).
+3. **Constraint region** — port step 1 above (`ConstraintCheckWithSelectorsAir`) over the recomposed
+   quotient + the opened trace values.
+The hard part is the **column plumbing** between regions (the transcript outputs feed the query/constraint
+regions; the query indices feed the Merkle paths) wired via periodic/selector columns — this is the bulk,
+and it is validatable only once whole.
+
+**Validation strategy:** prove the verifier AIR over a real inner proof's columns; it must accept iff
+`p3::verify` accepts, and reject every tampered inner proof (mirror `native_fri_verify_agrees_with_p3`).
+Plus its own corrupted-trace suite (each region's constraints).
+
+**B4 (aggregation) — sits on top of the finished port:** the verifier AIR ×K (tiled, like `batch_*_air`),
+folding each inner proof's per-tx statement digest into the block tx-root via the existing `DOM_TXROOT`
+MD-chain — emitting the SAME tx-root, so the node's `verifyBatch`/`batchRoot` seam is unchanged.
+**B5:** compose outer-as-inner (log-depth tree) + the C ABI/Zig seam mirroring the batch seam + a real
+cross-language integration. B4/B5 cannot be built or validated until the port (above) exists.

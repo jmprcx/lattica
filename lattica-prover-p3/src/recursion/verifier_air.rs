@@ -1006,12 +1006,177 @@ pub fn verify_constraint_check(proof_bytes: &[u8], quotient: Challenge) -> bool 
     verify(&make_config(), &ConstraintCheckAir, &proof, &pis).is_ok()
 }
 
+// =================================================================================================
+// AIR PORT (step 1) — compose component 4 (in-circuit domain selectors) INTO component 2 (constraint
+// check). The verifier's constraint/OOD region now DERIVES is_first/is_transition/inv_vanishing from ζ
+// in-circuit (the squaring chain + selector formulas + in-circuit inverses) instead of taking them as
+// witness, then folds the constraints with α and checks folded·inv_van == quotient. Validated end-to-end
+// vs the real `domain.selectors_at_point(ζ)` + the folded relation — the first wired multi-gadget
+// fragment of the verifier AIR. (Both sub-gadgets are individually validated; this validates they
+// compose: the AIR accepts iff the selectors-at-ζ are correct AND the constraint relation holds.)
+// =================================================================================================
+
+const CCS_ZETA: usize = 0; // squaring chain S_1..S_{DS_LOG_SIZE} follows at offset 2*i (S_0 = ζ)
+const CCS_INV_UM1: usize = 2 * (DS_LOG_SIZE + 1);
+const CCS_INV_UMG: usize = CCS_INV_UM1 + 2;
+const CCS_INV_ZH: usize = CCS_INV_UMG + 2;
+const CCS_LOCAL: usize = CCS_INV_ZH + 2;
+const CCS_NEXT: usize = CCS_LOCAL + 2;
+const CCS_ALPHA: usize = CCS_NEXT + 2;
+const CCS_PUB: usize = CCS_ALPHA + 2; // base
+const CCS_QUOT: usize = CCS_PUB + 1;
+const CCS_WIDTH: usize = CCS_QUOT + 2;
+
+pub struct ConstraintCheckWithSelectorsAir;
+
+impl BaseAir<Goldilocks> for ConstraintCheckWithSelectorsAir {
+    fn width(&self) -> usize {
+        CCS_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the quotient (bound)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckWithSelectorsAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let w = AB::Expr::from(Goldilocks::from_u64(W_EXT));
+        let g_inv = AB::Expr::from(ds_g_inv());
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
+        };
+        let g = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let mut fr = builder.when_first_row();
+
+        // --- component 4: derive the selectors from ζ ---
+        for i in 1..=DS_LOG_SIZE {
+            let sq = emul(g(2 * (i - 1)), g(2 * (i - 1)));
+            fr.assert_zero(cur[2 * i].clone() - sq.0);
+            fr.assert_zero(cur[2 * i + 1].clone() - sq.1);
+        }
+        let u = g(CCS_ZETA);
+        let z_h = (cur[2 * DS_LOG_SIZE].clone() - one.clone(), cur[2 * DS_LOG_SIZE + 1].clone());
+        let u_m1 = (u.0.clone() - one.clone(), u.1.clone());
+        let u_mg = (u.0.clone() - g_inv, u.1.clone());
+        let p1 = emul(g(CCS_INV_UM1), u_m1);
+        fr.assert_zero(p1.0 - one.clone());
+        fr.assert_zero(p1.1);
+        let p2 = emul(g(CCS_INV_UMG), u_mg.clone());
+        fr.assert_zero(p2.0 - one.clone());
+        fr.assert_zero(p2.1);
+        let p3 = emul(g(CCS_INV_ZH), z_h.clone());
+        fr.assert_zero(p3.0 - one.clone());
+        fr.assert_zero(p3.1);
+        let is_first = emul(z_h, g(CCS_INV_UM1));
+        let is_trans = u_mg; // is_transition = ζ − g⁻¹
+        let inv_van = g(CCS_INV_ZH);
+
+        // --- component 2: fold the constraints with the derived selectors ---
+        let local_m_pub = (cur[CCS_LOCAL].clone() - cur[CCS_PUB].clone(), cur[CCS_LOCAL + 1].clone());
+        let c0 = emul(is_first, local_m_pub);
+        let next_m_local = (cur[CCS_NEXT].clone() - cur[CCS_LOCAL].clone(), cur[CCS_NEXT + 1].clone() - cur[CCS_LOCAL + 1].clone());
+        let c1 = emul(is_trans, next_m_local);
+        let c0a = emul(c0, g(CCS_ALPHA));
+        let folded = (c0a.0 + c1.0, c0a.1 + c1.1);
+        let lhs = emul(folded, inv_van);
+        fr.assert_zero(lhs.0 - cur[CCS_QUOT].clone());
+        fr.assert_zero(lhs.1 - cur[CCS_QUOT + 1].clone());
+        fr.assert_zero(cur[CCS_QUOT].clone() - pis[0].clone());
+        fr.assert_zero(cur[CCS_QUOT + 1].clone() - pis[1].clone());
+    }
+}
+
+/// Native reference for the composed fragment: the quotient implied by deriving the selectors at ζ and
+/// folding the (ConstAir-shaped) constraints with α. Uses the same selector formula as component 4.
+pub fn ccs_native_quotient(zeta: Challenge, alpha: Challenge, local: Challenge, next: Challenge, pub_val: Val) -> Challenge {
+    let (chain, inv_um1, _inv_umg, inv_zh) = ds_native(zeta);
+    let z_h = *chain.last().unwrap() - Challenge::ONE;
+    let is_first = z_h * inv_um1;
+    let is_trans = zeta - Challenge::from(ds_g_inv());
+    let c0 = is_first * (local - Challenge::from(pub_val));
+    let c1 = is_trans * (next - local);
+    (c0 * alpha + c1) * inv_zh
+}
+
+fn ccs_build_trace(zeta: Challenge, alpha: Challenge, local: Challenge, next: Challenge, pub_val: Val, quotient: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let (chain, inv_um1, inv_umg, inv_zh) = ds_native(zeta);
+    let mut r = [Val::ZERO; CCS_WIDTH];
+    let zc = c(zeta);
+    r[CCS_ZETA] = zc[0];
+    r[CCS_ZETA + 1] = zc[1];
+    for (i, s) in chain.iter().enumerate() {
+        let sc = c(*s);
+        r[2 * (i + 1)] = sc[0];
+        r[2 * (i + 1) + 1] = sc[1];
+    }
+    for (off, v) in [(CCS_INV_UM1, inv_um1), (CCS_INV_UMG, inv_umg), (CCS_INV_ZH, inv_zh), (CCS_LOCAL, local), (CCS_NEXT, next), (CCS_ALPHA, alpha), (CCS_QUOT, quotient)] {
+        let vc = c(v);
+        r[off] = vc[0];
+        r[off + 1] = vc[1];
+    }
+    r[CCS_PUB] = pub_val;
+    let mut vals = Vec::with_capacity(8 * CCS_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, CCS_WIDTH)
+}
+
+pub fn prove_ccs(zeta: Challenge, alpha: Challenge, local: Challenge, next: Challenge, pub_val: Val, quotient: Challenge) -> Vec<u8> {
+    use p3_field::BasedVectorSpace;
+    let pis = quotient.as_basis_coefficients_slice().to_vec();
+    postcard::to_allocvec(&prove(&make_config(), &ConstraintCheckWithSelectorsAir, ccs_build_trace(zeta, alpha, local, next, pub_val, quotient), &pis)).expect("serialize")
+}
+
+pub fn verify_ccs(proof_bytes: &[u8], quotient: Challenge) -> bool {
+    use p3_field::BasedVectorSpace;
+    let pis = quotient.as_basis_coefficients_slice().to_vec();
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), &ConstraintCheckWithSelectorsAir, &proof, &pis).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn felts(start: u64, n: usize) -> Vec<Val> {
         (0..n as u64).map(|i| Val::from_u64(start + i)).collect()
+    }
+
+    #[test]
+    #[ignore = "slow: composed constraint-check w/ in-circuit selectors vs native selectors_at_point + fold"]
+    fn ccs_matches_native() {
+        use p3_commit::{Pcs, PolynomialSpace};
+        use p3_field::BasedVectorSpace;
+        use p3_uni_stark::StarkGenericConfig;
+        let config = make_config();
+        let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(config.pcs(), 1 << DS_LOG_SIZE);
+        let ch = |a: u64, b: u64| Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }));
+        let zeta = ch(7_777, 5_555);
+        let sels = domain.selectors_at_point(zeta);
+        let (alpha, local, next, pub_val) = (ch(31, 37), ch(11, 13), ch(17, 19), Val::from_u64(23));
+
+        // expected quotient via the REAL `selectors_at_point` + the folded relation.
+        let c0 = sels.is_first_row * (local - Challenge::from(pub_val));
+        let c1 = sels.is_transition * (next - local);
+        let quotient = (c0 * alpha + c1) * sels.inv_vanishing;
+        // the in-circuit selectors (component 4 formula) must agree with the real selectors_at_point.
+        assert_eq!(ccs_native_quotient(zeta, alpha, local, next, pub_val), quotient);
+
+        let proof = prove_ccs(zeta, alpha, local, next, pub_val, quotient);
+        assert!(verify_ccs(&proof, quotient), "composed selectors+constraint must match native");
+        assert!(!verify_ccs(&proof, quotient + Challenge::ONE));
     }
 
     #[test]
