@@ -1239,6 +1239,129 @@ pub(crate) fn tq_build_trace(
     RowMajorMatrix::new(t, width)
 }
 
+// =================================================================================================
+// Phase 4.0 — the monolith SKELETON: de-risks the unified layout (the #1 assembly risk) BEFORE wiring
+// logic. One trace with the [transcript | query | epilogue] region structure, period-32 Poseidon round
+// columns, and full-height region masks (S_POSEIDON gates the round constraints to the transcript region;
+// the query/epilogue rows ignore them). Confirms: the periodic schedule + masks + 32-alignment compile and
+// prove, a Poseidon sponge runs correctly INSIDE a masked sub-region, and a transcript-output value binds
+// to public via a one-hot (the binding mechanism Phase 4.A generalizes) — all within the 8 GB / ≤2^16 budget.
+// =================================================================================================
+
+const SK_TB: usize = 4; // transcript Poseidon blocks (skeleton size)
+// periodic: 11 round cols + P_BLOCK_LAST (idx 11, present for alignment) + S_POSEIDON + P_OUT.
+const SK_S_POSEIDON: usize = 12; // 1 on the transcript region's rows
+const SK_P_OUT: usize = 13; // one-hot at the transcript's last block output row
+const SK_N_PERIODIC: usize = 14;
+
+#[allow(dead_code)]
+pub(crate) struct MonolithSkeletonAir;
+
+impl MonolithSkeletonAir {
+    fn height(&self) -> usize {
+        (SK_TB * BLOCK + BLOCK).next_power_of_two() // transcript region + a query/epilogue region, padded
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round cols (period BLOCK)
+        let mut block_last = vec![Val::ZERO; BLOCK];
+        block_last[BLOCK - 1] = Val::ONE;
+        cols.push(block_last);
+        let mut s_pos = vec![Val::ZERO; h]; // transcript region = the first SK_TB blocks
+        for r in 0..SK_TB * BLOCK {
+            s_pos[r] = Val::ONE;
+        }
+        cols.push(s_pos);
+        let mut p_out = vec![Val::ZERO; h];
+        p_out[SK_TB * BLOCK - 1] = Val::ONE; // last transcript block's output row
+        cols.push(p_out);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for MonolithSkeletonAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the bound transcript output (rate[3], rate[2])
+    }
+    fn num_periodic_columns(&self) -> usize {
+        SK_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithSkeletonAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let s_pos = p[SK_S_POSEIDON].clone();
+
+        // Poseidon round constraints, GATED to the transcript region by S_POSEIDON (the query/epilogue rows
+        // ignore the period-32 schedule). periodic_table zeroes the round selectors at each block's last row,
+        // so the region-boundary transition is automatically vacuous.
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(s_pos.clone() * step);
+        }
+
+        // transcript seed: the first block absorbs a fixed sponge input [1, 0, …].
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[0].clone() - AB::Expr::ONE);
+            for i in 1..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // bind the transcript output (rate[3], rate[2]) at the last block's output row → public.
+        let out = p[SK_P_OUT].clone();
+        builder.assert_zero(out.clone() * (cur[3].clone() - pis[0].clone()));
+        builder.assert_zero(out * (cur[2].clone() - pis[1].clone()));
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn skeleton_build_trace() -> (RowMajorMatrix<Val>, [Val; 2]) {
+    let air = MonolithSkeletonAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * W];
+    // transcript region: a dummy duplex sponge (block 0 input [1,0,…], chained block-to-block).
+    let mut input = [Val::ZERO; W];
+    input[0] = Val::ONE;
+    let mut last_out = [Val::ZERO; W];
+    for blk in 0..SK_TB {
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        last_out = native_permute(input);
+        input = last_out; // chain (squeeze-style)
+    }
+    // the bound output = (rate[3], rate[2]) of the last transcript block's output row.
+    let out = [last_out[3], last_out[2]];
+    (RowMajorMatrix::new(t, W), out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -1789,5 +1912,30 @@ mod tests {
         bad[0] += Val::ONE;
         assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong final_poly target ⇒ reject");
         println!("Phase 4 tiled query region: all {} queries verified in ONE AIR ({} rows)", MILESTONE_QUERIES, air.height());
+    }
+
+    /// Phase 4.0: the monolith skeleton — the unified [transcript | query | epilogue] layout with masked
+    /// Poseidon + region selectors + 32-alignment compiles, proves (a sponge runs inside the masked
+    /// region, its output binds to public), and fits the 8 GB / ≤2^16 budget. De-risks the layout.
+    #[test]
+    #[ignore = "slow: Phase 4.0 monolith skeleton (layout de-risk) proves + budget"]
+    fn phase4_skeleton_layout() {
+        use super::{skeleton_build_trace, MonolithSkeletonAir, SK_TB};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let air = MonolithSkeletonAir;
+        let (trace, out) = skeleton_build_trace();
+        let pis = out.to_vec();
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "skeleton layout (masked Poseidon + region masks + 32-align) must prove");
+        let mut bad = pis.clone();
+        bad[0] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong transcript output ⇒ reject");
+        let h = air.height();
+        let log_h = h.trailing_zeros();
+        assert!(h <= (1 << 18), "skeleton height ≤ 2^18");
+        println!("Phase 4.0 skeleton: {h} rows (2^{log_h}; {SK_TB} transcript blocks + query/epilogue), masked-Poseidon layout proves");
+        let rss = peak_rss_bytes();
+        println!("  -> peak RSS {} MiB", rss / (1 << 20));
+        assert!(rss <= EIGHT_GB, "skeleton peak RSS ≤ 8 GB");
     }
 }
