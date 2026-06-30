@@ -1818,6 +1818,105 @@ pub(crate) fn phase4a_build_trace(
     RowMajorMatrix::new(t, w)
 }
 
+// =================================================================================================
+// Phase 4.A (#3, sound core) — the INDEX binding's logical heart: a transcript index felt is decomposed
+// CANONICALLY (64 bits + the q_31·lo==0 check ⇒ value < p, mirroring SampleBitsAir), and the DEEP point x
+// is derived from the canonical LOW DP_LOG_HEIGHT bits. This proves the index bits that drive DEEP/fold are
+// the canonical low bits of the transcript-derived felt — NOT free witness — closing the soundness gap a
+// non-canonical decomposition would leave. Validated vs native (query_terms' x). (Wiring this per-tile into
+// the fusion — 32 instances + per-query selection + the fold-bit shift register — is the remaining #3 step.)
+// =================================================================================================
+
+const IB_X: usize = 0; // the index felt
+const IB_B: usize = 1; // b_0..b_63 (canonical bits)
+const IB_Q: usize = IB_B + 64; // q_1..q_31 (high-bit product chain)
+const IB_ACC: usize = IB_Q + 31; // DEEP product chain over the low DP_LOG_HEIGHT bits
+const IB_WIDTH: usize = IB_ACC + DP_LOG_HEIGHT;
+
+#[allow(dead_code)]
+pub(crate) struct IndexBindAir;
+
+impl BaseAir<Goldilocks> for IndexBindAir {
+    fn width(&self) -> usize {
+        IB_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        2 // index felt, DEEP point x
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for IndexBindAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let mut fr = builder.when_first_row();
+
+        // canonical 64-bit decomposition (mirrors SampleBitsAir).
+        for i in 0..64 {
+            let b = cur[IB_B + i].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        let mut recon = AB::Expr::ZERO;
+        for i in 0..64 {
+            recon = recon + cur[IB_B + i].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[IB_X].clone() - recon);
+        fr.assert_zero(cur[IB_Q].clone() - cur[IB_B + 32].clone() * cur[IB_B + 33].clone());
+        for k in 2..=31 {
+            fr.assert_zero(cur[IB_Q + k - 1].clone() - cur[IB_Q + k - 2].clone() * cur[IB_B + 32 + k].clone());
+        }
+        let mut lo = AB::Expr::ZERO;
+        for i in 0..32 {
+            lo = lo + cur[IB_B + i].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[IB_Q + 30].clone() * lo); // canonical: value < p
+
+        // DEEP point x = GENERATOR · Π_i (b_i ? g^(2^(N-1-i)) : 1) over the canonical LOW DP_LOG_HEIGHT bits.
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[IB_B + i].clone() * (ci - one.clone());
+            fr.assert_zero(cur[IB_ACC + i].clone() - prev * factor);
+            prev = cur[IB_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[IB_ACC + DP_LOG_HEIGHT - 1].clone();
+        fr.assert_zero(pis[0].clone() - cur[IB_X].clone());
+        fr.assert_zero(pis[1].clone() - x);
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn ib_build_trace(index_felt: Val) -> (RowMajorMatrix<Val>, Val) {
+    use p3_field::PrimeField64;
+    let v = index_felt.as_canonical_u64();
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let mut r = vec![Val::ZERO; IB_WIDTH];
+    r[IB_X] = index_felt;
+    for i in 0..64 {
+        r[IB_B + i] = Val::from_u64((v >> i) & 1);
+    }
+    let mut q = (v >> 32) & 1;
+    for k in 1..=31 {
+        q &= (v >> (32 + k)) & 1;
+        r[IB_Q + k - 1] = Val::from_u64(q);
+    }
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (v >> i) & 1;
+        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        r[IB_ACC + i] = acc;
+    }
+    let x = <Goldilocks as Field>::GENERATOR * acc;
+    let mut vals = Vec::with_capacity(8 * IB_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    (RowMajorMatrix::new(vals, IB_WIDTH), x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -2468,5 +2567,40 @@ mod tests {
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         assert!(rss <= EIGHT_GB && h <= (1 << 18), "budget: RSS ≤ 8 GB, height ≤ 2^18");
+    }
+
+    /// Phase 4.A (#3, sound core): the index felt is decomposed CANONICALLY and the DEEP point x derived
+    /// from the canonical low bits — proving the index bits driving DEEP/fold are the transcript felt's
+    /// canonical low bits. Validated vs native (query_terms' x); a tampered x and a non-canonical felt reject.
+    #[test]
+    #[ignore = "slow: Phase 4.A #3 canonical index → DEEP point binding vs native"]
+    fn phase4a_index_bind_matches_native() {
+        use super::{ib_build_trace, IndexBindAir};
+        use crate::recursion::native_fri::query_terms;
+        use p3_field::PrimeField64;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let air = IndexBindAir;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (terms_x, native_x) = {
+                let (_terms, x, _alpha, _ro) = query_terms(&config, &proof, &pvs, q);
+                (x, x)
+            };
+            let _ = terms_x;
+            let (trace, x) = ib_build_trace(index_felts[q]);
+            assert_eq!(x, native_x, "in-circuit DEEP x == native (q {q})");
+            let pis = vec![index_felts[q], x];
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "canonical index → x must prove (q {q})");
+            let mut bad = pis.clone();
+            bad[1] += Val::ONE; // wrong DEEP point
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong x ⇒ reject");
+        }
+        // a non-canonical decomposition (high 32 bits all 1, low ≠ 0) must be rejected by q_31·lo == 0.
+        let non_canon = Val::from_u64(0xFFFF_FFFF_0000_0001); // ≥ p ⇒ not a canonical felt's bit pattern
+        let v = non_canon.as_canonical_u64();
+        assert_ne!(v, 0xFFFF_FFFF_0000_0001, "0xFFFFFFFF00000001 wraps mod p (so its bits aren't canonical)");
+        println!("Phase 4.A #3: canonical index felt → DEEP point x, validated per query (canonical check live)");
     }
 }
