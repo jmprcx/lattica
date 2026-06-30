@@ -803,6 +803,218 @@ pub(crate) fn qi_build_trace(index: usize, terms: &[(Challenge, Challenge, Val)]
     RowMajorMatrix::new(vals, air.w())
 }
 
+// =================================================================================================
+// Phase 4 (part 2) — the FULL per-query arithmetic tile: a multi-row AIR composing DEEP point + reduced
+// opening (row 0) → ro = E_0, then the bit-aware commit-phase fold chain (all rows) → folded_eval, then
+// the per-query accept folded_eval == final_poly[0] (last row). One AIR does the entire per-query
+// arithmetic: index → x → ro → fold → accept. Validated vs verify_query's per-query accept. (The Merkle
+// bindings authenticating the opened rows/siblings, and the ×K tiling + transcript wire, follow.)
+// =================================================================================================
+
+const QT_E: usize = 0; // fold: running eval
+const QT_S: usize = 2; // fold: sibling
+const QT_B: usize = 4; // fold: β_r
+const QT_BIT: usize = 6; // fold: group-order bit
+const QT_SPT: usize = 7; // fold: point s_r
+const QT_I2S: usize = 8; // fold: inv(2 s_r)
+const QT_DBITS: usize = 9; // DEEP index bits (row 0)
+const QT_ACC: usize = QT_DBITS + DP_LOG_HEIGHT;
+const QT_ALPHA: usize = QT_ACC + DP_LOG_HEIGHT;
+const QT_TERMS: usize = QT_ALPHA + 2;
+
+#[allow(dead_code)]
+pub(crate) struct QueryTileAir {
+    pub n_terms: usize,
+}
+
+impl QueryTileAir {
+    fn z(&self, k: usize) -> usize {
+        QT_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    fn w(&self) -> usize {
+        QT_TERMS + 9 * self.n_terms
+    }
+}
+
+impl BaseAir<Goldilocks> for QueryTileAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // final_poly[0] (the per-query accept target)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+
+        // --- row 0: DEEP point + reduced opening → ro, and E_0 == ro ---
+        {
+            let mut fr = builder.when_first_row();
+            for i in 0..DP_LOG_HEIGHT {
+                let b = cur[QT_DBITS + i].clone();
+                fr.assert_zero(b.clone() * (one.clone() - b));
+            }
+            let mut prev = one.clone();
+            for i in 0..DP_LOG_HEIGHT {
+                let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+                let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
+                fr.assert_zero(cur[QT_ACC + i].clone() - prev * factor);
+                prev = cur[QT_ACC + i].clone();
+            }
+            let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+            let alpha = gg(QT_ALPHA);
+            fr.assert_zero(cur[self.apow(0)].clone() - one.clone());
+            fr.assert_zero(cur[self.apow(0) + 1].clone());
+            for k in 1..self.n_terms {
+                let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+                fr.assert_zero(cur[self.apow(k)].clone() - prod.0);
+                fr.assert_zero(cur[self.apow(k) + 1].clone() - prod.1);
+            }
+            let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+            for k in 0..self.n_terms {
+                let z = gg(self.z(k));
+                let inv = gg(self.inv(k));
+                let z_m_x = (z.0 - x.clone(), z.1);
+                let chk = emul(inv.clone(), z_m_x);
+                fr.assert_zero(chk.0 - one.clone());
+                fr.assert_zero(chk.1);
+                let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+                let t = emul(emul(gg(self.apow(k)), d), inv);
+                ro = (ro.0 + t.0, ro.1 + t.1);
+            }
+            fr.assert_zero(cur[QT_E].clone() - ro.0); // E_0 == ro
+            fr.assert_zero(cur[QT_E + 1].clone() - ro.1);
+        }
+
+        // --- all rows: bit-aware fold chain E → folded_eval ---
+        let bit = cur[QT_BIT].clone();
+        let i2s = cur[QT_I2S].clone();
+        let spt = cur[QT_SPT].clone();
+        builder.when_transition().assert_zero(bit.clone() * (one.clone() - bit.clone()));
+        builder.when_transition().assert_zero(i2s.clone() * (two.clone() * spt) - one.clone());
+        let sign = one - two * bit;
+        let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
+        let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
+        let b = (cur[QT_B].clone(), cur[QT_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, b);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(nxt[QT_E].clone() - fold0);
+        builder.when_transition().assert_zero(nxt[QT_E + 1].clone() - fold1);
+
+        // --- last row: folded_eval == final_poly[0] (the per-query accept) ---
+        {
+            let mut lr = builder.when_last_row();
+            lr.assert_zero(cur[QT_E].clone() - pis[0].clone());
+            lr.assert_zero(cur[QT_E + 1].clone() - pis[1].clone());
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qt_build_trace(
+    index: usize,
+    terms: &[(Challenge, Challenge, Val)],
+    alpha: Challenge,
+    ro: Challenge,
+    rounds: &[(Challenge, Challenge, bool, Val)],
+) -> RowMajorMatrix<Val> {
+    use crate::recursion::fri_fold::native_fold;
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = QueryTileAir { n_terms: terms.len() };
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let n = rounds.len();
+    let height = (n + 1).next_power_of_two().max(2);
+    let mut t = vec![Val::ZERO; height * air.w()];
+
+    // fold-chain columns (all rows) + the running eval.
+    let mut e = ro;
+    for r in 0..height {
+        let base = r * air.w();
+        let ec = c(e);
+        t[base + QT_E] = ec[0];
+        t[base + QT_E + 1] = ec[1];
+        if r < n {
+            let (sib, beta, bit, s) = rounds[r];
+            let (sc, bc) = (c(sib), c(beta));
+            t[base + QT_S] = sc[0];
+            t[base + QT_S + 1] = sc[1];
+            t[base + QT_B] = bc[0];
+            t[base + QT_B + 1] = bc[1];
+            t[base + QT_BIT] = if bit { Val::ONE } else { Val::ZERO };
+            t[base + QT_SPT] = s;
+            t[base + QT_I2S] = (Val::TWO * s).inverse();
+            let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+            e = native_fold(e0, e1, beta, s);
+        } else {
+            t[base + QT_S] = ec[0];
+            t[base + QT_S + 1] = ec[1];
+            t[base + QT_SPT] = Val::ONE;
+            t[base + QT_I2S] = Val::TWO.inverse();
+        }
+    }
+
+    // row 0: DEEP (bits + acc) + reduced (alpha + terms).
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (index >> i) & 1;
+        t[QT_DBITS + i] = Val::from_u64(bit as u64);
+        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        t[QT_ACC + i] = acc;
+    }
+    let x = <Goldilocks as Field>::GENERATOR * acc;
+    let ac = c(alpha);
+    t[QT_ALPHA] = ac[0];
+    t[QT_ALPHA + 1] = ac[1];
+    let mut apow = Challenge::ONE;
+    for (k, &(z, pz, px)) in terms.iter().enumerate() {
+        let (zc, pzc) = (c(z), c(pz));
+        t[air.z(k)] = zc[0];
+        t[air.z(k) + 1] = zc[1];
+        t[air.pz(k)] = pzc[0];
+        t[air.pz(k) + 1] = pzc[1];
+        t[air.px(k)] = px;
+        let inv = c((z - Challenge::from(x)).inverse());
+        t[air.inv(k)] = inv[0];
+        t[air.inv(k) + 1] = inv[1];
+        let ap = c(apow);
+        t[air.apow(k)] = ap[0];
+        t[air.apow(k) + 1] = ap[1];
+        apow *= alpha;
+    }
+    RowMajorMatrix::new(t, air.w())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -1243,5 +1455,35 @@ mod tests {
             bad[0] += Val::ONE;
             assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong ro ⇒ reject");
         }
+    }
+
+    /// Phase 4 (part 2): the FULL per-query tile — index → x → ro → fold → folded_eval == final_poly[0],
+    /// the entire per-query arithmetic in one AIR — validated vs verify_query's per-query accept.
+    #[test]
+    #[ignore = "slow: Phase 4 full per-query tile vs native verify_query accept"]
+    fn phase4_query_tile_matches_native() {
+        use super::QueryTileAir;
+        use crate::recursion::native_fri::{full_transcript_challenges, query_fold_data, query_terms};
+        use p3_field::PrimeField64;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+            let (ro2, rounds, folded_eval, final0) = query_fold_data(&config, &proof, &pvs, q);
+            assert_eq!(ro, ro2, "the two oracles agree on ro");
+            assert_eq!(folded_eval, final0, "valid proof: folded_eval == final_poly[0]");
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let air = QueryTileAir { n_terms: terms.len() };
+            let trace = super::qt_build_trace(index, &terms, alpha, ro, &rounds);
+            let pis = final0.as_basis_coefficients_slice().to_vec();
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "full query tile must reproduce verify_query's accept (q {q})");
+            let mut bad = pis.clone();
+            bad[0] += Val::ONE;
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong final_poly target ⇒ reject");
+        }
+        println!("Phase 4 query tile: index → x → ro → fold → folded_eval == final_poly[0] (validated end-to-end per query)");
     }
 }
