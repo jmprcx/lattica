@@ -23,7 +23,7 @@ use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 
 use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W};
-use crate::recursion::native_fri::Val;
+use crate::recursion::native_fri::{Challenge, Val};
 
 const RATE: usize = 4;
 const CAP_LANE: usize = RATE;
@@ -416,6 +416,134 @@ pub(crate) fn dp_build_trace(index: usize) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(vals, DP_WIDTH)
 }
 
+// =================================================================================================
+// Phase 3 (part 2) — the reduced opening (DEEP combination) for `open_input`'s real shape: a generic
+// N-term `ro = Σ_k α^k·(p_z_k − p_x_k)/(z_k − x)`, where p_z (claimed eval) is F_p², p_x (opened row
+// value) is base, x (the DEEP point) is base and shared across a height, and z_k are the opening points.
+// The milestone has 3 terms: trace at ζ, trace at ζ·g (the next row), quotient at ζ. Witnessed α-powers
+// and per-term inverse denominators (in-circuit inverse). Validated vs native_fri::query_terms's `ro`.
+// =================================================================================================
+
+const MRO_W_EXT: u64 = 7; // F_p² : X² = 7
+
+#[allow(dead_code)] // standalone-validated in Phase 3; composed into MonolithAir's query region in Phase 4
+pub(crate) struct MroAir {
+    pub n_terms: usize,
+}
+
+impl MroAir {
+    fn x(&self) -> usize {
+        0
+    }
+    fn alpha(&self) -> usize {
+        1
+    }
+    fn z(&self, k: usize) -> usize {
+        3 + 2 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        3 + 2 * self.n_terms + 2 * k
+    }
+    fn px(&self, k: usize) -> usize {
+        3 + 4 * self.n_terms + k
+    }
+    fn inv(&self, k: usize) -> usize {
+        3 + 5 * self.n_terms + 2 * k
+    }
+    fn apow(&self, k: usize) -> usize {
+        3 + 7 * self.n_terms + 2 * k
+    }
+    fn w(&self) -> usize {
+        3 + 9 * self.n_terms
+    }
+}
+
+impl BaseAir<Goldilocks> for MroAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the reduced opening
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MroAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let zero = AB::Expr::ZERO;
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let g = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let mut fr = builder.when_first_row();
+
+        let alpha = g(self.alpha());
+        let xb = cur[self.x()].clone(); // DEEP point (base)
+
+        // α-power chain: apow_0 = 1, apow_k = apow_{k-1} · α.
+        fr.assert_zero(cur[self.apow(0)].clone() - one.clone());
+        fr.assert_zero(cur[self.apow(0) + 1].clone());
+        for k in 1..self.n_terms {
+            let prod = emul(g(self.apow(k - 1)), alpha.clone());
+            fr.assert_zero(cur[self.apow(k)].clone() - prod.0);
+            fr.assert_zero(cur[self.apow(k) + 1].clone() - prod.1);
+        }
+
+        // ro = Σ_k apow_k · (p_z_k − p_x_k) · inv_k,  inv_k · (z_k − x) == 1.
+        let mut ro = (zero.clone(), zero.clone());
+        for k in 0..self.n_terms {
+            let z = g(self.z(k));
+            let inv = g(self.inv(k));
+            let z_m_x = (z.0 - xb.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            fr.assert_zero(chk.0 - one.clone());
+            fr.assert_zero(chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(g(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        fr.assert_zero(ro.0 - pis[0].clone());
+        fr.assert_zero(ro.1 - pis[1].clone());
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn mro_build_trace(terms: &[(Challenge, Challenge, Val)], x: Val, alpha: Challenge, ro: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = MroAir { n_terms: terms.len() };
+    let mut r = vec![Val::ZERO; air.w()];
+    r[air.x()] = x;
+    let ac = c(alpha);
+    r[air.alpha()] = ac[0];
+    r[air.alpha() + 1] = ac[1];
+    let mut apow = Challenge::ONE;
+    for (k, &(z, pz, px)) in terms.iter().enumerate() {
+        let (zc, pzc) = (c(z), c(pz));
+        r[air.z(k)] = zc[0];
+        r[air.z(k) + 1] = zc[1];
+        r[air.pz(k)] = pzc[0];
+        r[air.pz(k) + 1] = pzc[1];
+        r[air.px(k)] = px;
+        let inv = c((z - x).inverse());
+        r[air.inv(k)] = inv[0];
+        r[air.inv(k) + 1] = inv[1];
+        let ap = c(apow);
+        r[air.apow(k)] = ap[0];
+        r[air.apow(k) + 1] = ap[1];
+        apow *= alpha;
+    }
+    let _ = ro;
+    let mut vals = Vec::with_capacity(8 * air.w());
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, air.w())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -777,6 +905,30 @@ mod tests {
             let prf = prove(&config, &DeepPointAir, dp_build_trace(index), &vec![x]);
             assert!(verify(&config, &DeepPointAir, &prf, &vec![x]).is_ok(), "in-circuit DEEP point must match native (index {index})");
             assert!(verify(&config, &DeepPointAir, &prf, &vec![x + Val::ONE]).is_err());
+        }
+    }
+
+    /// Phase 3 (part 2): the in-circuit reduced opening matches native_fri's `open_input` ro for a query.
+    #[test]
+    #[ignore = "slow: Phase 3 reduced opening (DEEP) vs native open_input"]
+    fn phase3_reduced_opening_matches_native() {
+        use super::{mro_build_trace, MroAir};
+        use crate::recursion::native_fri::query_terms;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (terms, x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+            if q == 0 {
+                println!("Phase 3 reduced opening: {} DEEP terms per query", terms.len());
+            }
+            let air = MroAir { n_terms: terms.len() };
+            let trace = mro_build_trace(&terms, x, alpha, ro);
+            let pis: Vec<Val> = ro.as_basis_coefficients_slice().to_vec();
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "in-circuit reduced opening must match native (q {q})");
+            let mut bad = pis.clone();
+            bad[0] += Val::ONE;
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong ro ⇒ reject");
         }
     }
 }

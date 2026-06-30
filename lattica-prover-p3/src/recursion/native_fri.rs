@@ -504,6 +504,74 @@ pub(crate) fn full_transcript_challenges(
     (pair(alpha_stark), pair(zeta), pair(alpha_fri), betas.iter().map(|b| pair(*b)).collect(), index_felts)
 }
 
+/// Per-query oracle (Phase 3): builds the opening rounds like `verify_proof`, then mirrors `open_input`'s
+/// reduced-opening loop for query `q`, returning the DEEP terms `[(z, p_z, p_x)]` (z = opening point ext,
+/// p_z = claimed eval ext, p_x = opened row value base), the DEEP point x (base, shared across the
+/// milestone's single log_height), α_fri, and the native reduced opening `ro = Σ α^k (p_z − p_x)/(z − x)`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn query_terms(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> (Vec<(Challenge, Challenge, Val)>, Val, Challenge, Challenge) {
+    use p3_field::BasedVectorSpace;
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (_, zeta_p, alpha_p, _, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let zeta = to_ext(zeta_p);
+    let alpha = to_ext(alpha_p);
+
+    // opening rounds (mirror verify_proof): trace at {ζ, ζ_next} + quotient chunks at ζ.
+    let air = ConstAir;
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
+    let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let layout = AirLayout::from_air::<Val>(&air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, 0);
+    let nqc = 1usize << log_nqc;
+    let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    let zeta_next = trace_domain.next_point(zeta).unwrap();
+    let trace_pts = vec![(zeta, proof.opened_values.trace_local.clone()), (zeta_next, proof.opened_values.trace_next.clone().unwrap())];
+    let coms: ComOpenings = vec![
+        (proof.commitments.trace.clone(), vec![(trace_domain, trace_pts)]),
+        (proof.commitments.quotient_chunks.clone(), qcd.iter().zip(&proof.opened_values.quotient_chunks).map(|(d, v)| (*d, vec![(zeta, v.clone())])).collect()),
+    ];
+
+    // log_global + the query index.
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    use p3_field::PrimeField64;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+
+    // open_input's reduced-opening loop, capturing the terms.
+    let input_proof = &fri.query_proofs[q].input_proof;
+    let mut terms = Vec::new();
+    let mut alpha_pow = Challenge::ONE;
+    let mut ro = Challenge::ZERO;
+    let mut x_out = Val::ZERO;
+    for (batch_opening, (_, mats)) in input_proof.iter().zip(coms.iter()) {
+        for (mat_opening, (mat_domain, mat_pts)) in batch_opening.opened_values.iter().zip(mats.iter()) {
+            let log_height = log2_strict(mat_domain.size()) + 4;
+            let bits_reduced = log_global - log_height;
+            let rev = reverse_bits_len(index >> bits_reduced, log_height);
+            let x = Val::GENERATOR * Val::two_adic_generator(log_height).exp_u64(rev as u64);
+            x_out = x;
+            for (z, ps_at_z) in mat_pts.iter() {
+                let inv = (*z - x).inverse();
+                for (&p_x, &p_z) in mat_opening.iter().zip(ps_at_z.iter()) {
+                    terms.push((*z, p_z, p_x));
+                    ro += alpha_pow * (p_z - p_x) * inv;
+                    alpha_pow *= alpha;
+                }
+            }
+        }
+    }
+    (terms, x_out, alpha, ro)
+}
+
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
 /// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
 /// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify
