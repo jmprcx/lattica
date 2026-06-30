@@ -657,6 +657,152 @@ pub(crate) fn qf_build_trace(ro: Challenge, rounds: &[(Challenge, Challenge, boo
     RowMajorMatrix::new(t, QF_WIDTH)
 }
 
+// =================================================================================================
+// Phase 4 (part 1) — the per-query INPUT TILE: compose the DEEP point (3a) + reduced opening (3b) into
+// ONE AIR so x is no longer a separate input — the query index bits drive the DEEP product chain → x,
+// and that same x feeds the reduced-opening denominators → ro. This is the first cross-gadget composition
+// of the monolith's query region (column flow index → x → ro). Validated end-to-end vs native_fri's ro.
+// (The fold chain + Merkle bindings + ×K tiling + the transcript wire — accept-iff-p3::verify — follow.)
+// =================================================================================================
+
+// layout: DEEP bits b_0..b_{N-1} ‖ acc_1..acc_N ‖ α ‖ per-term {z, p_z, p_x, inv, apow}
+const QI_BITS: usize = 0;
+const QI_ACC: usize = DP_LOG_HEIGHT;
+const QI_ALPHA: usize = 2 * DP_LOG_HEIGHT;
+const QI_TERMS: usize = 2 * DP_LOG_HEIGHT + 2;
+
+#[allow(dead_code)]
+pub(crate) struct QueryInputTileAir {
+    pub n_terms: usize,
+}
+
+impl QueryInputTileAir {
+    fn z(&self, k: usize) -> usize {
+        QI_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    fn w(&self) -> usize {
+        QI_TERMS + 9 * self.n_terms
+    }
+}
+
+impl BaseAir<Goldilocks> for QueryInputTileAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // ro
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryInputTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let mut fr = builder.when_first_row();
+
+        // --- DEEP point: index bits → x = GENERATOR · Π_i (b_i ? g^(2^(N-1-i)) : 1) ---
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[QI_BITS + i].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[QI_BITS + i].clone() * (ci - one.clone());
+            fr.assert_zero(cur[QI_ACC + i].clone() - prev * factor);
+            prev = cur[QI_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QI_ACC + DP_LOG_HEIGHT - 1].clone();
+
+        // --- reduced opening using THAT x: ro = Σ_k apow_k·(p_z_k − p_x_k)·inv_k, inv_k·(z_k − x) == 1 ---
+        let alpha = gg(QI_ALPHA);
+        fr.assert_zero(cur[self.apow(0)].clone() - one.clone());
+        fr.assert_zero(cur[self.apow(0) + 1].clone());
+        for k in 1..self.n_terms {
+            let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+            fr.assert_zero(cur[self.apow(k)].clone() - prod.0);
+            fr.assert_zero(cur[self.apow(k) + 1].clone() - prod.1);
+        }
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for k in 0..self.n_terms {
+            let z = gg(self.z(k));
+            let inv = gg(self.inv(k));
+            let z_m_x = (z.0 - x.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            fr.assert_zero(chk.0 - one.clone());
+            fr.assert_zero(chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(gg(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        fr.assert_zero(ro.0 - pis[0].clone());
+        fr.assert_zero(ro.1 - pis[1].clone());
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn qi_build_trace(index: usize, terms: &[(Challenge, Challenge, Val)], alpha: Challenge, ro: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = QueryInputTileAir { n_terms: terms.len() };
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let mut r = vec![Val::ZERO; air.w()];
+    // DEEP: bits + acc chain → x
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (index >> i) & 1;
+        r[QI_BITS + i] = Val::from_u64(bit as u64);
+        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        r[QI_ACC + i] = acc;
+    }
+    let x = <Goldilocks as Field>::GENERATOR * acc;
+    // reduced opening terms
+    let ac = c(alpha);
+    r[QI_ALPHA] = ac[0];
+    r[QI_ALPHA + 1] = ac[1];
+    let mut apow = Challenge::ONE;
+    for (k, &(z, pz, px)) in terms.iter().enumerate() {
+        let (zc, pzc) = (c(z), c(pz));
+        r[air.z(k)] = zc[0];
+        r[air.z(k) + 1] = zc[1];
+        r[air.pz(k)] = pzc[0];
+        r[air.pz(k) + 1] = pzc[1];
+        r[air.px(k)] = px;
+        let inv = c((z - Challenge::from(x)).inverse());
+        r[air.inv(k)] = inv[0];
+        r[air.inv(k) + 1] = inv[1];
+        let ap = c(apow);
+        r[air.apow(k)] = ap[0];
+        r[air.apow(k) + 1] = ap[1];
+        apow *= alpha;
+    }
+    let _ = ro;
+    let mut vals = Vec::with_capacity(8 * air.w());
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, air.w())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -1070,6 +1216,32 @@ mod tests {
             let mut bad = pis.clone();
             bad[2] += Val::ONE;
             assert!(verify(&config, &QueryFoldAir, &prf, &bad).is_err(), "wrong folded_eval ⇒ reject");
+        }
+    }
+
+    /// Phase 4 (part 1): the per-query input tile composes DEEP point + reduced opening — the query index
+    /// drives x in-circuit, and that x feeds ro. Validated end-to-end vs native (index → x → ro).
+    #[test]
+    #[ignore = "slow: Phase 4 input tile (DEEP + reduced composed) vs native"]
+    fn phase4_input_tile_matches_native() {
+        use super::QueryInputTileAir;
+        use crate::recursion::native_fri::{full_transcript_challenges, query_terms};
+        use p3_field::PrimeField64;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let air = QueryInputTileAir { n_terms: terms.len() };
+            let trace = super::qi_build_trace(index, &terms, alpha, ro);
+            let pis = ro.as_basis_coefficients_slice().to_vec();
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "input tile (index → x → ro) must match native (q {q})");
+            let mut bad = pis.clone();
+            bad[0] += Val::ONE;
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong ro ⇒ reject");
         }
     }
 }
