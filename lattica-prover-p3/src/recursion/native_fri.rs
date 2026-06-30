@@ -572,6 +572,48 @@ pub(crate) fn query_terms(
     (terms, x_out, alpha, ro)
 }
 
+/// Per-query commit-phase oracle (Phase 3): mirrors `verify_query` for query `q`, returning the reduced
+/// opening e0 = ro, the per-round fold data `(sibling, β_r, bit, point s_r)` (bit = the arity-2 group slot
+/// of the running eval; s_r = g_{log+1}^reverse_bits(parent_index, log)), the resulting `folded_eval`, and
+/// `final_poly[0]` (= eval_final_poly for log_final_poly_len = 0). The per-query accept is
+/// `folded_eval == final_poly[0]`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn query_fold_data(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> (Challenge, Vec<(Challenge, Challenge, bool, Val)>, Challenge, Challenge) {
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (_, _, _, betas_p, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let betas: Vec<Challenge> = betas_p.iter().map(|&p| to_ext(p)).collect();
+    let (_, _, _, ro) = query_terms(config, proof, pvs, q);
+
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let mut start = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let mut e = ro;
+    let mut log_current = log_global;
+    let mut rounds = Vec::new();
+    for (r, step) in fri.query_proofs[q].commit_phase_openings.iter().enumerate() {
+        let la = step.log_arity as usize; // arity-2 ⇒ 1
+        let arity = 1usize << la;
+        let bit = start % arity;
+        let sibling = step.sibling_values[0];
+        let log_folded = log_current - la;
+        start >>= la;
+        let s = Val::two_adic_generator(log_folded + la).exp_u64(reverse_bits_len(start, log_folded) as u64);
+        let (e0, e1) = if bit == 0 { (e, sibling) } else { (sibling, e) };
+        e = crate::recursion::fri_fold::native_fold(e0, e1, betas[r], s);
+        rounds.push((sibling, betas[r], bit == 1, s));
+        log_current = log_folded;
+    }
+    let final0 = fri.final_poly[0];
+    (ro, rounds, e, final0)
+}
+
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
 /// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
 /// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify

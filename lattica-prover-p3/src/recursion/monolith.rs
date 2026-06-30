@@ -544,6 +544,119 @@ pub(crate) fn mro_build_trace(terms: &[(Challenge, Challenge, Val)], x: Val, alp
     RowMajorMatrix::new(vals, air.w())
 }
 
+// =================================================================================================
+// Phase 3 (parts 3+5) — the commit-phase fold chain + final check. Per round the running eval E folds
+// with that round's sibling at β_r and the fold point s_r, BIT-AWARE (the index bit decides the arity-2
+// group order): fold = (E+sib)/2 + (1−2·bit)·(E−sib)·β·inv(2s). The chain runs E0 = ro down to
+// folded_eval; the per-query accept (log_final_poly_len = 0) is folded_eval == final_poly[0]. The fold
+// points s_r are provided per round (their in-circuit derivation from the index is Phase-4 wiring).
+// Validated vs native_fri::query_fold_data.
+// =================================================================================================
+
+const QF_E: usize = 0; // running eval (F_p²)
+const QF_S: usize = 2; // sibling (F_p²)
+const QF_B: usize = 4; // β_r (F_p²)
+const QF_BIT: usize = 6; // arity-2 group slot of the running eval (boolean)
+const QF_SPT: usize = 7; // fold point s_r (base)
+const QF_I2S: usize = 8; // inv(2·s_r) (base)
+const QF_WIDTH: usize = 9;
+
+#[allow(dead_code)] // standalone-validated in Phase 3; composed into MonolithAir's query region in Phase 4
+pub(crate) struct QueryFoldAir;
+
+impl BaseAir<Goldilocks> for QueryFoldAir {
+    fn width(&self) -> usize {
+        QF_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        4 // ro (initial E) ‖ folded_eval (final E)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryFoldAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+
+        // first row: running eval == public ro
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[QF_E].clone() - pis[0].clone());
+            fr.assert_zero(cur[QF_E + 1].clone() - pis[1].clone());
+        }
+
+        let bit = cur[QF_BIT].clone();
+        let i2s = cur[QF_I2S].clone();
+        let spt = cur[QF_SPT].clone();
+        builder.when_transition().assert_zero(bit.clone() * (one.clone() - bit.clone())); // boolean
+        builder.when_transition().assert_zero(i2s.clone() * (two.clone() * spt) - one.clone()); // inv(2s)
+        let sign = one - two * bit; // 1 − 2·bit ∈ {+1, −1}
+        let e = (cur[QF_E].clone(), cur[QF_E + 1].clone());
+        let s = (cur[QF_S].clone(), cur[QF_S + 1].clone());
+        let b = (cur[QF_B].clone(), cur[QF_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, b);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(nxt[QF_E].clone() - fold0);
+        builder.when_transition().assert_zero(nxt[QF_E + 1].clone() - fold1);
+
+        // last row: running eval == public folded_eval
+        {
+            let mut lr = builder.when_last_row();
+            lr.assert_zero(cur[QF_E].clone() - pis[2].clone());
+            lr.assert_zero(cur[QF_E + 1].clone() - pis[3].clone());
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn qf_build_trace(ro: Challenge, rounds: &[(Challenge, Challenge, bool, Val)], _folded_eval: Challenge) -> RowMajorMatrix<Val> {
+    use crate::recursion::fri_fold::native_fold;
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let n = rounds.len();
+    let height = (n + 1).next_power_of_two().max(2);
+    let mut t = vec![Val::ZERO; height * QF_WIDTH];
+    let mut e = ro;
+    for r in 0..height {
+        let base = r * QF_WIDTH;
+        let ec = c(e);
+        t[base + QF_E] = ec[0];
+        t[base + QF_E + 1] = ec[1];
+        if r < n {
+            let (sib, beta, bit, s) = rounds[r];
+            let (sc, bc) = (c(sib), c(beta));
+            t[base + QF_S] = sc[0];
+            t[base + QF_S + 1] = sc[1];
+            t[base + QF_B] = bc[0];
+            t[base + QF_B + 1] = bc[1];
+            t[base + QF_BIT] = if bit { Val::ONE } else { Val::ZERO };
+            t[base + QF_SPT] = s;
+            t[base + QF_I2S] = (Val::TWO * s).inverse();
+            let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+            e = native_fold(e0, e1, beta, s);
+        } else {
+            // padding: sibling = running eval, β = 0, bit = 0 ⇒ fold = E (identity); s = 1.
+            t[base + QF_S] = ec[0];
+            t[base + QF_S + 1] = ec[1];
+            t[base + QF_SPT] = Val::ONE;
+            t[base + QF_I2S] = Val::TWO.inverse();
+        }
+    }
+    RowMajorMatrix::new(t, QF_WIDTH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -929,6 +1042,34 @@ mod tests {
             let mut bad = pis.clone();
             bad[0] += Val::ONE;
             assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong ro ⇒ reject");
+        }
+    }
+
+    /// Phase 3 (parts 3+5): the in-circuit commit-phase fold chain reproduces verify_query's folded_eval,
+    /// and the per-query final check folded_eval == final_poly[0] holds.
+    #[test]
+    #[ignore = "slow: Phase 3 commit-phase fold chain + final check vs native verify_query"]
+    fn phase3_fold_chain_matches_native() {
+        use super::{qf_build_trace, QueryFoldAir};
+        use crate::recursion::native_fri::query_fold_data;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (ro, rounds, folded_eval, final0) = query_fold_data(&config, &proof, &pvs, q);
+            // Phase 3e: the per-query accept condition (log_final_poly_len = 0).
+            assert_eq!(folded_eval, final0, "per-query final check: folded_eval == final_poly[0] (q {q})");
+            if q == 0 {
+                println!("Phase 3 fold chain: {} commit-phase rounds → folded_eval == final_poly[0]", rounds.len());
+            }
+            let trace = qf_build_trace(ro, &rounds, folded_eval);
+            let ro_c = ro.as_basis_coefficients_slice();
+            let fe_c = folded_eval.as_basis_coefficients_slice();
+            let pis = vec![ro_c[0], ro_c[1], fe_c[0], fe_c[1]];
+            let prf = prove(&config, &QueryFoldAir, trace, &pis);
+            assert!(verify(&config, &QueryFoldAir, &prf, &pis).is_ok(), "in-circuit fold chain must match native (q {q})");
+            let mut bad = pis.clone();
+            bad[2] += Val::ONE;
+            assert!(verify(&config, &QueryFoldAir, &prf, &bad).is_err(), "wrong folded_eval ⇒ reject");
         }
     }
 }
