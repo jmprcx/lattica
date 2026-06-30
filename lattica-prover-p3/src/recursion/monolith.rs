@@ -2011,6 +2011,110 @@ pub(crate) fn ib_build_trace(index_felt: Val) -> (RowMajorMatrix<Val>, Val) {
     (RowMajorMatrix::new(vals, IB_WIDTH), x)
 }
 
+// =================================================================================================
+// Phase 4.A (#4, sound core) — the FOLD POINTS s_r derived in-circuit from the index bits. Native:
+// s_r = two_adic_generator(N-r)^reverse_bits(index>>(r+1), N-r-1) = Π_{m=r+1}^{N-1} (b_m ? g_N^(2^(N-1-m+r)) : 1),
+// g_N = two_adic_generator(DP_LOG_HEIGHT). Each s_r is a product chain over the canonical index bits (the
+// same bits that feed DEEP + the fold group order) — replacing the free-witness QT_SPT. Validated vs native
+// (query_fold_data's s). (Wiring per-tile into the fusion mirrors #3: the chains on the TF row + carry/select.)
+// =================================================================================================
+
+#[allow(dead_code)]
+pub(crate) struct FoldPointAir {
+    pub n_rounds: usize,
+}
+
+impl FoldPointAir {
+    fn b(&self, i: usize) -> usize {
+        1 + i // index bits b_0..b_{N-1}
+    }
+    fn s(&self, r: usize) -> usize {
+        1 + DP_LOG_HEIGHT + r // the derived fold point s_r
+    }
+    fn acc(&self, r: usize, m: usize) -> usize {
+        1 + DP_LOG_HEIGHT + self.n_rounds + r * DP_LOG_HEIGHT + m // chain[r][m]
+    }
+    fn w(&self) -> usize {
+        1 + DP_LOG_HEIGHT + self.n_rounds + self.n_rounds * DP_LOG_HEIGHT
+    }
+}
+
+impl BaseAir<Goldilocks> for FoldPointAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        1 + self.n_rounds // index, s_0..s_{R-1}
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldPointAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let n = DP_LOG_HEIGHT;
+        let mut fr = builder.when_first_row();
+
+        for i in 0..n {
+            let b = cur[self.b(i)].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        let mut recon = AB::Expr::ZERO;
+        for i in 0..n {
+            recon = recon + cur[self.b(i)].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[0].clone() - recon);
+
+        for r in 0..self.n_rounds {
+            // chain[r][0] == 1 (m=0 < r+1 ⇒ identity factor)
+            fr.assert_zero(cur[self.acc(r, 0)].clone() - one.clone());
+            for m in 1..n {
+                let factor = if m >= r + 1 {
+                    let c = AB::Expr::from(g.exp_power_of_2(n - 1 - m + r)); // g_N^(2^(N-1-m+r))
+                    one.clone() + cur[self.b(m)].clone() * (c - one.clone())
+                } else {
+                    one.clone()
+                };
+                fr.assert_zero(cur[self.acc(r, m)].clone() - cur[self.acc(r, m - 1)].clone() * factor);
+            }
+            fr.assert_zero(cur[self.s(r)].clone() - cur[self.acc(r, n - 1)].clone());
+            fr.assert_zero(cur[self.s(r)].clone() - pis[1 + r].clone()); // == native s_r
+        }
+        fr.assert_zero(cur[0].clone() - pis[0].clone());
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn fp_build_trace(n_rounds: usize, index: usize) -> RowMajorMatrix<Val> {
+    let air = FoldPointAir { n_rounds };
+    let w = air.w();
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let n = DP_LOG_HEIGHT;
+    let mut r0 = vec![Val::ZERO; w];
+    r0[0] = Val::from_usize(index);
+    for i in 0..n {
+        r0[air.b(i)] = Val::from_u64(((index >> i) & 1) as u64);
+    }
+    for r in 0..n_rounds {
+        let mut acc = Val::ONE;
+        r0[air.acc(r, 0)] = acc;
+        for m in 1..n {
+            let factor = if m >= r + 1 && (index >> m) & 1 == 1 { g.exp_power_of_2(n - 1 - m + r) } else { Val::ONE };
+            acc *= factor;
+            r0[air.acc(r, m)] = acc;
+        }
+        r0[air.s(r)] = acc;
+    }
+    let mut vals = Vec::with_capacity(8 * w);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r0);
+    }
+    RowMajorMatrix::new(vals, w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -2699,5 +2803,37 @@ mod tests {
         let v = non_canon.as_canonical_u64();
         assert_ne!(v, 0xFFFF_FFFF_0000_0001, "0xFFFFFFFF00000001 wraps mod p (so its bits aren't canonical)");
         println!("Phase 4.A #3: canonical index felt → DEEP point x, validated per query (canonical check live)");
+    }
+
+    /// Phase 4.A (#4, sound core): the fold points s_r derived in-circuit from the index bits, validated
+    /// vs native (query_fold_data's s). Replaces the free-witness QT_SPT — the last verifier arithmetic.
+    #[test]
+    #[ignore = "slow: Phase 4.A #4 in-circuit fold-point s_r derivation vs native"]
+    fn phase4a_fold_point_matches_native() {
+        use super::{fp_build_trace, FoldPointAir};
+        use crate::recursion::native_fri::{full_transcript_challenges, query_fold_data};
+        use p3_field::PrimeField64;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let mut n_rounds = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (_ro, rounds, _folded, _f0) = query_fold_data(&config, &proof, &pvs, q);
+            n_rounds = rounds.len();
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let air = FoldPointAir { n_rounds };
+            let trace = fp_build_trace(n_rounds, index);
+            let mut pis = vec![Val::from_usize(index)];
+            for (_sib, _beta, _bit, s) in &rounds {
+                pis.push(*s); // native s_r
+            }
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "in-circuit s_r == native (q {q})");
+            let mut bad = pis.clone();
+            bad[1] += Val::ONE; // wrong s_0
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong s_r ⇒ reject");
+        }
+        println!("Phase 4.A #4: in-circuit fold points s_0..s_{} derived from the index, validated vs native", n_rounds - 1);
     }
 }
