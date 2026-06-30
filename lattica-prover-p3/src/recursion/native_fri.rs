@@ -647,6 +647,38 @@ pub(crate) fn query_input_merkle(
     (leaf, path, cap_entry)
 }
 
+/// Per-query QUOTIENT-batch Merkle oracle: the quotient row (input_proof[1]) hashes to a leaf and
+/// authenticates to the quotient commitment cap. Mirrors the trace opening; the quotient may be committed at
+/// a height ≤ 2^log_global, so the path uses the reduced index `index >> (4 − depth)` (4 = log_global − cap).
+/// Returns (leaf, path, cap entry, row width).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn query_quotient_merkle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> ([Val; 4], Vec<([Val; 4], bool)>, [Val; 4], usize) {
+    use p3_field::PrimeField64;
+    use p3_symmetric::CryptographicHasher;
+    let (_, _, _, _, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let batch = &fri.query_proofs[q].input_proof[1]; // quotient batch
+    let row = &batch.opened_values[0];
+    let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+    let leaf: [Val; 4] = hasher.hash_iter(row.iter().copied());
+    let siblings = &batch.opening_proof;
+    let depth = siblings.len();
+    let reduction = (log_global - 6) - depth; // cap_height = 6 ⇒ total drop to the cap is log_global − 6
+    let reduced = index >> reduction;
+    let path: Vec<([Val; 4], bool)> = siblings.iter().enumerate().map(|(lvl, &s)| (s, (reduced >> lvl) & 1 == 1)).collect();
+    let cap = proof.commitments.quotient_chunks.roots();
+    let cap_entry = cap[reduced >> depth];
+    (leaf, path, cap_entry, row.len())
+}
+
 /// Per-query commit-phase Merkle oracle (Phase 4), round 1: the reconstructed arity-2 group
 /// {e_1, sibling} (e_1 = running eval after round 0's fold; ordered by the index bit) hashes to a leaf,
 /// then authenticates up to the round-1 commitment's cap entry. Mirrors `verify_query`'s per-round

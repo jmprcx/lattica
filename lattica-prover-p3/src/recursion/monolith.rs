@@ -4339,6 +4339,26 @@ mod tests {
         assert!(rss <= EIGHT_GB, "tiled super-tiles peak RSS ≤ 8 GB");
     }
 
+    /// Phase 4.D: the quotient-batch opening structure — the quotient row authenticates to the quotient cap.
+    #[test]
+    #[ignore = "slow: Phase 4.D quotient opening structure vs the real proof"]
+    fn phase4d_quotient_merkle_structure() {
+        use crate::recursion::fri_merkle::{prove_opening, verify_opening};
+        use crate::recursion::native_fri::query_quotient_merkle;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let mut depth = 0;
+        let mut rw = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (leaf, path, cap_entry, row_w) = query_quotient_merkle(&config, &proof, &pvs, q);
+            depth = path.len();
+            rw = row_w;
+            let prf = prove_opening(leaf, &path, cap_entry);
+            assert!(verify_opening(&prf, leaf, cap_entry), "quotient row authenticates to the quotient cap (q {q})");
+        }
+        println!("Phase 4.D quotient opening: row width {rw}, depth {depth} → quotient cap, validated");
+    }
+
     /// Phase 4.D: THE MONOLITH (input-Merkle fusion) — transcript + 32 super-tiles in ONE AIR. The transcript
     /// derives α_fri/β_r + the canonical indices; each super-tile reads them and verifies its query AND
     /// authenticates its opened value to the committed cap. Validated vs the real proof + tamper set.
