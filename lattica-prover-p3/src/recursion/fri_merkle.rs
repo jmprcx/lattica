@@ -319,6 +319,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: real prover (B3-wire §9.1 proof-structure groundwork)"]
+    fn proof_structure_introspection() {
+        // B3-wire §9.1: pin the real Proof structure the integration must parse into trace columns.
+        // opening_proof = (OpenedValues, FriProof); FriProof carries the FRI commit-phase commitments,
+        // the per-query proofs, and the final polynomial. Validated against a real proof under lattica's
+        // config (num_queries = 96, log_final_poly_len = 0 ⇒ final_poly length 1).
+        let leaves: Vec<[Val; DIGEST]> = (0..(1u64 << 8)).map(leaf_of).collect();
+        let levels = build_tree(&leaves);
+        let (leaf, path, root) = opening(&levels, 5);
+        let bytes = prove_opening(leaf, &path, root);
+        let proof: Proof<MyConfig> = postcard::from_bytes(&bytes).unwrap();
+        let fri = &proof.opening_proof.1;
+        assert_eq!(fri.query_proofs.len(), 96, "one query proof per FRI query");
+        assert_eq!(fri.final_poly.len(), 1, "log_final_poly_len = 0 ⇒ constant final poly");
+        assert!(!fri.commit_phase_commits.is_empty());
+        let rounds = fri.commit_phase_commits.len();
+        for q in &fri.query_proofs {
+            // each query opens once per commit-phase round
+            assert_eq!(q.commit_phase_openings.len(), rounds, "openings per query == commit rounds");
+        }
+        println!(
+            "B3-wire proof structure: {} queries, {} commit rounds, final_poly len {}",
+            fri.query_proofs.len(),
+            rounds,
+            fri.final_poly.len(),
+        );
+    }
+
+    #[test]
     #[ignore = "slow: benchmark — per-path proving cost for the go/no-go"]
     fn benchmark_one_path() {
         use p3_field::PrimeField64;

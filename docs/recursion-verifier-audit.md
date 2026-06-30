@@ -122,11 +122,14 @@ tampered ones**, then translate each native step into the constraints already pr
 Porting is mechanical once the native composition is proven correct; debugging native is far cheaper than
 debugging a circuit.
 
-### 9.1 Proof → trace columns
+### 9.1 Proof → trace columns  ✓ groundwork validated
 Parse a `p3_uni_stark::Proof` into witness columns: `commitments{trace, quotient_chunks, random?}` (each a
 4-felt MerkleCap), `opened_values{trace_local, trace_next, quotient_chunks, …}` (F_p² vectors),
-`opening_proof` = the `FriProof` (`commit_phase_commits[]`, `query_proofs[]` with per-round
-`{log_arity, sibling_values, opening_proof}`, `final_poly[]`, PoW witnesses), and `degree_bits`.
+`opening_proof = (OpenedValues, FriProof)` where the `FriProof` carries `commit_phase_commits[]`,
+`query_proofs[]` (each `{input_proof, commit_phase_openings[{log_arity, sibling_values, opening_proof}]}`),
+`final_poly[]`, PoW witnesses; plus `degree_bits`. **Validated against a real proof** (`fri_merkle.rs`
+`proof_structure_introspection`): under lattica's config a proof has 96 query proofs, one
+`commit_phase_openings` entry per commit round, and a length-1 `final_poly` (`log_final_poly_len = 0`).
 
 ### 9.2 Transcript replay (use `ModelChallenger` as the executable spec — §8)
 Replay EXACTLY the native order (from `p3-uni-stark::verify`): observe degree bits + base degree bits +
