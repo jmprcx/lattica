@@ -2343,6 +2343,338 @@ pub(crate) fn im_build_trace(v: Val, path: &[([Val; 4], bool)]) -> (RowMajorMatr
     (RowMajorMatrix::new(t, IMT_W), terminal)
 }
 
+// =================================================================================================
+// Phase 4.B (structural scaling) — the SUPER-TILE: one query's arithmetic AND its inline input-Merkle in
+// ONE AIR. Block 0 is the arith (QueryTileAir: DEEP→reduced→fold→accept, rows 0..7); blocks 1..5 are the
+// input-Merkle (leaf-hash + 4 binary merges); blocks 6..7 pad to a pow2 block count. The opened value used
+// in the reduced opening (QT_px, term 0 = the trace value) is carried to the leaf-hash via a global-
+// persistent column and absorbed as the leaf preimage — so the value the arith opens is THE value
+// authenticated to the trace commitment (no second witness). S_POSEIDON gates the round constraints to the
+// Merkle blocks; the arith block runs no Poseidon. This is the building block the ×K fusion tiles.
+// Validated vs the real proof: the query verifies AND its opened value authenticates to the committed cap.
+// =================================================================================================
+
+const ST_SIB: usize = 8; // sibling digest (overlays arith cols on Merkle rows — disjoint rows)
+const ST_BIT: usize = 12; // merge direction
+const ST_CARRY: usize = QT_TERMS + 9 * 4; // opened-value carrier (after the n_terms=4 arith layout)
+const ST_W: usize = ST_CARRY + 1;
+const ST_NBLOCKS_PAD: usize = 8;
+const ST_LEAF_BLOCK: usize = 1;
+const ST_TERMINAL_BLOCK: usize = 5; // leaf (1) + 4 merges (2..5)
+// periodic indices
+const ST_P_BLOCK_LAST: usize = 11;
+const ST_P_SPOS: usize = 12; // 1 on the Merkle blocks (1..7)
+const ST_P_TF: usize = 13; // arith head (block 0 row 0)
+const ST_P_ROUND0: usize = 14; // P_ROUND_0..5 at block 0 rows 0..5 (fold)
+const ST_P_TL: usize = 20; // arith accept (block 0 row 7)
+const ST_P_LEAF: usize = 21; // leaf-hash head (block 1 row 0)
+const ST_P_TERM: usize = 22; // Merkle terminal (block 5 row 31)
+const ST_N_PERIODIC: usize = 23;
+
+#[allow(dead_code)]
+pub(crate) struct SuperTileAir;
+
+impl SuperTileAir {
+    fn z(&self, k: usize) -> usize {
+        QT_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    fn height(&self) -> usize {
+        ST_NBLOCKS_PAD * BLOCK
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round
+        let onehot = |row: usize| -> Vec<Val> {
+            let mut c = vec![Val::ZERO; h];
+            c[row] = Val::ONE;
+            c
+        };
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..ST_NBLOCKS_PAD {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl); // P_BLOCK_LAST
+        let mut spos = vec![Val::ZERO; h];
+        for r in BLOCK..h {
+            spos[r] = Val::ONE; // blocks 1..7 (the Merkle region)
+        }
+        cols.push(spos); // S_POSEIDON
+        cols.push(onehot(0)); // P_TF (block 0 row 0)
+        for r in 0..6 {
+            cols.push(onehot(r)); // P_ROUND_0..5 (block 0 rows 0..5)
+        }
+        cols.push(onehot(6)); // P_TL — accept at the folded_eval row (E_6, after the 6 fold rounds)
+        cols.push(onehot(ST_LEAF_BLOCK * BLOCK)); // P_LEAF (block 1 row 0)
+        cols.push(onehot(ST_TERMINAL_BLOCK * BLOCK + BLOCK - 1)); // P_TERMINAL (block 5 row 31)
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for SuperTileAir {
+    fn width(&self) -> usize {
+        ST_W
+    }
+    fn num_public_values(&self) -> usize {
+        2 + 4 // final_poly[0] (2) + the committed cap entry (4)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        ST_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let tf = p[ST_P_TF].clone();
+        let tl = p[ST_P_TL].clone();
+        let spos = p[ST_P_SPOS].clone();
+
+        // ---------------- arith (block 0): DEEP + reduced → ro = E_0; fold; accept ----------------
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[QT_DBITS + i].clone();
+            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
+        }
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
+            builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
+            prev = cur[QT_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+        let alpha = gg(QT_ALPHA);
+        builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
+        builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
+        for k in 1..4 {
+            let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+            builder.assert_zero(tf.clone() * (cur[self.apow(k)].clone() - prod.0));
+            builder.assert_zero(tf.clone() * (cur[self.apow(k) + 1].clone() - prod.1));
+        }
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for k in 0..4 {
+            let z = gg(self.z(k));
+            let inv = gg(self.inv(k));
+            let z_m_x = (z.0 - x.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
+            builder.assert_zero(tf.clone() * chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(gg(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        builder.assert_zero(tf.clone() * (cur[QT_E].clone() - ro.0));
+        builder.assert_zero(tf.clone() * (cur[QT_E + 1].clone() - ro.1));
+        // fold (transitions on the round rows 0..5)
+        let mut round_mask = AB::Expr::ZERO;
+        for r in 0..6 {
+            round_mask = round_mask + p[ST_P_ROUND0 + r].clone();
+        }
+        let bit = cur[QT_BIT].clone();
+        let i2s = cur[QT_I2S].clone();
+        let spt = cur[QT_SPT].clone();
+        builder.when_transition().assert_zero(round_mask.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder.when_transition().assert_zero(round_mask.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        let sign = one.clone() - two.clone() * bit;
+        let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
+        let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
+        let bb = (cur[QT_B].clone(), cur[QT_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, bb);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(round_mask.clone() * (nxt[QT_E].clone() - fold0));
+        builder.when_transition().assert_zero(round_mask * (nxt[QT_E + 1].clone() - fold1));
+        // accept (block 0 row 7): folded_eval == final_poly[0]
+        builder.assert_zero(tl.clone() * (cur[QT_E].clone() - pis[0].clone()));
+        builder.assert_zero(tl * (cur[QT_E + 1].clone() - pis[1].clone()));
+
+        // ---------------- opened-value carrier: held; == QT_px(term 0) at the arith head; the leaf preimage.
+        builder.when_transition().assert_zero(nxt[ST_CARRY].clone() - cur[ST_CARRY].clone());
+        builder.assert_zero(tf.clone() * (cur[ST_CARRY].clone() - cur[self.px(0)].clone()));
+
+        // ---------------- input-Merkle (blocks 1..5): leaf-hash + binary merges → terminal == cap entry ----
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(spos.clone() * step); // Poseidon only on the Merkle blocks
+        }
+        // leaf-hash head (block 1 row 0): state = [v, 0, …], v = the carried opened value.
+        let leaf = p[ST_P_LEAF].clone();
+        builder.assert_zero(leaf.clone() * (cur[0].clone() - cur[ST_CARRY].clone()));
+        for i in 1..W {
+            builder.assert_zero(leaf.clone() * cur[i].clone());
+        }
+        // merge bit boolean (on Merkle blocks), and the bit-ordered block link (block i output → block i+1).
+        builder.assert_zero(spos.clone() * (cur[ST_BIT].clone() * (one.clone() - cur[ST_BIT].clone())));
+        {
+            let link = spos.clone() * p[ST_P_BLOCK_LAST].clone(); // Merkle block-last only (not block 0→1)
+            let nb = nxt[ST_BIT].clone();
+            for k in 0..4 {
+                builder.when_transition().assert_zero(link.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[ST_SIB + k].clone())));
+                builder.when_transition().assert_zero(link.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[ST_SIB + k].clone() + nb.clone() * cur[k].clone())));
+            }
+        }
+        // terminal (block 5 row 31): output digest == the committed cap entry.
+        let term = p[ST_P_TERM].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[2 + k].clone()));
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn st_build_trace(
+    query: &(usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>),
+    v: Val,
+    path: &[([Val; 4], bool)],
+) -> RowMajorMatrix<Val> {
+    use crate::recursion::fri_fold::native_fold;
+    use p3_field::BasedVectorSpace;
+    let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = SuperTileAir;
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * ST_W];
+    let (index, terms, alpha, ro, rounds) = query;
+
+    // block 0: the arith. fold chain E_0..E_6 (rows 0..6); DEEP+reduced on row 0.
+    let mut e = *ro;
+    for r in 0..=6 {
+        let base = r * ST_W;
+        let ec = c(e);
+        t[base + QT_E] = ec[0];
+        t[base + QT_E + 1] = ec[1];
+        if r < rounds.len() {
+            let (sib, beta, bit, s) = rounds[r];
+            let (sc, bc) = (c(sib), c(beta));
+            t[base + QT_S] = sc[0];
+            t[base + QT_S + 1] = sc[1];
+            t[base + QT_B] = bc[0];
+            t[base + QT_B + 1] = bc[1];
+            t[base + QT_BIT] = if bit { Val::ONE } else { Val::ZERO };
+            t[base + QT_SPT] = s;
+            t[base + QT_I2S] = (Val::TWO * s).inverse();
+            let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+            e = native_fold(e0, e1, beta, s);
+        }
+    }
+    let base0 = 0;
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (index >> i) & 1;
+        t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
+        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        t[base0 + QT_ACC + i] = acc;
+    }
+    let x = <Goldilocks as Field>::GENERATOR * acc;
+    let ac = c(*alpha);
+    t[base0 + QT_ALPHA] = ac[0];
+    t[base0 + QT_ALPHA + 1] = ac[1];
+    let mut apow = Challenge::ONE;
+    for (k, &(z, pz, px)) in terms.iter().enumerate() {
+        let (zc, pzc) = (c(z), c(pz));
+        t[base0 + air.z(k)] = zc[0];
+        t[base0 + air.z(k) + 1] = zc[1];
+        t[base0 + air.pz(k)] = pzc[0];
+        t[base0 + air.pz(k) + 1] = pzc[1];
+        t[base0 + air.px(k)] = px;
+        let inv = c((z - Challenge::from(x)).inverse());
+        t[base0 + air.inv(k)] = inv[0];
+        t[base0 + air.inv(k) + 1] = inv[1];
+        let ap = c(apow);
+        t[base0 + air.apow(k)] = ap[0];
+        t[base0 + air.apow(k) + 1] = ap[1];
+        apow *= *alpha;
+    }
+
+    // blocks 1..5: the input-Merkle. leaf-hash (block 1) absorbs v; 4 merges (blocks 2..5).
+    let mut input = [Val::ZERO; W];
+    input[0] = v;
+    let rows = native_steps(input);
+    for r in 0..BLOCK {
+        let base = (ST_LEAF_BLOCK * BLOCK + r) * ST_W;
+        t[base..base + W].copy_from_slice(&rows[r]);
+    }
+    let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+    for (l, &(sib, b)) in path.iter().enumerate() {
+        let blk = ST_LEAF_BLOCK + 1 + l;
+        let mut inp = [Val::ZERO; W];
+        if b {
+            inp[..4].copy_from_slice(&sib);
+            inp[4..].copy_from_slice(&node);
+        } else {
+            inp[..4].copy_from_slice(&node);
+            inp[4..].copy_from_slice(&sib);
+        }
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * ST_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+            t[base + ST_SIB..base + ST_SIB + 4].copy_from_slice(&sib);
+            t[base + ST_BIT] = if b { Val::ONE } else { Val::ZERO };
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    // padding blocks (6..8): continue valid Poseidon so the round constraints hold to the pow2 height.
+    for blk in (ST_TERMINAL_BLOCK + 1)..ST_NBLOCKS_PAD {
+        let mut inp = [Val::ZERO; W];
+        inp[..4].copy_from_slice(&node);
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * ST_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    // opened-value carrier: held = v across the whole trace.
+    for r in 0..h {
+        t[r * ST_W + ST_CARRY] = v;
+    }
+    RowMajorMatrix::new(t, ST_W)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -3134,5 +3466,42 @@ mod tests {
             assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered opened value ⇒ reject");
         }
         println!("Phase 4.B inline input-Merkle: opened value → leaf → {IMT_DEPTH}-level path → committed cap entry, validated per query");
+    }
+
+    /// Phase 4.B (structural scaling): the SUPER-TILE — one query's arith (DEEP→reduced→fold→accept) AND its
+    /// inline input-Merkle in ONE AIR, with the opened value (QT_px term 0) carried to the leaf preimage. The
+    /// value the arith opens IS the value authenticated to the trace commitment. Validated vs the real proof.
+    #[test]
+    #[ignore = "slow: Phase 4.B super-tile (arith + inline input-Merkle, opened value bound) vs native"]
+    fn phase4b_super_tile_matches_native() {
+        use super::{st_build_trace, SuperTileAir};
+        use crate::recursion::native_fri::{full_transcript_challenges, query_fold_data, query_input_merkle, query_terms};
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let air = SuperTileAir;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+            let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
+            assert_eq!(terms[0].2, v, "reduced-opening term 0's p_x == the trace opened value (q {q})");
+            let (_leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            let query = (index, terms, alpha, ro, rounds);
+            let trace = st_build_trace(&query, v, &path);
+            let mut pis: Vec<Val> = f0.as_basis_coefficients_slice().to_vec();
+            pis.extend_from_slice(&cap_entry);
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "super-tile: query verifies AND opened value authenticates (q {q})");
+            let mut bad = pis.clone();
+            bad[0] += Val::ONE; // tamper final_poly[0] ⇒ the arith accept fails
+            assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered final_poly ⇒ reject");
+            let mut bad2 = pis.clone();
+            bad2[2] += Val::ONE; // tamper the cap entry ⇒ the Merkle terminal fails
+            assert!(verify(&config, &air, &prf, &bad2).is_err(), "tampered cap entry ⇒ reject");
+        }
+        println!("Phase 4.B super-tile: arith (query verify) + inline input-Merkle (opened value → leaf → path → cap), bound, validated");
     }
 }
