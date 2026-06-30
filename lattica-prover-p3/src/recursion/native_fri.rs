@@ -446,8 +446,8 @@ pub(crate) fn full_transcript_challenges(
     config: &MyConfig,
     proof: &Proof<MyConfig>,
     pvs: &[Val],
-) -> ([Val; 2], [Val; 2], [Val; 2], Vec<[Val; 2]>, Vec<usize>) {
-    use p3_challenger::{CanSampleBits, GrindingChallenger};
+) -> ([Val; 2], [Val; 2], [Val; 2], Vec<[Val; 2]>, Vec<Val>) {
+    use p3_challenger::{CanSample, GrindingChallenger};
     use p3_field::BasedVectorSpace;
     let pcs = config.pcs();
     let degree_bits = proof.degree_bits;
@@ -492,10 +492,16 @@ pub(crate) fn full_transcript_challenges(
         ch.observe(Val::from_usize(la));
     }
     assert!(ch.check_witness(16, fri.query_pow_witness), "query pow");
-    let log_global = log_arities.iter().sum::<usize>() + 4;
-    let indices: Vec<usize> = (0..fri.query_proofs.len()).map(|_| ch.sample_bits(log_global)).collect();
+    // sample_bits(b) = sample::<Val>() & ((1<<b)-1) (DuplexChallenger); capture the index FELTS (the
+    // in-circuit transcript reproduces these; the low-`bits` masking is the validated SampleBitsAir).
+    let index_felts: Vec<Val> = (0..fri.query_proofs.len())
+        .map(|_| {
+            let f: Val = ch.sample();
+            f
+        })
+        .collect();
 
-    (pair(alpha_stark), pair(zeta), pair(alpha_fri), betas.iter().map(|b| pair(*b)).collect(), indices)
+    (pair(alpha_stark), pair(zeta), pair(alpha_fri), betas.iter().map(|b| pair(*b)).collect(), index_felts)
 }
 
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)

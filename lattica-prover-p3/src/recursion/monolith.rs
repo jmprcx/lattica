@@ -194,11 +194,15 @@ const FT_IS_SQ_NEXT: usize = 14; // 1 if block b+1 is a squeeze (count 0 ⇒ rat
 const FT_BIND_START: usize = 15; // one one-hot per bound challenge follows
 
 /// The full-transcript duplex AIR. `counts[b]` = the prefix-free count for block b; `binds[j]` = the block
-/// whose output row carries the j-th challenge (bound to public[2j], public[2j+1] = rate[3], rate[2]).
+/// whose output row carries the j-th ext challenge (→ public[2j], public[2j+1] = rate[3], rate[2]).
+/// `index_binds[k] = (block, lane)` locates the k-th query INDEX felt (a single rate lane popped from a
+/// squeeze block) → public[2·binds.len() + k]. The low-`bits` masking of each index felt is the
+/// separately-validated `SampleBitsAir`.
 #[allow(dead_code)] // standalone-validated in Phase 2; composed into MonolithAir in Phase 4
 pub(crate) struct FullTranscriptAir {
     pub counts: Vec<u8>,
     pub binds: Vec<usize>,
+    pub index_binds: Vec<(usize, usize)>,
 }
 
 #[allow(dead_code)]
@@ -234,6 +238,11 @@ impl FullTranscriptAir {
             col[blk * BLOCK + BLOCK - 1] = Val::ONE; // the block's output row
             cols.push(col);
         }
+        for &(blk, _lane) in &self.index_binds {
+            let mut col = vec![Val::ZERO; h];
+            col[blk * BLOCK + BLOCK - 1] = Val::ONE;
+            cols.push(col);
+        }
         cols
     }
 }
@@ -243,10 +252,10 @@ impl BaseAir<Goldilocks> for FullTranscriptAir {
         W
     }
     fn num_public_values(&self) -> usize {
-        2 * self.binds.len()
+        2 * self.binds.len() + self.index_binds.len()
     }
     fn num_periodic_columns(&self) -> usize {
-        FT_BIND_START + self.binds.len()
+        FT_BIND_START + self.binds.len() + self.index_binds.len()
     }
     fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
         self.periodic()
@@ -300,11 +309,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullTranscriptAir {
                 builder.when_transition().assert_zero(bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()));
             }
         }
-        // challenge bindings: at each bind block's output row, (rate[3], rate[2]) = the public challenge.
+        // ext challenge bindings: at each bind block's output row, (rate[3], rate[2]) = the public challenge.
         for j in 0..self.binds.len() {
             let b = p[FT_BIND_START + j].clone();
             builder.assert_zero(b.clone() * (cur[3].clone() - pis[2 * j].clone()));
             builder.assert_zero(b * (cur[2].clone() - pis[2 * j + 1].clone()));
+        }
+        // index-felt bindings: at each (block, lane), the popped rate lane = the public index felt.
+        let ext_pubs = 2 * self.binds.len();
+        let idx_start = FT_BIND_START + self.binds.len();
+        for (k, &(_blk, lane)) in self.index_binds.iter().enumerate() {
+            let b = p[idx_start + k].clone();
+            builder.assert_zero(b * (cur[lane].clone() - pis[ext_pubs + k].clone()));
         }
     }
 }
@@ -381,24 +397,31 @@ mod tests {
                 self.observe(c);
             }
         }
-        fn sample_base(&mut self) -> (Val, usize) {
+        fn sample_base(&mut self) -> (Val, usize, usize) {
             if !self.input.is_empty() || self.output.is_empty() {
                 self.duplex();
             }
             let blk = self.block_inputs.len() - 1;
-            (self.output.pop().unwrap(), blk) // pop from the back
+            let lane = self.output.len() - 1; // pop from the back
+            (self.output.pop().unwrap(), blk, lane)
         }
         fn sample_ext(&mut self) -> ([Val; 2], usize) {
-            let (c0, blk) = self.sample_base();
-            let (c1, _) = self.sample_base();
+            let (c0, blk, _) = self.sample_base();
+            let (c1, _, _) = self.sample_base();
             ([c0, c1], blk)
         }
     }
 
-    /// Replay the transcript through the β_r (α_stark, ζ, α_fri, β_0..β_{R-1}), recording the schedule.
-    /// Returns (per-block input states, counts, bind block per challenge, challenge values as [Val;2]).
+    /// Replay the ENTIRE transcript (α_stark, ζ, α_fri, β_0..β_{R-1}, then the final_poly/arities/query-PoW
+    /// absorbs and the squeeze-only index tail), recording the schedule. Returns
+    /// (per-block input states, counts, ext-bind block per challenge, ext challenge values,
+    /// index binds = (block, lane) per query, index felts).
     #[allow(clippy::type_complexity)]
-    fn sim_through_betas(config: &MyConfig, proof: &Proof<MyConfig>, pvs: &[Val]) -> (Vec<[Val; W]>, Vec<u8>, Vec<usize>, Vec<[Val; 2]>) {
+    fn sim_full(
+        config: &MyConfig,
+        proof: &Proof<MyConfig>,
+        pvs: &[Val],
+    ) -> (Vec<[Val; W]>, Vec<u8>, Vec<usize>, Vec<[Val; 2]>, Vec<(usize, usize)>, Vec<Val>) {
         let (instance, commitment, _, _) = preamble_challenges(config, proof, pvs);
         let mut s = Sim::new();
         for &f in &instance {
@@ -425,7 +448,8 @@ mod tests {
         let (a_fri, b2) = s.sample_ext();
         let mut binds = vec![b0, b1, b2];
         let mut chs = vec![a_stark, zeta, a_fri];
-        for comm in &proof.opening_proof.commit_phase_commits {
+        let fri = &proof.opening_proof;
+        for comm in &fri.commit_phase_commits {
             for f in cap_felts(comm) {
                 s.observe(f);
             }
@@ -433,7 +457,24 @@ mod tests {
             binds.push(bb);
             chs.push(beta);
         }
-        (s.block_inputs, s.counts, binds, chs)
+        // final_poly + arities + query-PoW (observe witness + one sample_bits), then the index tail.
+        for &x in &fri.final_poly {
+            s.observe_ext(x);
+        }
+        let log_arities: Vec<usize> = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+        for &la in &log_arities {
+            s.observe(Val::from_usize(la));
+        }
+        s.observe(fri.query_pow_witness);
+        let _ = s.sample_base(); // the 16-bit query-PoW sample
+        let mut index_binds = Vec::new();
+        let mut index_felts = Vec::new();
+        for _ in 0..fri.query_proofs.len() {
+            let (f, blk, lane) = s.sample_base();
+            index_binds.push((blk, lane));
+            index_felts.push(f);
+        }
+        (s.block_inputs, s.counts, binds, chs, index_binds, index_felts)
     }
 
     const CAP_HEIGHT: usize = 6; // MerkleTreeMmcs cap (build_mmcs_and_params)
@@ -605,37 +646,49 @@ mod tests {
         assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong α ⇒ reject");
     }
 
-    /// Phase 2: the in-circuit full transcript reproduces α_stark, ζ, α_fri, and every β_r.
+    /// Phase 2: the in-circuit full transcript reproduces α_stark, ζ, α_fri, every β_r, AND every query
+    /// index felt (the low-`bits` masking is the separately-validated SampleBitsAir).
     #[test]
-    #[ignore = "slow: Phase 2 full transcript (α_fri, β_r) vs native challenger"]
+    #[ignore = "slow: Phase 2 full transcript (α_fri, β_r, index felts) vs native challenger"]
     fn phase2_full_transcript_matches_native() {
+        use p3_field::PrimeField64;
         let config = make_config(1, MILESTONE_QUERIES);
         let (proof, pvs) = gen_const_proof(&config, 42, 6);
-        let (a_stark, zeta, a_fri, betas, _indices) = full_transcript_challenges(&config, &proof, &pvs);
+        let (a_stark, zeta, a_fri, betas, oracle_index_felts) = full_transcript_challenges(&config, &proof, &pvs);
 
-        // The recording sim reproduces the native challenger's α_stark, ζ, α_fri, β_r.
-        let (block_inputs, counts, binds, chs) = sim_through_betas(&config, &proof, &pvs);
+        // The recording sim reproduces the native challenger's challenges + index felts.
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
         assert_eq!(chs[0], a_stark, "α_stark");
         assert_eq!(chs[1], zeta, "ζ");
         assert_eq!(chs[2], a_fri, "α_fri");
         for (i, b) in betas.iter().enumerate() {
             assert_eq!(chs[3 + i], *b, "β_{i}");
         }
+        assert_eq!(index_felts, oracle_index_felts, "all query index felts must match the native challenger");
+        // sanity: the low-log_global bits of each index felt = the FRI query index (SampleBitsAir's job).
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4; // arity-2: rounds = Σlog_arity
+        let mask = (1u64 << log_global) - 1;
+        let _indices: Vec<u64> = index_felts.iter().map(|f| f.as_canonical_u64() & mask).collect();
         println!(
-            "Phase 2: {} transcript blocks → α_stark, ζ, α_fri, {} betas (all match native)",
+            "Phase 2: {} transcript blocks → α_stark, ζ, α_fri, {} betas, {} index felts (all match native)",
             counts.len(),
-            betas.len()
+            betas.len(),
+            index_felts.len()
         );
 
-        // The in-circuit FullTranscriptAir reproduces them all.
-        let air = FullTranscriptAir { counts, binds };
+        // The in-circuit FullTranscriptAir reproduces every challenge + index felt.
+        let air = FullTranscriptAir { counts, binds, index_binds };
         let trace = ft_build_trace(&block_inputs);
-        let pis: Vec<Val> = chs.iter().flatten().copied().collect();
+        let mut pis: Vec<Val> = chs.iter().flatten().copied().collect();
+        pis.extend_from_slice(&index_felts);
         let prf = prove(&config, &air, trace, &pis);
-        assert!(verify(&config, &air, &prf, &pis).is_ok(), "in-circuit full transcript α_fri/β_r must match native");
-        // tamper α_fri ⇒ reject
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "in-circuit full transcript must match native");
+        // tamper α_fri ⇒ reject; tamper an index felt ⇒ reject.
         let mut bad = pis.clone();
         bad[4] += Val::ONE;
         assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong α_fri ⇒ reject");
+        let mut bad2 = pis.clone();
+        *bad2.last_mut().unwrap() += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad2).is_err(), "wrong index felt ⇒ reject");
     }
 }
