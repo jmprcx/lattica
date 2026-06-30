@@ -221,6 +221,125 @@ pub fn verify_transcript(proof_bytes: &[u8], alpha: [Val; 2], zeta: [Val; 2]) ->
 }
 
 // =================================================================================================
+// Component 3b-ii — in-circuit reduced opening (the FRI DEEP combination), single matrix / single point.
+// p3 reduces a query's matrix openings to: reduced[X] = inv_denom[X] · Σ_i α^i·(p_i[X] − y_i), where
+// p_i[X] is the opened row value of column i at the query point X, y_i is the claimed evaluation at ζ,
+// and inv_denom[X] = 1/(X − ζ) (the DEEP denominator). Built in-circuit (F_p², in-circuit inverse,
+// Horner over α), validated vs a native computation of the same. (The multi-matrix α-power offset +
+// multi-point {ζ, ζ·g} accumulation is the wiring.)
+// =================================================================================================
+
+const RO_NCOLS: usize = 4;
+const RO_P: usize = 0; // p_0..p_3 (base row values), 1 each
+const RO_Y: usize = RO_NCOLS; // y_0..y_3 (F_p² openings at ζ), 2 each
+const RO_ALPHA: usize = RO_Y + 2 * RO_NCOLS;
+const RO_X: usize = RO_ALPHA + 2; // query point (base)
+const RO_ZETA: usize = RO_X + 1;
+const RO_INV_DENOM: usize = RO_ZETA + 2;
+const RO_WIDTH: usize = RO_INV_DENOM + 2;
+
+pub struct ReducedOpeningAir;
+
+impl BaseAir<Goldilocks> for ReducedOpeningAir {
+    fn width(&self) -> usize {
+        RO_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the reduced opening
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ReducedOpeningAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let zero = AB::Expr::ZERO;
+        let w = AB::Expr::from(Goldilocks::from_u64(W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
+        };
+
+        let mut fr = builder.when_first_row();
+        let alpha = (cur[RO_ALPHA].clone(), cur[RO_ALPHA + 1].clone());
+        let zeta = (cur[RO_ZETA].clone(), cur[RO_ZETA + 1].clone());
+        let inv_denom = (cur[RO_INV_DENOM].clone(), cur[RO_INV_DENOM + 1].clone());
+
+        // inv_denom · (X − ζ) == 1  [X − ζ = (X − ζ_0, −ζ_1)]
+        let x_m_zeta = (cur[RO_X].clone() - zeta.0.clone(), zero.clone() - zeta.1.clone());
+        let chk = emul(inv_denom.clone(), x_m_zeta);
+        fr.assert_zero(chk.0 - one.clone());
+        fr.assert_zero(chk.1);
+
+        // num = Σ_i α^i·(p_i − y_i)  via Horner (i high → low)
+        let mut acc = (zero.clone(), zero.clone());
+        for i in (0..RO_NCOLS).rev() {
+            let d = (cur[RO_P + i].clone() - cur[RO_Y + 2 * i].clone(), zero.clone() - cur[RO_Y + 2 * i + 1].clone());
+            let t = emul(acc, alpha.clone());
+            acc = (t.0 + d.0, t.1 + d.1);
+        }
+        // reduced = inv_denom · num
+        let reduced = emul(inv_denom, acc);
+        fr.assert_zero(reduced.0 - pis[0].clone());
+        fr.assert_zero(reduced.1 - pis[1].clone());
+    }
+}
+
+fn ro_build_trace(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alpha: Challenge, x: Val, zeta: Challenge, reduced: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let inv_denom = (Challenge::from(x) - zeta).inverse();
+    let mut r = [Val::ZERO; RO_WIDTH];
+    for i in 0..RO_NCOLS {
+        r[RO_P + i] = p[i];
+        let yc = c(y[i]);
+        r[RO_Y + 2 * i] = yc[0];
+        r[RO_Y + 2 * i + 1] = yc[1];
+    }
+    let (ac, zc, idc, _rc) = (c(alpha), c(zeta), c(inv_denom), c(reduced));
+    r[RO_ALPHA] = ac[0];
+    r[RO_ALPHA + 1] = ac[1];
+    r[RO_X] = x;
+    r[RO_ZETA] = zc[0];
+    r[RO_ZETA + 1] = zc[1];
+    r[RO_INV_DENOM] = idc[0];
+    r[RO_INV_DENOM + 1] = idc[1];
+    let mut vals = Vec::with_capacity(8 * RO_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, RO_WIDTH)
+}
+
+/// Native reduced opening: `(X − ζ)⁻¹ · Σ_i α^i·(p_i − y_i)`.
+pub fn native_reduced_opening(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alpha: Challenge, x: Val, zeta: Challenge) -> Challenge {
+    let mut num = Challenge::ZERO;
+    for i in (0..RO_NCOLS).rev() {
+        num = num * alpha + (Challenge::from(p[i]) - y[i]);
+    }
+    (Challenge::from(x) - zeta).inverse() * num
+}
+
+pub fn prove_reduced_opening(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alpha: Challenge, x: Val, zeta: Challenge, reduced: Challenge) -> Vec<u8> {
+    use p3_field::BasedVectorSpace;
+    let pis = reduced.as_basis_coefficients_slice().to_vec();
+    postcard::to_allocvec(&prove(&make_config(), &ReducedOpeningAir, ro_build_trace(p, y, alpha, x, zeta, reduced), &pis)).expect("serialize")
+}
+
+pub fn verify_reduced_opening(proof_bytes: &[u8], reduced: Challenge) -> bool {
+    use p3_field::BasedVectorSpace;
+    let pis = reduced.as_basis_coefficients_slice().to_vec();
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), &ReducedOpeningAir, &proof, &pis).is_ok()
+}
+
+// =================================================================================================
 // Component 3b-i — in-circuit MMCS leaf hash (PaddingFreeSponge).
 // A FRI query opens a committed matrix ROW; the MMCS hashes that row to a 4-felt leaf digest via
 // `MyHash = PaddingFreeSponge<Perm,8,4,4>`, then merges up the path (the validated `fri_merkle` gadget).
@@ -809,6 +928,22 @@ mod tests {
             verify_transcript(&p, alpha, zeta)
         }));
         assert!(matches!(outcome, Ok(false) | Err(_)));
+    }
+
+    #[test]
+    #[ignore = "slow: in-circuit reduced opening (DEEP) vs native"]
+    fn reduced_opening_matches_native() {
+        use p3_field::BasedVectorSpace;
+        let ch = |a: u64, b: u64| Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }));
+        let p = [Val::from_u64(3), Val::from_u64(5), Val::from_u64(7), Val::from_u64(11)];
+        let y = [ch(2, 1), ch(4, 3), ch(6, 5), ch(8, 7)];
+        let alpha = ch(13, 17);
+        let x = Val::from_u64(19);
+        let zeta = ch(23, 29);
+        let reduced = native_reduced_opening(p, y, alpha, x, zeta);
+        let proof = prove_reduced_opening(p, y, alpha, x, zeta, reduced);
+        assert!(verify_reduced_opening(&proof, reduced), "in-circuit reduced opening must match native");
+        assert!(!verify_reduced_opening(&proof, reduced + ch(1, 0)));
     }
 
     #[test]

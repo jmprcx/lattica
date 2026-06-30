@@ -171,10 +171,16 @@ constraints) + re-implementing the FRI query-loop orchestration in-circuit.
   - **3b-i — in-circuit MMCS leaf hash: DONE + validated (`LeafHashAir`).** Hashes a committed matrix row
     to a 4-felt leaf digest via the `PaddingFreeSponge` (rate-overwrite + capacity-carry, no prefix-free
     count) in-circuit; validated vs native `MyHash`. The leaf level beneath the `fri_merkle` path-merge.
-  - **3b — the query loop proper (remaining bulk):** wire it up — add the query-index `sample_bits` + the
-    reduced-opening / DEEP combination, then run all 96 queries (leaf hash [3b-i] → path merge
-    [`fri_merkle`] → fold [`fri_fold`], with reduced-opening roll-ins) + the `final_poly` check, against a
-    real proof's columns, validated end-to-end vs `pcs.verify`. This wiring is the multi-week core.
+  - **3b-ii — in-circuit reduced opening (DEEP): DONE + validated (`ReducedOpeningAir`).** Computes
+    `(X−ζ)⁻¹·Σ_i α^i·(p_i−y_i)` (Horner over α, in-circuit inverse) for a single matrix/point; validated vs
+    a native computation. (The multi-matrix α-offset + multi-point {ζ, ζ·g} accumulation is the wiring.)
+  - **3b — the query loop proper (remaining = the WIRING, the multi-week core):** the building blocks now
+    exist and are each validated — leaf hash [3b-i] → path merge [`fri_merkle`] → reduced opening [3b-ii]
+    → fold/fold-chain [`fri_fold`] + challenge derivation [3a]. What remains is `sample_bits` (the query
+    index, needs an in-circuit canonical bit-decomposition) and **wiring all of these into the per-query
+    loop over a real proof's columns**, with the multi-matrix/multi-point accumulation + the roll-ins +
+    the `final_poly` check, validated end-to-end vs `pcs.verify`. This composition is the bulk that can
+    only be validated as a whole.
 - **Component 4 — in-circuit domain selectors at ζ: DONE + validated (`DomainSelectorsAir`).** Computes
   `z_h = ζ^(2^log_size)−1` (a squaring chain), `is_first = z_h/(ζ−1)`, `is_last = z_h/(ζ−g⁻¹)`,
   `is_transition = ζ−g⁻¹`, `inv_vanishing = z_h⁻¹` in-circuit (F_p², in-circuit inverses), validated to
