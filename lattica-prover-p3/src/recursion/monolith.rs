@@ -2115,6 +2115,68 @@ pub(crate) fn fp_build_trace(n_rounds: usize, index: usize) -> RowMajorMatrix<Va
     RowMajorMatrix::new(vals, w)
 }
 
+// =================================================================================================
+// Phase 4.B (#7, sound core) — the CAP MUX: a query's Merkle path stops `depth = log_height − cap_height`
+// below the cap and must equal commit.roots()[index >> depth]. The committed cap is public; the high
+// `cap_height` index bits select the entry via a degree-`cap_height` selector
+// cap_sel[l] = Σ_e (Π_j (e_j ? b_j : 1−b_j)) · cap[e][l]  (zero extra columns). Because the caps are
+// absorbed into the transcript (fixing the challenges) AND select the Merkle terminal here, a prover
+// cannot absorb one cap and authenticate to another. Validated vs native (commit.roots()[index>>depth]).
+// =================================================================================================
+
+const CM_CAP_HEIGHT: usize = 6; // = CAP_HEIGHT; cap has 2^6 = 64 entries of 4 felts
+
+#[allow(dead_code)]
+pub(crate) struct CapMuxAir;
+
+impl BaseAir<Goldilocks> for CapMuxAir {
+    fn width(&self) -> usize {
+        CM_CAP_HEIGHT // the high index bits
+    }
+    fn num_public_values(&self) -> usize {
+        (1 << CM_CAP_HEIGHT) * 4 + 4 // the cap (64 entries × 4) + the claimed entry (4)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CapMuxAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let n = 1 << CM_CAP_HEIGHT;
+        let mut fr = builder.when_first_row();
+        for j in 0..CM_CAP_HEIGHT {
+            let b = cur[j].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        for l in 0..4 {
+            let mut mux = AB::Expr::ZERO;
+            for e in 0..n {
+                let mut sel = one.clone();
+                for j in 0..CM_CAP_HEIGHT {
+                    let b = cur[j].clone();
+                    sel = sel * if (e >> j) & 1 == 1 { b } else { one.clone() - b };
+                }
+                mux = mux + sel * pis[e * 4 + l].clone();
+            }
+            fr.assert_zero(mux - pis[n * 4 + l].clone());
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn cm_build_trace(index_high: usize) -> RowMajorMatrix<Val> {
+    let mut r = vec![Val::ZERO; CM_CAP_HEIGHT];
+    for j in 0..CM_CAP_HEIGHT {
+        r[j] = Val::from_u64(((index_high >> j) & 1) as u64);
+    }
+    let mut vals = Vec::with_capacity(8 * CM_CAP_HEIGHT);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, CM_CAP_HEIGHT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -2835,5 +2897,48 @@ mod tests {
             assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong s_r ⇒ reject");
         }
         println!("Phase 4.A #4: in-circuit fold points s_0..s_{} derived from the index, validated vs native", n_rounds - 1);
+    }
+
+    /// Phase 4.B (#7, sound core): the cap-mux selects commit.roots()[index>>depth] via a degree-cap_height
+    /// selector over the high index bits — the binding that stops a prover authenticating to a different cap
+    /// than the one absorbed into the transcript. Validated vs native (query_input_merkle's cap entry).
+    #[test]
+    #[ignore = "slow: Phase 4.B #7 cap-mux selects the committed cap entry vs native"]
+    fn phase4b_cap_mux_matches_native() {
+        use super::{cm_build_trace, CapMuxAir, CM_CAP_HEIGHT};
+        use crate::recursion::native_fri::{full_transcript_challenges, query_input_merkle};
+        use p3_field::PrimeField64;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let cap = proof.commitments.trace.roots(); // Vec<[Val; 4]>, 2^cap_height entries
+        assert_eq!(cap.len(), 1 << CM_CAP_HEIGHT, "cap has 2^cap_height entries");
+        let depth = log_global - CM_CAP_HEIGHT;
+        let air = CapMuxAir;
+        let n = 1 << CM_CAP_HEIGHT;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let high = index >> depth; // the cap_height high bits
+            // (1) the cap-mux index matches the REAL opening: commit.roots()[index>>depth] == the path's cap entry.
+            let (_, _, native_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            assert_eq!(cap[high], native_entry, "cap[index>>depth] == the real opening's cap entry (q {q})");
+            // (2) the in-circuit selector discriminates — validated on a DISTINCT synthetic cap (the real
+            //     cap of a constant proof has equal entries, so a bit-flip there is a no-op).
+            let mut pis = Vec::new();
+            for e in 0..n {
+                for l in 0..4 {
+                    pis.push(Val::from_usize(e * 4 + l + 1)); // distinct per (e, l)
+                }
+            }
+            for l in 0..4 {
+                pis.push(Val::from_usize(high * 4 + l + 1)); // claimed = synth cap[high]
+            }
+            let prf = prove(&config, &air, cm_build_trace(high), &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "cap-mux selects synth cap[high] (q {q})");
+            let bad_prf = prove(&config, &air, cm_build_trace(high ^ 1), &pis);
+            assert!(verify(&config, &air, &bad_prf, &pis).is_err(), "wrong high index bit ⇒ wrong cap entry ⇒ reject");
+        }
+        println!("Phase 4.B #7: cap-mux selects commit.roots()[index>>{depth}] via a {CM_CAP_HEIGHT}-bit selector (real index matches; selector discriminates), validated");
     }
 }
