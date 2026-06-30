@@ -221,6 +221,112 @@ pub fn verify_transcript(proof_bytes: &[u8], alpha: [Val; 2], zeta: [Val; 2]) ->
 }
 
 // =================================================================================================
+// Component 3b-iii — in-circuit `sample_bits` (the FRI query index).
+// `sample_bits(bits)` = the low `bits` of the squeezed challenge's CANONICAL u64. In-circuit: decompose
+// x into 64 boolean bits, reconstruct x = Σ b_i·2^i, prove the value is CANONICAL (< Goldilocks p =
+// 2^64 − 2^32 + 1 ⇔ NOT(high 32 bits all 1 AND low 32 bits ≠ 0), enforced soundly by q₃₁·lo == 0 where
+// q₃₁ = Π of the high 32 bits and lo = Σ_{i<32} b_i·2^i), and output the low `bits` as the index.
+// Validated vs the native challenger's `sample_bits`.
+// =================================================================================================
+
+const SB_BITS: usize = 16; // index width (a representative log_height)
+const SB_X: usize = 0;
+const SB_B: usize = 1; // b_0..b_63
+const SB_Q: usize = SB_B + 64; // q_1..q_31 (product chain over the high 32 bits)
+const SB_WIDTH: usize = SB_Q + 31;
+
+pub struct SampleBitsAir;
+
+impl BaseAir<Goldilocks> for SampleBitsAir {
+    fn width(&self) -> usize {
+        SB_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        1 // the query index
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SampleBitsAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
+        let mut fr = builder.when_first_row();
+
+        // each bit is boolean
+        for i in 0..64 {
+            let b = cur[SB_B + i].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        // reconstruction: x = Σ_{i=0}^{63} b_i·2^i
+        let mut recon = AB::Expr::ZERO;
+        for i in 0..64 {
+            recon = recon + cur[SB_B + i].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[SB_X].clone() - recon);
+
+        // product chain over the high 32 bits: q_1 = b_32·b_33, q_k = q_{k-1}·b_{32+k}; q_31 = Π high bits
+        fr.assert_zero(cur[SB_Q].clone() - cur[SB_B + 32].clone() * cur[SB_B + 33].clone());
+        for k in 2..=31 {
+            fr.assert_zero(cur[SB_Q + k - 1].clone() - cur[SB_Q + k - 2].clone() * cur[SB_B + 32 + k].clone());
+        }
+        // canonical: q_31 · lo == 0  (lo = Σ_{i<32} b_i·2^i) ⇒ value < p
+        let mut lo = AB::Expr::ZERO;
+        for i in 0..32 {
+            lo = lo + cur[SB_B + i].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[SB_Q + 30].clone() * lo);
+
+        // index = low SB_BITS bits, bound to the public output
+        let mut idx = AB::Expr::ZERO;
+        for i in 0..SB_BITS {
+            idx = idx + cur[SB_B + i].clone() * pow2(i);
+        }
+        fr.assert_zero(idx - pis[0].clone());
+    }
+}
+
+fn sb_build_trace(x: Val) -> RowMajorMatrix<Val> {
+    use p3_field::PrimeField64;
+    let v = x.as_canonical_u64();
+    let mut r = [Val::ZERO; SB_WIDTH];
+    r[SB_X] = x;
+    for i in 0..64 {
+        r[SB_B + i] = Val::from_u64((v >> i) & 1);
+    }
+    // product chain q_1..q_31 over the high 32 bits
+    let mut q = (v >> 32) & 1; // = b_32
+    for k in 1..=31 {
+        q &= (v >> (32 + k)) & 1;
+        r[SB_Q + k - 1] = Val::from_u64(q);
+    }
+    let mut vals = Vec::with_capacity(8 * SB_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, SB_WIDTH)
+}
+
+/// Native reference: the low `SB_BITS` bits of x's canonical u64.
+pub fn native_sample_bits(x: Val) -> u64 {
+    use p3_field::PrimeField64;
+    x.as_canonical_u64() & ((1u64 << SB_BITS) - 1)
+}
+
+pub fn prove_sample_bits(x: Val, index: u64) -> Vec<u8> {
+    postcard::to_allocvec(&prove(&make_config(), &SampleBitsAir, sb_build_trace(x), &vec![Val::from_u64(index)])).expect("serialize")
+}
+
+pub fn verify_sample_bits(proof_bytes: &[u8], index: u64) -> bool {
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), &SampleBitsAir, &proof, &vec![Val::from_u64(index)]).is_ok()
+}
+
+// =================================================================================================
 // Component 3b-ii — in-circuit reduced opening (the FRI DEEP combination), single matrix / single point.
 // p3 reduces a query's matrix openings to: reduced[X] = inv_denom[X] · Σ_i α^i·(p_i[X] − y_i), where
 // p_i[X] is the opened row value of column i at the query point X, y_i is the claimed evaluation at ζ,
@@ -928,6 +1034,22 @@ mod tests {
             verify_transcript(&p, alpha, zeta)
         }));
         assert!(matches!(outcome, Ok(false) | Err(_)));
+    }
+
+    #[test]
+    #[ignore = "slow: in-circuit sample_bits (query index, canonical) vs native"]
+    fn sample_bits_matches_native() {
+        // includes the canonical boundary 0xFFFF_FFFF_0000_0000 (high 32 bits all 1, lo = 0 ⇒ < p).
+        for x in [
+            Val::from_u64(0xDEAD_BEEF_1234_5678),
+            Val::from_u64(42),
+            Val::from_u64(0xFFFF_FFFF_0000_0000),
+        ] {
+            let index = native_sample_bits(x);
+            let proof = prove_sample_bits(x, index);
+            assert!(verify_sample_bits(&proof, index), "in-circuit index must match native sample_bits");
+            assert!(!verify_sample_bits(&proof, index ^ 1));
+        }
     }
 
     #[test]

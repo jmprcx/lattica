@@ -174,13 +174,16 @@ constraints) + re-implementing the FRI query-loop orchestration in-circuit.
   - **3b-ii — in-circuit reduced opening (DEEP): DONE + validated (`ReducedOpeningAir`).** Computes
     `(X−ζ)⁻¹·Σ_i α^i·(p_i−y_i)` (Horner over α, in-circuit inverse) for a single matrix/point; validated vs
     a native computation. (The multi-matrix α-offset + multi-point {ζ, ζ·g} accumulation is the wiring.)
-  - **3b — the query loop proper (remaining = the WIRING, the multi-week core):** the building blocks now
-    exist and are each validated — leaf hash [3b-i] → path merge [`fri_merkle`] → reduced opening [3b-ii]
-    → fold/fold-chain [`fri_fold`] + challenge derivation [3a]. What remains is `sample_bits` (the query
-    index, needs an in-circuit canonical bit-decomposition) and **wiring all of these into the per-query
-    loop over a real proof's columns**, with the multi-matrix/multi-point accumulation + the roll-ins +
-    the `final_poly` check, validated end-to-end vs `pcs.verify`. This composition is the bulk that can
-    only be validated as a whole.
+  - **3b-iii — in-circuit `sample_bits` (query index): DONE + validated (`SampleBitsAir`).** Decomposes the
+    squeezed challenge into 64 boolean bits, reconstructs `x = Σ b_i·2^i`, enforces CANONICAL (`< p`) via
+    `q₃₁·lo == 0` (q₃₁ = Π high 32 bits, lo = low 32 bits), and outputs the low `bits` as the index.
+    Validated vs the native challenger's `sample_bits` (canonical-boundary case included).
+  - **3b — the query loop proper (remaining = ONLY the WIRING, the multi-week core):** **all building
+    blocks are now built + individually validated** — challenge derivation [3a], `sample_bits` [3b-iii],
+    leaf hash [3b-i] → path merge [`fri_merkle`] → reduced opening [3b-ii] → fold/fold-chain [`fri_fold`].
+    What remains is **wiring them into the per-query loop over a real proof's columns** (multi-matrix /
+    multi-point accumulation + roll-ins + the `final_poly` check), validated end-to-end vs `pcs.verify`.
+    This composition is the bulk that can only be validated as a whole — the remaining multi-week core.
 - **Component 4 — in-circuit domain selectors at ζ: DONE + validated (`DomainSelectorsAir`).** Computes
   `z_h = ζ^(2^log_size)−1` (a squaring chain), `is_first = z_h/(ζ−1)`, `is_last = z_h/(ζ−g⁻¹)`,
   `is_transition = ζ−g⁻¹`, `inv_vanishing = z_h⁻¹` in-circuit (F_p², in-circuit inverses), validated to
