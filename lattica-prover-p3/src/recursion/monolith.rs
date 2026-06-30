@@ -1510,8 +1510,11 @@ impl Phase4AAir {
     fn p_round(&self, r: usize) -> usize {
         FT_BIND_START + self.nb() + self.ni() + r // per-round one-hot: 1 at tile-row r of every tile
     }
+    fn p_query(&self, q: usize) -> usize {
+        FT_BIND_START + self.nb() + self.ni() + self.n_rounds() + q // per-query one-hot at tile q's first row
+    }
     fn p_tf(&self) -> usize {
-        FT_BIND_START + self.nb() + self.ni() + self.n_rounds()
+        FT_BIND_START + self.nb() + self.ni() + self.n_rounds() + self.n_queries
     }
     fn p_tl(&self) -> usize {
         self.p_tf() + 1
@@ -1522,6 +1525,19 @@ impl Phase4AAir {
     fn p_squery(&self) -> usize {
         self.p_tf() + 3
     }
+    // index-binding columns (#3): per-tile canonical decomposition (SB) + the fold-bit shift register.
+    fn sb_x(&self) -> usize {
+        self.tile_w() // the index felt for this tile
+    }
+    fn sb_b(&self, i: usize) -> usize {
+        self.sb_x() + 1 + i // b_0..b_63
+    }
+    fn sb_q(&self, k: usize) -> usize {
+        self.sb_x() + 65 + k // q_1..q_31
+    }
+    fn idx_rem(&self) -> usize {
+        self.sb_x() + 96 // remaining index in the fold-bit shift register
+    }
     fn tr(&self) -> usize {
         self.counts.len().next_power_of_two() * BLOCK
     }
@@ -1529,7 +1545,7 @@ impl Phase4AAir {
         QT_TERMS + 9 * self.n_terms
     }
     fn carry(&self) -> usize {
-        self.tile_w()
+        self.idx_rem() + 1 // α_fri carrier (after the index-binding columns)
     }
     // tile column accessors (= TiledQueryAir's QT_* layout)
     fn z(&self, k: usize) -> usize {
@@ -1548,7 +1564,7 @@ impl Phase4AAir {
         self.z(k) + 7
     }
     fn fused_w(&self) -> usize {
-        self.tile_w() + 2 // + α_fri carrier
+        self.idx_rem() + 3 // tile + SB(96) + idx_rem(1) + α_fri carrier(2)
     }
     fn height(&self) -> usize {
         (self.tr() + self.n_queries * TILE_H).next_power_of_two()
@@ -1590,6 +1606,12 @@ impl Phase4AAir {
             for q in 0..self.n_queries {
                 col[tr + q * TILE_H + r] = Val::ONE;
             }
+            cols.push(col);
+        }
+        // per-query one-hots: P_QUERY_q = 1 at tile q's first row (selects the q-th public index felt).
+        for q in 0..self.n_queries {
+            let mut col = vec![Val::ZERO; h];
+            col[tr + q * TILE_H] = Val::ONE;
             cols.push(col);
         }
         let mut tf = vec![Val::ZERO; h];
@@ -1755,6 +1777,53 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
             builder.assert_zero(pr * (cur[QT_B + 1].clone() - pis[2 * bidx + 1].clone()));
         }
 
+        // ---------- index binding (#3): the per-query index is decomposed CANONICALLY; the DEEP bits and
+        // the per-round fold bits are pinned to the canonical low bits of the transcript-derived felt. ----------
+        let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
+        // at TF, SB_X == the q-th transcript index felt (selected by P_QUERY_q; pis[ext_pubs + q]).
+        let mut sel = AB::Expr::ZERO;
+        for q in 0..self.n_queries {
+            sel = sel + p[self.p_query(q)].clone() * pis[ext_pubs + q].clone();
+        }
+        builder.assert_zero(tf.clone() * cur[self.sb_x()].clone() - sel);
+        // canonical 64-bit decomposition (gated by TF; mirrors SampleBitsAir).
+        for i in 0..64 {
+            let b = cur[self.sb_b(i)].clone();
+            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
+        }
+        let mut recon = AB::Expr::ZERO;
+        for i in 0..64 {
+            recon = recon + cur[self.sb_b(i)].clone() * pow2(i);
+        }
+        builder.assert_zero(tf.clone() * (cur[self.sb_x()].clone() - recon));
+        builder.assert_zero(tf.clone() * (cur[self.sb_q(0)].clone() - cur[self.sb_b(32)].clone() * cur[self.sb_b(33)].clone()));
+        for k in 2..=31 {
+            builder.assert_zero(tf.clone() * (cur[self.sb_q(k - 1)].clone() - cur[self.sb_q(k - 2)].clone() * cur[self.sb_b(32 + k)].clone()));
+        }
+        let mut lo = AB::Expr::ZERO;
+        for i in 0..32 {
+            lo = lo + cur[self.sb_b(i)].clone() * pow2(i);
+        }
+        builder.assert_zero(tf.clone() * (cur[self.sb_q(30)].clone() * lo)); // canonical: value < p
+        // the DEEP bits are the canonical low bits.
+        for i in 0..DP_LOG_HEIGHT {
+            builder.assert_zero(tf.clone() * (cur[QT_DBITS + i].clone() - cur[self.sb_b(i)].clone()));
+        }
+        // idx_rem at TF = the query index (low DP_LOG_HEIGHT bits); the shift register feeds QT_BIT.
+        let mut qidx = AB::Expr::ZERO;
+        for i in 0..DP_LOG_HEIGHT {
+            qidx = qidx + cur[self.sb_b(i)].clone() * pow2(i);
+        }
+        builder.assert_zero(tf.clone() * (cur[self.idx_rem()].clone() - qidx));
+        // fold-bit shift register (gated by the round rows): idx_rem == 2·idx_rem_next + QT_BIT ⇒ QT_BIT = bit r.
+        let mut round_mask = AB::Expr::ZERO;
+        for r in 0..self.n_rounds() {
+            round_mask = round_mask + p[self.p_round(r)].clone();
+        }
+        builder
+            .when_transition()
+            .assert_zero(round_mask * (cur[self.idx_rem()].clone() - two.clone() * nxt[self.idx_rem()].clone() - cur[QT_BIT].clone()));
+
         // tile fold (transition gated by S_QUERY·(1-TL)).
         let fold_gate = sq.clone() * (one.clone() - tl.clone());
         let bit = cur[QT_BIT].clone();
@@ -1789,7 +1858,9 @@ pub(crate) fn phase4a_build_trace(
     block_inputs: &[[Val; W]],
     per_query: &[(usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>)],
     alpha_fri: [Val; 2],
+    index_felts: &[Val],
 ) -> RowMajorMatrix<Val> {
+    use p3_field::PrimeField64;
     let h = air.height();
     let w = air.fused_w();
     let tr = air.tr();
@@ -1808,6 +1879,29 @@ pub(crate) fn phase4a_build_trace(
     for r in 0..qrows {
         for i in 0..tw {
             t[(tr + r) * w + i] = tq.values[r * tw + i];
+        }
+    }
+    // index binding (#3): per tile, the canonical decomposition of the index felt (on the TF row) + the
+    // fold-bit shift register down the tile rows.
+    for q in 0..air.n_queries {
+        let tf_row = tr + q * TILE_H;
+        let felt = index_felts[q];
+        let v = felt.as_canonical_u64();
+        t[tf_row * w + air.sb_x()] = felt;
+        for i in 0..64 {
+            t[tf_row * w + air.sb_b(i)] = Val::from_u64((v >> i) & 1);
+        }
+        let mut qq = (v >> 32) & 1;
+        for k in 1..=31 {
+            qq &= (v >> (32 + k)) & 1;
+            t[tf_row * w + air.sb_q(k - 1)] = Val::from_u64(qq);
+        }
+        let mut rem = v & ((1u64 << DP_LOG_HEIGHT) - 1); // the masked query index
+        for r in 0..TILE_H {
+            t[(tf_row + r) * w + air.idx_rem()] = Val::from_u64(rem);
+            if r < air.n_rounds() {
+                rem >>= 1;
+            }
         }
     }
     // α_fri carrier: held constant across the whole trace.
@@ -2553,17 +2647,20 @@ mod tests {
         let fp0: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
         pis.push(fp0[0]);
         pis.push(fp0[1]);
-        let trace = phase4a_build_trace(&air, &block_inputs, &per_query, alpha_fri);
+        let trace = phase4a_build_trace(&air, &block_inputs, &per_query, alpha_fri, &index_felts);
         let h = air.height();
         println!("Phase 4.A fusion: 2^{} rows ({} transcript blocks + {} tiles, width {})", h.trailing_zeros(), counts.len(), MILESTONE_QUERIES, air.fused_w());
         let prf = prove(&config, &air, trace, &pis);
-        assert!(verify(&config, &air, &prf, &pis).is_ok(), "fused transcript+tiles must prove with α_fri + all β_r DERIVED");
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "fused transcript+tiles must prove with α_fri + all β_r + the canonical index DERIVED");
         let mut bad = pis.clone();
         bad[4] += Val::ONE; // α_fri public (chs[2] → pis[4]) — the bind fails
         assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered α_fri ⇒ reject");
         let mut bad_beta = pis.clone();
         bad_beta[6] += Val::ONE; // β_0 public (chs[3] → pis[6]) — the per-round fold binding fails
         assert!(verify(&config, &air, &prf, &bad_beta).is_err(), "tampered β_0 ⇒ reject (fold binding)");
+        let mut bad_idx = pis.clone();
+        bad_idx[2 * chs.len()] += Val::ONE; // the first index felt (pis[ext_pubs+0]) — the per-query SB bind fails
+        assert!(verify(&config, &air, &prf, &bad_idx).is_err(), "tampered index felt ⇒ reject (canonical index binding)");
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         assert!(rss <= EIGHT_GB && h <= (1 << 18), "budget: RSS ≤ 8 GB, height ≤ 2^18");
