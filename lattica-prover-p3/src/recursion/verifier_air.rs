@@ -220,6 +220,136 @@ pub fn verify_transcript(proof_bytes: &[u8], alpha: [Val; 2], zeta: [Val; 2]) ->
     verify(&make_config(), &TranscriptAir, &proof, &pis).is_ok()
 }
 
+// =================================================================================================
+// Component 2 — in-circuit OOD / constraint check (the "constraint folder as constraints").
+// Evaluates the INNER AIR's constraints at ζ in-circuit, combined with α (Horner), and checks
+// folded(ζ) == Z_H(ζ)·quotient (i.e. folded·inv_vanishing == quotient) — the verifier's exit step.
+// Inner AIR = ConstAir (2 constraints: is_first·(local−pub), is_transition·(next−local)). The domain
+// selectors at ζ (is_first, is_transition, inv_vanishing) are computed natively and fed as witness for
+// this component; computing them in-circuit is a separate sub-component. All arithmetic is over F_p².
+// =================================================================================================
+
+const W_EXT: u64 = 7; // X² = 7
+
+// column layout (width 15): local(2) ‖ next(2) ‖ alpha(2) ‖ is_first(2) ‖ is_transition(2) ‖
+//                            inv_vanishing(2) ‖ quotient(2) ‖ pub(1, base)
+const CC_LOCAL: usize = 0;
+const CC_NEXT: usize = 2;
+const CC_ALPHA: usize = 4;
+const CC_ISFIRST: usize = 6;
+const CC_ISTRANS: usize = 8;
+const CC_INVVAN: usize = 10;
+const CC_QUOT: usize = 12;
+const CC_PUB: usize = 14;
+const CC_WIDTH: usize = 15;
+
+pub struct ConstraintCheckAir;
+
+impl BaseAir<Goldilocks> for ConstraintCheckAir {
+    fn width(&self) -> usize {
+        CC_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the quotient (bound)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let w = AB::Expr::from(Goldilocks::from_u64(W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
+        };
+        let g = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+
+        let mut fr = builder.when_first_row();
+        // c0 = is_first ⊗ (local − pub)   [pub is base, lifted to (pub, 0)]
+        let local_m_pub = (cur[CC_LOCAL].clone() - cur[CC_PUB].clone(), cur[CC_LOCAL + 1].clone());
+        let c0 = emul(g(CC_ISFIRST), local_m_pub);
+        // c1 = is_transition ⊗ (next − local)
+        let next_m_local = (cur[CC_NEXT].clone() - cur[CC_LOCAL].clone(), cur[CC_NEXT + 1].clone() - cur[CC_LOCAL + 1].clone());
+        let c1 = emul(g(CC_ISTRANS), next_m_local);
+        // folded = c0·α + c1   (Horner, matching the VerifierConstraintFolder accumulation order)
+        let c0a = emul(c0, g(CC_ALPHA));
+        let folded = (c0a.0 + c1.0, c0a.1 + c1.1);
+        // check folded · inv_vanishing == quotient
+        let lhs = emul(folded, g(CC_INVVAN));
+        fr.assert_zero(lhs.0 - cur[CC_QUOT].clone());
+        fr.assert_zero(lhs.1 - cur[CC_QUOT + 1].clone());
+        // bind quotient to the public output
+        fr.assert_zero(cur[CC_QUOT].clone() - pis[0].clone());
+        fr.assert_zero(cur[CC_QUOT + 1].clone() - pis[1].clone());
+    }
+}
+
+fn cc_build_trace(
+    local: Challenge,
+    next: Challenge,
+    alpha: Challenge,
+    is_first: Challenge,
+    is_trans: Challenge,
+    inv_van: Challenge,
+    quotient: Challenge,
+    pub_val: Val,
+) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let mut r = [Val::ZERO; CC_WIDTH];
+    for (off, v) in [
+        (CC_LOCAL, local),
+        (CC_NEXT, next),
+        (CC_ALPHA, alpha),
+        (CC_ISFIRST, is_first),
+        (CC_ISTRANS, is_trans),
+        (CC_INVVAN, inv_van),
+        (CC_QUOT, quotient),
+    ] {
+        let cc = c(v);
+        r[off] = cc[0];
+        r[off + 1] = cc[1];
+    }
+    r[CC_PUB] = pub_val;
+    let mut vals = Vec::with_capacity(8 * CC_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, CC_WIDTH)
+}
+
+/// Prove the in-circuit constraint/OOD check for the given (opened values, challenges, selectors,
+/// quotient); the quotient is the public output.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_constraint_check(
+    local: Challenge,
+    next: Challenge,
+    alpha: Challenge,
+    is_first: Challenge,
+    is_trans: Challenge,
+    inv_van: Challenge,
+    quotient: Challenge,
+    pub_val: Val,
+) -> Vec<u8> {
+    use p3_field::BasedVectorSpace;
+    let pis: Vec<Val> = quotient.as_basis_coefficients_slice().to_vec();
+    let trace = cc_build_trace(local, next, alpha, is_first, is_trans, inv_van, quotient, pub_val);
+    postcard::to_allocvec(&prove(&make_config(), &ConstraintCheckAir, trace, &pis)).expect("serialize")
+}
+
+pub fn verify_constraint_check(proof_bytes: &[u8], quotient: Challenge) -> bool {
+    use p3_field::BasedVectorSpace;
+    let pis: Vec<Val> = quotient.as_basis_coefficients_slice().to_vec();
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), &ConstraintCheckAir, &proof, &pis).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +378,53 @@ mod tests {
             verify_transcript(&p, alpha, zeta)
         }));
         assert!(matches!(outcome, Ok(false) | Err(_)));
+    }
+
+    #[test]
+    #[ignore = "slow: in-circuit constraint check vs native verify_constraints"]
+    fn constraint_check_matches_native() {
+        use crate::recursion::native_verify::ConstAir;
+        use p3_commit::{Pcs, PolynomialSpace};
+        use p3_field::BasedVectorSpace;
+        use p3_uni_stark::{verify_constraints, StarkGenericConfig};
+
+        let ext = |x: Val| Challenge::from_basis_coefficients_fn(|i| if i == 0 { x } else { Val::ZERO });
+        let ch = |a: u64, b: u64| Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }));
+
+        let config = make_config();
+        let pcs = config.pcs();
+        let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, 1 << 4);
+
+        let local = ch(5, 6);
+        let next = ch(7, 8);
+        let alpha = ch(9, 10);
+        let pub_val = Val::from_u64(5);
+        let zeta = ch(1234567, 7654321); // not in the domain
+        let sels = domain.selectors_at_point(zeta);
+
+        // native ConstAir folder: c0 = is_first·(local−pub), c1 = is_transition·(next−local),
+        // folded = c0·α + c1 (Horner order matching the eval: when_first_row then when_transition).
+        let c0 = sels.is_first_row * (local - ext(pub_val));
+        let c1 = sels.is_transition * (next - local);
+        let folded = c0 * alpha + c1;
+        let quotient = folded * sels.inv_vanishing;
+
+        type PErr = <MyPcs as Pcs<Challenge, Challenger>>::Error;
+        // native verify_constraints accepts this quotient…
+        assert!(verify_constraints::<MyConfig, ConstAir, PErr>(
+            &ConstAir, &[local], &[next], None, None, &[], &[pub_val], domain, zeta, alpha, quotient
+        )
+        .is_ok());
+        // …and the in-circuit check agrees (real prover).
+        let proof = prove_constraint_check(local, next, alpha, sels.is_first_row, sels.is_transition, sels.inv_vanishing, quotient, pub_val);
+        assert!(verify_constraint_check(&proof, quotient), "in-circuit constraint check must accept the correct quotient");
+
+        // a wrong quotient ⇒ both native and in-circuit reject.
+        let bad = quotient + ext(Val::ONE);
+        assert!(verify_constraints::<MyConfig, ConstAir, PErr>(
+            &ConstAir, &[local], &[next], None, None, &[], &[pub_val], domain, zeta, alpha, bad
+        )
+        .is_err());
+        assert!(!verify_constraint_check(&proof, bad));
     }
 }

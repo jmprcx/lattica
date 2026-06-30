@@ -152,8 +152,31 @@ primitives). This is the porting blueprint: each step maps to an in-circuit gadg
 the actual in-circuit AIR port (replace `pcs.verify` with the primitives + the constraint folder as
 constraints) + re-implementing the FRI query-loop orchestration in-circuit.
 
+**In-circuit verifier — construction STARTED (`verifier_air.rs`), 2 of N components validated:**
+- **Component 1 — in-circuit Fiat–Shamir transcript (`TranscriptAir`):** replays verify's two-phase
+  transcript (absorb instance → squeeze **α** → absorb quotient+random commitments → squeeze **ζ**) as a
+  Poseidon2 sponge AIR, binding α, ζ as public outputs. Validated: the in-circuit (α, ζ) equal the native
+  `ModelChallenger`'s (which agrees with the real `DuplexChallenger`); wrong α / tampered absorb rejected.
+- **Component 2 — in-circuit OOD/constraint check (`ConstraintCheckAir`):** evaluates the inner AIR's
+  constraints at ζ in-circuit, combined with α (Horner), and checks `folded·inv_vanishing == quotient`.
+  Validated to **agree with native `verify_constraints`** (correct quotient accepts, wrong rejects) for
+  `ConstAir`. (The domain selectors at ζ are fed as witness here; computing them in-circuit is a separate
+  sub-component, below.)
+
 **Remaining — the large-scale integration (the genuine multi-month bulk):**
-- **B3-wire (in-circuit):** one AIR that parses a real `p3` `Proof`, replays the EXACT `p3-uni-stark::verify`
+- **Component 3 — in-circuit FRI query loop (the middle, the biggest piece):** parse a real `p3` `Proof`
+  into trace columns, extend the transcript to the FRI commit-phase (`β_i`) + query-index `sample_bits` +
+  variable-length absorb, then run all 96 queries (input opening + per-round Merkle openings via the
+  `fri_merkle` gadget + folds via `fri_fold` + "roll in reduced openings") and the `final_poly` check.
+- **Component 4 — in-circuit domain selectors** at ζ (`is_first`/`is_transition`/`inv_vanishing` from the
+  domain generator + ζ), feeding component 2 instead of witness.
+- **Wiring:** compose components 1–4 into one AIR that verifies a real inner proof end-to-end (agrees with
+  `p3::verify`); add the ZK/hiding in-circuit branches.
+- **B4 — aggregation:** verify K inner proofs (the verifier AIR ×K, tiled) + fold their per-tx statement
+  digests into the existing block tx-root (reuse the `DOM_TXROOT` fold), emitting the SAME tx-root so the
+  node seam is unchanged. **B5 — tree aggregation + seam:** compose outer-as-inner + C ABI + Zig seam.
+
+  (Original B3-wire description, retained:) one AIR that parses a real `p3` `Proof`, replays the EXACT `p3-uni-stark::verify`
   transcript order (observe degree bits → trace commit → public values → sample α → observe quotient
   commit → sample ζ → FRI commit-phase observes/`β_i` → query-index `sample_bits`), then runs all 96
   queries (input opening + per-round fold + Merkle openings + "roll in reduced openings") and the final
