@@ -1504,8 +1504,14 @@ impl Phase4AAir {
     fn ni(&self) -> usize {
         self.index_binds.len()
     }
+    fn n_rounds(&self) -> usize {
+        self.nb() - 3 // binds = [α_stark, ζ, α_fri, β_0..β_{R-1}]
+    }
+    fn p_round(&self, r: usize) -> usize {
+        FT_BIND_START + self.nb() + self.ni() + r // per-round one-hot: 1 at tile-row r of every tile
+    }
     fn p_tf(&self) -> usize {
-        FT_BIND_START + self.nb() + self.ni()
+        FT_BIND_START + self.nb() + self.ni() + self.n_rounds()
     }
     fn p_tl(&self) -> usize {
         self.p_tf() + 1
@@ -1578,6 +1584,14 @@ impl Phase4AAir {
             cols.push(col);
         }
         let tr = self.tr();
+        // per-round one-hots: P_ROUND_r = 1 at tile-row r of every tile (the fold row carrying β_r).
+        for r in 0..self.n_rounds() {
+            let mut col = vec![Val::ZERO; h];
+            for q in 0..self.n_queries {
+                col[tr + q * TILE_H + r] = Val::ONE;
+            }
+            cols.push(col);
+        }
         let mut tf = vec![Val::ZERO; h];
         let mut tl = vec![Val::ZERO; h];
         for q in 0..self.n_queries {
@@ -1731,6 +1745,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
         }
         builder.assert_zero(tf.clone() * (cur[QT_E].clone() - ro.0));
         builder.assert_zero(tf.clone() * (cur[QT_E + 1].clone() - ro.1));
+
+        // bind each fold-row's β_r to the DERIVED (public) β_r (binding #1, the fold challenges).
+        // β_r = binds[3+r] → public[2(3+r)], public[2(3+r)+1]; P_ROUND_r selects the fold row.
+        for r in 0..self.n_rounds() {
+            let pr = p[self.p_round(r)].clone();
+            let bidx = 3 + r;
+            builder.assert_zero(pr.clone() * (cur[QT_B].clone() - pis[2 * bidx].clone()));
+            builder.assert_zero(pr * (cur[QT_B + 1].clone() - pis[2 * bidx + 1].clone()));
+        }
 
         // tile fold (transition gated by S_QUERY·(1-TL)).
         let fold_gate = sq.clone() * (one.clone() - tl.clone());
@@ -2435,10 +2458,13 @@ mod tests {
         let h = air.height();
         println!("Phase 4.A fusion: 2^{} rows ({} transcript blocks + {} tiles, width {})", h.trailing_zeros(), counts.len(), MILESTONE_QUERIES, air.fused_w());
         let prf = prove(&config, &air, trace, &pis);
-        assert!(verify(&config, &air, &prf, &pis).is_ok(), "fused transcript+tiles must prove with α_fri DERIVED");
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "fused transcript+tiles must prove with α_fri + all β_r DERIVED");
         let mut bad = pis.clone();
         bad[4] += Val::ONE; // α_fri public (chs[2] → pis[4]) — the bind fails
         assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered α_fri ⇒ reject");
+        let mut bad_beta = pis.clone();
+        bad_beta[6] += Val::ONE; // β_0 public (chs[3] → pis[6]) — the per-round fold binding fails
+        assert!(verify(&config, &air, &prf, &bad_beta).is_err(), "tampered β_0 ⇒ reject (fold binding)");
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         assert!(rss <= EIGHT_GB && h <= (1 << 18), "budget: RSS ≤ 8 GB, height ≤ 2^18");
