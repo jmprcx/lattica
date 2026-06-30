@@ -1362,6 +1362,121 @@ pub(crate) fn skeleton_build_trace() -> (RowMajorMatrix<Val>, [Val; 2]) {
     (RowMajorMatrix::new(t, W), out)
 }
 
+// =================================================================================================
+// Phase 4.A (binding mechanism) — the cross-region challenge carrier. A value squeezed in the transcript
+// region (rate[3],rate[2] at the output bind row) is written to a GLOBAL-PERSISTENT carrier column, held
+// constant across the whole trace, and READ in a later (query) region. This is the producer→carrier→
+// consumer pattern (the `batch_*_air::ROOT` mechanism) by which the tiles consume the transcript's DERIVED
+// challenges instead of free inputs — the soundness core of the full assembly. De-risked here on the
+// skeleton's real Poseidon sponge before fusing the actual FullTranscriptAir + TiledQueryAir.
+// =================================================================================================
+
+const CA_CARRY: usize = W; // 2 global-persistent carrier lanes (the squeezed value V)
+const CA_WIDTH: usize = W + 2;
+
+#[allow(dead_code)]
+pub(crate) struct CarryBindAir;
+
+impl CarryBindAir {
+    fn height(&self) -> usize {
+        (SK_TB * BLOCK + BLOCK).next_power_of_two()
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        MonolithSkeletonAir.periodic() // reuse: round + block_last + S_POSEIDON + P_OUT
+    }
+}
+
+impl BaseAir<Goldilocks> for CarryBindAir {
+    fn width(&self) -> usize {
+        CA_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the carrier value read in the consumer region
+    }
+    fn num_periodic_columns(&self) -> usize {
+        SK_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CarryBindAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let s_pos = p[SK_S_POSEIDON].clone();
+
+        // Poseidon sponge in the transcript region (gated by S_POSEIDON) — the producer.
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(s_pos.clone() * step);
+        }
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[0].clone() - AB::Expr::ONE);
+            for i in 1..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+
+        // The carrier: GLOBAL-PERSISTENT (held every transition), pinned to the squeezed value
+        // (rate[3],rate[2]) at the transcript output row, read in the consumer (last) row → public.
+        builder.when_transition().assert_zero(nxt[CA_CARRY].clone() - cur[CA_CARRY].clone());
+        builder.when_transition().assert_zero(nxt[CA_CARRY + 1].clone() - cur[CA_CARRY + 1].clone());
+        let out = p[SK_P_OUT].clone();
+        builder.assert_zero(out.clone() * (cur[CA_CARRY].clone() - cur[3].clone()));
+        builder.assert_zero(out * (cur[CA_CARRY + 1].clone() - cur[2].clone()));
+        {
+            let mut lr = builder.when_last_row();
+            lr.assert_zero(cur[CA_CARRY].clone() - pis[0].clone());
+            lr.assert_zero(cur[CA_CARRY + 1].clone() - pis[1].clone());
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn carry_build_trace() -> (RowMajorMatrix<Val>, [Val; 2]) {
+    let air = CarryBindAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * CA_WIDTH];
+    let mut input = [Val::ZERO; W];
+    input[0] = Val::ONE;
+    let mut last_out = [Val::ZERO; W];
+    for blk in 0..SK_TB {
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * CA_WIDTH;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        last_out = native_permute(input);
+        input = last_out;
+    }
+    let v = [last_out[3], last_out[2]]; // the squeezed value V
+    for r in 0..h {
+        // carrier holds V across the WHOLE trace (constant; pinned at the output row, read at the last row)
+        t[r * CA_WIDTH + CA_CARRY] = v[0];
+        t[r * CA_WIDTH + CA_CARRY + 1] = v[1];
+    }
+    (RowMajorMatrix::new(t, CA_WIDTH), v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -1937,5 +2052,25 @@ mod tests {
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         assert!(rss <= EIGHT_GB, "skeleton peak RSS ≤ 8 GB");
+    }
+
+    /// Phase 4.A (binding mechanism): a value squeezed in the transcript region is carried in a
+    /// global-persistent column and READ in the consumer (query) region — the producer→carrier→consumer
+    /// pattern by which the tiles consume the transcript's derived challenges. Validated end-to-end.
+    #[test]
+    #[ignore = "slow: Phase 4.A cross-region carrier binding"]
+    fn phase4a_carrier_binding() {
+        use super::{carry_build_trace, CarryBindAir};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let air = CarryBindAir;
+        let (trace, v) = carry_build_trace();
+        let pis = v.to_vec();
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "the consumer must read the transcript's carried value V");
+        // wrong carried value ⇒ reject (the consumer is bound to the producer's value via the carrier).
+        let mut bad = pis.clone();
+        bad[0] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "wrong carried value ⇒ reject");
+        println!("Phase 4.A carrier binding: transcript squeeze → global-persistent carrier → consumer read, validated");
     }
 }
