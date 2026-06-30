@@ -1,9 +1,13 @@
 //! B3b WIRING — native FRI verify (re-implementing `p3-fri::verify_fri`), the blueprint to port to the
-//! in-circuit AIR.  ⚠️ WORK IN PROGRESS — this is NOT yet a complete or validated verifier.
+//! in-circuit AIR.  ✅ COMPLETE + VALIDATED (native): `verify_proof` runs the full FRI-STARK verify with
+//! NO `pcs.verify` delegation and agrees with `p3::verify` (test `native_fri_verify_agrees_with_p3`:
+//! accept a real proof; reject a tampered public value, a tampered commit-phase sibling, and a tampered
+//! `final_poly`). The remaining work is the AIR PORT — turning this validated native algorithm into
+//! constraints, using the in-circuit gadget each step already maps to.
 //!
 //! The in-circuit verifier's last and largest part is the FRI query loop. It can only be validated as a
-//! whole (against `pcs.verify`), so it is built as ONE native re-implementation first (the algorithm),
-//! then ported to constraints (every operation it performs already has a validated in-circuit gadget).
+//! whole, so it was built as ONE native re-implementation first (the algorithm), then ported to
+//! constraints (every operation it performs already has a validated in-circuit gadget).
 //!
 //! ## The algorithm (`p3-fri::verify_fri`), mapped to the validated building blocks
 //! 1. **Transcript** — sample α; per FRI round observe `commit_phase_commits[r]` + PoW, sample β_r;
@@ -23,21 +27,43 @@
 //! 4. **Final check** — `eval(final_poly, x) == folded_eval`, `x = g^reverse_bits(domain_index)`.
 //!    → in-circuit: a Horner evaluation (cheap F_p² arithmetic).
 //!
-//! ## Status
-//! - `verify_query` (step 3): implemented natively below, mirroring p3 (uses `mmcs.verify_batch` +
-//!   `TwoAdicFriFolding::fold_row`, the latter validated == our `fri_fold::native_fold`).
-//! - `open_input` (step 2) + the `verify_fri` driver (steps 1, 4): the remaining native implementation;
-//!   then end-to-end validation vs `pcs.verify` (accept real / reject tampered), then the AIR port.
+//! ## Status — native wiring COMPLETE + validated
+//! - `open_input` (step 2), `verify_query` (step 3), the `verify_fri_native` driver (steps 1+4), and the
+//!   `verify_proof` STARK wrapper are all implemented natively, mirroring p3. NO `pcs.verify` is used —
+//!   the FRI low-degree test runs from scratch. End-to-end validated by `native_fri_verify_agrees_with_p3`.
+//! - Remaining: the AIR PORT (replace this native code with the in-circuit gadgets + the constraint
+//!   folder as constraints), then B4/B5 aggregation. This native verify is the exact algorithm to port.
 
-use p3_commit::Mmcs;
+use alloc::collections::BTreeMap;
+
+use p3_air::BaseAir;
+use p3_challenger::{CanObserve, DuplexChallenger, FieldChallenger};
+use p3_commit::{BatchOpening, ExtensionMmcs, Mmcs, Pcs, PolynomialSpace};
+use p3_dft::Radix2DitParallel;
 use p3_field::extension::BinomialExtensionField;
-use p3_field::{PrimeCharacteristicRing, TwoAdicField};
-use p3_fri::{CommitPhaseProofStep, FriParameters, TwoAdicFriFolding};
-use p3_goldilocks::Goldilocks;
+use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
+use p3_fri::{CommitPhaseProofStep, FriParameters, TwoAdicFriFolding, TwoAdicFriPcs};
+use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilocks};
 use p3_matrix::Dimensions;
+use p3_merkle_tree::MerkleTreeMmcs;
+use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+use p3_uni_stark::{
+    get_log_num_quotient_chunks, recompose_quotient_from_chunks, validate_degree_bits, verify_constraints,
+    AirLayout, Proof, StarkGenericConfig,
+};
+
+use super::native_verify::ConstAir;
+
+extern crate alloc;
 
 type Val = Goldilocks;
 type Challenge = BinomialExtensionField<Val, 2>;
+
+/// log2 of a power of two (replaces `p3_util::log2_strict`, which isn't a direct dependency).
+fn log2_strict(n: usize) -> usize {
+    debug_assert!(n.is_power_of_two());
+    n.trailing_zeros() as usize
+}
 
 /// One commit-phase round's data for a query: (β_r, commitment, opening step).
 pub struct CommitStep<'a, M: Mmcs<Challenge>> {
@@ -161,7 +187,333 @@ fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
     r
 }
 
-// TODO (wiring continuation): `open_input` (reduced openings from the batch MMCS openings + the DEEP
-// combination, with the GENERATOR shift + bit-reversal + α-by-height accumulation) and the `verify_fri`
-// driver (transcript → per-query open_input + verify_query + final-poly check), then end-to-end
-// validation vs `pcs.verify` (accept real proof / reject tampered), then the AIR port.
+// --- non-ZK config (standard TwoAdicFriPcs — `verify_fri` applies exactly, no hiding randomization) ---
+type Perm = Poseidon2Goldilocks<8>;
+type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
+type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
+type InputMmcs = MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
+type ChallengeMmcs = ExtensionMmcs<Val, Challenge, InputMmcs>;
+type Chal = DuplexChallenger<Val, Perm, 8, 4>;
+type Dft = Radix2DitParallel<Val>;
+type MyPcs = TwoAdicFriPcs<Val, Dft, InputMmcs, ChallengeMmcs>;
+pub type MyConfig = p3_uni_stark::StarkConfig<MyPcs, Challenge, Chal>;
+type Domain = <MyPcs as Pcs<Challenge, Chal>>::Domain;
+type InputCommit = <InputMmcs as Mmcs<Val>>::Commitment;
+type ComOpenings = Vec<(InputCommit, Vec<(Domain, Vec<(Challenge, Vec<Challenge>)>)>)>;
+
+/// `open_input` — per-query reduced openings (faithful port of `p3-fri::open_input`): MMCS-verify each
+/// committed batch's opened rows, then reduce to `ro[log_height] = Σ α^k·(p_z − p_x)/(z − x)` with
+/// `x = GENERATOR·g^reverse_bits(index >> bits_reduced, log_height)`, accumulating the α-power per height.
+#[allow(clippy::type_complexity)]
+fn open_input(
+    params: &FriParameters<ChallengeMmcs>,
+    log_global_max_height: usize,
+    index: usize,
+    input_proof: &[BatchOpening<Val, InputMmcs>],
+    alpha: Challenge,
+    input_mmcs: &InputMmcs,
+    coms: &[(InputCommit, Vec<(Domain, Vec<(Challenge, Vec<Challenge>)>)>)],
+) -> Result<Vec<(usize, Challenge)>, String> {
+    let mut reduced: BTreeMap<usize, (Challenge, Challenge)> = BTreeMap::new();
+    if input_proof.len() != coms.len() {
+        return Err("input proof batch count mismatch".into());
+    }
+    for (batch_opening, (batch_commit, mats)) in input_proof.iter().zip(coms.iter()) {
+        if batch_opening.opened_values.len() != mats.len() {
+            return Err("batch opened-values count mismatch".into());
+        }
+        let batch_heights: Vec<usize> = mats.iter().map(|(d, _)| d.size() << params.log_blowup).collect();
+        let batch_dims: Vec<Dimensions> = mats
+            .iter()
+            .zip(&batch_heights)
+            .map(|((_, pts), &height)| {
+                let (_, values) = pts.first().ok_or("matrix without opening points")?;
+                Ok(Dimensions { width: values.len(), height })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let reduced_index = batch_heights
+            .iter()
+            .max()
+            .map(|&h| index >> (log_global_max_height - log2_strict(h)))
+            .unwrap_or(0);
+        input_mmcs
+            .verify_batch(batch_commit, &batch_dims, reduced_index, batch_opening.into())
+            .map_err(|_| "input MMCS verify failed".to_string())?;
+
+        for (mat_opening, (mat_domain, mat_pts)) in batch_opening.opened_values.iter().zip(mats.iter()) {
+            let log_height = log2_strict(mat_domain.size()) + params.log_blowup;
+            let bits_reduced = log_global_max_height - log_height;
+            let rev = reverse_bits_len(index >> bits_reduced, log_height);
+            let x = Val::GENERATOR * Val::two_adic_generator(log_height).exp_u64(rev as u64);
+            let (alpha_pow, ro) = reduced.entry(log_height).or_insert((Challenge::ONE, Challenge::ZERO));
+            for (z, ps_at_z) in mat_pts.iter() {
+                if mat_opening.len() != ps_at_z.len() {
+                    return Err("point evaluation count mismatch".into());
+                }
+                let quotient = (*z - x).try_inverse().ok_or("opening point matches query point")?;
+                for (&p_at_x, &p_at_z) in mat_opening.iter().zip(ps_at_z.iter()) {
+                    *ro += *alpha_pow * (p_at_z - p_at_x) * quotient;
+                    *alpha_pow *= alpha;
+                }
+            }
+        }
+    }
+    if let Some((_, ro)) = reduced.get(&params.log_blowup) {
+        if !ro.is_zero() {
+            return Err("nonzero blowup-height reduced opening".into());
+        }
+    }
+    Ok(reduced.into_iter().rev().map(|(lh, (_, ro))| (lh, ro)).collect())
+}
+
+/// The FRI verify driver (faithful port of `p3-fri::verify_fri`): sample α, derive βs per round, then per
+/// query open the input (`open_input`) + fold the commit phase (`verify_query`) + check `final_poly`.
+fn verify_fri_native(
+    params: &FriParameters<ChallengeMmcs>,
+    fri_proof: &p3_fri::FriProof<Challenge, ChallengeMmcs, Val, Vec<BatchOpening<Val, InputMmcs>>>,
+    challenger: &mut Chal,
+    coms: &ComOpenings,
+    input_mmcs: &InputMmcs,
+) -> Result<(), String> {
+    use p3_challenger::{CanSampleBits, GrindingChallenger};
+    if params.num_queries == 0 {
+        return Err("zero queries".into());
+    }
+    let alpha: Challenge = challenger.sample_algebra_element();
+
+    let expected_rounds = fri_proof.commit_phase_commits.len();
+    for qp in &fri_proof.query_proofs {
+        if qp.commit_phase_openings.len() != expected_rounds {
+            return Err("query commit-phase opening count mismatch".into());
+        }
+    }
+    let log_arities: Vec<usize> = fri_proof
+        .query_proofs
+        .first()
+        .map(|qp| qp.commit_phase_openings.iter().map(|o| o.log_arity as usize).collect())
+        .unwrap_or_default();
+    let total: usize = log_arities.iter().sum();
+    let log_global_max_height = total + params.log_blowup + params.log_final_poly_len;
+    let expected = coms
+        .iter()
+        .flat_map(|(_, mats)| mats.iter().map(|(d, _)| log2_strict(d.size()) + params.log_blowup))
+        .max();
+    if let Some(e) = expected {
+        if log_global_max_height != e {
+            return Err(format!("global max height {log_global_max_height} != {e}"));
+        }
+    }
+
+    let betas: Vec<Challenge> = fri_proof
+        .commit_phase_commits
+        .iter()
+        .zip(&fri_proof.commit_pow_witnesses)
+        .map(|(comm, witness)| {
+            challenger.observe(comm.clone());
+            if !challenger.check_witness(params.commit_proof_of_work_bits, *witness) {
+                return Err("invalid commit pow".to_string());
+            }
+            Ok(challenger.sample_algebra_element())
+        })
+        .collect::<Result<_, _>>()?;
+
+    if fri_proof.final_poly.len() != params.final_poly_len() {
+        return Err("final poly length mismatch".into());
+    }
+    challenger.observe_algebra_slice(&fri_proof.final_poly);
+    if fri_proof.query_proofs.len() != params.num_queries {
+        return Err("query proof count mismatch".into());
+    }
+    for &la in &log_arities {
+        challenger.observe(Val::from_usize(la));
+    }
+    if !challenger.check_witness(params.query_proof_of_work_bits, fri_proof.query_pow_witness) {
+        return Err("invalid query pow".into());
+    }
+    let log_final_height = params.log_blowup + params.log_final_poly_len;
+    // The fold only needs FriFoldingStrategy::fold_row (independent of the InputProof type param); a
+    // `<()>` folding suffices, and ChallengeMmcs::Error == InputMmcs::Error so the trait bound holds.
+    let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> = TwoAdicFriFolding(core::marker::PhantomData);
+
+    for qp in fri_proof.query_proofs.iter() {
+        let index = challenger.sample_bits(log_global_max_height);
+        let ro = open_input(params, log_global_max_height, index, &qp.input_proof, alpha, input_mmcs, coms)?;
+        let mut domain_index = index;
+        let fold_data: Vec<CommitStep<'_, ChallengeMmcs>> = betas
+            .iter()
+            .zip(fri_proof.commit_phase_commits.iter())
+            .zip(qp.commit_phase_openings.iter())
+            .map(|((&beta, commit), opening)| CommitStep { beta, commit, opening })
+            .collect();
+        let folded = verify_query(params, &folding, &mut domain_index, &fold_data, ro, log_global_max_height, log_final_height)?;
+        let x = final_query_point(domain_index, log_global_max_height);
+        if eval_final_poly(&fri_proof.final_poly, x) != folded {
+            return Err("final poly mismatch".into());
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the input MMCS + FRI parameters deterministically (identical to the config's, since Poseidon2
+/// + the literals are fixed) — `TwoAdicFriPcs` doesn't expose them, and my FRI verify needs both.
+fn build_mmcs_and_params() -> (Perm, InputMmcs, FriParameters<ChallengeMmcs>) {
+    let perm = default_goldilocks_poseidon2_8();
+    let input_mmcs = InputMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6);
+    let params = FriParameters {
+        log_blowup: 4,
+        log_final_poly_len: 0,
+        max_log_arity: 4,
+        num_queries: 96,
+        commit_proof_of_work_bits: 0,
+        query_proof_of_work_bits: 16,
+        mmcs: ChallengeMmcs::new(input_mmcs.clone()),
+    };
+    (perm, input_mmcs, params)
+}
+
+/// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
+/// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
+/// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify
+/// → recompose quotient → constraint/OOD check. Validated to agree with `p3::verify`.
+pub fn verify_proof(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val]) -> Result<(), String> {
+    let air = ConstAir;
+    let Proof { commitments, opened_values, opening_proof, degree_bits } = proof;
+    let degree_bits = *degree_bits;
+    let pcs = config.pcs();
+    let is_zk = 0usize;
+
+    let (base_degree_bits, degree) =
+        validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).map_err(|e| format!("degree bits: {e:?}"))?;
+    let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let preprocessed_width = 0usize;
+    let layout = AirLayout::from_air::<Val>(&air);
+    let log_num_quotient_chunks = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, is_zk);
+    let num_quotient_chunks = 1usize << log_num_quotient_chunks; // is_zk=0
+
+    let mut challenger = config.initialise_challenger();
+    let init_trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let quotient_domain_size = 1usize << (degree_bits + log_num_quotient_chunks);
+    let quotient_domain = trace_domain.create_disjoint_domain(quotient_domain_size);
+    let quotient_chunks_domains = quotient_domain.split_domains(num_quotient_chunks);
+    let randomized_quotient_chunks_domains = quotient_chunks_domains.clone(); // << is_zk = 0
+
+    challenger.observe(Val::from_usize(degree_bits));
+    challenger.observe(Val::from_usize(base_degree_bits));
+    challenger.observe(Val::from_usize(preprocessed_width));
+    challenger.observe(commitments.trace.clone());
+    challenger.observe_slice(public_values);
+    let alpha: Challenge = challenger.sample_algebra_element();
+    challenger.observe(commitments.quotient_chunks.clone());
+    // no random commitment (non-ZK)
+    let zeta: Challenge = challenger.sample_algebra_element();
+    if init_trace_domain.vanishing_poly_at_point(zeta).is_zero() {
+        return Err("zeta in trace domain".into());
+    }
+    let periodic_columns = air.periodic_columns();
+    let periodic_values: Vec<Challenge> =
+        periodic_columns.iter().map(|c| init_trace_domain.evaluate_periodic_column_at(c, zeta)).collect();
+    let zeta_next = init_trace_domain.next_point(zeta).ok_or("no next point")?;
+    let main_next = !air.main_next_row_columns().is_empty();
+
+    let trace_round = {
+        let mut pts = vec![(zeta, opened_values.trace_local.clone())];
+        if main_next {
+            pts.push((zeta_next, opened_values.trace_next.clone().ok_or("missing trace_next")?));
+        }
+        (commitments.trace.clone(), vec![(trace_domain, pts)])
+    };
+    let coms_to_verify: ComOpenings = vec![
+        trace_round,
+        (
+            commitments.quotient_chunks.clone(),
+            randomized_quotient_chunks_domains.iter().zip(&opened_values.quotient_chunks).map(|(d, v)| (*d, vec![(zeta, v.clone())])).collect(),
+        ),
+    ];
+
+    // observe all opened evaluations — `TwoAdicFriPcs::verify` does this before `verify_fri`.
+    for (_, round) in &coms_to_verify {
+        for (_, mat) in round {
+            for (_, point) in mat {
+                challenger.observe_algebra_slice(point);
+            }
+        }
+    }
+
+    // ---- MY native FRI verify (the wiring), in place of pcs.verify ----
+    let (_perm, input_mmcs, params) = build_mmcs_and_params();
+    verify_fri_native(&params, opening_proof, &mut challenger, &coms_to_verify, &input_mmcs)?;
+
+    // ---- recompose the quotient + check the constraint relation at ζ ----
+    let quotient = recompose_quotient_from_chunks::<MyConfig>(&quotient_chunks_domains, &opened_values.quotient_chunks, zeta);
+    let zeros;
+    let trace_next_slice: &[Challenge] = match &opened_values.trace_next {
+        Some(v) => v.as_slice(),
+        None => {
+            zeros = Challenge::zero_vec(air.width());
+            &zeros
+        }
+    };
+    verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Chal>>::Error>(
+        &air,
+        &opened_values.trace_local,
+        trace_next_slice,
+        None,
+        None,
+        &periodic_values,
+        public_values,
+        init_trace_domain,
+        zeta,
+        alpha,
+        quotient,
+    )
+    .map_err(|e| format!("constraints: {e:?}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_uni_stark::{prove, verify};
+
+    fn make_config() -> MyConfig {
+        let (perm, input_mmcs, params) = build_mmcs_and_params();
+        let pcs = MyPcs::new(Dft::default(), input_mmcs, params);
+        MyConfig::new(pcs, Chal::new(perm))
+    }
+
+    fn gen_proof(config: &MyConfig, value: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+        let v = Val::from_u64(value);
+        let trace = RowMajorMatrix::new(vec![v; 1 << log_height], 1);
+        let pvs = vec![v];
+        (prove(config, &ConstAir, trace, &pvs), pvs)
+    }
+
+    #[test]
+    #[ignore = "slow: COMPLETE native FRI verify (the wiring) vs p3::verify"]
+    fn native_fri_verify_agrees_with_p3() {
+        let config = make_config();
+        let (mut proof, pvs) = gen_proof(&config, 42, 6);
+
+        // p3 accepts the proof.
+        assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "p3::verify should accept");
+        // my COMPLETE native FRI verify (open_input + verify_query + final-poly, no pcs.verify) accepts it.
+        if let Err(e) = verify_proof(&config, &proof, &pvs) {
+            panic!("native FRI verify rejected a valid proof: {e}");
+        }
+        // tampered public value ⇒ reject.
+        let bad = vec![Val::from_u64(43)];
+        assert!(verify(&config, &ConstAir, &proof, &bad).is_err());
+        assert!(verify_proof(&config, &proof, &bad).is_err(), "should reject wrong public value");
+
+        // corrupt a query's commit-phase sibling ⇒ reject (proves verify_query's MMCS/fold actually checks).
+        // (Non-ZK proving is deterministic, so this is the same proof generated fresh.)
+        let (mut p2, _) = gen_proof(&config, 42, 6);
+        p2.opening_proof.query_proofs[0].commit_phase_openings[0].sibling_values[0] += Challenge::ONE;
+        assert!(verify_proof(&config, &p2, &pvs).is_err(), "should reject tampered commit-phase sibling");
+
+        // corrupt a final_poly coefficient ⇒ reject (proves the final low-degree check is doing work).
+        proof.opening_proof.final_poly[0] += Challenge::ONE;
+        assert!(verify_proof(&config, &proof, &pvs).is_err(), "should reject tampered final_poly");
+    }
+}

@@ -178,17 +178,18 @@ constraints) + re-implementing the FRI query-loop orchestration in-circuit.
     squeezed challenge into 64 boolean bits, reconstructs `x = Σ b_i·2^i`, enforces CANONICAL (`< p`) via
     `q₃₁·lo == 0` (q₃₁ = Π high 32 bits, lo = low 32 bits), and outputs the low `bits` as the index.
     Validated vs the native challenger's `sample_bits` (canonical-boundary case included).
-  - **3b — the query loop proper: WIRING STARTED (`native_fri.rs`, WIP).** All building blocks are built +
-    individually validated — challenge derivation [3a], `sample_bits` [3b-iii], leaf hash [3b-i] → path
-    merge [`fri_merkle`] → reduced opening [3b-ii] → fold/fold-chain [`fri_fold`]. The wiring re-implements
-    `p3-fri::verify_fri` natively (the blueprint to port to the AIR); the module doc maps every step to
-    its validated gadget. **Done so far:** `verify_query` (the commit-phase fold loop — reconstruct the
-    arity group, MMCS-verify it, fold at β_r, roll in openings) implemented mirroring p3 (uses
-    `mmcs.verify_batch` + `fold_row`, the latter == our validated `native_fold`); plus the `final_poly`
-    Horner evaluation + the final-domain point. **Remaining:** `open_input` (the reduced-openings with the
-    GENERATOR shift + bit-reversal + α-by-height accumulation) and the `verify_fri` driver, then
-    **end-to-end validation vs `pcs.verify`** (accept real / reject tampered) — this whole composition is
-    validatable only as a unit, the remaining multi-week core — then the AIR port.
+  - **3b — the query loop proper: WIRING COMPLETE + VALIDATED (native) (`native_fri.rs`).** All building
+    blocks are built + individually validated — challenge derivation [3a], `sample_bits` [3b-iii], leaf
+    hash [3b-i] → path merge [`fri_merkle`] → reduced opening [3b-ii] → fold/fold-chain [`fri_fold`]. The
+    wiring re-implements `p3-fri::verify_fri` natively (the blueprint to port to the AIR): `open_input`
+    (reduced openings — GENERATOR shift + bit-reversal + α-by-height accumulation + the input MMCS verify),
+    `verify_query` (commit-phase fold loop — reconstruct the arity group, MMCS-verify, fold at β_r, roll in
+    openings), the `verify_fri` driver (transcript → per-query open_input + verify_query + `final_poly`
+    check), and a `verify_proof` STARK wrapper. **`verify_proof` runs the FULL FRI-STARK verify with NO
+    `pcs.verify` delegation and agrees with `p3::verify`** (`native_fri_verify_agrees_with_p3`: accepts a
+    real proof; rejects a tampered public value, a tampered commit-phase sibling, and a tampered
+    `final_poly`). **Remaining: the AIR PORT** — turn this validated native algorithm into constraints
+    using the in-circuit gadgets each step maps to (the heavy in-circuit engineering), then B4/B5.
 - **Component 4 — in-circuit domain selectors at ζ: DONE + validated (`DomainSelectorsAir`).** Computes
   `z_h = ζ^(2^log_size)−1` (a squaring chain), `is_first = z_h/(ζ−1)`, `is_last = z_h/(ζ−g⁻¹)`,
   `is_transition = ζ−g⁻¹`, `inv_vanishing = z_h⁻¹` in-circuit (F_p², in-circuit inverses), validated to
