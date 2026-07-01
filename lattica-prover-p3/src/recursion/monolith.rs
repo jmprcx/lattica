@@ -2857,21 +2857,55 @@ pub(crate) fn cm2_build_trace(group: [Val; 4], path: &[([Val; 4], bool)]) -> (Ro
 // constraint epilogue are the remaining stages. Validated: the fused AIR proves over the real milestone proof.
 // =================================================================================================
 
-// Monolith super-tile block layout (16 blocks): 0 arith | 1..5 input-Merkle | 6..10 quotient-Merkle | 11..15 pad.
-// Super-tile block layout (23 blocks, → exactly 2^16 total with the 2^14 transcript + 32 tiles):
-// 0 arith | 1..5 input-Merkle | 6..10 quotient-Merkle | 11..22 commit-phase Merkle (6 rounds).
-const M_NBLOCKS: usize = 23;
-const M_PERIOD: usize = M_NBLOCKS * BLOCK; // 736
-const M_DEGREE_BITS: usize = DP_LOG_HEIGHT - 4; // inner-trace degree_bits (log_global − log_blowup = 10 − 4 = 6)
-const M_INPUT_LEAF: usize = 1;
-const M_INPUT_TERM: usize = 5;
-const M_QUOT_LEAF: usize = 6;
-const M_QUOT_TERM: usize = 10;
-// commit-phase: 6 fold rounds, depths [3,2,1,0,0,0] (log_global=10, cap_height=6). Each round = 1 leaf-hash
-// block + `depth` merge blocks; the leaf absorbs the bit-ordered arity-2 fold group {e_r, sib_r}.
-const CM_ROUNDS: usize = 6;
-const CM_LEAF: [usize; CM_ROUNDS] = [11, 15, 18, 20, 21, 22]; // leaf-hash block per round
-const CM_TERM: [usize; CM_ROUNDS] = [14, 17, 19, 20, 21, 22]; // terminal block per round (leaf + depth)
+// ── Monolith super-tile geometry, DERIVED from the base params so re-pinning the FRI depth is a config change,
+//    not a rewrite. Base params: DP_LOG_HEIGHT (= log_global = degree_bits + log_blowup), CM_CAP_HEIGHT (the
+//    FRI Merkle-cap height), LOG_BLOWUP (the FRI rate). Every derived value below equals the db=6 milestone
+//    literal (guarded by the `geometry_matches_milestone` test). Layout: block 0 arith | input-Merkle |
+//    quotient-Merkle | commit-phase Merkle (CM_ROUNDS rounds). ──
+const LOG_BLOWUP: usize = 4; // FRI rate (log); log_global = degree_bits + LOG_BLOWUP
+const M_DEGREE_BITS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // inner-trace degree_bits (10 − 4 = 6)
+const CM_ROUNDS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // FRI commit rounds = folds to the rate floor = degree_bits
+const INPUT_DEPTH: usize = DP_LOG_HEIGHT - CM_CAP_HEIGHT; // input/quotient Merkle path depth to the cap (10 − 6 = 4)
+const M_INPUT_LEAF: usize = 1; // single-block leaf (inner W ≤ Poseidon rate here; the multi-block leaf is 7.9)
+const M_INPUT_TERM: usize = M_INPUT_LEAF + INPUT_DEPTH; // 1 + 4 = 5
+const M_QUOT_LEAF: usize = M_INPUT_TERM + 1; // 6
+const M_QUOT_TERM: usize = M_QUOT_LEAF + INPUT_DEPTH; // 6 + 4 = 10 (single-block quotient leaf, nqc = 1)
+// commit round r folds the codeword to log-height DP_LOG_HEIGHT−(r+1); its Merkle path is that many levels
+// above the cap (0 once the codeword ≤ 2^cap_height). depths at db=6: [3,2,1,0,0,0].
+const fn cm_depth(r: usize) -> usize {
+    let h = DP_LOG_HEIGHT - (r + 1);
+    if h > CM_CAP_HEIGHT {
+        h - CM_CAP_HEIGHT
+    } else {
+        0
+    }
+}
+// commit-phase blocks after the quotient-Merkle: each round = 1 leaf-hash block + cm_depth(r) merge blocks.
+const fn cm_leaf_blocks() -> [usize; CM_ROUNDS] {
+    let mut leaf = [0usize; CM_ROUNDS];
+    let mut blk = M_QUOT_TERM + 1;
+    let mut r = 0;
+    while r < CM_ROUNDS {
+        leaf[r] = blk;
+        blk += cm_depth(r) + 1;
+        r += 1;
+    }
+    leaf
+}
+const fn cm_term_blocks() -> [usize; CM_ROUNDS] {
+    let leaf = cm_leaf_blocks();
+    let mut term = [0usize; CM_ROUNDS];
+    let mut r = 0;
+    while r < CM_ROUNDS {
+        term[r] = leaf[r] + cm_depth(r);
+        r += 1;
+    }
+    term
+}
+const CM_LEAF: [usize; CM_ROUNDS] = cm_leaf_blocks(); // db=6: [11,15,18,20,21,22] — leaf-hash block per round
+const CM_TERM: [usize; CM_ROUNDS] = cm_term_blocks(); // db=6: [14,17,19,20,21,22] — terminal block per round
+const M_NBLOCKS: usize = CM_TERM[CM_ROUNDS - 1] + 1; // db=6: 23
+const M_PERIOD: usize = M_NBLOCKS * BLOCK; // db=6: 736
 
 /// Max inner proofs the tiled aggregator folds in ONE outer proof, mirroring `batch_joinsplit_air::
 /// MAX_BATCH_TILES`. K must be a power of two (the fold's Merkle–Damgård chain pads to pow2, as `batch_root`
@@ -6696,6 +6730,26 @@ mod tests {
         let (log2h, rss) = run_counter_monolith(MILESTONE_QUERIES);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "counter monolith within 8 GB / 2^18");
         println!("Phase 6.2: monolith verifies a non-degenerate counter inner (distinct caps + non-zero quotient), 2^{log2h}");
+    }
+
+    /// Guard: the DERIVED super-tile geometry (from DP_LOG_HEIGHT / CM_CAP_HEIGHT / LOG_BLOWUP) reproduces the
+    /// db=6 milestone layout byte-for-byte. If a re-pin changes the base params, this pins the expected values
+    /// so the derivation stays honest (and documents what the literals used to be).
+    #[test]
+    fn geometry_matches_milestone() {
+        use super::{cm_depth, CM_CAP_HEIGHT, CM_LEAF, CM_ROUNDS, CM_TERM, DP_LOG_HEIGHT, INPUT_DEPTH, LOG_BLOWUP, M_DEGREE_BITS, M_INPUT_LEAF, M_INPUT_TERM, M_NBLOCKS, M_PERIOD, M_QUOT_LEAF, M_QUOT_TERM};
+        // base params (the milestone config)
+        assert_eq!((DP_LOG_HEIGHT, CM_CAP_HEIGHT, LOG_BLOWUP), (10, 6, 4));
+        // derived scalars
+        assert_eq!(M_DEGREE_BITS, 6);
+        assert_eq!(CM_ROUNDS, 6);
+        assert_eq!(INPUT_DEPTH, 4);
+        assert_eq!((M_INPUT_LEAF, M_INPUT_TERM, M_QUOT_LEAF, M_QUOT_TERM), (1, 5, 6, 10));
+        // derived commit-phase block layout + per-round depths
+        assert_eq!(CM_LEAF, [11, 15, 18, 20, 21, 22]);
+        assert_eq!(CM_TERM, [14, 17, 19, 20, 21, 22]);
+        assert_eq!([cm_depth(0), cm_depth(1), cm_depth(2), cm_depth(3), cm_depth(4), cm_depth(5)], [3, 2, 1, 0, 0, 0]);
+        assert_eq!((M_NBLOCKS, M_PERIOD), (23, 736));
     }
 
     #[test]
