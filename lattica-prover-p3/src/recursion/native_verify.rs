@@ -667,6 +667,38 @@ fn hiding_query_fold_data(
     (ro, rounds, e, fri.final_poly[0])
 }
 
+/// The HIDING analog of query_input_merkle: the trace-round inline-Merkle witness — the SALTED leaf
+/// `MyHash(committed_row ‖ salt)` (salt from opening_proof.0), the sibling path, and the cap entry
+/// `cap[index >> depth]`. Trace is input round 1 when the random round is present (is_zk=1). This is the
+/// leaf+path witness the monolith's inline input-Merkle region consumes (its leaf sponge now absorbs W+8 felts).
+#[cfg(test)]
+fn hiding_query_input_merkle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+    q: usize,
+) -> ([Val; 4], Vec<([Val; 4], bool)>, [Val; 4]) {
+    use p3_field::PrimeField64;
+    use p3_goldilocks::default_goldilocks_poseidon2_8;
+    use p3_symmetric::CryptographicHasher;
+    let (_, _, _, _, index_felts) = hiding_transcript_challenges(config, proof, public_values);
+    let fri = &proof.opening_proof.1;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let trace_batch = if proof.commitments.random.is_some() { 1 } else { 0 };
+    let batch = &fri.query_proofs[q].input_proof[trace_batch];
+    let row = &batch.opened_values[0];
+    let salt = &batch.opening_proof.0[0]; // hiding MMCS Proof = (salts, siblings); salt per matrix
+    let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+    let preimage: Vec<Val> = row.iter().chain(salt.iter()).copied().collect();
+    let leaf: [Val; 4] = hasher.hash_iter(preimage.iter().copied());
+    let siblings = &batch.opening_proof.1;
+    let path: Vec<([Val; 4], bool)> = siblings.iter().enumerate().map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1)).collect();
+    let depth = siblings.len();
+    let cap_entry = proof.commitments.trace.roots()[index >> depth];
+    (leaf, path, cap_entry)
+}
+
 /// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
 /// hiding monolith's query region will reproduce). Replays the hiding transcript (random-commitment absorb +
 /// codeword-merged opened values, as in `hiding_transcript_challenges`), then per query computes the reduced
@@ -1242,5 +1274,30 @@ mod tests {
             n_rounds = rounds.len();
         }
         println!("hiding fold chain (arity-2): {n_rounds} rounds fold ro → final_poly[0] (monolith-compatible fold witness)");
+    }
+
+    /// Native hiding monolith harness (#86, step 4): the SALTED inline-Merkle witness. hiding_query_input_merkle
+    /// gives the trace leaf `MyHash(row ‖ salt)` + path + cap entry; folding the leaf up the path (MyCompress,
+    /// index-bit direction) must reach the cap entry — i.e., the salted leaf authenticates against the trace
+    /// commitment. This is the leaf+path the monolith's inline Merkle region binds (validated leaf sponge W+8).
+    #[test]
+    #[ignore = "slow: hiding salted input-Merkle leaf+path folds to the trace cap"]
+    fn hiding_input_merkle_folds_to_cap() {
+        use p3_symmetric::PseudoCompressionFunction;
+        let config = make_config();
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        let compressor = MyCompress::new(default_goldilocks_poseidon2_8());
+        let fri = &proof.opening_proof.1;
+        let mut depth = 0;
+        for q in [0usize, 1, fri.query_proofs.len() - 1] {
+            let (leaf, path, cap_entry) = hiding_query_input_merkle(&config, &proof, &pvs, q);
+            let mut node = leaf;
+            for (sib, dir) in &path {
+                node = if *dir { compressor.compress([*sib, node]) } else { compressor.compress([node, *sib]) };
+            }
+            assert_eq!(node, cap_entry, "q{q}: salted leaf (row ‖ salt) + path must fold to the trace cap entry");
+            depth = path.len();
+        }
+        println!("hiding input Merkle: salted leaf (row ‖ salt) + {depth}-level path folds to the trace cap entry");
     }
 }
