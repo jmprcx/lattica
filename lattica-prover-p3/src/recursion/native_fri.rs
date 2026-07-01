@@ -500,6 +500,61 @@ pub(crate) fn gen_wide_proof(config: &MyConfig, seed0: u64, log_height: usize) -
     (p3_uni_stark::prove(config, &WideAir, RowMajorMatrix::new(vals, WIDE_W), &pvs), pvs)
 }
 
+/// Generate a real inner proof for the DEGREE-3 `CubeAir` (2 cols `[a, c]`, a'=a+1, c=a³) — max constraint
+/// degree 3 ⇒ nqc=2 quotient chunks, exercising the monolith's multi-CHUNK quotient recompose (2·nqc=4
+/// reduced-opening terms). pvs = `[seed]`.
+#[cfg(test)]
+pub(crate) fn gen_cube_proof(config: &MyConfig, seed: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use super::native_verify::CubeAir;
+    use p3_matrix::dense::RowMajorMatrix;
+    let n = 1usize << log_height;
+    let mut vals = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let a = Val::from_u64(seed + i as u64);
+        vals.push(a);
+        vals.push(a * a * a); // c = a³
+    }
+    let pvs = vec![Val::from_u64(seed)];
+    (p3_uni_stark::prove(config, &CubeAir, RowMajorMatrix::new(vals, 2), &pvs), pvs)
+}
+
+/// The nqc quotient-recompose weights — EXACTLY p3's `recompose_quotient_from_chunks`:
+/// `zps_i = Π_{j≠i} vanishing_j(ζ) · vanishing_j(domain_i.first_point())⁻¹`. These verifier-computed public
+/// F_p² scalars are what the monolith's epilogue consumes to recompose quotient(ζ) = Σ_i zps_i·chunk_i.
+/// Deterministic in ζ + the public quotient sub-domains (so, like the periodic column values, sound to supply
+/// as public inputs in pis-mode).
+#[cfg(test)]
+pub(crate) fn quotient_recompose_weights<A>(config: &MyConfig, air: &A, proof: &Proof<MyConfig>, pvs: &[Val]) -> Vec<Challenge>
+where
+    A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
+{
+    use p3_commit::PolynomialSpace;
+    use p3_field::BasedVectorSpace;
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (_, zeta_p, _, _, _) = full_transcript_challenges(config, proof, pvs);
+    let zeta = to_ext(zeta_p);
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
+    let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let layout = AirLayout::from_air::<Val>(air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, A>(air, layout, 0);
+    let nqc = 1usize << log_nqc;
+    let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    (0..nqc)
+        .map(|i| {
+            let mut zp = Challenge::ONE;
+            for j in 0..nqc {
+                if j != i {
+                    zp *= qcd[j].vanishing_poly_at_point(zeta) * qcd[j].vanishing_poly_at_point(qcd[i].first_point()).inverse();
+                }
+            }
+            zp
+        })
+        .collect()
+}
+
 /// A `MerkleCap` commitment flattened to its felt sequence (roots in order) — EXACTLY the felts the
 /// challenger observes via `observe(cap)`. The monolith transcript region must absorb this same sequence.
 #[cfg(test)]
@@ -628,15 +683,16 @@ pub(crate) fn query_terms(
     let zeta = to_ext(zeta_p);
     let alpha = to_ext(alpha_p);
 
-    // opening rounds (mirror verify_proof): trace at {ζ, ζ_next} + quotient chunks at ζ.
-    let air = ConstAir;
+    // opening rounds (mirror verify_proof): trace at {ζ, ζ_next} + quotient chunks at ζ. nqc is derived from
+    // the PROOF (quotient_chunks.len()), NOT a fixed AIR — so the reduced opening `ro` (which seeds the FRI fold
+    // chain in query_fold_data) covers all 2·nqc quotient terms for any inner degree (ConstAir/fib nqc=1, cube
+    // nqc=2, join-split nqc=8). A ConstAir assumption here silently dropped chunks ≥1 for higher-degree inners.
     let pcs = config.pcs();
     let degree_bits = proof.degree_bits;
     let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
     let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
-    let layout = AirLayout::from_air::<Val>(&air);
-    let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, 0);
-    let nqc = 1usize << log_nqc;
+    let nqc = proof.opened_values.quotient_chunks.len();
+    let log_nqc = log2_strict(nqc);
     let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
     let qcd = qd.split_domains(nqc);
     let zeta_next = trace_domain.next_point(zeta).unwrap();

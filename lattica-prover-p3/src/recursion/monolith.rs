@@ -2995,10 +2995,11 @@ impl MonolithAir {
     fn leaf_blocks(&self) -> usize {
         self.w_inner().div_ceil(RATE)
     }
-    // quotient chunks (p3 num_quotient_chunks = 1<<log2_ceil(max_constraint_degree−1)); nqc=1 for every current
-    // inner (degree ≤ 2). Increment B lifts this to the real value (join-split degree-7 ⇒ nqc=8).
+    // quotient chunks: the proof carries 2·nqc quotient reduced-opening terms (each chunk opens a 2-felt F_p²
+    // value), so nqc = n_quot()/2 — derived from the proof, not hardcoded. ConstAir/Counter/Fib/Mul/Periodic/
+    // Wide are all nqc=1 (degree ≤ 2); CubeAir (degree 3) is nqc=2; a real join-split (degree 7) is nqc=8.
     fn nqc(&self) -> usize {
-        1
+        self.n_quot() / 2
     }
     // quotient-Merkle leaf-hash blocks = ceil(2·nqc / RATE) (each chunk opens a 2-felt F_p² value at the query row).
     fn quot_leaf_blocks(&self) -> usize {
@@ -3052,9 +3053,9 @@ impl MonolithAir {
     fn ov_c(&self, c: usize) -> usize {
         self.ov() + c
     }
-    // start of the commit-phase fold-group carriers (after the W-wide opened row + the 2 quotient carriers).
+    // start of the commit-phase fold-group carriers (after the W-wide opened row + the 2·nqc quotient carriers).
     fn carriers_base(&self) -> usize {
-        self.ov() + self.w_inner() + 2
+        self.ov() + self.w_inner() + self.n_quot()
     }
     fn nb(&self) -> usize {
         self.binds.len()
@@ -3148,8 +3149,22 @@ impl MonolithAir {
     fn periodic_base(&self) -> usize {
         self.ccap_base() + self.commit_caps_len()
     }
-    fn pis_count(&self) -> usize {
+    // quotient recompose weights zps_i (nqc F_p² publics = 2·nqc felts), a pis region AFTER the periodic values.
+    // Present ONLY when nqc>1 (nqc=1 recomposes as the single chunk c0+c1·X with implicit weight 1, so no region
+    // ⇒ byte-for-byte). Verifier-computed from ζ + the public quotient sub-domains (like the periodic values):
+    // zps_i = Π_{j≠i}(s_db−c_j)/(c_i−c_j), consumed by the epilogue's quotient(ζ) = Σ_i zps_i·chunk_i.
+    fn qwt_base(&self) -> usize {
         self.periodic_base() + self.n_periodic() * 2
+    }
+    fn qwt_len(&self) -> usize {
+        if self.symbolic() && self.nqc() > 1 {
+            2 * self.nqc()
+        } else {
+            0
+        }
+    }
+    fn pis_count(&self) -> usize {
+        self.qwt_base() + self.qwt_len()
     }
     // pis cap layout — the FULL cap (2^cap_height entries) for a non-constant inner (so the cap-mux can select
     // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
@@ -3777,9 +3792,25 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 builder.assert_zero(tf.clone() * biv.1);
                 let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(c))).collect();
                 let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(w_in + c))).collect();
-                let c0 = gg(self.pz(2 * w_in));
-                let c1 = gg(self.pz(2 * w_in + 1));
-                let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone());
+                // recompose quotient(ζ) from the nqc chunk-openings: Σ_i zps_i·(pz(2W+2i)+pz(2W+2i+1)·X). nqc=1 ⇒
+                // the single chunk c0+c1·X (implicit weight 1, byte-for-byte); nqc>1 ⇒ verifier-computed weights
+                // zps_i (the qwt pis region) — exactly p3's recompose_quotient_from_chunks (validated by the oracle).
+                let quot = {
+                    let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
+                    for i in 0..self.nqc() {
+                        let d0 = gg(self.pz(2 * w_in + 2 * i));
+                        let d1 = gg(self.pz(2 * w_in + 2 * i + 1));
+                        let chunk = (d0.0.clone() + w.clone() * d1.1.clone(), d0.1.clone() + d1.0.clone());
+                        let weighted = if self.nqc() == 1 {
+                            chunk
+                        } else {
+                            let zps = (pis[self.qwt_base() + 2 * i].clone(), pis[self.qwt_base() + 2 * i + 1].clone());
+                            emul(zps, chunk)
+                        };
+                        acc = (acc.0 + weighted.0, acc.1 + weighted.1);
+                    }
+                    acc
+                };
                 let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub()).map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO)).collect();
                 // periodic column values at ζ (verifier-computed publics in the periodic pis region).
                 let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic()).map(|i| (pis[self.periodic_base() + 2 * i].clone(), pis[self.periodic_base() + 2 * i + 1].clone())).collect();
@@ -3840,12 +3871,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(c)].clone())); // px(c) @ ζ
             builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(w_in + c)].clone())); // px(W+c) @ ζ_next
         }
-        // quotient opened-value carriers: held within the super-tile; == the quotient terms px(2W), px(2W+1).
-        let (qc0, qc1) = (self.qc(0), self.qc(1));
-        builder.when_transition().assert_zero(hold.clone() * (nxt[qc0].clone() - cur[qc0].clone()));
-        builder.when_transition().assert_zero(hold.clone() * (nxt[qc1].clone() - cur[qc1].clone()));
-        builder.assert_zero(tf.clone() * (cur[qc0].clone() - cur[self.px(2 * w_in)].clone()));
-        builder.assert_zero(tf.clone() * (cur[qc1].clone() - cur[self.px(2 * w_in + 1)].clone()));
+        // quotient opened-value carriers (2·nqc felts): held within the super-tile; == the quotient reduced-
+        // opening terms px(2W+j) (the nqc chunk-openings at the query row — the quotient-leaf preimage).
+        for j in 0..self.n_quot() {
+            let qcj = self.qc(j);
+            builder.when_transition().assert_zero(hold.clone() * (nxt[qcj].clone() - cur[qcj].clone()));
+            builder.assert_zero(tf.clone() * (cur[qcj].clone() - cur[self.px(2 * w_in + j)].clone()));
+        }
         // commit-phase group carriers: seed the bit-ordered fold group {e_r, sib_r} at fold row r (p_round(r));
         // held within the super-tile so round r's leaf-hash block can absorb it (group[0..2]=lo, [2..4]=hi).
         for r in 0..CM_ROUNDS {
@@ -3898,11 +3930,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 }
             }
         }
-        // quotient-Merkle leaf (block 6): absorb the 2-felt quotient row [qc0, qc1].
+        // quotient-Merkle leaf: absorb the 2·nqc-felt quotient row (the nqc chunk-openings) into the rate. Single
+        // block for nqc≤2 (2·nqc≤RATE — the nqc=1 milestone absorbs [qc0,qc1] exactly); B2 adds the multi-block
+        // quotient leaf for nqc≥3.
         let qleaf = p[self.q_leaf()].clone();
-        builder.assert_zero(qleaf.clone() * (cur[0].clone() - cur[qc0].clone()));
-        builder.assert_zero(qleaf.clone() * (cur[1].clone() - cur[qc1].clone()));
-        for i in 2..W {
+        let qlc0 = core::cmp::min(self.n_quot(), RATE);
+        for k in 0..qlc0 {
+            builder.assert_zero(qleaf.clone() * (cur[k].clone() - cur[self.qc(k)].clone()));
+        }
+        for i in qlc0..W {
             builder.assert_zero(qleaf.clone() * cur[i].clone());
         }
         // commit-phase leaves (blocks CM_LEAF[r]): absorb the bit-ordered fold group carried in cg(r,·).
@@ -4199,20 +4235,25 @@ pub(crate) fn monolith_build_trace(
             node = merge_block(&mut t, off, M_INPUT_LEAF + n_leaf + l, node, sib, b);
         }
         let trace_cap_entry = node; // the input-Merkle terminal == the query's selected trace cap entry
-        // inline quotient-Merkle: leaf-hash (block m_quot_leaf) absorbs the 2-felt quotient row (terms 2W, 2W+1).
-        let qc0 = terms[2 * w_in].2;
-        let qc1 = terms[2 * w_in + 1].2;
-        let mut qinput = [Val::ZERO; W];
-        qinput[0] = qc0;
-        qinput[1] = qc1;
-        let rows = native_steps(qinput);
-        for r in 0..BLOCK {
-            let base = (off + air.m_quot_leaf() * BLOCK + r) * w;
-            t[base..base + W].copy_from_slice(&rows[r]);
+        // inline quotient-Merkle: MULTI-BLOCK leaf-hash (blocks m_quot_leaf .. +quot_leaf_blocks) absorbs the
+        // 2·nqc-felt quotient row (the nqc chunk-openings) RATE felts/block (same PaddingFreeSponge overwrite-mode
+        // as the input leaf), then INPUT_DEPTH merges. Single block for nqc≤2 (== the milestone [qc0,qc1] leaf).
+        let qc_vals: Vec<Val> = (0..air.n_quot()).map(|j| terms[2 * w_in + j].2).collect();
+        let n_qleaf = air.quot_leaf_blocks();
+        let mut qstate = [Val::ZERO; W];
+        for b in 0..n_qleaf {
+            let clen = core::cmp::min(RATE, air.n_quot() - b * RATE);
+            qstate[..clen].copy_from_slice(&qc_vals[b * RATE..b * RATE + clen]);
+            let rows = native_steps(qstate);
+            for r in 0..BLOCK {
+                let base = (off + (air.m_quot_leaf() + b) * BLOCK + r) * w;
+                t[base..base + W].copy_from_slice(&rows[r]);
+            }
+            qstate = native_permute(qstate);
         }
-        let mut qnode: [Val; 4] = native_permute(qinput)[..4].try_into().unwrap();
+        let mut qnode: [Val; 4] = qstate[..4].try_into().unwrap();
         for (l, &(sib, b)) in quot_paths[q].iter().enumerate() {
-            qnode = merge_block(&mut t, off, air.m_quot_leaf() + 1 + l, qnode, sib, b);
+            qnode = merge_block(&mut t, off, air.m_quot_leaf() + n_qleaf + l, qnode, sib, b);
         }
         let quot_cap_entry = qnode; // the quotient-Merkle terminal == the selected quotient cap entry
         // inline commit-phase Merkle: 6 rounds, each a leaf-hash (absorb the bit-ordered fold group) + `depth`
@@ -4232,14 +4273,15 @@ pub(crate) fn monolith_build_trace(
             }
             commit_cap_entries[r] = cnode; // this round's commit-Merkle terminal == the selected commit cap
         }
-        // carriers held within this super-tile: the W-value opened row + the quotient row [qc0, qc1] + the 6
+        // carriers held within this super-tile: the W-value opened row + the 2·nqc-value quotient row + the 6
         // fold groups (+ the 8 per-query cap-entry carriers when verifying a non-constant inner).
         for r in 0..air.m_period() {
             for c in 0..w_in {
                 t[(off + r) * w + air.ov_c(c)] = opened_row[c];
             }
-            t[(off + r) * w + air.qc(0)] = qc0;
-            t[(off + r) * w + air.qc(1)] = qc1;
+            for (j, &qv) in qc_vals.iter().enumerate() {
+                t[(off + r) * w + air.qc(j)] = qv;
+            }
             for (cr, (group, _l, _p, _c)) in commit_data[q].iter().enumerate() {
                 for k in 0..4 {
                     t[(off + r) * w + air.cg(cr, k)] = group[k];
@@ -6727,7 +6769,8 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        assert_eq!(n_terms, 2 * w_inner + 2, "{label}: 2·W trace terms + 2 quotient terms (nqc=1)");
+        let nqc = proof.opened_values.quotient_chunks.len();
+        assert_eq!(n_terms, 2 * w_inner + 2 * nqc, "{label}: 2·W trace terms + 2·nqc quotient terms");
         let layout = AirLayout::from_air::<Val>(inner);
         let constraints = get_symbolic_constraints::<Val, A>(inner, layout);
         assert!(!constraints.is_empty(), "{label}: symbolic constraints extracted");
@@ -6767,6 +6810,23 @@ mod tests {
             let c = cc(*pv);
             pis.push(c[0]);
             pis.push(c[1]);
+        }
+        // quotient recompose weights zps_i (verifier-computed publics; nqc>1 only — the qwt pis region).
+        if nqc > 1 {
+            let zps = crate::recursion::native_fri::quotient_recompose_weights(config, inner, proof, pvs);
+            // validate the recompose (the nqc>1 check the ConstAir self-check never exercised): the epilogue's
+            // Σ_i zps_i·(chunk_i.0 + chunk_i.1·X) must equal eo_quot (== p3's recompose_quotient_from_chunks).
+            let x = Challenge::from_basis_coefficients_fn(|k| if k == 1 { Val::ONE } else { Val::ZERO });
+            let mut rq = Challenge::ZERO;
+            for (i, ch) in proof.opened_values.quotient_chunks.iter().enumerate() {
+                rq += zps[i] * (ch[0] + ch[1] * x);
+            }
+            assert_eq!(rq, eo_quot, "{label}: Σ zps_i·chunk_i == recomposed quotient(ζ) (nqc recompose)");
+            for z in &zps {
+                let c = cc(*z);
+                pis.push(c[0]);
+                pis.push(c[1]);
+            }
         }
         assert_eq!(pis.len(), air.pis_count(), "{label} pis layout matches pis_count");
         {
@@ -6841,6 +6901,14 @@ mod tests {
         run_symbolic_monolith(&config, &WideAir, &proof, &pvs, WIDE_W, WIDE_W, 0, "wide") // W=8 > RATE ⇒ 2-block leaf
     }
 
+    fn run_cube_monolith(n_queries: usize) -> (u32, u64) {
+        use crate::recursion::native_fri::gen_cube_proof;
+        use crate::recursion::native_verify::CubeAir;
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_cube_proof(&config, 3, 6);
+        run_symbolic_monolith(&config, &CubeAir, &proof, &pvs, 2, 1, 0, "cube") // W=2, degree-3 ⇒ nqc=2 (4 quotient terms)
+    }
+
     #[test]
     #[ignore = "slow: Phase 7.6 multi-column monolith (2-column Fibonacci) via the data-driven symbolic epilogue"]
     fn phase7_fib_monolith() {
@@ -6880,6 +6948,19 @@ mod tests {
         let (log2h, rss) = run_wide_monolith(MILESTONE_QUERIES);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "wide monolith within 8 GB / 2^18");
         println!("Phase 7 (wire it): the monolith verifies a WIDE W=8 inner via the MULTI-BLOCK (2-block) input leaf at 2^{log2h} / {} MiB", rss / (1 << 20));
+    }
+
+    /// Phase 7 ("wire it", quotient half): the monolith verifies a DEGREE-3 inner (`CubeAir`, c=a³) whose
+    /// quotient splits into nqc=2 chunks — exercising the multi-CHUNK quotient recompose (2·nqc=4 reduced-opening
+    /// terms + 4 carriers; the epilogue reconstructs quotient(ζ) = Σ_i zps_i·chunk_i from the verifier-computed
+    /// weights, vs the nqc=1 c0+c1·X). Still a single-block quotient leaf (2·nqc=4 ≤ RATE), so it isolates the
+    /// recompose from the multi-block quotient leaf. Rejects a tampered pub + trace cap.
+    #[test]
+    #[ignore = "slow: Phase 7 monolith verifies a DEGREE-3 inner via the multi-CHUNK quotient recompose (nqc=2)"]
+    fn phase7_cube_monolith() {
+        let (log2h, rss) = run_cube_monolith(MILESTONE_QUERIES);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "cube monolith within 8 GB / 2^18");
+        println!("Phase 7 (wire it): the monolith verifies a DEGREE-3 inner (nqc=2) via the multi-chunk quotient recompose at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     #[test]

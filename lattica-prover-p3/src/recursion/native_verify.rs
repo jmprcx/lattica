@@ -211,6 +211,36 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for WideAir {
     }
 }
 
+/// A DEGREE-3 inner (Phase 7 "wire it", quotient half): 2 columns `[a, c]` with a counter `a'=a+1` and a
+/// CUBIC constraint `c = a³` (every row). Max constraint degree 3 ⇒ p3 splits the quotient into
+/// nqc = next_pow2(3−1) = 2 chunks, so the monolith must open 2·nqc = 4 quotient reduced-opening terms and
+/// RECOMPOSE quotient(ζ) = Σ_i zps_i·chunk_i over the 2 chunks (vs the nqc=1 `c0+c1·X`). Still a single-block
+/// quotient leaf (2·nqc=4 ≤ RATE), so it isolates the multi-CHUNK recompose from the multi-BLOCK quotient
+/// leaf (the degree-4 CubeAir's bigger sibling). Emission: C0 first-row a-seed, C1 cubic c−a³, C2 a'−a−1.
+pub struct CubeAir;
+
+impl BaseAir<Goldilocks> for CubeAir {
+    fn width(&self) -> usize {
+        2
+    }
+    fn num_public_values(&self) -> usize {
+        1 // seed a
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CubeAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0: a = pub
+        let a = cur[0].clone();
+        builder.assert_zero(cur[1].clone() - a.clone() * a.clone() * a); // C1: c = a³ (degree 3, every row)
+        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C2: a' = a + 1
+    }
+}
+
 // --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
 //     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;
