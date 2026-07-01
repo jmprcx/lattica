@@ -699,6 +699,44 @@ fn hiding_query_input_merkle(
     (leaf, path, cap_entry)
 }
 
+/// The HIDING analog of query_quotient_merkle: the quotient-round inline-Merkle witness. Unlike the trace
+/// (single matrix), the hiding quotient is nqc SEPARATE same-height matrices in ONE tree, so the leaf is a
+/// MULTI-MATRIX salted hash: `MyHash((row_0 ‖ salt_0) ‖ (row_1 ‖ salt_1) ‖ …)` over the nqc chunks in matrix
+/// order (matching MerkleTreeHidingMmcs's per-matrix `row ‖ salt` feeding the inner tree). All chunks sit at
+/// log_global (randomized domain 2^degree_bits), so reduction is 0.
+#[cfg(test)]
+fn hiding_query_quotient_merkle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+    q: usize,
+) -> ([Val; 4], Vec<([Val; 4], bool)>, [Val; 4], usize) {
+    use p3_field::PrimeField64;
+    use p3_goldilocks::default_goldilocks_poseidon2_8;
+    use p3_symmetric::CryptographicHasher;
+    let (_, _, _, _, index_felts) = hiding_transcript_challenges(config, proof, public_values);
+    let fri = &proof.opening_proof.1;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let quot_batch = if proof.commitments.random.is_some() { 2 } else { 1 };
+    let batch = &fri.query_proofs[q].input_proof[quot_batch];
+    // multi-matrix salted leaf: per chunk, row_m ‖ salt_m, concatenated in matrix order.
+    let mut preimage: Vec<Val> = Vec::new();
+    for (m, row) in batch.opened_values.iter().enumerate() {
+        preimage.extend_from_slice(row);
+        preimage.extend_from_slice(&batch.opening_proof.0[m]);
+    }
+    let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+    let leaf: [Val; 4] = hasher.hash_iter(preimage.iter().copied());
+    let siblings = &batch.opening_proof.1;
+    let depth = siblings.len();
+    let reduction = (log_global - 6) - depth; // cap_height=6; 0 when the quotient is at log_global
+    let reduced = index >> reduction;
+    let path: Vec<([Val; 4], bool)> = siblings.iter().enumerate().map(|(lvl, &s)| (s, (reduced >> lvl) & 1 == 1)).collect();
+    let cap_entry = proof.commitments.quotient_chunks.roots()[reduced >> depth];
+    (leaf, path, cap_entry, preimage.len())
+}
+
 /// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
 /// hiding monolith's query region will reproduce). Replays the hiding transcript (random-commitment absorb +
 /// codeword-merged opened values, as in `hiding_transcript_challenges`), then per query computes the reduced
@@ -1299,5 +1337,31 @@ mod tests {
             depth = path.len();
         }
         println!("hiding input Merkle: salted leaf (row ‖ salt) + {depth}-level path folds to the trace cap entry");
+    }
+
+    /// Native hiding monolith harness (#86, step 5): the MULTI-MATRIX salted quotient-Merkle witness.
+    /// hiding_query_quotient_merkle builds the leaf from all nqc chunks (per-chunk row ‖ salt, concatenated);
+    /// folding it up the path must reach the quotient cap entry — validating both the multi-matrix leaf
+    /// concatenation order and the salted quotient authentication against the quotient commitment.
+    #[test]
+    #[ignore = "slow: hiding multi-matrix salted quotient-Merkle leaf+path folds to the quotient cap"]
+    fn hiding_quotient_merkle_folds_to_cap() {
+        use p3_symmetric::PseudoCompressionFunction;
+        let config = make_config();
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        let compressor = MyCompress::new(default_goldilocks_poseidon2_8());
+        let fri = &proof.opening_proof.1;
+        let nqc = proof.opened_values.quotient_chunks.len();
+        let mut leaf_felts = 0;
+        for q in [0usize, 1, fri.query_proofs.len() - 1] {
+            let (leaf, path, cap_entry, n) = hiding_query_quotient_merkle(&config, &proof, &pvs, q);
+            leaf_felts = n;
+            let mut node = leaf;
+            for (sib, dir) in &path {
+                node = if *dir { compressor.compress([*sib, node]) } else { compressor.compress([node, *sib]) };
+            }
+            assert_eq!(node, cap_entry, "q{q}: multi-matrix salted quotient leaf + path must fold to the quotient cap entry");
+        }
+        println!("hiding quotient Merkle: {nqc}-chunk multi-matrix salted leaf ({leaf_felts} felts) + path folds to the quotient cap entry");
     }
 }
