@@ -465,6 +465,23 @@ pub(crate) fn gen_mul_proof(config: &MyConfig, seed_a: u64, seed_b: u64, log_hei
     (p3_uni_stark::prove(config, &MulAir, RowMajorMatrix::new(vals, 3), &pvs), pvs)
 }
 
+/// Generate a real inner proof for `PeriodicAir` (1 col accumulating the periodic pattern `[3,7]`: a'=a+p) —
+/// exercises a PERIODIC-column reference in a (non-degenerate) transition constraint. pvs = `[seed]`.
+#[cfg(test)]
+pub(crate) fn gen_periodic_proof(config: &MyConfig, seed: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use super::native_verify::{PeriodicAir, PERIODIC_PATTERN};
+    use p3_matrix::dense::RowMajorMatrix;
+    let n = 1usize << log_height;
+    let mut a = Val::from_u64(seed);
+    let mut vals = Vec::with_capacity(n);
+    for i in 0..n {
+        vals.push(a);
+        a += Val::from_u64(PERIODIC_PATTERN[i % PERIODIC_PATTERN.len()]); // a' = a + p_i
+    }
+    let pvs = vec![Val::from_u64(seed)];
+    (p3_uni_stark::prove(config, &PeriodicAir, RowMajorMatrix::new(vals, 1), &pvs), pvs)
+}
+
 /// A `MerkleCap` commitment flattened to its felt sequence (roots in order) — EXACTLY the felts the
 /// challenger observes via `observe(cap)`. The monolith transcript region must absorb this same sequence.
 #[cfg(test)]
@@ -856,11 +873,13 @@ pub(crate) fn fib_epilogue_oracle(
 /// evaluator — the same tree the in-circuit epilogue walks — so the monolith can verify ANY inner AIR from
 /// its symbolic constraints rather than a hardcoded per-AIR fold.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_symbolic_native(
     e: &p3_uni_stark::SymbolicExpression<Val>,
     local: &[Challenge],
     next: &[Challenge],
     pubs: &[Challenge],
+    periodic: &[Challenge],
     is_first: Challenge,
     is_last: Challenge,
     is_trans: Challenge,
@@ -877,7 +896,8 @@ pub(crate) fn eval_symbolic_native(
                     }
                 }
                 BaseEntry::Public => pubs[v.index],
-                _ => panic!("unsupported symbolic entry (preprocessed/periodic) for these inners"),
+                BaseEntry::Periodic => periodic[v.index], // periodic column value at ζ
+                BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
             },
             BaseLeaf::IsFirstRow => is_first,
             BaseLeaf::IsLastRow => is_last,
@@ -885,14 +905,14 @@ pub(crate) fn eval_symbolic_native(
             BaseLeaf::Constant(c) => Challenge::from(*c),
         },
         SymbolicExpr::Add { x, y, .. } => {
-            eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans) + eval_symbolic_native(y, local, next, pubs, is_first, is_last, is_trans)
+            eval_symbolic_native(x, local, next, pubs, periodic, is_first, is_last, is_trans) + eval_symbolic_native(y, local, next, pubs, periodic, is_first, is_last, is_trans)
         }
         SymbolicExpr::Sub { x, y, .. } => {
-            eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans) - eval_symbolic_native(y, local, next, pubs, is_first, is_last, is_trans)
+            eval_symbolic_native(x, local, next, pubs, periodic, is_first, is_last, is_trans) - eval_symbolic_native(y, local, next, pubs, periodic, is_first, is_last, is_trans)
         }
-        SymbolicExpr::Neg { x, .. } => -eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans),
+        SymbolicExpr::Neg { x, .. } => -eval_symbolic_native(x, local, next, pubs, periodic, is_first, is_last, is_trans),
         SymbolicExpr::Mul { x, y, .. } => {
-            eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans) * eval_symbolic_native(y, local, next, pubs, is_first, is_last, is_trans)
+            eval_symbolic_native(x, local, next, pubs, periodic, is_first, is_last, is_trans) * eval_symbolic_native(y, local, next, pubs, periodic, is_first, is_last, is_trans)
         }
     }
 }
@@ -908,7 +928,7 @@ pub(crate) fn epilogue_openings<A>(
     air: &A,
     proof: &Proof<MyConfig>,
     pvs: &[Val],
-) -> (Vec<Challenge>, Vec<Challenge>, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge)
+) -> (Vec<Challenge>, Vec<Challenge>, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Vec<Challenge>)
 where
     A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
 {
@@ -930,7 +950,9 @@ where
     let local = proof.opened_values.trace_local.clone();
     let next = proof.opened_values.trace_next.clone().unwrap();
     let sel = trace_domain.selectors_at_point(zeta);
-    (local, next, sel.is_first_row, sel.is_last_row, sel.is_transition, sel.inv_vanishing, quotient, alpha, zeta)
+    // the AIR's periodic columns evaluated at ζ (verifier-computed, deterministic in ζ) — the Periodic leaves.
+    let periodic: Vec<Challenge> = air.periodic_columns().iter().map(|col| trace_domain.evaluate_periodic_column_at(col, zeta)).collect();
+    (local, next, sel.is_first_row, sel.is_last_row, sel.is_transition, sel.inv_vanishing, quotient, alpha, zeta, periodic)
 }
 
 /// Per-query commit-phase oracle (Phase 3): mirrors `verify_query` for query `q`, returning the reduced
@@ -1454,7 +1476,7 @@ mod tests {
         // Horner α-fold over the extracted constraints (emission order, first-emitted highest power).
         let mut folded = Challenge::ZERO;
         for c in &constraints {
-            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, is_first, is_last, is_trans);
+            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, &[], is_first, is_last, is_trans);
         }
         assert_eq!(folded * inv_van, quotient, "GENERIC symbolic fold reproduces p3::verify_constraints (Fibonacci)");
         println!("Phase 7.5: generic symbolic-constraint fold == p3 for Fibonacci ({} constraints, data-driven, no hardcoded fold)", constraints.len());
@@ -1473,16 +1495,41 @@ mod tests {
         let config = make_config(1, 32);
         let (proof, pvs) = gen_mul_proof(&config, 3, 5, 6);
         assert!(verify(&config, &MulAir, &proof, &pvs).is_ok(), "p3 accepts the degree-2 MulAir proof");
-        let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, _z) = epilogue_openings(&config, &MulAir, &proof, &pvs);
+        let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, _z, periodic) = epilogue_openings(&config, &MulAir, &proof, &pvs);
         let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
         let layout = AirLayout::from_air::<Val>(&MulAir);
         let constraints = get_symbolic_constraints::<Val, MulAir>(&MulAir, layout);
         assert_eq!(constraints.len(), 5, "MulAir emits 5 constraints (incl. the degree-2 product)");
         let mut folded = Challenge::ZERO;
         for c in &constraints {
-            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, is_first, is_last, is_trans);
+            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, &periodic, is_first, is_last, is_trans);
         }
         assert_eq!(folded * inv_van, quotient, "generic symbolic fold reproduces p3 for a DEGREE-2 (variable·variable) AIR");
         println!("Phase 7.5: generic symbolic fold == p3 for the degree-2 MulAir (c=a·b exercises the Mul-of-variables path)");
+    }
+
+    /// Phase 7.7 (native): the generic symbolic fold handles a PERIODIC-column inner — `PeriodicAir`'s
+    /// transition `a' = a + p` references a periodic value (BaseEntry::Periodic). `epilogue_openings` returns
+    /// the periodic column evaluated at ζ; the evaluator's Periodic leaf reads it. Reproduces p3.
+    #[test]
+    #[ignore = "slow: Phase 7.7 generic symbolic fold on a periodic-column inner (PeriodicAir) vs p3"]
+    fn phase7_periodic_symbolic_fold_matches_p3() {
+        use super::super::native_verify::PeriodicAir;
+        use super::{epilogue_openings, eval_symbolic_native};
+        use p3_uni_stark::{get_symbolic_constraints, verify, AirLayout};
+        let config = make_config(1, 32);
+        let (proof, pvs) = gen_periodic_proof(&config, 5, 6);
+        assert!(verify(&config, &PeriodicAir, &proof, &pvs).is_ok(), "p3 accepts the periodic-column proof");
+        let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, _z, periodic) = epilogue_openings(&config, &PeriodicAir, &proof, &pvs);
+        assert_eq!(periodic.len(), 1, "PeriodicAir has 1 periodic column");
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let layout = AirLayout::from_air::<Val>(&PeriodicAir);
+        let constraints = get_symbolic_constraints::<Val, PeriodicAir>(&PeriodicAir, layout);
+        let mut folded = Challenge::ZERO;
+        for c in &constraints {
+            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, &periodic, is_first, is_last, is_trans);
+        }
+        assert_eq!(folded * inv_van, quotient, "generic symbolic fold reproduces p3 for a PERIODIC-column AIR");
+        println!("Phase 7.7: generic symbolic fold == p3 for PeriodicAir (a'=a+p reads the periodic value at ζ)");
     }
 }

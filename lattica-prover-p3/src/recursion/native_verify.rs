@@ -140,6 +140,43 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MulAir {
     }
 }
 
+/// An inner with a PERIODIC column (Phase 7.7): 1 trace column `a` accumulating a repeating pattern
+/// `p = [3, 7]` (a periodic column, e.g. round constants in real AIRs): first row `a = pub[0]`, transition
+/// `a' = a + p`. The transition constraint references the periodic value `p` (BaseEntry::Periodic in the
+/// symbolic tree) — the last leaf kind the evaluator needs for real high-degree AIRs. Emission order: C0
+/// first-row seed, C1 transition accumulate.
+pub struct PeriodicAir;
+
+/// The periodic pattern `[3, 7]` (period 2), shared by the AIR and the proof/oracle.
+pub const PERIODIC_PATTERN: [u64; 2] = [3, 7];
+
+impl BaseAir<Goldilocks> for PeriodicAir {
+    fn width(&self) -> usize {
+        1
+    }
+    fn num_public_values(&self) -> usize {
+        1 // seed
+    }
+    fn num_periodic_columns(&self) -> usize {
+        1 // (the default is 0; must be overridden alongside periodic_columns)
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        vec![PERIODIC_PATTERN.iter().map(|&v| Goldilocks::from_u64(v)).collect()]
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PeriodicAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0
+        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - p[0].clone()); // C1: a' = a + p
+    }
+}
+
 // --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
 //     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;

@@ -2921,6 +2921,10 @@ pub(crate) struct MonolithAir {
     pub w_inner_f: usize,
     /// Inner public-value count when `constraints` is non-empty; ignored (treated as 1) otherwise.
     pub n_pub_f: usize,
+    /// Inner PERIODIC-column count (symbolic mode). Their values at ζ are verifier-computed publics (a pis
+    /// region after the commit caps), consumed by the symbolic evaluator's `Periodic` leaves. 0 for inners
+    /// with no periodic columns (Fibonacci/Mul).
+    pub n_periodic_f: usize,
 }
 
 #[allow(dead_code)]
@@ -3045,12 +3049,26 @@ impl MonolithAir {
     }
     // the inner-proof "pis" size: challenges + indices + final_poly + trace/quot caps + pub + commit caps
     // (full caps in counter mode so the cap-mux can select; single entries for ConstAir).
-    fn pis_count(&self) -> usize {
-        if self.full_cap() {
-            self.ccap_base() + (0..CM_ROUNDS).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
+    fn n_periodic(&self) -> usize {
+        if self.symbolic() {
+            self.n_periodic_f
         } else {
-            self.ccap_base() + CM_ROUNDS * 4
+            0
         }
+    }
+    fn commit_caps_len(&self) -> usize {
+        if self.full_cap() {
+            (0..CM_ROUNDS).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
+        } else {
+            CM_ROUNDS * 4
+        }
+    }
+    // periodic column values at ζ (2 felts each): a pis region AFTER the commit caps (symbolic mode only).
+    fn periodic_base(&self) -> usize {
+        self.ccap_base() + self.commit_caps_len()
+    }
+    fn pis_count(&self) -> usize {
+        self.periodic_base() + self.n_periodic() * 2
     }
     // pis cap layout — the FULL cap (2^cap_height entries) for a non-constant inner (so the cap-mux can select
     // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
@@ -3631,9 +3649,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 let c1 = gg(self.pz(2 * w_in + 1));
                 let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone());
                 let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub()).map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO)).collect();
+                // periodic column values at ζ (verifier-computed publics in the periodic pis region).
+                let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic()).map(|i| (pis[self.periodic_base() + 2 * i].clone(), pis[self.periodic_base() + 2 * i + 1].clone())).collect();
                 let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
                 for c in &self.constraints {
-                    let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &is_first, &is_last, &is_trans, &w);
+                    let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w);
                     let fa = emul(folded.clone(), alpha_stark.clone());
                     folded = (fa.0 + ci.0, fa.1 + ci.1);
                 }
@@ -4963,6 +4983,7 @@ fn eval_symbolic_circuit<AB: AirBuilder<F = Goldilocks>>(
     local: &[(AB::Expr, AB::Expr)],
     next: &[(AB::Expr, AB::Expr)],
     pubs: &[(AB::Expr, AB::Expr)],
+    periodic: &[(AB::Expr, AB::Expr)],
     is_first: &(AB::Expr, AB::Expr),
     is_last: &(AB::Expr, AB::Expr),
     is_trans: &(AB::Expr, AB::Expr),
@@ -4983,7 +5004,8 @@ fn eval_symbolic_circuit<AB: AirBuilder<F = Goldilocks>>(
                     }
                 }
                 BaseEntry::Public => pubs[v.index].clone(),
-                _ => panic!("unsupported symbolic entry (preprocessed/periodic)"),
+                BaseEntry::Periodic => periodic[v.index].clone(), // periodic column value at ζ
+                BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
             },
             BaseLeaf::IsFirstRow => is_first.clone(),
             BaseLeaf::IsLastRow => is_last.clone(),
@@ -4991,22 +5013,22 @@ fn eval_symbolic_circuit<AB: AirBuilder<F = Goldilocks>>(
             BaseLeaf::Constant(c) => (AB::Expr::from(*c), AB::Expr::ZERO),
         },
         SymbolicExpr::Add { x, y, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
-            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
+            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
             (a.0 + b.0, a.1 + b.1)
         }
         SymbolicExpr::Sub { x, y, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
-            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
+            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
             (a.0 - b.0, a.1 - b.1)
         }
         SymbolicExpr::Neg { x, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
             (AB::Expr::ZERO - a.0, AB::Expr::ZERO - a.1)
         }
         SymbolicExpr::Mul { x, y, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
-            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
+            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
             emul(a, b)
         }
     }
@@ -5091,9 +5113,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SymbolicEpilogueAir {
         fr.assert_zero(b_iv.0 - one.clone());
         fr.assert_zero(b_iv.1);
         // Horner α-fold over the extracted symbolic constraints (data-driven tree walk).
+        let no_periodic: Vec<(AB::Expr, AB::Expr)> = Vec::new(); // this standalone gadget's inners have no periodic columns
         let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
         for c in &self.constraints {
-            let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &is_first, &is_last, &is_trans, &w_ext);
+            let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &no_periodic, &is_first, &is_last, &is_trans, &w_ext);
             let fa = emul(folded.clone(), alpha.clone());
             folded = (fa.0 + ci.0, fa.1 + ci.1);
         }
@@ -6098,7 +6121,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1 };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6213,6 +6236,7 @@ mod tests {
             constraints: vec![],
             w_inner_f: 1,
             n_pub_f: 1,
+            n_periodic_f: 0,
         };
         let mut pis = Vec::new();
         for ch in &chs {
@@ -6263,7 +6287,7 @@ mod tests {
             }
         }
         let (counts, binds, index_binds, n_terms) = params.unwrap();
-        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, constraints: vec![], w_inner_f: 1, n_pub_f: 1 };
+        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0 };
         let fw = air.fused_w();
         let w = air.fold_w();
         let inst_h = air.inst_h();
@@ -6404,7 +6428,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1 };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6454,7 +6478,7 @@ mod tests {
     /// symbolic epilogue (accept-iff-p3::verify). The inner's constraint trees (`get_symbolic_constraints`) drive
     /// the OOD fold; `w_inner`/`n_pub` size the opened-row carrier + pub range. Same code for Fibonacci and
     /// MulAir — no hardcoded per-AIR fold. Returns (log2 height, RSS).
-    fn run_symbolic_monolith<A>(config: &MyConfig, inner: &A, proof: &Proof<MyConfig>, pvs: &[Val], w_inner: usize, n_pub: usize, label: &str) -> (u32, u64)
+    fn run_symbolic_monolith<A>(config: &MyConfig, inner: &A, proof: &Proof<MyConfig>, pvs: &[Val], w_inner: usize, n_pub: usize, n_periodic: usize, label: &str) -> (u32, u64)
     where
         A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
     {
@@ -6489,7 +6513,11 @@ mod tests {
         let layout = AirLayout::from_air::<Val>(inner);
         let constraints = get_symbolic_constraints::<Val, A>(inner, layout);
         assert!(!constraints.is_empty(), "{label}: symbolic constraints extracted");
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, constraints, w_inner_f: w_inner, n_pub_f: n_pub };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, constraints, w_inner_f: w_inner, n_pub_f: n_pub, n_periodic_f: n_periodic };
+        // OOD openings + selectors + periodic-column values at ζ (verifier-computed publics).
+        let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) = epilogue_openings(config, inner, proof, pvs);
+        assert_eq!(eo_periodic.len(), n_periodic, "{label}: periodic column count matches n_periodic");
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6501,7 +6529,8 @@ mod tests {
         let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
         pis.push(fp[0]);
         pis.push(fp[1]);
-        // FULL caps (cap-mux selects cap[index>>shift]): trace, quotient, then the n_pub inner pubs, then commit rounds.
+        // FULL caps (cap-mux selects cap[index>>shift]): trace, quotient, then the n_pub inner pubs, then commit
+        // rounds, then the periodic-column values at ζ (the Periodic pis region).
         for e in proof.commitments.trace.roots().iter() {
             pis.extend_from_slice(e);
         }
@@ -6516,20 +6545,23 @@ mod tests {
                 pis.extend_from_slice(e);
             }
         }
+        for pv in &eo_periodic {
+            let c = cc(*pv);
+            pis.push(c[0]);
+            pis.push(c[1]);
+        }
         assert_eq!(pis.len(), air.pis_count(), "{label} pis layout matches pis_count");
-        let mut trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
-        // fill the witnessed Lagrange selectors at ζ (is_first/is_last/inv_van), bound in-circuit to their ζ-defs.
-        let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z) = epilogue_openings(config, inner, proof, pvs);
         {
-            // native pre-check: the symbolic fold on the SAME openings/selectors == quot (localizes wiring bugs).
+            // native pre-check: the symbolic fold on the SAME openings/selectors/periodic == quot (localizes wiring bugs).
             let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
             let mut folded = Challenge::ZERO;
             for c in &air.constraints {
-                folded = folded * eo_alpha + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, is_first, is_last, is_trans);
+                folded = folded * eo_alpha + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, &eo_periodic, is_first, is_last, is_trans);
             }
             assert_eq!(folded * inv_van, eo_quot, "{label} PRE-CHECK: native symbolic fold == quot(ζ)");
         }
-        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let mut trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
+        // fill the witnessed Lagrange selectors at ζ (is_first/is_last/inv_van), bound in-circuit to their ζ-defs.
         let (isf, isl, iv) = (cc(is_first), cc(is_last), cc(inv_van));
         let fw = air.fused_w();
         let sb = air.sel_base();
@@ -6564,7 +6596,7 @@ mod tests {
         use crate::recursion::native_verify::FibonacciAir;
         let config = make_config(1, n_queries);
         let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
-        run_symbolic_monolith(&config, &FibonacciAir, &proof, &pvs, 2, 3, "fib")
+        run_symbolic_monolith(&config, &FibonacciAir, &proof, &pvs, 2, 3, 0, "fib")
     }
 
     fn run_mul_monolith(n_queries: usize) -> (u32, u64) {
@@ -6572,7 +6604,15 @@ mod tests {
         use crate::recursion::native_verify::MulAir;
         let config = make_config(1, n_queries);
         let (proof, pvs) = gen_mul_proof(&config, 3, 5, 6);
-        run_symbolic_monolith(&config, &MulAir, &proof, &pvs, 3, 2, "mul")
+        run_symbolic_monolith(&config, &MulAir, &proof, &pvs, 3, 2, 0, "mul")
+    }
+
+    fn run_periodic_monolith(n_queries: usize) -> (u32, u64) {
+        use crate::recursion::native_fri::gen_periodic_proof;
+        use crate::recursion::native_verify::PeriodicAir;
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_periodic_proof(&config, 5, 6);
+        run_symbolic_monolith(&config, &PeriodicAir, &proof, &pvs, 1, 1, 1, "periodic") // W=1, 1 pub, 1 periodic column
     }
 
     #[test]
@@ -6589,6 +6629,18 @@ mod tests {
         let (log2h, rss) = run_mul_monolith(MILESTONE_QUERIES);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "mul monolith within 8 GB / 2^18");
         println!("Phase 7.6: the monolith verifies the degree-2 MulAir (W=3) via the SAME symbolic epilogue at 2^{log2h} / {} MiB", rss / (1 << 20));
+    }
+
+    /// Phase 7.7: the monolith verifies an inner with a PERIODIC column (`PeriodicAir`, a'=a+p over the
+    /// pattern [3,7]) via the same data-driven symbolic epilogue — the constraint tree's `Periodic` leaf reads
+    /// the periodic value at ζ (a verifier-computed public in the periodic pis region). The last leaf kind
+    /// real high-degree AIRs (round constants) need. Rejects a tampered pub + trace cap.
+    #[test]
+    #[ignore = "slow: Phase 7.7 monolith verifies a PERIODIC-column inner via the symbolic epilogue"]
+    fn phase7_periodic_monolith() {
+        let (log2h, rss) = run_periodic_monolith(MILESTONE_QUERIES);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "periodic monolith within 8 GB / 2^18");
+        println!("Phase 7.7: the monolith verifies a PERIODIC-column inner via the symbolic epilogue at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     #[test]
@@ -6766,7 +6818,7 @@ mod tests {
         use p3_uni_stark::{get_symbolic_constraints, AirLayout};
         let config = make_config(1, MILESTONE_QUERIES);
         let (proof, pvs) = gen_mul_proof(&config, 3, 5, 6);
-        let (local, next, is_first, is_last, _is_trans, inv_van, quotient, alpha, zeta) = epilogue_openings(&config, &MulAir, &proof, &pvs);
+        let (local, next, is_first, is_last, _is_trans, inv_van, quotient, alpha, zeta, _periodic) = epilogue_openings(&config, &MulAir, &proof, &pvs);
         let layout = AirLayout::from_air::<Val>(&MulAir);
         let constraints = get_symbolic_constraints::<Val, MulAir>(&MulAir, layout);
         let air = SymbolicEpilogueAir { constraints, w: 3, n_pub: 2 };
