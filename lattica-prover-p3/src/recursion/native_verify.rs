@@ -18,6 +18,7 @@ use p3_field::extension::BinomialExtensionField;
 use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_fri::{FriParameters, HidingFriPcs, TwoAdicFriFolding};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
+use p3_matrix::Dimensions;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use rand_chacha::ChaCha20Rng;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
@@ -541,6 +542,7 @@ fn hiding_query_terms(
 fn hiding_verify_fri_native(
     config: &MyConfig,
     fri_params: &FriParameters<ChallengeMmcs>,
+    input_mmcs: &ValMmcs,
     proof: &Proof<MyConfig>,
     public_values: &[Val],
 ) -> Result<(), String> {
@@ -651,8 +653,32 @@ fn hiding_verify_fri_native(
     let log_final_height = fri_params.log_blowup + fri_params.log_final_poly_len;
     let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> =
         TwoAdicFriFolding(core::marker::PhantomData);
+    // input commitments in round order (matches `merged`/`rounds_um`): [random?, trace, quotient].
+    let mut input_commits: Vec<&<ValMmcs as Mmcs<Val>>::Commitment> = Vec::new();
+    if let Some(r) = commitments.random.as_ref() {
+        input_commits.push(r);
+    }
+    input_commits.push(&commitments.trace);
+    input_commits.push(&commitments.quotient_chunks);
     for qp in fri.query_proofs.iter() {
         let index = ch.sample_bits(log_global_max_height);
+        // salted-leaf INPUT Merkle auth (the hiding-MMCS delta): the outer verify_batch reconstructs each
+        // leaf as `row ‖ 4 salt` (salt from the opening_proof) and widens dims by SALT_ELEMS=4 internally, so
+        // we pass the UN-salted row width. This is the exact preimage the in-circuit salted-leaf gadget hashes.
+        for (b, mats) in merged.iter().enumerate() {
+            let bo = &qp.input_proof[b];
+            let heights: Vec<usize> = mats.iter().map(|(ld, _)| 1usize << (ld + fri_params.log_blowup)).collect();
+            let dims: Vec<Dimensions> = mats
+                .iter()
+                .zip(&heights)
+                .map(|((_, pts), &h)| Dimensions { width: pts[0].1.len(), height: h })
+                .collect();
+            let max_h = *heights.iter().max().ok_or("empty batch")?;
+            let reduced_index = index >> (log_global_max_height - max_h.trailing_zeros() as usize);
+            input_mmcs
+                .verify_batch(input_commits[b], &dims, reduced_index, bo.into())
+                .map_err(|_| format!("input batch {b} salted MMCS verify failed"))?;
+        }
         let ro = hiding_query_terms(fri_params.log_blowup, log_global_max_height, index, &qp.input_proof, alpha_fri, &merged)?;
         let mut domain_index = index;
         let fold_data: Vec<CommitStep<'_, ChallengeMmcs>> = betas
@@ -794,20 +820,21 @@ mod tests {
             num_queries: 96,
             commit_proof_of_work_bits: 0,
             query_proof_of_work_bits: 16,
-            mmcs: ChallengeMmcs::new(val_mmcs),
+            mmcs: ChallengeMmcs::new(val_mmcs.clone()),
         };
 
-        // the native hiding FRI verifier accepts the valid proof (⇒ hiding_query_terms is the true reduced opening).
-        if let Err(e) = hiding_verify_fri_native(&config, &fri_params, &proof, &pvs) {
+        // the native hiding FRI verifier accepts the valid proof: salted-leaf INPUT Merkle auth (row ‖ 4 salt)
+        // + reduced opening (hiding_query_terms) folds to final_poly ⇒ the whole reduced-opening oracle is true.
+        if let Err(e) = hiding_verify_fri_native(&config, &fri_params, &val_mmcs, &proof, &pvs) {
             panic!("native hiding FRI verify rejected a valid proof: {e}");
         }
 
         // tamper: corrupt an opened trace value ⇒ the reduced opening is wrong ⇒ the fold misses final_poly.
         proof.opened_values.trace_local[0] += Challenge::ONE;
         assert!(
-            hiding_verify_fri_native(&config, &fri_params, &proof, &pvs).is_err(),
+            hiding_verify_fri_native(&config, &fri_params, &val_mmcs, &proof, &pvs).is_err(),
             "a tampered opened value must break the fold to final_poly"
         );
-        println!("native hiding oracle: reduced opening (hiding_query_terms) + fold validated vs p3::verify");
+        println!("native hiding oracle: salted-leaf INPUT Merkle (row ‖ 4 salt) + reduced opening + fold validated vs p3::verify");
     }
 }
