@@ -2858,13 +2858,20 @@ pub(crate) fn cm2_build_trace(group: [Val; 4], path: &[([Val; 4], bool)]) -> (Ro
 // =================================================================================================
 
 // Monolith super-tile block layout (16 blocks): 0 arith | 1..5 input-Merkle | 6..10 quotient-Merkle | 11..15 pad.
-const M_NBLOCKS: usize = 16;
-const M_PERIOD: usize = M_NBLOCKS * BLOCK; // 512
+// Super-tile block layout (23 blocks, → exactly 2^16 total with the 2^14 transcript + 32 tiles):
+// 0 arith | 1..5 input-Merkle | 6..10 quotient-Merkle | 11..22 commit-phase Merkle (6 rounds).
+const M_NBLOCKS: usize = 23;
+const M_PERIOD: usize = M_NBLOCKS * BLOCK; // 736
 const M_DEGREE_BITS: usize = DP_LOG_HEIGHT - 4; // inner-trace degree_bits (log_global − log_blowup = 10 − 4 = 6)
 const M_INPUT_LEAF: usize = 1;
 const M_INPUT_TERM: usize = 5;
 const M_QUOT_LEAF: usize = 6;
 const M_QUOT_TERM: usize = 10;
+// commit-phase: 6 fold rounds, depths [3,2,1,0,0,0] (log_global=10, cap_height=6). Each round = 1 leaf-hash
+// block + `depth` merge blocks; the leaf absorbs the bit-ordered arity-2 fold group {e_r, sib_r}.
+const CM_ROUNDS: usize = 6;
+const CM_LEAF: [usize; CM_ROUNDS] = [11, 15, 18, 20, 21, 22]; // leaf-hash block per round
+const CM_TERM: [usize; CM_ROUNDS] = [14, 17, 19, 20, 21, 22]; // terminal block per round (leaf + depth)
 
 #[allow(dead_code)]
 pub(crate) struct MonolithAir {
@@ -2924,8 +2931,11 @@ impl MonolithAir {
     fn qc(&self, i: usize) -> usize {
         self.ov() + 1 + i // quotient opened-value carriers (the quotient-Merkle leaf preimage, 2 felts)
     }
+    fn cg(&self, r: usize, k: usize) -> usize {
+        self.ov() + 3 + 4 * r + k // commit-phase group carriers: 6 rounds × 4 felts (the fold group {e_r, sib_r})
+    }
     fn fused_w(&self) -> usize {
-        self.ov() + 3 // ov(1) + qc(2)
+        self.ov() + 3 + 4 * CM_ROUNDS // ov(1) + qc(2) + cg(6×4)
     }
     // Merkle columns overlay the arith Poseidon lanes on the Merkle rows (disjoint rows).
     fn m_sib(&self) -> usize {
@@ -2976,6 +2986,12 @@ impl MonolithAir {
     }
     fn q_term(&self) -> usize {
         self.m_base() + 10 // quotient-Merkle terminal
+    }
+    fn c_leaf(&self, r: usize) -> usize {
+        self.m_base() + 11 + r // commit-phase leaf-hash one-hots (6)
+    }
+    fn c_term(&self, r: usize) -> usize {
+        self.m_base() + 11 + CM_ROUNDS + r // commit-phase terminal one-hots (6)
     }
     fn tr(&self) -> usize {
         self.counts.len().next_power_of_two() * BLOCK
@@ -3067,6 +3083,12 @@ impl MonolithAir {
         cols.push(tiled(M_PERIOD - 1)); // P_ST_LAST (super-tile carrier boundary)
         cols.push(tiled(M_QUOT_LEAF * BLOCK)); // Q_LEAF
         cols.push(tiled(M_QUOT_TERM * BLOCK + BLOCK - 1)); // Q_TERM
+        for r in 0..CM_ROUNDS {
+            cols.push(tiled(CM_LEAF[r] * BLOCK)); // C_LEAF_r (commit-phase leaf-hash head)
+        }
+        for r in 0..CM_ROUNDS {
+            cols.push(tiled(CM_TERM[r] * BLOCK + BLOCK - 1)); // C_TERM_r (commit-phase terminal)
+        }
         cols
     }
 }
@@ -3076,10 +3098,10 @@ impl BaseAir<Goldilocks> for MonolithAir {
         self.fused_w()
     }
     fn num_public_values(&self) -> usize {
-        2 * self.nb() + self.ni() + 2 + 4 + 4 + 1 // transcript binds + index felts + final_poly[0] + trace cap + quotient cap + inner pub value
+        2 * self.nb() + self.ni() + 2 + 4 + 4 + 1 + 4 * CM_ROUNDS // + inner pub value + 6 commit-phase cap entries
     }
     fn num_periodic_columns(&self) -> usize {
-        self.q_term() + 1
+        self.c_term(CM_ROUNDS - 1) + 1
     }
     fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
         self.periodic()
@@ -3328,9 +3350,25 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // quotient opened-value carriers: held within the super-tile; == QT_px terms 2,3 at the arith head.
         let (qc0, qc1) = (self.qc(0), self.qc(1));
         builder.when_transition().assert_zero(hold.clone() * (nxt[qc0].clone() - cur[qc0].clone()));
-        builder.when_transition().assert_zero(hold * (nxt[qc1].clone() - cur[qc1].clone()));
+        builder.when_transition().assert_zero(hold.clone() * (nxt[qc1].clone() - cur[qc1].clone()));
         builder.assert_zero(tf.clone() * (cur[qc0].clone() - cur[self.px(2)].clone()));
         builder.assert_zero(tf.clone() * (cur[qc1].clone() - cur[self.px(3)].clone()));
+        // commit-phase group carriers: seed the bit-ordered fold group {e_r, sib_r} at fold row r (p_round(r));
+        // held within the super-tile so round r's leaf-hash block can absorb it (group[0..2]=lo, [2..4]=hi).
+        for r in 0..CM_ROUNDS {
+            let pr = p[self.p_round(r)].clone();
+            let bit = cur[QT_BIT].clone();
+            let nbit = one.clone() - bit.clone();
+            let (e0, e1) = (cur[QT_E].clone(), cur[QT_E + 1].clone());
+            let (sib0, sib1) = (cur[QT_S].clone(), cur[QT_S + 1].clone());
+            builder.assert_zero(pr.clone() * (cur[self.cg(r, 0)].clone() - (nbit.clone() * e0.clone() + bit.clone() * sib0.clone())));
+            builder.assert_zero(pr.clone() * (cur[self.cg(r, 1)].clone() - (nbit.clone() * e1.clone() + bit.clone() * sib1.clone())));
+            builder.assert_zero(pr.clone() * (cur[self.cg(r, 2)].clone() - (nbit.clone() * sib0 + bit.clone() * e0)));
+            builder.assert_zero(pr.clone() * (cur[self.cg(r, 3)].clone() - (nbit * sib1 + bit * e1)));
+            for k in 0..4 {
+                builder.when_transition().assert_zero(hold.clone() * (nxt[self.cg(r, k)].clone() - cur[self.cg(r, k)].clone()));
+            }
+        }
 
         // ---------- super-tile inline Merkle (input + quotient blocks, gated by S_MERKLE) ----------
         // input-Merkle leaf (block 1): absorb the trace opened value.
@@ -3346,15 +3384,25 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         for i in 2..W {
             builder.assert_zero(qleaf.clone() * cur[i].clone());
         }
+        // commit-phase leaves (blocks CM_LEAF[r]): absorb the bit-ordered fold group carried in cg(r,·).
+        for r in 0..CM_ROUNDS {
+            let cl = p[self.c_leaf(r)].clone();
+            for k in 0..4 {
+                builder.assert_zero(cl.clone() * (cur[k].clone() - cur[self.cg(r, k)].clone()));
+            }
+            for i in 4..W {
+                builder.assert_zero(cl.clone() * cur[i].clone());
+            }
+        }
         builder.assert_zero(s_merkle.clone() * (cur[self.m_bit()].clone() * (one.clone() - cur[self.m_bit()].clone())));
         {
-            // bit-ordered merge link across Merkle block boundaries, EXCEPT the terminals (M_TERM = input
-            // terminal → quotient leaf; Q_TERM = quotient terminal → padding) which are not merges.
-            let link = s_merkle.clone()
-                * p[FT_P_BLOCK_LAST].clone()
-                * (one.clone() - p[self.p_st_last()].clone())
-                * (one.clone() - p[self.m_term()].clone())
-                * (one.clone() - p[self.q_term()].clone());
+            // bit-ordered merge link across Merkle block boundaries, EXCEPT after any terminal (input/quotient/
+            // commit) — the block after a terminal is a fresh leaf-hash seeded from its carrier, not a merge.
+            let mut not_term = (one.clone() - p[self.m_term()].clone()) * (one.clone() - p[self.q_term()].clone());
+            for r in 0..CM_ROUNDS {
+                not_term = not_term * (one.clone() - p[self.c_term(r)].clone());
+            }
+            let link = s_merkle.clone() * p[FT_P_BLOCK_LAST].clone() * (one.clone() - p[self.p_st_last()].clone()) * not_term;
             let nb_ = nxt[self.m_bit()].clone();
             let sib = self.m_sib();
             for k in 0..4 {
@@ -3369,6 +3417,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         for k in 0..4 {
             builder.assert_zero(term.clone() * (cur[k].clone() - pis[cap + k].clone()));
             builder.assert_zero(qterm.clone() * (cur[k].clone() - pis[qcap + k].clone()));
+        }
+        // commit-phase terminals: each round's path terminal == the committed round cap entry.
+        let ccap = cap + 9; // after trace cap (4) + quotient cap (4) + inner pub (1)
+        for r in 0..CM_ROUNDS {
+            let ct = p[self.c_term(r)].clone();
+            for k in 0..4 {
+                builder.assert_zero(ct.clone() * (cur[k].clone() - pis[ccap + 4 * r + k].clone()));
+            }
         }
     }
 }
@@ -3386,6 +3442,7 @@ pub(crate) fn monolith_build_trace(
     alpha_fri: [Val; 2],
     index_felts: &[Val],
     quot_paths: &[Vec<([Val; 4], bool)>],
+    commit_data: &[Vec<([Val; 4], [Val; 4], Vec<([Val; 4], bool)>, [Val; 4])>],
 ) -> RowMajorMatrix<Val> {
     use crate::recursion::fri_fold::native_fold;
     use p3_field::{BasedVectorSpace, PrimeField64};
@@ -3522,23 +3579,31 @@ pub(crate) fn monolith_build_trace(
         for (l, &(sib, b)) in quot_paths[q].iter().enumerate() {
             qnode = merge_block(&mut t, off, M_QUOT_LEAF + 1 + l, qnode, sib, b);
         }
-        // padding blocks continue valid Poseidon (from the quotient terminal) to the period.
-        let mut pad = qnode;
-        for blk in (M_QUOT_TERM + 1)..M_NBLOCKS {
-            let mut inp = [Val::ZERO; W];
-            inp[..4].copy_from_slice(&pad);
-            let rows = native_steps(inp);
-            for r in 0..BLOCK {
-                let base = (off + blk * BLOCK + r) * w;
-                t[base..base + W].copy_from_slice(&rows[r]);
+        // inline commit-phase Merkle: 6 rounds, each a leaf-hash (absorb the bit-ordered fold group) + `depth`
+        // merges, authenticating every fold sibling to commit_phase_commits[r].
+        for (r, (group, _leaf, cpath, _cap)) in commit_data[q].iter().enumerate() {
+            let mut cinput = [Val::ZERO; W];
+            cinput[..4].copy_from_slice(group);
+            let rows = native_steps(cinput);
+            for row in 0..BLOCK {
+                let base = (off + CM_LEAF[r] * BLOCK + row) * w;
+                t[base..base + W].copy_from_slice(&rows[row]);
             }
-            pad = native_permute(inp)[..4].try_into().unwrap();
+            let mut cnode: [Val; 4] = native_permute(cinput)[..4].try_into().unwrap();
+            for (l, &(sib, b)) in cpath.iter().enumerate() {
+                cnode = merge_block(&mut t, off, CM_LEAF[r] + 1 + l, cnode, sib, b);
+            }
         }
-        // carriers held within this super-tile: opened value v + the quotient row [qc0, qc1]
+        // carriers held within this super-tile: opened value v + the quotient row [qc0, qc1] + the 6 fold groups.
         for r in 0..M_PERIOD {
             t[(off + r) * w + air.ov()] = v;
             t[(off + r) * w + air.qc(0)] = qc0;
             t[(off + r) * w + air.qc(1)] = qc1;
+            for (cr, (group, _l, _p, _c)) in commit_data[q].iter().enumerate() {
+                for k in 0..4 {
+                    t[(off + r) * w + air.cg(cr, k)] = group[k];
+                }
+            }
         }
     }
     // α_fri carrier held across the whole trace
@@ -4476,8 +4541,8 @@ mod tests {
     #[test]
     #[ignore = "slow: Phase 4.D monolith (transcript + super-tiles + input-Merkle) vs native"]
     fn phase4d_monolith_input_fusion() {
-        use super::{monolith_build_trace, MonolithAir};
-        use crate::recursion::native_fri::{query_fold_data, query_input_merkle, query_quotient_merkle, query_terms};
+        use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
+        use crate::recursion::native_fri::{query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle, query_terms};
         use p3_field::{BasedVectorSpace, PrimeField64};
         let config = make_config(1, MILESTONE_QUERIES);
         let (proof, pvs) = gen_const_proof(&config, 42, 6);
@@ -4485,16 +4550,19 @@ mod tests {
         let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
         let mut per_query = Vec::new();
         let mut quot_paths = Vec::new();
+        let mut commit_data = Vec::new();
         let mut n_terms = 0;
         let mut final0 = Challenge::ZERO;
         let mut cap0 = [Val::ZERO; 4];
         let mut qcap0 = [Val::ZERO; 4];
+        let mut ccap0 = [[Val::ZERO; 4]; CM_ROUNDS];
         for q in 0..MILESTONE_QUERIES {
             let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
             let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
             let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
             let (_leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
             let (_ql, qpath, qcap_entry, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
+            let cm = query_commit_merkle_all(&config, &proof, &pvs, q);
             // the quotient row = the reduced-opening terms 2,3's p_x
             let qrow = &proof.opening_proof.query_proofs[q].input_proof[1].opened_values[0];
             assert_eq!((terms[2].2, terms[3].2), (qrow[0], qrow[1]), "reduced-opening quotient terms == the quotient row (q {q})");
@@ -4502,14 +4570,21 @@ mod tests {
                 final0 = f0;
                 cap0 = cap_entry;
                 qcap0 = qcap_entry;
+                for (r, (_g, _l, _p, ce)) in cm.iter().enumerate() {
+                    ccap0[r] = *ce;
+                }
             } else {
                 assert_eq!(cap_entry, cap0, "constant-proof trace cap entries equal across queries");
                 assert_eq!(qcap_entry, qcap0, "constant-proof quotient cap entries equal across queries");
+                for (r, (_g, _l, _p, ce)) in cm.iter().enumerate() {
+                    assert_eq!(*ce, ccap0[r], "constant-proof commit cap entries equal across queries (q {q} r {r})");
+                }
             }
             n_terms = terms.len();
             let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
             per_query.push(((index, terms, alpha, ro, rounds), v, path));
             quot_paths.push(qpath);
+            commit_data.push(cm);
         }
         let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries: MILESTONE_QUERIES, n_terms };
         let mut pis = Vec::new();
@@ -4526,11 +4601,15 @@ mod tests {
         pis.extend_from_slice(&cap0);
         pis.extend_from_slice(&qcap0);
         pis.push(pvs[0]); // inner public value (read by the constraint epilogue)
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths);
+        let ccap_base = pis.len();
+        for ce in &ccap0 {
+            pis.extend_from_slice(ce); // 6 commit-phase cap entries (4 felts each)
+        }
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data);
         let hh = air.height();
         println!("Phase 4.D monolith: 2^{} rows (width {}, {} transcript blocks + {} super-tiles)", hh.trailing_zeros(), air.fused_w(), counts.len(), MILESTONE_QUERIES);
         let prf = prove(&config, &air, trace, &pis);
-        assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith proves: transcript derives + super-tiles verify + input & quotient authenticate");
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith proves: transcript derives + super-tiles verify + input, quotient & commit-phase authenticate + OOD check");
         let mut bad_a = pis.clone();
         bad_a[4] += Val::ONE; // α_fri public
         assert!(verify(&config, &air, &prf, &bad_a).is_err(), "tampered α_fri ⇒ reject");
@@ -4538,12 +4617,14 @@ mod tests {
         bad_i[2 * chs.len()] += Val::ONE; // first index felt
         assert!(verify(&config, &air, &prf, &bad_i).is_err(), "tampered index felt ⇒ reject");
         let mut bad_c = pis.clone();
-        bad_c[2 * chs.len() + index_felts.len() + 2] += Val::ONE; // cap entry
+        bad_c[2 * chs.len() + index_felts.len() + 2] += Val::ONE; // trace cap entry
         assert!(verify(&config, &air, &prf, &bad_c).is_err(), "tampered cap entry ⇒ reject");
         let mut bad_p = pis.clone();
-        let plen = bad_p.len();
-        bad_p[plen - 1] += Val::ONE; // inner public value ⇒ epilogue OOD check fails
+        bad_p[ccap_base - 1] += Val::ONE; // inner public value ⇒ epilogue OOD check fails
         assert!(verify(&config, &air, &prf, &bad_p).is_err(), "tampered inner pub ⇒ epilogue rejects");
+        let mut bad_cm = pis.clone();
+        bad_cm[ccap_base] += Val::ONE; // round-0 commit cap entry ⇒ commit-phase Merkle authentication fails
+        assert!(verify(&config, &air, &prf, &bad_cm).is_err(), "tampered commit-phase cap ⇒ reject");
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         assert!(rss <= EIGHT_GB && hh <= (1 << 18), "budget: RSS ≤ 8 GB, height ≤ 2^18");
