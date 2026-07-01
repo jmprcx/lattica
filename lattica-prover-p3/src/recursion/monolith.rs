@@ -2891,6 +2891,10 @@ pub(crate) struct MonolithAir {
     /// tile). The monolith's internal binds (squeeze↦challenge, terminal↦cap, SB↦index, OOD↦pub) pin the
     /// window, so it stays sound; only the block tx-root is public in the aggregator. `false` = pis mode.
     pub column_window: bool,
+    /// Number of INNER PROOFS tiled in this AIR (the aggregator). Each instance is a full column-window
+    /// monolith (transcript + super-tiles) laid out row-disjoint; the periodic pattern repeats per instance,
+    /// the transcript IV / carrier holds become per-instance (p_inst_first / p_inst_last). 1 = single monolith.
+    pub k_instances: usize,
 }
 
 #[allow(dead_code)]
@@ -3074,11 +3078,48 @@ impl MonolithAir {
     fn tr(&self) -> usize {
         self.counts.len().next_power_of_two() * BLOCK
     }
+    fn inst_h(&self) -> usize {
+        (self.tr() + self.n_queries * M_PERIOD).next_power_of_two() // one inner-proof instance
+    }
     fn height(&self) -> usize {
-        (self.tr() + self.n_queries * M_PERIOD).next_power_of_two()
+        self.k_instances * self.inst_h() // K instances tiled row-disjoint
+    }
+    // per-instance first/last row one-hots (appended after the single-instance periodic columns): the
+    // transcript IV fires at each instance's first row; the carrier holds reset at each instance's last row.
+    fn p_inst_first(&self) -> usize {
+        self.c_term(CM_ROUNDS - 1) + 1
+    }
+    fn p_inst_last(&self) -> usize {
+        self.c_term(CM_ROUNDS - 1) + 2
     }
     fn periodic(&self) -> Vec<Vec<Val>> {
-        let h = self.height();
+        // build the single-instance pattern, then tile it K× + append the per-instance first/last one-hots.
+        let single = self.single_periodic();
+        let inst_h = self.inst_h();
+        let k = self.k_instances;
+        let h = k * inst_h;
+        let mut cols: Vec<Vec<Val>> = single
+            .iter()
+            .map(|c| {
+                let mut tiled = Vec::with_capacity(h);
+                for _ in 0..k {
+                    tiled.extend_from_slice(c);
+                }
+                tiled
+            })
+            .collect();
+        let mut first = vec![Val::ZERO; h];
+        let mut last = vec![Val::ZERO; h];
+        for i in 0..k {
+            first[i * inst_h] = Val::ONE;
+            last[i * inst_h + inst_h - 1] = Val::ONE;
+        }
+        cols.push(first); // P_INST_FIRST
+        cols.push(last); // P_INST_LAST
+        cols
+    }
+    fn single_periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.inst_h();
         let tr = self.tr();
         let nb_used = self.counts.len();
         let count_of = |b: usize| -> Val { if b < nb_used { Val::from_u64(self.counts[b] as u64) } else { Val::ZERO } };
@@ -3185,7 +3226,7 @@ impl BaseAir<Goldilocks> for MonolithAir {
         }
     }
     fn num_periodic_columns(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 1
+        self.c_term(CM_ROUNDS - 1) + 1 + 2 // single-instance columns + P_INST_FIRST + P_INST_LAST
     }
     fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
         self.periodic()
@@ -3245,12 +3286,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             builder.when_transition().assert_zero(s_pos.clone() * step);
         }
 
-        // ---------- transcript: first-row capacity, sponge linkage, ext + index binds ----------
+        // ---------- transcript: first-row capacity (per instance), sponge linkage, ext + index binds ----------
         {
-            let mut fr = builder.when_first_row();
-            fr.assert_zero(cur[CAP_LANE].clone() - p[FT_COUNT].clone());
+            // per-instance first row (= global row 0 when k_instances=1): the sponge IV.
+            let pif = p[self.p_inst_first()].clone();
+            builder.assert_zero(pif.clone() * (cur[CAP_LANE].clone() - p[FT_COUNT].clone()));
             for i in (CAP_LANE + 1)..W {
-                fr.assert_zero(cur[i].clone());
+                builder.assert_zero(pif.clone() * cur[i].clone());
             }
         }
         {
@@ -3274,10 +3316,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             builder.assert_zero(b * (cur[lane].clone() - pis[ext_pubs + k].clone()));
         }
 
-        // ---------- α_fri carrier (global-persistent): held; pinned at α_fri's bind row ----------
+        // ---------- α_fri carrier (per-instance-persistent): held (except across instance boundaries); pinned
+        // at α_fri's bind row ----------
         let carry = self.carry();
-        builder.when_transition().assert_zero(nxt[carry].clone() - cur[carry].clone());
-        builder.when_transition().assert_zero(nxt[carry + 1].clone() - cur[carry + 1].clone());
+        let not_inst_last = one.clone() - p[self.p_inst_last()].clone();
+        builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[carry].clone() - cur[carry].clone()));
+        builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[carry + 1].clone() - cur[carry + 1].clone()));
         let alpha_bind = p[FT_BIND_START + 2].clone();
         builder.assert_zero(alpha_bind.clone() * (cur[carry].clone() - cur[3].clone()));
         builder.assert_zero(alpha_bind * (cur[carry + 1].clone() - cur[2].clone()));
@@ -3285,11 +3329,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // ---------- column-window: the inner-proof pis window is held constant across the whole instance ----
         // (global-persistent for K=1; the aggregator resets it per instance). The binds/terminals/OOD pin it.
         if self.column_window {
+            // per-instance-persistent (reset across instance boundaries so each inner has its own window).
             for i in 0..self.pis_count() {
-                builder.when_transition().assert_zero(nxt[self.pw(i)].clone() - cur[self.pw(i)].clone());
+                builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[self.pw(i)].clone() - cur[self.pw(i)].clone()));
             }
             for j in 0..(2 * M_DEGREE_BITS) {
-                builder.when_transition().assert_zero(nxt[self.sch(j)].clone() - cur[self.sch(j)].clone());
+                builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[self.sch(j)].clone() - cur[self.sch(j)].clone()));
             }
         }
 
@@ -5381,7 +5426,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -5441,6 +5486,126 @@ mod tests {
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         (hh.trailing_zeros(), rss)
+    }
+
+    /// Build ONE column-window monolith instance trace (height `inst_h`, width the column-window width) for a
+    /// ConstAir proof of `value`, returning the flat trace values + the (shared) AIR params. The aggregator
+    /// concatenates K of these row-disjoint.
+    #[allow(clippy::type_complexity)]
+    fn build_inner_window(config: &MyConfig, value: u64, n_queries: usize) -> (Vec<Val>, Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize) {
+        use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
+        use crate::recursion::native_fri::{query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle, query_terms};
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        let (proof, pvs) = gen_const_proof(config, value, 6);
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let mut per_query = Vec::new();
+        let mut quot_paths = Vec::new();
+        let mut commit_data = Vec::new();
+        let mut n_terms = 0;
+        let mut final0 = Challenge::ZERO;
+        let mut cap0 = [Val::ZERO; 4];
+        let mut qcap0 = [Val::ZERO; 4];
+        let mut ccap0 = [[Val::ZERO; 4]; CM_ROUNDS];
+        for q in 0..n_queries {
+            let (terms, _x, alpha, ro) = query_terms(config, &proof, &pvs, q);
+            let (_ro2, rounds, _folded, f0) = query_fold_data(config, &proof, &pvs, q);
+            let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
+            let (_leaf, path, cap_entry) = query_input_merkle(config, &proof, &pvs, q);
+            let (_ql, qpath, qcap_entry, _qw) = query_quotient_merkle(config, &proof, &pvs, q);
+            let cm = query_commit_merkle_all(config, &proof, &pvs, q);
+            if q == 0 {
+                final0 = f0;
+                cap0 = cap_entry;
+                qcap0 = qcap_entry;
+                for (r, (_g, _l, _p, ce)) in cm.iter().enumerate() {
+                    ccap0[r] = *ce;
+                }
+            }
+            n_terms = terms.len();
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            per_query.push(((index, terms, alpha, ro, rounds), v, path));
+            quot_paths.push(qpath);
+            commit_data.push(cm);
+        }
+        let air = MonolithAir {
+            counts: counts.clone(),
+            binds: binds.clone(),
+            index_binds: index_binds.clone(),
+            n_queries,
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+        };
+        let mut pis = Vec::new();
+        for ch in &chs {
+            pis.push(ch[0]);
+            pis.push(ch[1]);
+        }
+        for f in &index_felts {
+            pis.push(*f);
+        }
+        let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+        pis.push(fp[0]);
+        pis.push(fp[1]);
+        pis.extend_from_slice(&cap0);
+        pis.extend_from_slice(&qcap0);
+        pis.push(pvs[0]);
+        for ce in &ccap0 {
+            pis.extend_from_slice(ce);
+        }
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis);
+        (trace.values, counts, binds, index_binds, n_terms)
+    }
+
+    /// Phase 6.6: the TILED AGGREGATOR — K column-window monolith instances in ONE AIR (each verifies a
+    /// distinct inner proof). Proves iff ALL K inners verify; rejects a corrupted instance. This is the
+    /// aggregation harness (verify K inners succinctly); wiring each instance's pub into the tx-root fold is
+    /// the final step. Returns (log2 height, RSS).
+    fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
+        use super::MonolithAir;
+        use p3_matrix::dense::RowMajorMatrix;
+        let config = make_config(1, n_queries);
+        let mut all = Vec::new();
+        let mut params: Option<(Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize)> = None;
+        for i in 0..k {
+            let (tr, counts, binds, ib, nt) = build_inner_window(&config, 42 + i as u64, n_queries);
+            all.extend_from_slice(&tr);
+            if i == 0 {
+                params = Some((counts, binds, ib, nt));
+            }
+        }
+        let (counts, binds, index_binds, n_terms) = params.unwrap();
+        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k };
+        let w = air.fused_w();
+        let hh = air.height();
+        let inst_h = air.inst_h();
+        let trace = RowMajorMatrix::new(all, w);
+        println!("aggregator: {k} inners × 2^{} = 2^{} rows (width {w})", inst_h.trailing_zeros(), hh.trailing_zeros());
+        let prf = prove(&config, &air, trace.clone(), &[]);
+        assert!(verify(&config, &air, &prf, &[]).is_ok(), "aggregator: {k} inner proofs verify in ONE AIR");
+        // tamper instance 1's α_stark window column across all its rows ⇒ that instance's squeeze↦window bind
+        // fails ⇒ reject (a corrupted inner is caught).
+        let mut bad_vals = trace.values.clone();
+        for r in inst_h..(2 * inst_h) {
+            bad_vals[r * w + air.pw(0)] += Val::ONE;
+        }
+        let bad = RowMajorMatrix::new(bad_vals, w);
+        let bp = prove(&config, &air, bad, &[]);
+        assert!(verify(&config, &air, &bp, &[]).is_err(), "corrupted instance 1 window ⇒ reject");
+        let rss = peak_rss_bytes();
+        println!("  -> peak RSS {} MiB", rss / (1 << 20));
+        (hh.trailing_zeros(), rss)
+    }
+
+    #[test]
+    #[ignore = "slow: Phase 6.6 tiled aggregator (K inner proofs verified in one AIR)"]
+    fn phase6_tiled_aggregator() {
+        // K=2 at 16 queries/inner keeps 2 instances × 2^15 = 2^16 within the 8 GB budget.
+        let (log2h, rss) = run_aggregator(2, 16);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "tiled aggregator within 8 GB / 2^18");
+        println!("Phase 6.6: tiled aggregator verifies K=2 inner proofs in ONE AIR at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     /// Phase 4.D: THE MONOLITH — transcript + 32 super-tiles in ONE AIR that accepts iff p3::verify accepts.
@@ -5508,7 +5673,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
