@@ -737,6 +737,52 @@ fn hiding_query_quotient_merkle(
     (leaf, path, cap_entry, preimage.len())
 }
 
+/// The HIDING analog of query_commit_merkle_all (ARITY-2): the per-round commit-phase Merkle witness. The
+/// commit phase ALSO uses the salted MMCS (HidingFriPcs's inner TwoAdicFriPcs is built on the hiding
+/// ChallengeMmcs), so each round's leaf is `MyHash(group ‖ salt)` where group = the arity-2 fold pair
+/// [g0, g1] (4 felts) and salt (4 felts) comes from the step's opening_proof (a (salts, siblings) tuple for
+/// the hiding MMCS, vs a bare siblings Vec in the non-hiding case). Returns per round (group, leaf, path, cap).
+#[cfg(test)]
+fn hiding_query_commit_merkle_all(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+    q: usize,
+) -> Vec<([Val; 4], [Val; 4], Vec<([Val; 4], bool)>, [Val; 4])> {
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_goldilocks::default_goldilocks_poseidon2_8;
+    use p3_symmetric::CryptographicHasher;
+    let (_, _, _, _, index_felts) = hiding_transcript_challenges(config, proof, public_values);
+    let (ro, rounds, _e, _f0) = hiding_query_fold_data(config, proof, public_values, q);
+    let fri = &proof.opening_proof.1;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+    let mut e = ro;
+    let mut start = index;
+    let mut out = Vec::new();
+    for (r, step) in fri.query_proofs[q].commit_phase_openings.iter().enumerate() {
+        let la = step.log_arity as usize;
+        let (sibling, beta, bit, s) = rounds[r];
+        let (g0, g1) = if !bit { (e, sibling) } else { (sibling, e) };
+        let flat: Vec<Val> = [g0, g1].iter().flat_map(|x| x.as_basis_coefficients_slice().to_vec()).collect();
+        let group: [Val; 4] = flat.clone().try_into().unwrap();
+        // hiding: the committed leaf is `group ‖ salt` (salt from the hiding-MMCS (salts, siblings) proof).
+        let salt = &step.opening_proof.0[0];
+        let mut preimage = flat;
+        preimage.extend_from_slice(salt);
+        let leaf: [Val; 4] = hasher.hash_iter(preimage.iter().copied());
+        start >>= la;
+        let path_siblings = &step.opening_proof.1;
+        let path: Vec<([Val; 4], bool)> = path_siblings.iter().enumerate().map(|(lvl, &sb)| (sb, (start >> lvl) & 1 == 1)).collect();
+        let depth = path_siblings.len();
+        let cap_entry = fri.commit_phase_commits[r].roots()[start >> depth];
+        out.push((group, leaf, path, cap_entry));
+        e = crate::recursion::fri_fold::native_fold(g0, g1, beta, s);
+    }
+    out
+}
+
 /// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
 /// hiding monolith's query region will reproduce). Replays the hiding transcript (random-commitment absorb +
 /// codeword-merged opened values, as in `hiding_transcript_challenges`), then per query computes the reduced
@@ -1363,5 +1409,32 @@ mod tests {
             assert_eq!(node, cap_entry, "q{q}: multi-matrix salted quotient leaf + path must fold to the quotient cap entry");
         }
         println!("hiding quotient Merkle: {nqc}-chunk multi-matrix salted leaf ({leaf_felts} felts) + path folds to the quotient cap entry");
+    }
+
+    /// Native hiding monolith harness (#86, step 6): the per-round commit-phase salted-Merkle witness (ARITY-2).
+    /// hiding_query_commit_merkle_all gives, per commit round, the fold group + salted leaf MyHash(group ‖ salt)
+    /// + path + round cap; folding each leaf up its path must reach that round's commitment cap — validating the
+    /// salted commit-phase Merkle (the FRI fold's authentication) in the monolith's per-round format.
+    #[test]
+    #[ignore = "slow: arity-2 hiding commit-phase salted Merkle folds to each round's cap"]
+    fn hiding_commit_merkle_folds_to_cap() {
+        use p3_symmetric::PseudoCompressionFunction;
+        let config = make_config_ar(1, 96); // ARITY-2 (commit-phase fold group is a pair)
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        let compressor = MyCompress::new(default_goldilocks_poseidon2_8());
+        let fri = &proof.opening_proof.1;
+        let mut n_rounds = 0;
+        for q in [0usize, 1, fri.query_proofs.len() - 1] {
+            let rounds = hiding_query_commit_merkle_all(&config, &proof, &pvs, q);
+            n_rounds = rounds.len();
+            for (r, (_group, leaf, path, cap_entry)) in rounds.iter().enumerate() {
+                let mut node = *leaf;
+                for (sib, dir) in path {
+                    node = if *dir { compressor.compress([*sib, node]) } else { compressor.compress([node, *sib]) };
+                }
+                assert_eq!(node, *cap_entry, "q{q} round {r}: salted commit-phase leaf + path must fold to the round cap");
+            }
+        }
+        println!("hiding commit-phase Merkle: {n_rounds} rounds of salted MyHash(group ‖ salt) + path fold to each round's cap");
     }
 }
