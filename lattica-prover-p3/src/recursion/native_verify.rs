@@ -630,6 +630,43 @@ fn hiding_multicol_query_terms(
     (terms, x_out, alpha_fri, ro)
 }
 
+/// The HIDING analog of query_fold_data (ARITY-2): the commit-phase fold-chain witness `(sibling, β, bit, s)`
+/// per round, folding `ro` (from hiding_multicol_query_terms) down to the final value `e`. For
+/// log_final_poly_len=0 the accept is `e == final_poly[0]`. This is the fold-chain witness the monolith's
+/// arith-tile fold consumes; the commit-phase fold is is_zk-agnostic (the hiding deltas are all in the INPUT,
+/// not the fold) but the proof MUST be arity-2 (the monolith's fold chain folds one bit per round).
+#[cfg(test)]
+fn hiding_query_fold_data(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+    q: usize,
+) -> (Challenge, Vec<(Challenge, Challenge, bool, Val)>, Challenge, Challenge) {
+    use p3_field::PrimeField64;
+    let (_, _, _, betas, index_felts) = hiding_transcript_challenges(config, proof, public_values);
+    let (_terms, _x, _alpha, ro) = hiding_multicol_query_terms(config, proof, public_values, q);
+    let fri = &proof.opening_proof.1;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let mut start = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let mut e = ro;
+    let mut log_current = log_global;
+    let mut rounds = Vec::new();
+    for (r, step) in fri.query_proofs[q].commit_phase_openings.iter().enumerate() {
+        let la = step.log_arity as usize;
+        let arity = 1usize << la;
+        let bit = start % arity;
+        let sibling = step.sibling_values[0];
+        let log_folded = log_current - la;
+        start >>= la;
+        let s = Val::two_adic_generator(log_folded + la).exp_u64(reverse_bits_len(start, log_folded) as u64);
+        let (e0, e1) = if bit == 0 { (e, sibling) } else { (sibling, e) };
+        e = crate::recursion::fri_fold::native_fold(e0, e1, betas[r], s);
+        rounds.push((sibling, betas[r], bit == 1, s));
+        log_current = log_folded;
+    }
+    (ro, rounds, e, fri.final_poly[0])
+}
+
 /// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
 /// hiding monolith's query region will reproduce). Replays the hiding transcript (random-commitment absorb +
 /// codeword-merged opened values, as in `hiding_transcript_challenges`), then per query computes the reduced
@@ -804,21 +841,27 @@ mod tests {
     use p3_uni_stark::{prove, verify};
     use rand::SeedableRng;
 
-    fn make_config() -> MyConfig {
+    /// Hiding config parameterized by FRI arity + query count. `max_log_arity=1` ⇒ ARITY-2 (what the in-circuit
+    /// monolith's fold chain needs; all monolith end-to-end tests are arity-2). `=4` ⇒ the production arity-4.
+    fn make_config_ar(max_log_arity: usize, num_queries: usize) -> MyConfig {
         let perm = default_goldilocks_poseidon2_8();
         let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
         let fri = FriParameters {
             log_blowup: 4,
             log_final_poly_len: 0,
-            max_log_arity: 4,
-            num_queries: 96,
+            max_log_arity,
+            num_queries,
             commit_proof_of_work_bits: 0,
             query_proof_of_work_bits: 16,
             mmcs: challenge_mmcs,
         };
         let pcs = MyPcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
         MyConfig::new(pcs, Challenger::new(perm))
+    }
+
+    fn make_config() -> MyConfig {
+        make_config_ar(4, 96)
     }
 
     fn gen_proof(config: &MyConfig, value: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
@@ -1175,5 +1218,29 @@ mod tests {
             assert_eq!(eval_final_poly(&fri.final_poly, x), folded, "q{q}: terms' ro must fold to final_poly");
         }
         println!("hiding per-query terms: {n_terms} reduced-opening terms fold to final_poly (random round + merged codewords + 2× quotient) — the true reduced opening");
+    }
+
+    /// Native hiding monolith harness (#86, step 3): the ARITY-2 fold-chain witness. On an ARITY-2 hiding proof
+    /// (what the in-circuit monolith consumes), hiding_query_fold_data folds ro through the commit phase to `e`,
+    /// and `e == final_poly[0]` (log_final_poly_len=0) — the monolith's fold-chain accept. Confirms the hiding
+    /// proof folds identically to the non-hiding case once arity-2 (the hiding deltas are all in the input).
+    #[test]
+    #[ignore = "slow: arity-2 hiding fold-chain witness reaches final_poly[0]"]
+    fn hiding_fold_rounds_reach_final() {
+        let config = make_config_ar(1, 96); // ARITY-2 hiding (the monolith's fold arity)
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        assert!(reverify(&config, &proof, &pvs).is_ok(), "sanity: arity-2 hiding proof is valid");
+        let fri = &proof.opening_proof.1;
+        assert!(
+            fri.query_proofs[0].commit_phase_openings.iter().all(|o| o.log_arity == 1),
+            "config must be arity-2 (log_arity==1) for the monolith fold chain"
+        );
+        let mut n_rounds = 0;
+        for q in [0usize, 1, fri.query_proofs.len() - 1] {
+            let (_ro, rounds, e, final0) = hiding_query_fold_data(&config, &proof, &pvs, q);
+            assert_eq!(e, final0, "q{q}: hiding fold chain must reach final_poly[0]");
+            n_rounds = rounds.len();
+        }
+        println!("hiding fold chain (arity-2): {n_rounds} rounds fold ro → final_poly[0] (monolith-compatible fold witness)");
     }
 }
