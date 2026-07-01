@@ -178,6 +178,22 @@ pub fn final_query_point(domain_index: usize, log_global_max_height: usize) -> C
     Challenge::from(Val::two_adic_generator(log_global_max_height).exp_u64(rev as u64))
 }
 
+/// Reorder a length-2^k slice into bit-reversed index order (replaces `p3_util::reverse_slice_index_bits`).
+#[cfg(test)]
+pub(crate) fn reverse_slice_index_bits<T>(xs: &mut [T]) {
+    let n = xs.len();
+    if n <= 1 {
+        return;
+    }
+    let log_n = log2_strict(n);
+    for i in 0..n {
+        let j = reverse_bits_len(i, log_n);
+        if i < j {
+            xs.swap(i, j);
+        }
+    }
+}
+
 pub(crate) fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
     let mut r = 0;
     for _ in 0..bits {
@@ -828,6 +844,63 @@ pub(crate) fn query_commit_merkle_all(
         let cap_entry = fri.commit_phase_commits[r].roots()[start >> depth];
         out.push((group, leaf, path, cap_entry));
         e = crate::recursion::fri_fold::native_fold(g0, g1, beta, s);
+    }
+    out
+}
+
+/// GENERAL-ARITY commit-phase fold oracle (Phase 5). For query `q`, mirrors `verify_query`'s per-round fold
+/// but for ARBITRARY arity 2^la (the milestone uses la=1; `make_config(2,·)` gives la=2 arity-4). Per round
+/// returns `(evals, beta, xs, folded)`: `evals` = the reconstructed arity-2^la group (running eval slotted at
+/// `index % arity`, siblings elsewhere), `beta` = the round challenge, `xs` = the fold-point coset (EXACTLY
+/// p3 `fold_row`'s points: `reverse_bits( subgroup_start · g_la^i )`, `subgroup_start = g_{lf+la}^rev(idx,lf)`),
+/// and `folded` = p3's own `fold_row` result (the reference the in-circuit gadget must reproduce).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn general_fold_oracle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> Vec<(Vec<Challenge>, Challenge, Vec<Val>, Challenge)> {
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_fri::FriFoldingStrategy;
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (_, _, _, betas_p, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let betas: Vec<Challenge> = betas_p.iter().map(|&p| to_ext(p)).collect();
+    let (_, _, _, ro) = query_terms(config, proof, pvs, q);
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let mut index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let mut e = ro;
+    let mut log_current = log_global;
+    let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> = TwoAdicFriFolding(core::marker::PhantomData);
+    let mut out = Vec::new();
+    for (r, step) in fri.query_proofs[q].commit_phase_openings.iter().enumerate() {
+        let la = step.log_arity as usize;
+        let arity = 1usize << la;
+        let index_in_group = index % arity;
+        let mut evals = Challenge::zero_vec(arity);
+        evals[index_in_group] = e;
+        let mut sib = 0;
+        for (j, ev) in evals.iter_mut().enumerate() {
+            if j != index_in_group {
+                *ev = step.sibling_values[sib];
+                sib += 1;
+            }
+        }
+        let log_folded = log_current - la;
+        index >>= la;
+        // xs = p3 fold_row's coset points (base field): reverse_bits( subgroup_start · g_la^i ).
+        let subgroup_start = Val::two_adic_generator(log_folded + la).exp_u64(reverse_bits_len(index, log_folded) as u64);
+        let g_la = Val::two_adic_generator(la);
+        let mut xs: Vec<Val> = (0..arity).map(|i| subgroup_start * g_la.exp_u64(i as u64)).collect();
+        reverse_slice_index_bits(&mut xs);
+        let folded = <TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> as FriFoldingStrategy<Val, Challenge>>::fold_row(
+            &folding, index, log_folded, la, betas[r], evals.iter().copied(),
+        );
+        out.push((evals.clone(), betas[r], xs, folded));
+        e = folded;
+        log_current = log_folded;
     }
     out
 }

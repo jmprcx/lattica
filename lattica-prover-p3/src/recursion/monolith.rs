@@ -3614,6 +3614,133 @@ pub(crate) fn monolith_build_trace(
     RowMajorMatrix::new(t, w)
 }
 
+// =================================================================================================
+// Phase 5 — GENERAL-ARITY FRI fold. The milestone folds arity-2 (la=1); efficient/production configs fold
+// arity-2^la (fewer, wider rounds). p3's `fold_row` interpolates the arity-2^la coset {xs_i} at β via the
+// barycentric formula: folded = L(β)·Σ_i y_i·w_i/(β−x_i), where L(β)=Π_i(β−x_i), w_i = x_i/(n·x_0^n),
+// n = arity. This gadget verifies that relation in-circuit for ANY arity (xs, inverses, weight-scale as
+// witness — the same "point is witness in the gadget, derived in the monolith" split the arity-2 FriFoldAir
+// uses), validated vs p3's OWN fold_row on a real arity-4 (`make_config(2,·)`) proof.
+// =================================================================================================
+#[allow(dead_code)]
+pub(crate) struct GeneralFoldAir {
+    pub log_arity: usize,
+}
+#[allow(dead_code)]
+impl GeneralFoldAir {
+    fn arity(&self) -> usize {
+        1 << self.log_arity
+    }
+    fn c_eval(&self, i: usize) -> usize {
+        2 * i // arity ext evals
+    }
+    fn c_beta(&self) -> usize {
+        2 * self.arity()
+    }
+    fn c_xs(&self, i: usize) -> usize {
+        2 * self.arity() + 2 + i // arity base coset points
+    }
+    fn c_inv(&self, i: usize) -> usize {
+        3 * self.arity() + 2 + 2 * i // arity ext inverses of (β − xs_i)
+    }
+    fn c_wscale(&self) -> usize {
+        5 * self.arity() + 2 // base: 1/(arity · xs_0^arity)
+    }
+    fn c_folded(&self) -> usize {
+        5 * self.arity() + 3 // ext result
+    }
+    fn w(&self) -> usize {
+        5 * self.arity() + 5
+    }
+}
+impl BaseAir<Goldilocks> for GeneralFoldAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the folded F_p² result
+    }
+}
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralFoldAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let arity = self.arity();
+        let mut fr = builder.when_first_row();
+        let beta = (cur[self.c_beta()].clone(), cur[self.c_beta() + 1].clone());
+        // L(β) = Π_i (β − xs_i); each inv_i is the genuine ext inverse of (β − xs_i).
+        let mut lz = (one.clone(), AB::Expr::ZERO);
+        for i in 0..arity {
+            let d = (beta.0.clone() - cur[self.c_xs(i)].clone(), beta.1.clone());
+            let inv = (cur[self.c_inv(i)].clone(), cur[self.c_inv(i) + 1].clone());
+            let chk = emul(inv, d.clone());
+            fr.assert_zero(chk.0 - one.clone());
+            fr.assert_zero(chk.1);
+            lz = emul(lz, d);
+        }
+        // coset_power = xs_0^(2^la); weight_scale·(arity·coset_power) == 1.
+        let mut cp = cur[self.c_xs(0)].clone();
+        for _ in 0..self.log_arity {
+            cp = cp.clone() * cp.clone();
+        }
+        let wscale = cur[self.c_wscale()].clone();
+        fr.assert_zero(wscale.clone() * (AB::Expr::from(Goldilocks::from_usize(arity)) * cp) - one.clone());
+        // acc = Σ_i y_i ⊗ inv_i · (xs_i · weight_scale); folded = L(β) ⊗ acc.
+        let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for i in 0..arity {
+            let ev = (cur[self.c_eval(i)].clone(), cur[self.c_eval(i) + 1].clone());
+            let inv = (cur[self.c_inv(i)].clone(), cur[self.c_inv(i) + 1].clone());
+            let scal = cur[self.c_xs(i)].clone() * wscale.clone();
+            let t = emul(ev, inv);
+            acc = (acc.0 + t.0 * scal.clone(), acc.1 + t.1 * scal);
+        }
+        let res = emul(lz, acc);
+        fr.assert_zero(cur[self.c_folded()].clone() - res.0.clone());
+        fr.assert_zero(cur[self.c_folded() + 1].clone() - res.1.clone());
+        fr.assert_zero(cur[self.c_folded()].clone() - pis[0].clone());
+        fr.assert_zero(cur[self.c_folded() + 1].clone() - pis[1].clone());
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_general_fold_trace(log_arity: usize, evals: &[Challenge], beta: Challenge, xs: &[Val], folded: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let air = GeneralFoldAir { log_arity };
+    let arity = 1 << log_arity;
+    let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let height = 16;
+    let w = air.w();
+    let mut r0 = vec![Val::ZERO; w];
+    for i in 0..arity {
+        let e = c(evals[i]);
+        r0[air.c_eval(i)] = e[0];
+        r0[air.c_eval(i) + 1] = e[1];
+        r0[air.c_xs(i)] = xs[i];
+        let inv = c((beta - Challenge::from(xs[i])).inverse());
+        r0[air.c_inv(i)] = inv[0];
+        r0[air.c_inv(i) + 1] = inv[1];
+    }
+    let bc = c(beta);
+    r0[air.c_beta()] = bc[0];
+    r0[air.c_beta() + 1] = bc[1];
+    let cp = xs[0].exp_power_of_2(log_arity);
+    r0[air.c_wscale()] = (Val::from_usize(arity) * cp).inverse();
+    let fc = c(folded);
+    r0[air.c_folded()] = fc[0];
+    r0[air.c_folded() + 1] = fc[1];
+    let mut vals = Vec::with_capacity(height * w);
+    for _ in 0..height {
+        vals.extend_from_slice(&r0);
+    }
+    RowMajorMatrix::new(vals, w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -4654,6 +4781,52 @@ mod tests {
         // total commit-phase blocks per super-tile: Σ (1 leaf + depth merges) = 6 + (3+2+1) = 12.
         let blocks: usize = query_commit_merkle_all(&config, &proof, &pvs, 0).iter().map(|(_, _, p, _)| 1 + p.len()).sum();
         println!("commit-phase structure: 6 rounds, depths [3,2,1,0,0,0], {blocks} blocks/super-tile, all groups→leaves validated vs the real proof");
+    }
+
+    #[test]
+    fn arity4_probe() {
+        use crate::recursion::native_fri::verify_proof;
+        let config = make_config(2, MILESTONE_QUERIES); // max_log_arity=2 → arity-4 folds
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let fri = &proof.opening_proof;
+        let q0 = &fri.query_proofs[0];
+        println!("arity-4 config: {} commit rounds, final_poly len {}", q0.commit_phase_openings.len(), fri.final_poly.len());
+        for (r, o) in q0.commit_phase_openings.iter().enumerate() {
+            println!("  round {r}: log_arity={} siblings={} path_len={}", o.log_arity, o.sibling_values.len(), o.opening_proof.len());
+        }
+        assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "arity-4 proof valid (p3)");
+        let _ = verify_proof; // (native verify_proof is pinned to the arity-4/96-query config; oracle path used instead)
+    }
+
+    /// Phase 5: the in-circuit GENERAL-ARITY fold reproduces p3's own `fold_row` for arity-4 (la=2), every
+    /// round of several queries, and rejects a tampered result. Validates that the barycentric fold is
+    /// in-circuit-expressible for arbitrary arity (the milestone's arity-2 is the la=1 special case).
+    #[test]
+    #[ignore = "slow: Phase 5 general-arity fold vs p3 fold_row (arity-4)"]
+    fn phase5_general_fold_matches_p3() {
+        use super::{build_general_fold_trace, GeneralFoldAir};
+        use crate::recursion::native_fri::general_fold_oracle;
+        use p3_field::BasedVectorSpace;
+        let config = make_config(2, MILESTONE_QUERIES); // arity-4 data source
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let pcfg = make_config(1, MILESTONE_QUERIES); // prove the tiny gadget with a plain config
+        let mut checked = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES / 2, MILESTONE_QUERIES - 1] {
+            for (evals, beta, xs, folded) in general_fold_oracle(&config, &proof, &pvs, q) {
+                let la = xs.len().trailing_zeros() as usize;
+                assert_eq!(la, 2, "arity-4 config folds la=2");
+                let air = GeneralFoldAir { log_arity: la };
+                let fp: Vec<Val> = folded.as_basis_coefficients_slice().to_vec();
+                let trace = build_general_fold_trace(la, &evals, beta, &xs, folded);
+                let prf = prove(&pcfg, &air, trace, &fp);
+                assert!(verify(&pcfg, &air, &prf, &fp).is_ok(), "arity-{} fold == p3 fold_row (q {q})", 1 << la);
+                let mut bad = fp.clone();
+                bad[0] += Val::ONE;
+                assert!(verify(&pcfg, &air, &prf, &bad).is_err(), "tampered folded ⇒ reject (q {q})");
+                checked += 1;
+            }
+        }
+        println!("Phase 5: in-circuit general-arity fold validated vs p3 fold_row — {checked} arity-4 rounds");
     }
 
     #[test]
