@@ -729,6 +729,42 @@ mod tests {
         (prove(config, &ConstAir, trace, &pvs), pvs)
     }
 
+    /// Ground-truth geometry of a HIDING (is_zk=1) ConstAir proof — the exact shape the in-circuit hiding
+    /// monolith must lay out. Prints, per input round, the opened-row widths, codeword widths, and salt
+    /// widths (⇒ the salted-leaf preimage width = committed_row ‖ salt), plus the commit-phase arities.
+    #[test]
+    #[ignore = "diagnostic: dump hiding ConstAir proof geometry"]
+    fn hiding_proof_geometry() {
+        let config = make_config();
+        let (proof, _pvs) = gen_proof(&config, 42, 6);
+        let fri = &proof.opening_proof.1;
+        let rand_cws = &proof.opening_proof.0;
+        println!("degree_bits={}", proof.degree_bits);
+        println!("commitments.random present: {}", proof.commitments.random.is_some());
+        println!("opened_values: trace_local={} trace_next={:?} quotient_chunks={} (each {:?}) random={:?}",
+            proof.opened_values.trace_local.len(),
+            proof.opened_values.trace_next.as_ref().map(|v| v.len()),
+            proof.opened_values.quotient_chunks.len(),
+            proof.opened_values.quotient_chunks.first().map(|c| c.len()),
+            proof.opened_values.random.as_ref().map(|v| v.len()));
+        println!("rand_cws rounds={}", rand_cws.len());
+        for (r, round) in rand_cws.iter().enumerate() {
+            let per_mat: Vec<usize> = round.iter().map(|m| m.iter().map(|p| p.len()).sum()).collect();
+            println!("  round {r}: {} matrices, codeword felts/mat(sum over pts)={:?}", round.len(), per_mat);
+        }
+        println!("commit_phase rounds={}, arities={:?}", fri.commit_phase_commits.len(),
+            fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity).collect::<Vec<_>>());
+        let ip = &fri.query_proofs[0].input_proof;
+        println!("input_proof batches={}", ip.len());
+        for (b, bo) in ip.iter().enumerate() {
+            let row_widths: Vec<usize> = bo.opened_values.iter().map(|r| r.len()).collect();
+            let salt_widths: Vec<usize> = bo.opening_proof.0.iter().map(|s| s.len()).collect();
+            println!("  batch {b}: {} matrices, row_widths={:?}, salt_widths={:?}  ⇒ leaf preimage(s) = row‖salt = {:?}",
+                bo.opened_values.len(), row_widths, salt_widths,
+                row_widths.iter().zip(&salt_widths).map(|(r, s)| r + s).collect::<Vec<_>>());
+        }
+    }
+
     #[test]
     #[ignore = "slow: native re-verifier vs p3::verify"]
     fn reverify_agrees_with_p3() {
