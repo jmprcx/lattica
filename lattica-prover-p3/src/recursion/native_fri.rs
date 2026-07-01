@@ -445,6 +445,26 @@ pub(crate) fn gen_fib_proof(config: &MyConfig, seed_a: u64, seed_b: u64, log_hei
     (p3_uni_stark::prove(config, &FibonacciAir, RowMajorMatrix::new(vals, 2), &pvs), pvs)
 }
 
+/// Generate a real inner proof for the DEGREE-2 `MulAir` (3 cols `[a, b, c]`, a'=a+1, b'=b+1, c=a·b) — a
+/// non-affine (variable·variable) constraint, so per-query caps differ AND the constraint tree exercises the
+/// symbolic evaluator's Mul path. pvs = `[seed_a, seed_b]`.
+#[cfg(test)]
+pub(crate) fn gen_mul_proof(config: &MyConfig, seed_a: u64, seed_b: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use super::native_verify::MulAir;
+    use p3_matrix::dense::RowMajorMatrix;
+    let n = 1usize << log_height;
+    let mut vals = Vec::with_capacity(n * 3);
+    for i in 0..n {
+        let a = Val::from_u64(seed_a + i as u64);
+        let b = Val::from_u64(seed_b + i as u64);
+        vals.push(a);
+        vals.push(b);
+        vals.push(a * b);
+    }
+    let pvs = vec![Val::from_u64(seed_a), Val::from_u64(seed_b)];
+    (p3_uni_stark::prove(config, &MulAir, RowMajorMatrix::new(vals, 3), &pvs), pvs)
+}
+
 /// A `MerkleCap` commitment flattened to its felt sequence (roots in order) — EXACTLY the felts the
 /// challenger observes via `observe(cap)`. The monolith transcript region must absorb this same sequence.
 #[cfg(test)]
@@ -873,6 +893,42 @@ pub(crate) fn eval_symbolic_native(
             eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans) * eval_symbolic_native(y, local, next, pubs, is_first, is_last, is_trans)
         }
     }
+}
+
+/// Phase 7.5 (generic): the OOD epilogue INPUTS for an ARBITRARY inner AIR — the trace openings at ζ/ζ_next,
+/// the three Lagrange selectors + inv_van at ζ, quotient(ζ), α_stark, ζ. AIR-generic (the only AIR-specific
+/// step is the quotient-chunk count via `get_log_num_quotient_chunks`); the symbolic evaluator does the fold.
+/// Returns (local, next, is_first, is_last, is_trans, inv_van, quotient, α_stark, ζ).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn epilogue_openings<A>(
+    config: &MyConfig,
+    air: &A,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+) -> (Vec<Challenge>, Vec<Challenge>, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge)
+where
+    A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
+{
+    use p3_field::BasedVectorSpace;
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (alpha_p, zeta_p, _, _, _) = full_transcript_challenges(config, proof, pvs);
+    let alpha = to_ext(alpha_p);
+    let zeta = to_ext(zeta_p);
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
+    let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let layout = AirLayout::from_air::<Val>(air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, A>(air, layout, 0);
+    let nqc = 1usize << log_nqc;
+    let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    let quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta);
+    let local = proof.opened_values.trace_local.clone();
+    let next = proof.opened_values.trace_next.clone().unwrap();
+    let sel = trace_domain.selectors_at_point(zeta);
+    (local, next, sel.is_first_row, sel.is_last_row, sel.is_transition, sel.inv_vanishing, quotient, alpha, zeta)
 }
 
 /// Per-query commit-phase oracle (Phase 3): mirrors `verify_query` for query `q`, returning the reduced
@@ -1400,5 +1456,31 @@ mod tests {
         }
         assert_eq!(folded * inv_van, quotient, "GENERIC symbolic fold reproduces p3::verify_constraints (Fibonacci)");
         println!("Phase 7.5: generic symbolic-constraint fold == p3 for Fibonacci ({} constraints, data-driven, no hardcoded fold)", constraints.len());
+    }
+
+    /// Phase 7.5 (native, DEGREE-2): the generic symbolic fold handles a NON-AFFINE inner — `MulAir`'s
+    /// `c = a·b` constraint is a Mul of two trace variables (degree 2), exercising the evaluator's
+    /// variable·variable path (which Fibonacci's all-affine constraints don't). Uses the AIR-generic
+    /// `epilogue_openings` + `get_symbolic_constraints`, and reproduces p3::verify_constraints.
+    #[test]
+    #[ignore = "slow: Phase 7.5 generic symbolic fold on a degree-2 inner (MulAir) vs p3"]
+    fn phase7_mul_symbolic_fold_matches_p3() {
+        use super::super::native_verify::MulAir;
+        use super::{epilogue_openings, eval_symbolic_native};
+        use p3_uni_stark::{get_symbolic_constraints, verify, AirLayout};
+        let config = make_config(1, 32);
+        let (proof, pvs) = gen_mul_proof(&config, 3, 5, 6);
+        assert!(verify(&config, &MulAir, &proof, &pvs).is_ok(), "p3 accepts the degree-2 MulAir proof");
+        let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, _z) = epilogue_openings(&config, &MulAir, &proof, &pvs);
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let layout = AirLayout::from_air::<Val>(&MulAir);
+        let constraints = get_symbolic_constraints::<Val, MulAir>(&MulAir, layout);
+        assert_eq!(constraints.len(), 5, "MulAir emits 5 constraints (incl. the degree-2 product)");
+        let mut folded = Challenge::ZERO;
+        for c in &constraints {
+            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, is_first, is_last, is_trans);
+        }
+        assert_eq!(folded * inv_van, quotient, "generic symbolic fold reproduces p3 for a DEGREE-2 (variable·variable) AIR");
+        println!("Phase 7.5: generic symbolic fold == p3 for the degree-2 MulAir (c=a·b exercises the Mul-of-variables path)");
     }
 }

@@ -110,6 +110,36 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FibonacciAir {
     }
 }
 
+/// A DEGREE-2 multi-column inner (Phase 7.5): 3 columns `[a, b, c]` with two counters (a'=a+1, b'=b+1) and a
+/// NON-AFFINE product constraint `c = a·b` (every row). Unlike Fibonacci (whose constraints are all affine —
+/// Add/Sub + a selector multiply), this has a Mul of two TRACE VARIABLES, so it exercises the symbolic
+/// evaluator's variable·variable path — the constraint shape real high-degree AIRs (Poseidon, range checks)
+/// use. Emission order: C0 first-row a, C1 first-row b, C2 product c−a·b (unconditional), C3 a'−a−1, C4 b'−b−1.
+pub struct MulAir;
+
+impl BaseAir<Goldilocks> for MulAir {
+    fn width(&self) -> usize {
+        3
+    }
+    fn num_public_values(&self) -> usize {
+        2 // seed a, seed b
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MulAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0
+        builder.when_first_row().assert_zero(cur[1].clone() - pis[1].clone()); // C1
+        builder.assert_zero(cur[2].clone() - cur[0].clone() * cur[1].clone()); // C2: c = a·b (degree 2, every row)
+        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C3: a' = a + 1
+        builder.when_transition().assert_zero(nxt[1].clone() - cur[1].clone() - AB::Expr::ONE); // C4: b' = b + 1
+    }
+}
+
 // --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
 //     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;
