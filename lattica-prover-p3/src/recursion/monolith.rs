@@ -3832,8 +3832,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for g in 0..self.n_cap_c() {
                 builder.when_transition().assert_zero(hold.clone() * (nxt[self.cap_c(g)].clone() - cur[self.cap_c(g)].clone()));
             }
-            // (cg_offset, shift, bits, cap_base) per opening: trace, quotient, then 6 commit rounds.
-            let mut openings = vec![(0usize, 4usize, CM_CAP_HEIGHT, self.cap_base()), (4, 4, CM_CAP_HEIGHT, self.qcap_base())];
+            // (cg_offset, shift, bits, cap_base) per opening: trace, quotient, then CM_ROUNDS commit rounds.
+            // trace/quotient are at the max height, so the cap-selecting shift is INPUT_DEPTH (log_global−cap).
+            let mut openings = vec![(0usize, INPUT_DEPTH, CM_CAP_HEIGHT, self.cap_base()), (4, INPUT_DEPTH, CM_CAP_HEIGHT, self.qcap_base())];
             for r in 0..CM_ROUNDS {
                 openings.push((8 + 4 * r, self.commit_shift(r), self.commit_bits(r), self.commit_cap_base(r)));
             }
