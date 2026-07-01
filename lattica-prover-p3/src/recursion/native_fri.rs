@@ -726,6 +726,18 @@ pub(crate) fn fib_epilogue_oracle(
     let next: [Challenge; 2] = proof.opened_values.trace_next.as_ref().unwrap()[..2].try_into().unwrap();
     let sel = trace_domain.selectors_at_point(zeta);
     let (is_first, is_trans, is_last, inv_van) = (sel.is_first_row, sel.is_transition, sel.is_last_row, sel.inv_vanishing);
+    // Confirm the exact selector-derivation formulas the IN-CIRCUIT epilogue reconstructs from ζ (n = 2^db,
+    // g = two_adic_generator(db)): z_h = ζ^n − 1; is_trans = ζ − g^{-1}; is_first·(ζ−1) = z_h;
+    // is_last·(ζ−g^{-1}) = z_h; inv_van·z_h = 1. (Non-circular: sel.* come from p3's selectors_at_point.)
+    {
+        use p3_field::{Field, TwoAdicField};
+        let g_inv = Challenge::from(Val::two_adic_generator(degree_bits)).inverse();
+        let z_h = zeta.exp_power_of_2(degree_bits) - Challenge::ONE;
+        assert_eq!(is_trans, zeta - g_inv, "is_transition = ζ − g^{{-1}}");
+        assert_eq!(is_first * (zeta - Challenge::ONE), z_h, "is_first·(ζ−1) = z_h");
+        assert_eq!(is_last * (zeta - g_inv), z_h, "is_last·(ζ−g^{{-1}}) = z_h");
+        assert_eq!(inv_van * z_h, Challenge::ONE, "inv_van·z_h = 1");
+    }
     // hand-written GENERAL α-fold (Horner, first-emitted highest power), matching FibonacciAir's eval order.
     let pub0 = to_ext([pvs[0], Val::ZERO]);
     let pub1 = to_ext([pvs[1], Val::ZERO]);

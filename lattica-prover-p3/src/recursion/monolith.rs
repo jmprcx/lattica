@@ -4591,6 +4591,121 @@ pub(crate) fn build_agg_fold_trace(n_tiles: usize, pvs0: &[Val], tx_root: [Val; 
     RowMajorMatrix::new(t, AF_W)
 }
 
+// =================================================================================================
+// GENERAL OOD EPILOGUE (Phase 7.2) — the α-folded constraint check at ζ for an ARBITRARY multi-column AIR, as
+// a standalone gadget validated vs `fib_epilogue_oracle`. It DERIVES the Lagrange selectors from ζ in-circuit
+// (z_h = ζ^(2^db) − 1 via squaring; is_trans = ζ − g^{-1}; is_first·(ζ−1) = z_h; is_last·(ζ−g^{-1}) = z_h) and
+// checks the inverse-cleared relation for FibonacciAir's 5 constraints (Horner α-fold, EMISSION order — first
+// gets the highest power): with D = (ζ−1)(ζ−g^{-1}),
+//   α^4·z_h·(ζ−g^{-1})·(a−p0) + α^3·z_h·(ζ−g^{-1})·(b−p1)              [is_first·D = z_h·(ζ−g^{-1})]
+//   + α^2·(ζ−1)(ζ−g^{-1})^2·(a'−b) + α^1·(ζ−1)(ζ−g^{-1})^2·(b'−a−b)   [is_trans·D = (ζ−1)(ζ−g^{-1})^2]
+//   + z_h·(ζ−1)·(b−p2)                                               [is_last·D = z_h·(ζ−1)]
+//   == quotient · z_h·(ζ−1)·(ζ−g^{-1}),
+// which is exactly p3's `folded·inv_van == quotient`. Only the CONSTRAINT SET (the expr_i) is AIR-specific —
+// the selector derivation + Horner fold structure are AIR-independent (the reusable core the full multi-column
+// monolith fusion needs). ζ/α/pubs are public (degree 0) so the OOD openings + quotient stay degree 1.
+// =================================================================================================
+#[cfg(test)]
+struct GeneralEpilogueAir;
+#[cfg(test)]
+impl GeneralEpilogueAir {
+    fn c_la(&self) -> usize {
+        0 // local column a (ext, 2 felts)
+    }
+    fn c_lb(&self) -> usize {
+        2 // local column b
+    }
+    fn c_na(&self) -> usize {
+        4 // next column a
+    }
+    fn c_nb(&self) -> usize {
+        6 // next column b
+    }
+    fn c_q(&self) -> usize {
+        8 // quotient(ζ)
+    }
+}
+#[cfg(test)]
+impl BaseAir<Goldilocks> for GeneralEpilogueAir {
+    fn width(&self) -> usize {
+        10
+    }
+    fn num_public_values(&self) -> usize {
+        7 // ζ(2), α(2), p0, p1, p2
+    }
+}
+#[cfg(test)]
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralEpilogueAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let zeta = (pis[0].clone(), pis[1].clone());
+        let alpha = (pis[2].clone(), pis[3].clone());
+        let p0 = pis[4].clone();
+        let p1 = pis[5].clone();
+        let p2 = pis[6].clone();
+        let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS).inverse());
+        // z_h = ζ^(2^db) − 1 (ζ public ⇒ inline squaring, degree 0).
+        let mut s = zeta.clone();
+        for _ in 0..M_DEGREE_BITS {
+            s = emul(s.clone(), s.clone());
+        }
+        let z_h = (s.0 - one.clone(), s.1);
+        let zmg = (zeta.0.clone() - g_inv, zeta.1.clone()); // ζ − g^{-1}
+        let zm1 = (zeta.0.clone() - one.clone(), zeta.1.clone()); // ζ − 1
+        let zmg2 = emul(zmg.clone(), zmg.clone());
+        let mut ap = vec![(one.clone(), AB::Expr::ZERO)]; // α^0..α^4
+        for k in 1..5 {
+            ap.push(emul(ap[k - 1].clone(), alpha.clone()));
+        }
+        let coeff0 = emul(emul(ap[4].clone(), z_h.clone()), zmg.clone());
+        let coeff1 = emul(emul(ap[3].clone(), z_h.clone()), zmg.clone());
+        let coeff2 = emul(emul(ap[2].clone(), zm1.clone()), zmg2.clone());
+        let coeff3 = emul(emul(ap[1].clone(), zm1.clone()), zmg2.clone());
+        let coeff4 = emul(z_h.clone(), zm1.clone());
+        let rhs_coeff = emul(emul(z_h.clone(), zm1.clone()), zmg.clone());
+        let a = (cur[self.c_la()].clone(), cur[self.c_la() + 1].clone());
+        let b = (cur[self.c_lb()].clone(), cur[self.c_lb() + 1].clone());
+        let na = (cur[self.c_na()].clone(), cur[self.c_na() + 1].clone());
+        let nb = (cur[self.c_nb()].clone(), cur[self.c_nb() + 1].clone());
+        let q = (cur[self.c_q()].clone(), cur[self.c_q() + 1].clone());
+        let t0 = emul(coeff0, (a.0.clone() - p0, a.1.clone()));
+        let t1 = emul(coeff1, (b.0.clone() - p1, b.1.clone()));
+        let t2 = emul(coeff2, (na.0 - b.0.clone(), na.1 - b.1.clone()));
+        let t3 = emul(coeff3, (nb.0 - a.0.clone() - b.0.clone(), nb.1 - a.1.clone() - b.1.clone()));
+        let t4 = emul(coeff4, (b.0.clone() - p2, b.1.clone()));
+        let rhs = emul(rhs_coeff, q);
+        let mut fr = builder.when_first_row();
+        fr.assert_zero(t0.0 + t1.0 + t2.0 + t3.0 + t4.0 - rhs.0);
+        fr.assert_zero(t0.1 + t1.1 + t2.1 + t3.1 + t4.1 - rhs.1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn build_general_epilogue_trace(local: [Challenge; 2], next: [Challenge; 2], quotient: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let w = 10;
+    let height = 16;
+    let mut r0 = vec![Val::ZERO; w];
+    r0[0..2].copy_from_slice(&cc(local[0]));
+    r0[2..4].copy_from_slice(&cc(local[1]));
+    r0[4..6].copy_from_slice(&cc(next[0]));
+    r0[6..8].copy_from_slice(&cc(next[1]));
+    r0[8..10].copy_from_slice(&cc(quotient));
+    let mut vals = Vec::with_capacity(height * w);
+    for _ in 0..height {
+        vals.extend_from_slice(&r0);
+    }
+    RowMajorMatrix::new(vals, w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -5998,6 +6113,34 @@ mod tests {
         let (_l1, _p1, e1) = query_input_merkle(&config, &proof, &pvs, 1);
         println!("counter per-query cap entries differ across q0/q1: {}", e0 != e1);
         assert!(cap_distinct && !const_distinct, "counter has distinct cap entries; ConstAir does not");
+    }
+
+    /// Phase 7.2: the in-circuit GENERAL OOD epilogue gadget reproduces p3's constraint check at ζ for the
+    /// MULTI-COLUMN FibonacciAir — it derives the three Lagrange selectors from ζ in-circuit and folds the 5
+    /// cross-column constraints (Horner α-fold), matching `fib_epilogue_oracle` (⟺ p3 verify_constraints), and
+    /// rejects a tampered quotient. The AIR-independent core (selector derivation + fold) the full multi-column
+    /// monolith fusion reuses; only the constraint SET is inner-AIR-specific.
+    #[test]
+    #[ignore = "slow: Phase 7.2 in-circuit general OOD epilogue gadget vs fib_epilogue_oracle"]
+    fn phase7_general_epilogue_matches_oracle() {
+        use super::{build_general_epilogue_trace, GeneralEpilogueAir};
+        use crate::recursion::native_fri::{fib_epilogue_oracle, gen_fib_proof};
+        use p3_field::BasedVectorSpace;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        let (local, next, _isf, _ist, _isl, _iv, quotient, alpha, zeta) = fib_epilogue_oracle(&config, &proof, &pvs);
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let (za, al) = (cc(zeta), cc(alpha));
+        let pis = vec![za[0], za[1], al[0], al[1], pvs[0], pvs[1], pvs[2]];
+        let air = GeneralEpilogueAir;
+        let trace = build_general_epilogue_trace(local, next, quotient);
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "in-circuit general epilogue == p3 constraint check at ζ (multi-column)");
+        // tampered quotient(ζ) ⇒ the OOD relation fails ⇒ reject.
+        let bad = build_general_epilogue_trace(local, next, quotient + Challenge::ONE);
+        let bp = prove(&config, &air, bad, &pis);
+        assert!(verify(&config, &air, &bp, &pis).is_err(), "tampered quotient ⇒ reject");
+        println!("Phase 7.2: in-circuit general OOD epilogue (multi-column Fibonacci, 5 constraints, 3 selectors) matches p3");
     }
 
     /// Phase 6.3+6.4: the in-circuit aggregation tx-root FOLD (`AggFoldAir`) emits exactly the reference
