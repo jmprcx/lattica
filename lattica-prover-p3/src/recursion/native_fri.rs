@@ -572,6 +572,71 @@ pub(crate) fn query_terms(
     (terms, x_out, alpha, ro)
 }
 
+/// Epilogue probe/oracle: the OOD constraint-check inputs + the recomposed quotient(ζ), plus p3's OWN
+/// Lagrange selectors at ζ on the real trace domain (the non-circular anchor for the in-circuit selector
+/// chain). Internally asserts the in-circuit recompose kernel `Σ_i zps_i·(c_{i,0}+c_{i,1}·X)` matches p3's
+/// `recompose_quotient_from_chunks` on SYNTHETIC non-trivial chunks (the constant proof's quotient is 0).
+/// Returns (degree_bits, nqc, chunk_lens, quotient(ζ), local, next, [chunks at ζ], α_stark, ζ,
+///          native_is_first, native_is_trans, native_inv_van).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn epilogue_oracle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+) -> (usize, usize, Vec<usize>, Challenge, Challenge, Challenge, Vec<Challenge>, Challenge, Challenge, Challenge, Challenge, Challenge) {
+    use p3_field::BasedVectorSpace;
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    // the ext generator element X (= 0 + 1·X); for the binomial ext with X²=W: c0 + c1·X in coords.
+    let x_gen = Challenge::from_basis_coefficients_fn(|i| if i == 1 { Val::ONE } else { Val::ZERO });
+    let (_, zeta_p, alpha_p, _, _) = full_transcript_challenges(config, proof, pvs);
+    let zeta = to_ext(zeta_p);
+    let alpha_stark = to_ext(alpha_p);
+    let air = ConstAir;
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
+    let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let layout = AirLayout::from_air::<Val>(&air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, 0);
+    let nqc = 1usize << log_nqc;
+    let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    let quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta);
+    // --- self-check the in-circuit recompose kernel against p3 on synthetic NON-TRIVIAL chunks ---
+    // zps_i = Π_{j≠i} (S_db − c_j)/(c_i − c_j), c_j = ζ^(2^db) − vanishing_j(ζ); chunk_i value = ch_{i,0}+ch_{i,1}·X.
+    let s_db = zeta.exp_power_of_2(degree_bits);
+    let c_ext: Vec<Challenge> = qcd.iter().map(|d| s_db - d.vanishing_poly_at_point(zeta)).collect();
+    {
+        let synth: Vec<Vec<Challenge>> = (0..nqc)
+            .map(|i| vec![Challenge::from_u64((7 * i + 3) as u64), Challenge::from_u64((11 * i + 5) as u64)])
+            .collect();
+        let native_r = recompose_quotient_from_chunks::<MyConfig>(&qcd, &synth, zeta);
+        let mut mine = Challenge::ZERO;
+        for i in 0..nqc {
+            let chunk_val = synth[i][0] + synth[i][1] * x_gen;
+            let mut zp = Challenge::ONE;
+            for j in 0..nqc {
+                if j != i {
+                    zp *= (s_db - c_ext[j]) * (c_ext[i] - c_ext[j]).inverse();
+                }
+            }
+            mine += zp * chunk_val;
+        }
+        assert_eq!(mine, native_r, "in-circuit recompose kernel matches p3 recompose_quotient_from_chunks");
+    }
+    let chunk_lens: Vec<usize> = proof.opened_values.quotient_chunks.iter().map(|v| v.len()).collect();
+    let local = proof.opened_values.trace_local[0];
+    let next = proof.opened_values.trace_next.as_ref().unwrap()[0];
+    let chunks: Vec<Challenge> = proof.opened_values.quotient_chunks.iter().flatten().copied().collect();
+    // p3's own selectors at ζ on the real trace domain — the anchor for the in-circuit selector chain.
+    let sel = trace_domain.selectors_at_point(zeta);
+    (
+        degree_bits, nqc, chunk_lens, quotient, local, next, chunks, alpha_stark, zeta,
+        sel.is_first_row, sel.is_transition, sel.inv_vanishing,
+    )
+}
+
 /// Per-query commit-phase oracle (Phase 3): mirrors `verify_query` for query `q`, returning the reduced
 /// opening e0 = ro, the per-round fold data `(sibling, β_r, bit, point s_r)` (bit = the arity-2 group slot
 /// of the running eval; s_r = g_{log+1}^reverse_bits(parent_index, log)), the resulting `folded_eval`, and
