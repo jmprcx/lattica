@@ -531,6 +531,105 @@ fn hiding_query_terms(
     Ok(reduced.into_iter().rev().map(|(lh, (_, ro))| (lh, ro)).collect())
 }
 
+/// The HIDING analog of monolith's `multicol_query_terms`: the per-query DEEP reduced-opening TERMS in the
+/// monolith's format — `(terms=[(z, p_z, p_x)], x, α_fri, ro)`. `p_z` is the MERGED opened value (public ‖
+/// codewords, Challenge), `p_x` the committed row felt (Val). Round order [random?, trace{ζ,ζ_next}, quotient
+/// chunks over randomized domains]; for a hiding ConstAir all input matrices share one height (log_global), so
+/// there is a single `x`. This is the arith-tile witness the in-circuit hiding monolith's reduced opening
+/// consumes; the count is much larger than the is_zk=0 case (random round + merged widths + 2× quotient).
+#[cfg(test)]
+fn hiding_multicol_query_terms(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+    q: usize,
+) -> (Vec<(Challenge, Challenge, Val)>, Val, Challenge, Challenge) {
+    use p3_field::PrimeField64;
+    let pcs = config.pcs();
+    let is_zk = config.is_zk();
+    let degree_bits = proof.degree_bits;
+    let (_a_stark, zeta, alpha_fri, _betas, index_felts) = hiding_transcript_challenges(config, proof, public_values);
+
+    // domains (mirror reverify): trace_domain (committed), init_trace_domain (constraint), randomized quotient.
+    let (_, degree) = validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).expect("degree bits");
+    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+    let layout = AirLayout::from_air::<Val>(&ConstAir);
+    let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&ConstAir, layout, is_zk);
+    let nqc = 1usize << (log_nqc + is_zk);
+    let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
+    let rqcd: Vec<_> = qd
+        .split_domains(nqc)
+        .iter()
+        .map(|d| <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk))
+        .collect();
+    let zeta_next = init_trace_domain.next_point(zeta).expect("next");
+
+    // merged coms (public ‖ codewords), round order [random?, trace{ζ,ζ_next}, quotient chunks].
+    let rand_cws = &proof.opening_proof.0;
+    let fri = &proof.opening_proof.1;
+    let ld_trace = degree_bits;
+    let mut rounds_um: Vec<Vec<(usize, Vec<(Challenge, Vec<Challenge>)>)>> = Vec::new();
+    if let Some(rv) = &proof.opened_values.random {
+        rounds_um.push(vec![(ld_trace, vec![(zeta, rv.clone())])]);
+    }
+    {
+        let mut pts = vec![(zeta, proof.opened_values.trace_local.clone())];
+        if let Some(tn) = &proof.opened_values.trace_next {
+            pts.push((zeta_next, tn.clone()));
+        }
+        rounds_um.push(vec![(ld_trace, pts)]);
+    }
+    rounds_um.push(
+        rqcd.iter()
+            .zip(&proof.opened_values.quotient_chunks)
+            .map(|(d, v)| (d.size().trailing_zeros() as usize, vec![(zeta, v.clone())]))
+            .collect(),
+    );
+    let mut merged: Vec<Vec<(usize, Vec<(Challenge, Vec<Challenge>)>)>> = Vec::new();
+    for (r, rmats) in rounds_um.iter().enumerate() {
+        let mut mr = Vec::new();
+        for (m, (ld, pts)) in rmats.iter().enumerate() {
+            let mut mp = Vec::new();
+            for (p, (z, vals)) in pts.iter().enumerate() {
+                let mut mv = vals.clone();
+                mv.extend_from_slice(&rand_cws[r][m][p]);
+                mp.push((*z, mv));
+            }
+            mr.push((*ld, mp));
+        }
+        merged.push(mr);
+    }
+
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+
+    // open_input's reduced-opening loop, capturing the terms (z, p_z_merged, p_x).
+    let input_proof = &fri.query_proofs[q].input_proof;
+    let mut terms = Vec::new();
+    let mut alpha_pow = Challenge::ONE;
+    let mut ro = Challenge::ZERO;
+    let mut x_out = Val::ZERO;
+    for (bo, mats) in input_proof.iter().zip(merged.iter()) {
+        for (mat_opening, (log_dom, mat_pts)) in bo.opened_values.iter().zip(mats.iter()) {
+            let log_height = log_dom + 4;
+            let bits_reduced = log_global - log_height;
+            let rev = reverse_bits_len(index >> bits_reduced, log_height);
+            let x = Val::GENERATOR * Val::two_adic_generator(log_height).exp_u64(rev as u64);
+            x_out = x;
+            for (z, ps_at_z) in mat_pts.iter() {
+                let inv = (*z - x).inverse();
+                for (&p_x, &p_z) in mat_opening.iter().zip(ps_at_z.iter()) {
+                    terms.push((*z, p_z, p_x));
+                    ro += alpha_pow * (p_z - p_x) * inv;
+                    alpha_pow *= alpha_fri;
+                }
+            }
+        }
+    }
+    (terms, x_out, alpha_fri, ro)
+}
+
 /// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
 /// hiding monolith's query region will reproduce). Replays the hiding transcript (random-commitment absorb +
 /// codeword-merged opened values, as in `hiding_transcript_challenges`), then per query computes the reduced
@@ -1028,5 +1127,53 @@ mod tests {
             assert_eq!(chs[3 + i], c(*b), "Sim β_{i} != challenger");
         }
         println!("hiding transcript Sim: {} blocks reproduce α_stark/ζ/α_fri/{} β_r vs the real challenger", blocks.len(), betas.len());
+    }
+
+    /// Native hiding monolith harness (#86, step 2): `hiding_multicol_query_terms` produces the per-query
+    /// reduced-opening TERMS (z, p_z, p_x) in the monolith's arith-tile format. Validated by folding their `ro`
+    /// to `final_poly` (reusing verify_query) for several queries — the fold reaches final_poly ONLY when the
+    /// terms are the true DEEP reduced opening (so this validates the terms extraction: random round + merged
+    /// codewords + 2× quotient over randomized domains). Reports the term count (≫ the is_zk=0 case).
+    #[test]
+    #[ignore = "slow: hiding per-query reduced-opening terms fold to final_poly"]
+    fn hiding_multicol_terms_fold_to_final() {
+        use p3_field::PrimeField64;
+        let config = make_config();
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        let perm = default_goldilocks_poseidon2_8();
+        let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::seed_from_u64(0));
+        let fri_params = FriParameters {
+            log_blowup: 4,
+            log_final_poly_len: 0,
+            max_log_arity: 4,
+            num_queries: 96,
+            commit_proof_of_work_bits: 0,
+            query_proof_of_work_bits: 16,
+            mmcs: ChallengeMmcs::new(val_mmcs),
+        };
+        let (_, _, alpha_fri, betas, index_felts) = hiding_transcript_challenges(&config, &proof, &pvs);
+        let fri = &proof.opening_proof.1;
+        let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+        let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> = TwoAdicFriFolding(core::marker::PhantomData);
+        let mut n_terms = 0;
+        for q in [0usize, 1, fri.query_proofs.len() - 1] {
+            let (terms, _x, alpha, ro) = hiding_multicol_query_terms(&config, &proof, &pvs, q);
+            assert_eq!(alpha, alpha_fri, "q{q}: terms use α_fri");
+            n_terms = terms.len();
+            // all hiding-ConstAir input matrices share one height (log_global) ⇒ ro seeds the fold at log_global.
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let mut di = index;
+            let qp = &fri.query_proofs[q];
+            let fold_data: Vec<CommitStep<'_, ChallengeMmcs>> = betas
+                .iter()
+                .zip(fri.commit_phase_commits.iter())
+                .zip(qp.commit_phase_openings.iter())
+                .map(|((&b, c), o)| CommitStep { beta: b, commit: c, opening: o })
+                .collect();
+            let folded = verify_query(&fri_params, &folding, &mut di, &fold_data, vec![(log_global, ro)], log_global, 4).expect("fold");
+            let x = final_query_point(di, log_global);
+            assert_eq!(eval_final_poly(&fri.final_poly, x), folded, "q{q}: terms' ro must fold to final_poly");
+        }
+        println!("hiding per-query terms: {n_terms} reduced-opening terms fold to final_poly (random round + merged codewords + 2× quotient) — the true reduced opening");
     }
 }
