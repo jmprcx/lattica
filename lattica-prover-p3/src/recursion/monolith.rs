@@ -2866,10 +2866,15 @@ const LOG_BLOWUP: usize = 4; // FRI rate (log); log_global = degree_bits + LOG_B
 const M_DEGREE_BITS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // inner-trace degree_bits (10 − 4 = 6)
 const CM_ROUNDS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // FRI commit rounds = folds to the rate floor = degree_bits
 const INPUT_DEPTH: usize = DP_LOG_HEIGHT - CM_CAP_HEIGHT; // input/quotient Merkle path depth to the cap (10 − 6 = 4)
-const M_INPUT_LEAF: usize = 1; // single-block leaf (inner W ≤ Poseidon rate here; the multi-block leaf is 7.9)
-const M_INPUT_TERM: usize = M_INPUT_LEAF + INPUT_DEPTH; // 1 + 4 = 5
+// LEAF_BLOCKS = ceil(W_inner / RATE) input-Merkle leaf-hash blocks; QUOT_LEAF_BLOCKS = ceil(2·nqc / RATE)
+// quotient-Merkle leaf blocks. Both 1 here (the current inners are W ≤ RATE, nqc = 1); a wide/high-degree
+// inner (e.g. join-split W=19/nqc=8 → 5/4) re-pins these, and the layout below follows (multi-block leaf: 7.9).
+const LEAF_BLOCKS: usize = 1;
+const QUOT_LEAF_BLOCKS: usize = 1;
+const M_INPUT_LEAF: usize = 1; // first input-leaf block; the leaf spans M_INPUT_LEAF .. +LEAF_BLOCKS
+const M_INPUT_TERM: usize = M_INPUT_LEAF + (LEAF_BLOCKS - 1) + INPUT_DEPTH; // 1 + 0 + 4 = 5
 const M_QUOT_LEAF: usize = M_INPUT_TERM + 1; // 6
-const M_QUOT_TERM: usize = M_QUOT_LEAF + INPUT_DEPTH; // 6 + 4 = 10 (single-block quotient leaf, nqc = 1)
+const M_QUOT_TERM: usize = M_QUOT_LEAF + (QUOT_LEAF_BLOCKS - 1) + INPUT_DEPTH; // 6 + 0 + 4 = 10
 // commit round r folds the codeword to log-height DP_LOG_HEIGHT−(r+1); its Merkle path is that many levels
 // above the cap (0 once the codeword ≤ 2^cap_height). depths at db=6: [3,2,1,0,0,0]. Parameterized by
 // (log_global, cap) so the formula is validated at other configs (see `commit_layout_generalizes`).
@@ -2916,12 +2921,12 @@ const M_PERIOD: usize = M_NBLOCKS * BLOCK; // db=6: 736
 // and generalizes to other depths (see `commit_layout_generalizes`); the monolith itself uses the consts.
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
-fn commit_layout(log_global: usize, cap: usize, log_blowup: usize) -> (usize, usize, Vec<usize>, Vec<usize>, usize) {
+fn commit_layout(log_global: usize, cap: usize, log_blowup: usize, leaf_blocks: usize, quot_leaf_blocks: usize) -> (usize, usize, usize, usize, Vec<usize>, Vec<usize>, usize) {
     let cm_rounds = log_global - log_blowup;
     let input_depth = log_global - cap;
-    let m_input_term = M_INPUT_LEAF + input_depth;
+    let m_input_term = M_INPUT_LEAF + (leaf_blocks - 1) + input_depth; // multi-block input leaf + path
     let m_quot_leaf = m_input_term + 1;
-    let m_quot_term = m_quot_leaf + input_depth;
+    let m_quot_term = m_quot_leaf + (quot_leaf_blocks - 1) + input_depth; // multi-block quotient leaf + path
     let (mut leaf, mut term) = (Vec::with_capacity(cm_rounds), Vec::with_capacity(cm_rounds));
     let mut blk = m_quot_term + 1;
     for r in 0..cm_rounds {
@@ -2931,7 +2936,7 @@ fn commit_layout(log_global: usize, cap: usize, log_blowup: usize) -> (usize, us
         blk += d + 1;
     }
     let m_nblocks = term[cm_rounds - 1] + 1;
-    (cm_rounds, input_depth, leaf, term, m_nblocks)
+    (cm_rounds, input_depth, m_input_term, m_quot_term, leaf, term, m_nblocks)
 }
 
 /// Max inner proofs the tiled aggregator folds in ONE outer proof, mirroring `batch_joinsplit_air::
@@ -6780,23 +6785,29 @@ mod tests {
         assert_eq!((M_NBLOCKS, M_PERIOD), (23, 736));
     }
 
-    /// Demonstrates the geometry is genuinely CONFIGURABLE: the runtime layout twin matches the compile-time
-    /// consts at db=6, and the SAME formula yields a correct (single-block-leaf/nqc=1 baseline) layout at
-    /// db=12 (log_global=16) — the FRI-depth re-pin target. So re-pinning is changing DP_LOG_HEIGHT, not
-    /// rewriting the layout. (A full db=12 join-split additionally needs multi-block leaves + nqc>1.)
+    /// Demonstrates the geometry is genuinely CONFIGURABLE across ALL its parameters — FRI depth AND the
+    /// leaf-block / nqc dimensions. The runtime layout twin matches the compile-time consts at the milestone,
+    /// and the SAME formula yields the full REAL join-split super-tile layout (db=12, W=19 → 5 leaf blocks,
+    /// nqc=8 → 4 quotient-leaf blocks). So re-pinning to a join-split is choosing (log_global, leaf_blocks,
+    /// quot_leaf_blocks) — the layout follows; the remaining work is the eval/build loops that USE >1
+    /// leaf-block / nqc (the re-pin's eval side).
     #[test]
     fn commit_layout_generalizes() {
         use super::{cm_depth_at, commit_layout, CM_LEAF, CM_TERM, M_NBLOCKS};
-        // db=6: the runtime twin == the compile-time consts (single source of truth, no drift).
-        let (rounds, id, leaf, term, nb) = commit_layout(10, 6, 4);
-        assert_eq!((rounds, id, nb), (6, 4, M_NBLOCKS));
+        // milestone (db=6, single-block leaf, nqc=1): the runtime twin == the compile-time consts (no drift).
+        let (rounds, id, m_input_term, m_quot_term, leaf, term, nb) = commit_layout(10, 6, 4, 1, 1);
+        assert_eq!((rounds, id, m_input_term, m_quot_term, nb), (6, 4, 5, 10, M_NBLOCKS));
         assert_eq!((leaf, term), (CM_LEAF.to_vec(), CM_TERM.to_vec()));
-        // db=12 (log_global=16): the SAME formula → CM_ROUNDS=12, depths [9,8,…,0], 80 blocks.
-        let (rounds, id, leaf, term, nb) = commit_layout(16, 6, 4);
-        assert_eq!((rounds, id, nb), (12, 10, 80));
+        // FRI-depth only (db=12, still single-block leaf/nqc=1): 12 rounds, depths [9,…,0].
+        let (rounds, ..) = commit_layout(16, 6, 4, 1, 1);
+        assert_eq!(rounds, 12);
         assert_eq!((cm_depth_at(0, 16, 6), cm_depth_at(9, 16, 6), cm_depth_at(11, 16, 6)), (9, 0, 0));
-        assert_eq!((leaf[0], *leaf.last().unwrap(), *term.last().unwrap()), (23, 79, 79));
-        println!("geometry configurable: db=6 → 23 blocks/6 rounds (== consts); db=12 → 80 blocks/12 rounds (same formula)");
+        // the REAL join-split super-tile: db=12, W=19 → ceil(19/4)=5 leaf blocks, nqc=8 → ceil(16/4)=4 quot blocks.
+        let (rounds, id, m_input_term, m_quot_term, leaf, term, nb) = commit_layout(16, 6, 4, 5, 4);
+        assert_eq!((rounds, id), (12, 10));
+        assert_eq!((m_input_term, m_quot_term), (15, 29)); // input leaf(5)+path(10); quot leaf(4)+path(10)
+        assert_eq!((leaf[0], *leaf.last().unwrap(), *term.last().unwrap(), nb), (30, 86, 86, 87));
+        println!("geometry configurable across all params: milestone → 23 blocks/6 rounds (== consts); real join-split (db=12/W=19/nqc=8) → 87 blocks/12 rounds (same formula)");
     }
 
     #[test]
