@@ -783,6 +783,38 @@ fn hiding_query_commit_merkle_all(
     out
 }
 
+/// The HIDING analog of epilogue_openings (for ConstAir): the OOD-constraint witness — trace openings,
+/// selectors, recomposed quotient(ζ), α_stark, ζ, periodic values. The is_zk=1 deltas: the selectors and
+/// periodic columns are evaluated on the HALVED constraint domain init_trace_domain = degree>>is_zk (z_h uses
+/// degree_bits−is_zk), and the quotient is recomposed over the is_zk-aware split domains (nqc = 1<<(log+is_zk)).
+/// This is the epilogue witness the monolith's OOD region consumes; validated via p3's verify_constraints.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+fn hiding_epilogue_openings(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+) -> (Vec<Challenge>, Vec<Challenge>, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Vec<Challenge>) {
+    let air = ConstAir;
+    let (alpha_stark, zeta, _, _, _) = hiding_transcript_challenges(config, proof, public_values);
+    let pcs = config.pcs();
+    let is_zk = config.is_zk();
+    let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
+    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+    let layout = AirLayout::from_air::<Val>(&air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, is_zk);
+    let nqc = 1usize << (log_nqc + is_zk);
+    let qd = trace_domain.create_disjoint_domain(1 << (proof.degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    let quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta);
+    let local = proof.opened_values.trace_local.clone();
+    let next = proof.opened_values.trace_next.clone().unwrap_or_default();
+    let sel = init_trace_domain.selectors_at_point(zeta);
+    let periodic: Vec<Challenge> = air.periodic_columns().iter().map(|c| init_trace_domain.evaluate_periodic_column_at(c, zeta)).collect();
+    (local, next, sel.is_first_row, sel.is_last_row, sel.is_transition, sel.inv_vanishing, quotient, alpha_stark, zeta, periodic)
+}
+
 /// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
 /// hiding monolith's query region will reproduce). Replays the hiding transcript (random-commitment absorb +
 /// codeword-merged opened values, as in `hiding_transcript_challenges`), then per query computes the reduced
@@ -1436,5 +1468,40 @@ mod tests {
             }
         }
         println!("hiding commit-phase Merkle: {n_rounds} rounds of salted MyHash(group ‖ salt) + path fold to each round's cap");
+    }
+
+    /// Native hiding monolith harness (#86, step 7 — the last witness piece): the OOD-constraint epilogue.
+    /// hiding_epilogue_openings packages the trace openings + HALVED-domain selectors + recomposed quotient(ζ)
+    /// + α_stark/ζ; p3's verify_constraints on init_trace_domain (degree>>is_zk) must accept — i.e., the OOD
+    /// relation holds at the extracted challenges. A tampered quotient(ζ) must fail (guards a vacuous check).
+    #[test]
+    #[ignore = "slow: hiding epilogue openings pass verify_constraints on the halved domain"]
+    fn hiding_epilogue_openings_pass_verify_constraints() {
+        let config = make_config();
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        assert!(reverify(&config, &proof, &pvs).is_ok(), "sanity: hiding proof valid");
+        let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, zeta, periodic) =
+            hiding_epilogue_openings(&config, &proof, &pvs);
+        let air = ConstAir;
+        let pcs = config.pcs();
+        let is_zk = config.is_zk();
+        let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
+        let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+        // sanity: the packaged selectors are exactly the halved-domain selectors at ζ.
+        let sel = init_trace_domain.selectors_at_point(zeta);
+        assert_eq!((is_first, is_last, is_trans, inv_van), (sel.is_first_row, sel.is_last_row, sel.is_transition, sel.inv_vanishing));
+        verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
+            &air, &local, &next, None, None, &periodic, &pvs, init_trace_domain, zeta, alpha, quotient,
+        )
+        .expect("hiding epilogue openings must satisfy the OOD constraint relation");
+        // tamper: wrong quotient(ζ) ⇒ reject.
+        assert!(
+            verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
+                &air, &local, &next, None, None, &periodic, &pvs, init_trace_domain, zeta, alpha, quotient + Challenge::ONE,
+            )
+            .is_err(),
+            "a tampered quotient(ζ) must fail the OOD relation"
+        );
+        println!("hiding epilogue: OOD openings (halved domain, is_zk-recomposed quotient) satisfy verify_constraints");
     }
 }
