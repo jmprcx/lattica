@@ -905,6 +905,63 @@ pub(crate) fn general_fold_oracle(
     out
 }
 
+/// GENERAL-ARITY fold CHAIN oracle (Phase 5 re-fusion): the full commit-phase fold for query `q` as the
+/// monolith runs it — the initial reduced opening `ro`, then per round `(evals, beta, xs, slot, folded)`
+/// where `slot = index % arity` is the running eval's position in the group, and finally `final_poly[0]`
+/// (the accept value the chain must reach: for final_poly_len=1, `eval_final_poly` is that constant). This
+/// is the reference for the in-circuit arity-2^la fold chain E_0=ro → E_1 → … → E_N == final_poly[0].
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn general_fold_chain_oracle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> (Challenge, Vec<(Vec<Challenge>, Challenge, Vec<Val>, usize, Challenge)>, Challenge) {
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_fri::FriFoldingStrategy;
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (_, _, _, betas_p, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let betas: Vec<Challenge> = betas_p.iter().map(|&p| to_ext(p)).collect();
+    let (_, _, _, ro) = query_terms(config, proof, pvs, q);
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let mut index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let mut e = ro;
+    let mut log_current = log_global;
+    let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> = TwoAdicFriFolding(core::marker::PhantomData);
+    let mut out = Vec::new();
+    for (r, step) in fri.query_proofs[q].commit_phase_openings.iter().enumerate() {
+        let la = step.log_arity as usize;
+        let arity = 1usize << la;
+        let slot = index % arity;
+        let mut evals = Challenge::zero_vec(arity);
+        evals[slot] = e;
+        let mut sib = 0;
+        for (j, ev) in evals.iter_mut().enumerate() {
+            if j != slot {
+                *ev = step.sibling_values[sib];
+                sib += 1;
+            }
+        }
+        let log_folded = log_current - la;
+        index >>= la;
+        let subgroup_start = Val::two_adic_generator(log_folded + la).exp_u64(reverse_bits_len(index, log_folded) as u64);
+        let g_la = Val::two_adic_generator(la);
+        let mut xs: Vec<Val> = (0..arity).map(|i| subgroup_start * g_la.exp_u64(i as u64)).collect();
+        reverse_slice_index_bits(&mut xs);
+        let folded = <TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> as FriFoldingStrategy<Val, Challenge>>::fold_row(
+            &folding, index, log_folded, la, betas[r], evals.iter().copied(),
+        );
+        out.push((evals.clone(), betas[r], xs, slot, folded));
+        e = folded;
+        log_current = log_folded;
+    }
+    // final_poly_len = 1 for the milestone ⇒ eval_final_poly(x) = final_poly[0] (constant); the chain's last
+    // folded eval must equal it (the native `eval_final_poly(final_query_point) == folded` accept check).
+    (ro, out, fri.final_poly[0])
+}
+
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
 /// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
 /// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify

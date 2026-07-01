@@ -3877,6 +3877,174 @@ pub(crate) fn build_general_leaf_trace(n_felts: usize, group: &[Val], leaf: [Val
     RowMajorMatrix::new(t, W)
 }
 
+// =================================================================================================
+// Phase 5 re-fusion — the arity-4 fold CHAIN. The monolith's arity-2 fold does 6 rounds of the 2-point
+// formula; at arity-4 it does 3 rounds of the barycentric 4-point fold (fewer, wider rounds → a smaller
+// commit-phase super-tile). This AIR carries the running eval E across the chain E_0=ro → E_1 → … → E_N,
+// each step the general-arity fold over the 4-eval group {E_r, siblings} (slotted at index%4 via the 2
+// round bits), and checks the chain reaches final_poly[0] — the fused fold behavior the arity-4 monolith
+// needs. The 4 group evals are witness (authenticated by the commit-phase Merkle in the full monolith);
+// here the tie E_r == evals[slot] + the barycentric fold are validated vs p3's fold_row (general_fold_chain).
+// =================================================================================================
+const A4_E: usize = 0; // running eval (carried), 2 felts
+const A4_EVALS: usize = 2; // the 4-eval group, 4 ext = 8 felts
+const A4_B0: usize = 10;
+const A4_B1: usize = 11;
+const A4_BETA: usize = 12;
+const A4_XS: usize = 14; // 4 base coset points
+const A4_INV: usize = 18; // 4 ext inverses of (β − xs_i)
+const A4_WSCALE: usize = 26;
+const A4_W: usize = 27;
+#[allow(dead_code)]
+pub(crate) struct Arity4FoldChainAir {
+    pub n_rounds: usize,
+}
+#[allow(dead_code)]
+impl Arity4FoldChainAir {
+    fn height(&self) -> usize {
+        (self.n_rounds + 1).next_power_of_two().max(2)
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut fold = vec![Val::ZERO; h];
+        for r in 0..self.n_rounds {
+            fold[r] = Val::ONE;
+        }
+        let mut fin = vec![Val::ZERO; h];
+        fin[self.n_rounds] = Val::ONE;
+        vec![fold, fin]
+    }
+}
+impl BaseAir<Goldilocks> for Arity4FoldChainAir {
+    fn width(&self) -> usize {
+        A4_W
+    }
+    fn num_public_values(&self) -> usize {
+        4 // ro (2) + final_poly[0] (2)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        2
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Arity4FoldChainAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let p_fold = p[0].clone();
+        let p_fin = p[1].clone();
+        let ev = |i: usize| (cur[A4_EVALS + 2 * i].clone(), cur[A4_EVALS + 2 * i + 1].clone());
+        // E_0 == ro
+        builder.when_first_row().assert_zero(cur[A4_E].clone() - pis[0].clone());
+        builder.when_first_row().assert_zero(cur[A4_E + 1].clone() - pis[1].clone());
+        // fold rows: slot bits, the running eval sits at slot, the barycentric fold → E_{r+1}.
+        let b0 = cur[A4_B0].clone();
+        let b1 = cur[A4_B1].clone();
+        builder.assert_zero(p_fold.clone() * (b0.clone() * (one.clone() - b0.clone())));
+        builder.assert_zero(p_fold.clone() * (b1.clone() * (one.clone() - b1.clone())));
+        let sel = [
+            (one.clone() - b0.clone()) * (one.clone() - b1.clone()),
+            b0.clone() * (one.clone() - b1.clone()),
+            (one.clone() - b0.clone()) * b1.clone(),
+            b0.clone() * b1.clone(),
+        ];
+        // E == Σ sel_j · evals[j]  (the running eval occupies group slot = b0 + 2·b1)
+        let mut e_slot = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for j in 0..4 {
+            let e = ev(j);
+            e_slot = (e_slot.0 + sel[j].clone() * e.0, e_slot.1 + sel[j].clone() * e.1);
+        }
+        builder.assert_zero(p_fold.clone() * (cur[A4_E].clone() - e_slot.0));
+        builder.assert_zero(p_fold.clone() * (cur[A4_E + 1].clone() - e_slot.1));
+        // barycentric fold: L(β)·Σ_i y_i·(x_i·wscale)·inv_i, with inv_i·(β−x_i)==1, wscale·(4·x_0^4)==1.
+        let beta = (cur[A4_BETA].clone(), cur[A4_BETA + 1].clone());
+        let mut lz = (one.clone(), AB::Expr::ZERO);
+        for i in 0..4 {
+            let d = (beta.0.clone() - cur[A4_XS + i].clone(), beta.1.clone());
+            let inv = (cur[A4_INV + 2 * i].clone(), cur[A4_INV + 2 * i + 1].clone());
+            let chk = emul(inv, d.clone());
+            builder.assert_zero(p_fold.clone() * (chk.0 - one.clone()));
+            builder.assert_zero(p_fold.clone() * chk.1);
+            lz = emul(lz, d);
+        }
+        let cp = {
+            let x = cur[A4_XS].clone();
+            let x2 = x.clone() * x;
+            x2.clone() * x2
+        };
+        let wscale = cur[A4_WSCALE].clone();
+        builder.assert_zero(p_fold.clone() * (wscale.clone() * (AB::Expr::from(Goldilocks::from_usize(4)) * cp) - one.clone()));
+        let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for i in 0..4 {
+            let y = ev(i);
+            let inv = (cur[A4_INV + 2 * i].clone(), cur[A4_INV + 2 * i + 1].clone());
+            let scal = cur[A4_XS + i].clone() * wscale.clone();
+            let t = emul(y, inv);
+            acc = (acc.0 + t.0 * scal.clone(), acc.1 + t.1 * scal);
+        }
+        let res = emul(lz, acc);
+        // chain: next row's E == this round's folded result.
+        builder.when_transition().assert_zero(p_fold.clone() * (nxt[A4_E].clone() - res.0));
+        builder.when_transition().assert_zero(p_fold * (nxt[A4_E + 1].clone() - res.1));
+        // accept: after N folds, E == final_poly[0].
+        builder.assert_zero(p_fin.clone() * (cur[A4_E].clone() - pis[2].clone()));
+        builder.assert_zero(p_fin * (cur[A4_E + 1].clone() - pis[3].clone()));
+    }
+}
+
+#[allow(dead_code)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_arity4_fold_chain_trace(
+    n_rounds: usize,
+    ro: Challenge,
+    rounds: &[(Vec<Challenge>, Challenge, Vec<Val>, usize, Challenge)],
+    final0: Challenge,
+) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let air = Arity4FoldChainAir { n_rounds };
+    let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * A4_W];
+    let mut e = ro;
+    for (r, (evals, beta, xs, slot, folded)) in rounds.iter().enumerate() {
+        let base = r * A4_W;
+        let ec = c(e);
+        t[base + A4_E] = ec[0];
+        t[base + A4_E + 1] = ec[1];
+        for i in 0..4 {
+            let vc = c(evals[i]);
+            t[base + A4_EVALS + 2 * i] = vc[0];
+            t[base + A4_EVALS + 2 * i + 1] = vc[1];
+            t[base + A4_XS + i] = xs[i];
+            let inv = c((*beta - Challenge::from(xs[i])).inverse());
+            t[base + A4_INV + 2 * i] = inv[0];
+            t[base + A4_INV + 2 * i + 1] = inv[1];
+        }
+        t[base + A4_B0] = Val::from_u64((slot & 1) as u64);
+        t[base + A4_B1] = Val::from_u64(((slot >> 1) & 1) as u64);
+        let bc = c(*beta);
+        t[base + A4_BETA] = bc[0];
+        t[base + A4_BETA + 1] = bc[1];
+        t[base + A4_WSCALE] = (Val::from_usize(4) * xs[0].exp_power_of_2(2)).inverse();
+        e = *folded;
+    }
+    let ec = c(e); // == final0 after the last fold
+    t[n_rounds * A4_W + A4_E] = ec[0];
+    t[n_rounds * A4_W + A4_E + 1] = ec[1];
+    let _ = final0;
+    RowMajorMatrix::new(t, A4_W)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -5000,6 +5168,37 @@ mod tests {
             }
         }
         println!("Phase 5: general-arity commit leaf hash (2-block sponge) validated vs MyHash — {checked} groups");
+    }
+
+    /// Phase 5 re-fusion: the in-circuit arity-4 fold CHAIN carries E_0=ro through 3 barycentric folds and
+    /// reaches final_poly[0] — the fused fold behavior the arity-4 monolith needs. Validated vs p3's fold_row
+    /// chain (general_fold_chain_oracle); rejects a tampered accept value.
+    #[test]
+    #[ignore = "slow: Phase 5 re-fusion arity-4 fold chain → final_poly"]
+    fn phase5_arity4_fold_chain_reaches_final() {
+        use super::{build_arity4_fold_chain_trace, Arity4FoldChainAir};
+        use crate::recursion::native_fri::general_fold_chain_oracle;
+        use p3_field::BasedVectorSpace;
+        let config = make_config(2, MILESTONE_QUERIES); // arity-4
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let pcfg = make_config(1, MILESTONE_QUERIES);
+        let mut checked = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES / 3, MILESTONE_QUERIES - 1] {
+            let (ro, rounds, final0) = general_fold_chain_oracle(&config, &proof, &pvs, q);
+            assert_eq!(rounds.len(), 3, "arity-4 ⇒ 3 fold rounds");
+            let air = Arity4FoldChainAir { n_rounds: rounds.len() };
+            let roc: [Val; 2] = ro.as_basis_coefficients_slice().try_into().unwrap();
+            let fc: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+            let pis = vec![roc[0], roc[1], fc[0], fc[1]];
+            let trace = build_arity4_fold_chain_trace(rounds.len(), ro, &rounds, final0);
+            let prf = prove(&pcfg, &air, trace, &pis);
+            assert!(verify(&pcfg, &air, &prf, &pis).is_ok(), "arity-4 fold chain reaches final_poly (q {q})");
+            let mut bad = pis.clone();
+            bad[2] += Val::ONE;
+            assert!(verify(&pcfg, &air, &prf, &bad).is_err(), "tampered accept ⇒ reject (q {q})");
+            checked += 1;
+        }
+        println!("Phase 5 re-fusion: arity-4 fold chain (3 barycentric rounds) reaches final_poly — {checked} queries");
     }
 
     #[test]
