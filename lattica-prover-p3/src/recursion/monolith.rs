@@ -2880,6 +2880,11 @@ pub(crate) struct MonolithAir {
     pub index_binds: Vec<(usize, usize)>,
     pub n_queries: usize,
     pub n_terms: usize,
+    /// When true the inner AIR is the NON-degenerate `CounterAir` (`next = cur + 1`): the OOD epilogue uses
+    /// the `−1` transition and each opening's Merkle terminal is the index-selected cap entry carried per
+    /// super-tile (the counter's 64 cap entries differ per query), rather than ConstAir's single shared cap.
+    /// `false` keeps the exact validated ConstAir path (phase4d) untouched.
+    pub inner_counter: bool,
 }
 
 #[allow(dead_code)]
@@ -2934,8 +2939,37 @@ impl MonolithAir {
     fn cg(&self, r: usize, k: usize) -> usize {
         self.ov() + 3 + 4 * r + k // commit-phase group carriers: 6 rounds × 4 felts (the fold group {e_r, sib_r})
     }
+    // counter mode only: per-super-tile cap-entry carriers (8 openings × 4 felts) — the index-selected cap
+    // entry (input, quotient, 6 commit rounds), seeded at the arith head, held to each opening's terminal.
+    fn cap_c(&self, g: usize) -> usize {
+        self.ov() + 3 + 4 * CM_ROUNDS + g // g: input 0..4, quotient 4..8, commit r 8+4r..8+4r+4
+    }
+    fn n_cap_c(&self) -> usize {
+        (2 + CM_ROUNDS) * 4 // input + quotient + 6 commit = 8 entries × 4 = 32
+    }
+    // pis cap layout — per-query (stride n_queries·4) in counter mode, single (stride 4) for ConstAir. For
+    // ConstAir these give the exact current offsets (cap, cap+4, cap+8, cap+9).
+    fn cap_stride(&self) -> usize {
+        if self.inner_counter {
+            self.n_queries * 4
+        } else {
+            4
+        }
+    }
+    fn cap_base(&self) -> usize {
+        2 * self.nb() + self.ni() + 2 // after challenges + index felts + final_poly[0]
+    }
+    fn qcap_base(&self) -> usize {
+        self.cap_base() + self.cap_stride()
+    }
+    fn pub_pi(&self) -> usize {
+        self.qcap_base() + self.cap_stride()
+    }
+    fn ccap_base(&self) -> usize {
+        self.pub_pi() + 1
+    }
     fn fused_w(&self) -> usize {
-        self.ov() + 3 + 4 * CM_ROUNDS // ov(1) + qc(2) + cg(6×4)
+        self.ov() + 3 + 4 * CM_ROUNDS + if self.inner_counter { self.n_cap_c() } else { 0 }
     }
     // Merkle columns overlay the arith Poseidon lanes on the Merkle rows (disjoint rows).
     fn m_sib(&self) -> usize {
@@ -3098,7 +3132,8 @@ impl BaseAir<Goldilocks> for MonolithAir {
         self.fused_w()
     }
     fn num_public_values(&self) -> usize {
-        2 * self.nb() + self.ni() + 2 + 4 + 4 + 1 + 4 * CM_ROUNDS // + inner pub value + 6 commit-phase cap entries
+        // challenges + indices + final_poly[0] + trace/quot/commit caps (per-query in counter mode) + pub value
+        self.ccap_base() + if self.inner_counter { self.n_queries * (CM_ROUNDS * 4) } else { CM_ROUNDS * 4 }
     }
     fn num_periodic_columns(&self) -> usize {
         self.c_term(CM_ROUNDS - 1) + 1
@@ -3317,14 +3352,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let p1 = emul(z_h.clone(), alpha_stark); // z_h·α
             let p2 = emul(is_trans, zm1.clone()); // is_trans·(ζ−1)
             let p3v = emul(z_h, zm1); // z_h·(ζ−1)
-            let pub_val = pis[cap + 8].clone(); // inner public value (base; embeds as (pub, 0))
+            let pub_val = pis[self.pub_pi()].clone(); // inner public value (base; embeds as (pub, 0))
             let local = gg(self.pz(0));
             let next = gg(self.pz(1));
             let c0 = gg(self.pz(2));
             let c1 = gg(self.pz(3));
             let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone()); // c0 + c1·X
             let lm = (local.0.clone() - pub_val, local.1.clone()); // local − pub
-            let nl = (next.0 - local.0, next.1 - local.1); // next − local
+            // transition constant: ConstAir is `next − cur`; CounterAir is `next − cur − 1`.
+            let trans_const = if self.inner_counter { one.clone() } else { AB::Expr::ZERO };
+            let nl = (next.0 - local.0 - trans_const, next.1 - local.1); // next − local (− 1 for counter)
             let t1 = emul(p1, lm);
             let t2 = emul(p2, nl);
             let rhs = emul(p3v, quot);
@@ -3413,17 +3450,60 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // input terminal (block 5) == trace cap entry; quotient terminal (block 10) == quotient cap entry.
         let term = p[self.m_term()].clone();
         let qterm = p[self.q_term()].clone();
-        let qcap = cap + 4;
-        for k in 0..4 {
-            builder.assert_zero(term.clone() * (cur[k].clone() - pis[cap + k].clone()));
-            builder.assert_zero(qterm.clone() * (cur[k].clone() - pis[qcap + k].clone()));
-        }
-        // commit-phase terminals: each round's path terminal == the committed round cap entry.
-        let ccap = cap + 9; // after trace cap (4) + quotient cap (4) + inner pub (1)
-        for r in 0..CM_ROUNDS {
-            let ct = p[self.c_term(r)].clone();
+        if self.inner_counter {
+            // COUNTER: the inner trace is non-constant so cap entries DIFFER per query — each terminal equals
+            // the query's index-selected cap entry, carried per super-tile (seeded at the arith head from the
+            // per-query cap pis via the p_query one-hots, held to the terminals).
             for k in 0..4 {
-                builder.assert_zero(ct.clone() * (cur[k].clone() - pis[ccap + 4 * r + k].clone()));
+                builder.assert_zero(term.clone() * (cur[k].clone() - cur[self.cap_c(k)].clone())); // input
+                builder.assert_zero(qterm.clone() * (cur[k].clone() - cur[self.cap_c(4 + k)].clone())); // quotient
+            }
+            for r in 0..CM_ROUNDS {
+                let ct = p[self.c_term(r)].clone();
+                for k in 0..4 {
+                    builder.assert_zero(ct.clone() * (cur[k].clone() - cur[self.cap_c(8 + 4 * r + k)].clone()));
+                }
+            }
+            // hold the cap carriers across the super-tile; seed them at the arith head (M_TF) from the q-th
+            // per-query cap pis (Σ_q p_query(q)·pis[…]).
+            let hold = p[self.s_query()].clone() * (one.clone() - p[self.p_st_last()].clone());
+            for g in 0..self.n_cap_c() {
+                builder.when_transition().assert_zero(hold.clone() * (nxt[self.cap_c(g)].clone() - cur[self.cap_c(g)].clone()));
+            }
+            let (cb, qb, cc) = (self.cap_base(), self.qcap_base(), self.ccap_base());
+            for k in 0..4 {
+                let mut sel_tr = AB::Expr::ZERO;
+                let mut sel_q = AB::Expr::ZERO;
+                for q in 0..self.n_queries {
+                    let pq = p[self.p_query(q)].clone();
+                    sel_tr = sel_tr + pq.clone() * pis[cb + q * 4 + k].clone();
+                    sel_q = sel_q + pq * pis[qb + q * 4 + k].clone();
+                }
+                builder.assert_zero(tf.clone() * (cur[self.cap_c(k)].clone() - sel_tr));
+                builder.assert_zero(tf.clone() * (cur[self.cap_c(4 + k)].clone() - sel_q));
+            }
+            for r in 0..CM_ROUNDS {
+                for k in 0..4 {
+                    let mut sel_c = AB::Expr::ZERO;
+                    for q in 0..self.n_queries {
+                        sel_c = sel_c + p[self.p_query(q)].clone() * pis[cc + q * (CM_ROUNDS * 4) + r * 4 + k].clone();
+                    }
+                    builder.assert_zero(tf.clone() * (cur[self.cap_c(8 + 4 * r + k)].clone() - sel_c));
+                }
+            }
+        } else {
+            // ConstAir: all cap entries equal → a single shared cap entry per opening (the validated path).
+            let qcap = self.qcap_base();
+            let ccap = self.ccap_base();
+            for k in 0..4 {
+                builder.assert_zero(term.clone() * (cur[k].clone() - pis[cap + k].clone()));
+                builder.assert_zero(qterm.clone() * (cur[k].clone() - pis[qcap + k].clone()));
+            }
+            for r in 0..CM_ROUNDS {
+                let ct = p[self.c_term(r)].clone();
+                for k in 0..4 {
+                    builder.assert_zero(ct.clone() * (cur[k].clone() - pis[ccap + 4 * r + k].clone()));
+                }
             }
         }
     }
@@ -3564,6 +3644,7 @@ pub(crate) fn monolith_build_trace(
         for (l, &(sib, b)) in path.iter().enumerate() {
             node = merge_block(&mut t, off, M_INPUT_LEAF + 1 + l, node, sib, b);
         }
+        let trace_cap_entry = node; // the input-Merkle terminal == the query's selected trace cap entry
         // inline quotient-Merkle: leaf-hash (block M_QUOT_LEAF) absorbs the 2-felt quotient row; then 4 merges.
         let qc0 = terms[2].2;
         let qc1 = terms[3].2;
@@ -3579,8 +3660,10 @@ pub(crate) fn monolith_build_trace(
         for (l, &(sib, b)) in quot_paths[q].iter().enumerate() {
             qnode = merge_block(&mut t, off, M_QUOT_LEAF + 1 + l, qnode, sib, b);
         }
+        let quot_cap_entry = qnode; // the quotient-Merkle terminal == the selected quotient cap entry
         // inline commit-phase Merkle: 6 rounds, each a leaf-hash (absorb the bit-ordered fold group) + `depth`
         // merges, authenticating every fold sibling to commit_phase_commits[r].
+        let mut commit_cap_entries = [[Val::ZERO; 4]; CM_ROUNDS];
         for (r, (group, _leaf, cpath, _cap)) in commit_data[q].iter().enumerate() {
             let mut cinput = [Val::ZERO; W];
             cinput[..4].copy_from_slice(group);
@@ -3593,8 +3676,10 @@ pub(crate) fn monolith_build_trace(
             for (l, &(sib, b)) in cpath.iter().enumerate() {
                 cnode = merge_block(&mut t, off, CM_LEAF[r] + 1 + l, cnode, sib, b);
             }
+            commit_cap_entries[r] = cnode; // this round's commit-Merkle terminal == the selected commit cap
         }
-        // carriers held within this super-tile: opened value v + the quotient row [qc0, qc1] + the 6 fold groups.
+        // carriers held within this super-tile: opened value v + the quotient row [qc0, qc1] + the 6 fold groups
+        // (+ the 8 per-query cap-entry carriers when verifying a non-degenerate counter inner).
         for r in 0..M_PERIOD {
             t[(off + r) * w + air.ov()] = v;
             t[(off + r) * w + air.qc(0)] = qc0;
@@ -3602,6 +3687,15 @@ pub(crate) fn monolith_build_trace(
             for (cr, (group, _l, _p, _c)) in commit_data[q].iter().enumerate() {
                 for k in 0..4 {
                     t[(off + r) * w + air.cg(cr, k)] = group[k];
+                }
+            }
+            if air.inner_counter {
+                for k in 0..4 {
+                    t[(off + r) * w + air.cap_c(k)] = trace_cap_entry[k];
+                    t[(off + r) * w + air.cap_c(4 + k)] = quot_cap_entry[k];
+                    for cr in 0..CM_ROUNDS {
+                        t[(off + r) * w + air.cap_c(8 + 4 * cr + k)] = commit_cap_entries[cr][k];
+                    }
                 }
             }
         }
@@ -5185,7 +5279,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -5247,6 +5341,96 @@ mod tests {
         let (log2h, rss) = run_monolith(64);
         println!("Phase 5 scale: monolith @ 64 queries proves at 2^{log2h} / {} MiB ≤ 8 GB", rss / (1 << 20));
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "64-query monolith within 8 GB / 2^18");
+    }
+
+    /// Phase 6.2: the monolith verifies a NON-degenerate `CounterAir` inner (distinct per-query cap entries +
+    /// non-zero quotient). Each opening's terminal equals the query's selected cap entry (carried per super-
+    /// tile from per-query cap pis); the epilogue uses the counter's `next−cur−1` transition. Returns
+    /// (log2 height, RSS). Increment A: caps verifier-pre-selected (the cap-mux binding the selection to the
+    /// index + the FS absorb-binding are the next increments).
+    fn run_counter_monolith(n_queries: usize) -> (u32, u64) {
+        use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
+        use crate::recursion::native_fri::{gen_counter_proof, query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle, query_terms};
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_counter_proof(&config, 42, 6);
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let mut per_query = Vec::new();
+        let mut quot_paths = Vec::new();
+        let mut commit_data = Vec::new();
+        let mut trace_caps = Vec::new();
+        let mut quot_caps = Vec::new();
+        let mut commit_caps = Vec::new();
+        let mut n_terms = 0;
+        let mut final0 = Challenge::ZERO;
+        for q in 0..n_queries {
+            let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+            let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
+            let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
+            let (_leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            let (_ql, qpath, qcap_entry, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
+            let cm = query_commit_merkle_all(&config, &proof, &pvs, q);
+            if q == 0 {
+                final0 = f0;
+            }
+            n_terms = terms.len();
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            trace_caps.push(cap_entry);
+            quot_caps.push(qcap_entry);
+            let mut ccs = [[Val::ZERO; 4]; CM_ROUNDS];
+            for (r, (_g, _l, _p, ce)) in cm.iter().enumerate() {
+                ccs[r] = *ce;
+            }
+            commit_caps.push(ccs);
+            per_query.push(((index, terms, alpha, ro, rounds), v, path));
+            quot_paths.push(qpath);
+            commit_data.push(cm);
+        }
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true };
+        let mut pis = Vec::new();
+        for ch in &chs {
+            pis.push(ch[0]);
+            pis.push(ch[1]);
+        }
+        for f in &index_felts {
+            pis.push(*f);
+        }
+        let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+        pis.push(fp[0]);
+        pis.push(fp[1]);
+        for tc in &trace_caps {
+            pis.extend_from_slice(tc);
+        }
+        for qc in &quot_caps {
+            pis.extend_from_slice(qc);
+        }
+        pis.push(pvs[0]);
+        for cc in &commit_caps {
+            for r in 0..CM_ROUNDS {
+                pis.extend_from_slice(&cc[r]);
+            }
+        }
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data);
+        let hh = air.height();
+        println!("counter monolith @ {n_queries} queries: 2^{} rows (width {})", hh.trailing_zeros(), air.fused_w());
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith verifies a NON-degenerate counter inner");
+        let cap_base = 2 * chs.len() + index_felts.len() + 2;
+        let mut bad = pis.clone();
+        bad[cap_base] += Val::ONE; // tamper the first query's trace cap entry
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered per-query trace cap ⇒ reject");
+        let rss = peak_rss_bytes();
+        println!("  -> peak RSS {} MiB", rss / (1 << 20));
+        (hh.trailing_zeros(), rss)
+    }
+
+    #[test]
+    #[ignore = "slow: Phase 6.2 monolith verifies the non-degenerate counter inner (per-query caps)"]
+    fn phase6_counter_monolith() {
+        let (log2h, rss) = run_counter_monolith(MILESTONE_QUERIES);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "counter monolith within 8 GB / 2^18");
+        println!("Phase 6.2: monolith verifies a non-degenerate counter inner (distinct caps + non-zero quotient), 2^{log2h}");
     }
 
     #[test]
