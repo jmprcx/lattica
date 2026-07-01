@@ -2910,10 +2910,50 @@ pub(crate) struct MonolithAir {
     /// [pvs0,0,0,0])` then `root = merge(root, s_k)` (IV=0), exactly as `agg_root`/`batch_root`. The root's 4
     /// lanes are the ONLY public inputs (the node-seam block tx-root); every inner datum stays witness.
     pub fold: bool,
+    /// When true the inner AIR is the MULTI-COLUMN `FibonacciAir` (W=2, `[a,b]` with a'=b, b'=a+b + first/
+    /// last-row): the opened-row carrier widens to W felts, the trace batch contributes 2·W reduced-opening
+    /// terms (px shared per column across ζ/ζ_next), the input-Merkle leaf absorbs W values, and the OOD
+    /// epilogue uses the GENERAL Horner α-fold (the validated 7.2 form) over the 5 cross-column constraints.
+    /// Being non-constant, it reuses the counter's full-cap + cap-mux machinery (`full_cap`). `false` keeps the
+    /// 1-column ConstAir/CounterAir paths byte-for-byte.
+    pub fib: bool,
 }
 
 #[allow(dead_code)]
 impl MonolithAir {
+    // inner trace width (columns): Fibonacci = 2, ConstAir/CounterAir = 1.
+    fn w_inner(&self) -> usize {
+        if self.fib {
+            2
+        } else {
+            1
+        }
+    }
+    // inner public-value count: Fibonacci = 3 (seed_a, seed_b, last_b), else 1.
+    fn n_pub(&self) -> usize {
+        if self.fib {
+            3
+        } else {
+            1
+        }
+    }
+    // a NON-CONSTANT inner (counter or Fibonacci) needs the full committed cap + the index-selecting cap-mux
+    // (per-query cap entries differ), rather than ConstAir's single shared cap entry.
+    fn full_cap(&self) -> bool {
+        self.inner_counter || self.fib
+    }
+    // quotient DEEP terms = n_terms − the 2·W trace terms.
+    fn n_quot(&self) -> usize {
+        self.n_terms - 2 * self.w_inner()
+    }
+    // opened-row carrier felt c (0..W): the authenticated trace row value, shared across that column's ζ/ζ_next terms.
+    fn ov_c(&self, c: usize) -> usize {
+        self.ov() + c
+    }
+    // start of the commit-phase fold-group carriers (after the W-wide opened row + the 2 quotient carriers).
+    fn carriers_base(&self) -> usize {
+        self.ov() + self.w_inner() + 2
+    }
     fn nb(&self) -> usize {
         self.binds.len()
     }
@@ -2959,15 +2999,15 @@ impl MonolithAir {
         self.carry() + 2 // opened-value carrier (the input-Merkle leaf preimage)
     }
     fn qc(&self, i: usize) -> usize {
-        self.ov() + 1 + i // quotient opened-value carriers (the quotient-Merkle leaf preimage, 2 felts)
+        self.ov() + self.w_inner() + i // quotient opened-value carriers (after the W-wide opened row), 2 felts
     }
     fn cg(&self, r: usize, k: usize) -> usize {
-        self.ov() + 3 + 4 * r + k // commit-phase group carriers: 6 rounds × 4 felts (the fold group {e_r, sib_r})
+        self.carriers_base() + 4 * r + k // commit-phase group carriers: 6 rounds × 4 felts (the fold group {e_r, sib_r})
     }
-    // counter mode only: per-super-tile cap-entry carriers (8 openings × 4 felts) — the index-selected cap
+    // full-cap mode only: per-super-tile cap-entry carriers (8 openings × 4 felts) — the index-selected cap
     // entry (input, quotient, 6 commit rounds), seeded at the arith head, held to each opening's terminal.
     fn cap_c(&self, g: usize) -> usize {
-        self.ov() + 3 + 4 * CM_ROUNDS + g // g: input 0..4, quotient 4..8, commit r 8+4r..8+4r+4
+        self.carriers_base() + 4 * CM_ROUNDS + g // g: input 0..4, quotient 4..8, commit r 8+4r..8+4r+4
     }
     fn n_cap_c(&self) -> usize {
         (2 + CM_ROUNDS) * 4 // input + quotient + 6 commit = 8 entries × 4 = 32
@@ -2975,7 +3015,7 @@ impl MonolithAir {
     // column-window: the inner-proof "pis" as a witness column window (held constant across the instance) so
     // the monolith can be tiled. Placed after all other columns.
     fn pw_base(&self) -> usize {
-        self.ov() + 3 + 4 * CM_ROUNDS + if self.inner_counter { self.n_cap_c() } else { 0 }
+        self.carriers_base() + 4 * CM_ROUNDS + if self.full_cap() { self.n_cap_c() } else { 0 }
     }
     fn pw(&self, i: usize) -> usize {
         self.pw_base() + i
@@ -2989,17 +3029,17 @@ impl MonolithAir {
     // the inner-proof "pis" size: challenges + indices + final_poly + trace/quot caps + pub + commit caps
     // (full caps in counter mode so the cap-mux can select; single entries for ConstAir).
     fn pis_count(&self) -> usize {
-        if self.inner_counter {
+        if self.full_cap() {
             self.ccap_base() + (0..CM_ROUNDS).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
         } else {
             self.ccap_base() + CM_ROUNDS * 4
         }
     }
-    // pis cap layout — the FULL cap (2^cap_height entries) in counter mode (so the cap-mux can select
+    // pis cap layout — the FULL cap (2^cap_height entries) for a non-constant inner (so the cap-mux can select
     // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
     // give the exact current offsets (cap, cap+4, cap+8, cap+9).
     fn cap_stride(&self) -> usize {
-        if self.inner_counter {
+        if self.full_cap() {
             (1 << CM_CAP_HEIGHT) * 4 // full trace/quotient cap: 64 entries × 4
         } else {
             4
@@ -3015,7 +3055,7 @@ impl MonolithAir {
         self.qcap_base() + self.cap_stride()
     }
     fn ccap_base(&self) -> usize {
-        self.pub_pi() + 1
+        self.pub_pi() + self.n_pub() // after the n_pub inner public values
     }
     // commit-phase round r cap: the codeword folds to height 2^(log_global−(r+1)); its cap has
     // 2^min(cap_height, that) entries, and the selecting index is `index >> ((r+1)+depth_r)`.
@@ -3549,47 +3589,94 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS).inverse());
             let is_trans = (zeta.0.clone() - g_inv, zeta.1.clone());
             let zm1 = (zeta.0.clone() - one.clone(), zeta.1.clone());
-            let p1 = emul(z_h.clone(), alpha_stark); // z_h·α
-            let p2 = emul(is_trans, zm1.clone()); // is_trans·(ζ−1)
-            let p3v = emul(z_h, zm1); // z_h·(ζ−1)
-            let pub_val = pis[self.pub_pi()].clone(); // inner public value (base; embeds as (pub, 0))
-            let local = gg(self.pz(0));
-            let next = gg(self.pz(1));
-            let c0 = gg(self.pz(2));
-            let c1 = gg(self.pz(3));
-            let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone()); // c0 + c1·X
-            let lm = (local.0.clone() - pub_val, local.1.clone()); // local − pub
-            // transition constant: ConstAir is `next − cur`; CounterAir is `next − cur − 1`.
-            let trans_const = if self.inner_counter { one.clone() } else { AB::Expr::ZERO };
-            let nl = (next.0 - local.0 - trans_const, next.1 - local.1); // next − local (− 1 for counter)
-            let t1 = emul(p1, lm);
-            let t2 = emul(p2, nl);
-            let rhs = emul(p3v, quot);
-            builder.assert_zero(tf.clone() * (t1.0 + t2.0 - rhs.0));
-            builder.assert_zero(tf.clone() * (t1.1 + t2.1 - rhs.1));
-            // z-term binding: the reduced-opening z's must be ζ (terms 0,2,3) and ζ_next=ζ·g_trace (term 1),
-            // so QT_pz(k) is genuinely the opening AT ζ (closing the free-ζ gap the epilogue depends on).
-            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS));
-            for &k in &[0usize, 2, 3] {
-                builder.assert_zero(tf.clone() * (cur[self.z(k)].clone() - zeta.0.clone()));
-                builder.assert_zero(tf.clone() * (cur[self.z(k) + 1].clone() - zeta.1.clone()));
+            let w_in = self.w_inner();
+            if self.fib {
+                // MULTI-COLUMN: the GENERAL Horner α-fold (validated 7.2), inverse-cleared by D=(ζ−1)(ζ−g^{-1}),
+                // over FibonacciAir's 5 cross-column constraints (emission order C0..C4). local[c]=pz(c) (ζ),
+                // next[c]=pz(W+c) (ζ_next); quotient = pz(2W)+pz(2W+1)·X; pubs at pub_pi()+i.
+                //   is_first·D = z_h·(ζ−g^{-1}); is_trans·D = (ζ−1)(ζ−g^{-1})^2; is_last·D = z_h·(ζ−1).
+                let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(c))).collect();
+                let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(w_in + c))).collect();
+                let c0 = gg(self.pz(2 * w_in));
+                let c1 = gg(self.pz(2 * w_in + 1));
+                let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone());
+                let pb = |i: usize| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO);
+                let zmg2 = emul(is_trans.clone(), is_trans.clone());
+                let mut ap = vec![(one.clone(), AB::Expr::ZERO)];
+                for k in 1..5 {
+                    ap.push(emul(ap[k - 1].clone(), alpha_stark.clone()));
+                }
+                let coeff0 = emul(emul(ap[4].clone(), z_h.clone()), is_trans.clone());
+                let coeff1 = emul(emul(ap[3].clone(), z_h.clone()), is_trans.clone());
+                let coeff2 = emul(emul(ap[2].clone(), zm1.clone()), zmg2.clone());
+                let coeff3 = emul(emul(ap[1].clone(), zm1.clone()), zmg2.clone());
+                let coeff4 = emul(z_h.clone(), zm1.clone());
+                let rhs_coeff = emul(emul(z_h.clone(), zm1.clone()), is_trans.clone());
+                let t0 = emul(coeff0, (local[0].0.clone() - pb(0).0, local[0].1.clone()));
+                let t1 = emul(coeff1, (local[1].0.clone() - pb(1).0, local[1].1.clone()));
+                let t2 = emul(coeff2, (next[0].0.clone() - local[1].0.clone(), next[0].1.clone() - local[1].1.clone()));
+                let t3 = emul(
+                    coeff3,
+                    (next[1].0.clone() - local[0].0.clone() - local[1].0.clone(), next[1].1.clone() - local[0].1.clone() - local[1].1.clone()),
+                );
+                let t4 = emul(coeff4, (local[1].0.clone() - pb(2).0, local[1].1.clone()));
+                let rhs = emul(rhs_coeff, quot);
+                builder.assert_zero(tf.clone() * (t0.0 + t1.0 + t2.0 + t3.0 + t4.0 - rhs.0));
+                builder.assert_zero(tf.clone() * (t0.1 + t1.1 + t2.1 + t3.1 + t4.1 - rhs.1));
+            } else {
+                // 1-COLUMN ConstAir/CounterAir: the 2-constraint form (1 first-row + 1 transition):
+                //   z_h·α·(local−pub) + is_trans·(ζ−1)·(next−local[−1]) == z_h·(ζ−1)·(c0+c1·X).
+                let p1 = emul(z_h.clone(), alpha_stark.clone()); // z_h·α
+                let p2 = emul(is_trans.clone(), zm1.clone()); // is_trans·(ζ−1)
+                let p3v = emul(z_h.clone(), zm1.clone()); // z_h·(ζ−1)
+                let pub_val = pis[self.pub_pi()].clone();
+                let local = gg(self.pz(0));
+                let next = gg(self.pz(1));
+                let c0 = gg(self.pz(2));
+                let c1 = gg(self.pz(3));
+                let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone());
+                let lm = (local.0.clone() - pub_val, local.1.clone());
+                let trans_const = if self.inner_counter { one.clone() } else { AB::Expr::ZERO };
+                let nl = (next.0 - local.0 - trans_const, next.1 - local.1);
+                let t1 = emul(p1, lm);
+                let t2 = emul(p2, nl);
+                let rhs = emul(p3v, quot);
+                builder.assert_zero(tf.clone() * (t1.0 + t2.0 - rhs.0));
+                builder.assert_zero(tf.clone() * (t1.1 + t2.1 - rhs.1));
             }
-            builder.assert_zero(tf.clone() * (cur[self.z(1)].clone() - zeta.0.clone() * g_trace.clone()));
-            builder.assert_zero(tf.clone() * (cur[self.z(1) + 1].clone() - zeta.1.clone() * g_trace));
+            // z-term binding: the trace opening z's are ζ (columns 0..W) and ζ·g_trace (columns W..2W); the
+            // quotient z's are ζ (terms 2W..). So each QT_pz(k) is genuinely the opening AT its point.
+            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS));
+            for c in 0..w_in {
+                builder.assert_zero(tf.clone() * (cur[self.z(c)].clone() - zeta.0.clone()));
+                builder.assert_zero(tf.clone() * (cur[self.z(c) + 1].clone() - zeta.1.clone()));
+                builder.assert_zero(tf.clone() * (cur[self.z(w_in + c)].clone() - zeta.0.clone() * g_trace.clone()));
+                builder.assert_zero(tf.clone() * (cur[self.z(w_in + c) + 1].clone() - zeta.1.clone() * g_trace.clone()));
+            }
+            for j in 0..self.n_quot() {
+                builder.assert_zero(tf.clone() * (cur[self.z(2 * w_in + j)].clone() - zeta.0.clone()));
+                builder.assert_zero(tf.clone() * (cur[self.z(2 * w_in + j) + 1].clone() - zeta.1.clone()));
+            }
         }
 
         // ---------- opened-value carrier: held WITHIN each super-tile (S_QUERY · not-boundary) so it doesn't
         // leak across the transcript→query boundary; == QT_px(0) at the arith head; the leaf preimage. ----
-        let ov = self.ov();
+        let w_in = self.w_inner();
         let hold = p[self.s_query()].clone() * (one.clone() - p[self.p_st_last()].clone());
-        builder.when_transition().assert_zero(hold.clone() * (nxt[ov].clone() - cur[ov].clone()));
-        builder.assert_zero(tf.clone() * (cur[ov].clone() - cur[self.px(0)].clone()));
-        // quotient opened-value carriers: held within the super-tile; == QT_px terms 2,3 at the arith head.
+        // opened-row carrier (W felts): held within the super-tile; column c's value feeds BOTH its ζ term
+        // px(c) AND its ζ_next term px(W+c) (px-sharing — one authenticated value → two DEEP terms) and the leaf.
+        for c in 0..w_in {
+            let ovc = self.ov_c(c);
+            builder.when_transition().assert_zero(hold.clone() * (nxt[ovc].clone() - cur[ovc].clone()));
+            builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(c)].clone())); // px(c) @ ζ
+            builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(w_in + c)].clone())); // px(W+c) @ ζ_next
+        }
+        // quotient opened-value carriers: held within the super-tile; == the quotient terms px(2W), px(2W+1).
         let (qc0, qc1) = (self.qc(0), self.qc(1));
         builder.when_transition().assert_zero(hold.clone() * (nxt[qc0].clone() - cur[qc0].clone()));
         builder.when_transition().assert_zero(hold.clone() * (nxt[qc1].clone() - cur[qc1].clone()));
-        builder.assert_zero(tf.clone() * (cur[qc0].clone() - cur[self.px(2)].clone()));
-        builder.assert_zero(tf.clone() * (cur[qc1].clone() - cur[self.px(3)].clone()));
+        builder.assert_zero(tf.clone() * (cur[qc0].clone() - cur[self.px(2 * w_in)].clone()));
+        builder.assert_zero(tf.clone() * (cur[qc1].clone() - cur[self.px(2 * w_in + 1)].clone()));
         // commit-phase group carriers: seed the bit-ordered fold group {e_r, sib_r} at fold row r (p_round(r));
         // held within the super-tile so round r's leaf-hash block can absorb it (group[0..2]=lo, [2..4]=hi).
         for r in 0..CM_ROUNDS {
@@ -3608,10 +3695,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         }
 
         // ---------- super-tile inline Merkle (input + quotient blocks, gated by S_MERKLE) ----------
-        // input-Merkle leaf (block 1): absorb the trace opened value.
+        // input-Merkle leaf (block 1): absorb the W-value opened trace row (lanes 0..W = opened_row, W..8 = 0).
         let leaf = p[self.m_leaf()].clone();
-        builder.assert_zero(leaf.clone() * (cur[0].clone() - cur[ov].clone()));
-        for i in 1..W {
+        for c in 0..w_in {
+            builder.assert_zero(leaf.clone() * (cur[c].clone() - cur[self.ov_c(c)].clone()));
+        }
+        for i in w_in..W {
             builder.assert_zero(leaf.clone() * cur[i].clone());
         }
         // quotient-Merkle leaf (block 6): absorb the 2-felt quotient row [qc0, qc1].
@@ -3650,8 +3739,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // input terminal (block 5) == trace cap entry; quotient terminal (block 10) == quotient cap entry.
         let term = p[self.m_term()].clone();
         let qterm = p[self.q_term()].clone();
-        if self.inner_counter {
-            // COUNTER: the inner trace is non-constant so cap entries DIFFER per query — each terminal equals
+        if self.full_cap() {
+            // NON-CONSTANT inner (counter or Fibonacci): cap entries DIFFER per query — each terminal equals
             // the query's index-selected cap entry, carried per super-tile (seeded at the arith head from the
             // per-query cap pis via the p_query one-hots, held to the terminals).
             for k in 0..4 {
@@ -3795,9 +3884,9 @@ pub(crate) fn monolith_build_trace(
         }
     }
     // super-tile region
-    for (q, ((index, terms, alpha, ro, rounds), v, path)) in per_query.iter().enumerate() {
+    for (q, ((index, terms, alpha, ro, rounds), _v, path)) in per_query.iter().enumerate() {
         let off = tr + q * M_PERIOD;
-        let v = *v;
+        // (the opened row is derived from the first W reduced-opening terms below — px-sharing)
         // arith block 0: fold chain E_0..E_6
         let mut e = *ro;
         for r in 0..=6 {
@@ -3886,9 +3975,12 @@ pub(crate) fn monolith_build_trace(
             }
             native_permute(inp)[..4].try_into().unwrap()
         };
-        // inline input-Merkle: leaf-hash (block M_INPUT_LEAF) absorbs the trace value v; then 4 merges.
+        // the W-value opened trace row (px shared per column) = the first W terms' p_x.
+        let w_in = air.w_inner();
+        let opened_row: Vec<Val> = (0..w_in).map(|c| terms[c].2).collect();
+        // inline input-Merkle: leaf-hash (block M_INPUT_LEAF) absorbs the W-value opened row; then 4 merges.
         let mut input = [Val::ZERO; W];
-        input[0] = v;
+        input[..w_in].copy_from_slice(&opened_row);
         let rows = native_steps(input);
         for r in 0..BLOCK {
             let base = (off + M_INPUT_LEAF * BLOCK + r) * w;
@@ -3899,9 +3991,9 @@ pub(crate) fn monolith_build_trace(
             node = merge_block(&mut t, off, M_INPUT_LEAF + 1 + l, node, sib, b);
         }
         let trace_cap_entry = node; // the input-Merkle terminal == the query's selected trace cap entry
-        // inline quotient-Merkle: leaf-hash (block M_QUOT_LEAF) absorbs the 2-felt quotient row; then 4 merges.
-        let qc0 = terms[2].2;
-        let qc1 = terms[3].2;
+        // inline quotient-Merkle: leaf-hash (block M_QUOT_LEAF) absorbs the 2-felt quotient row (terms 2W, 2W+1).
+        let qc0 = terms[2 * w_in].2;
+        let qc1 = terms[2 * w_in + 1].2;
         let mut qinput = [Val::ZERO; W];
         qinput[0] = qc0;
         qinput[1] = qc1;
@@ -3932,10 +4024,12 @@ pub(crate) fn monolith_build_trace(
             }
             commit_cap_entries[r] = cnode; // this round's commit-Merkle terminal == the selected commit cap
         }
-        // carriers held within this super-tile: opened value v + the quotient row [qc0, qc1] + the 6 fold groups
-        // (+ the 8 per-query cap-entry carriers when verifying a non-degenerate counter inner).
+        // carriers held within this super-tile: the W-value opened row + the quotient row [qc0, qc1] + the 6
+        // fold groups (+ the 8 per-query cap-entry carriers when verifying a non-constant inner).
         for r in 0..M_PERIOD {
-            t[(off + r) * w + air.ov()] = v;
+            for c in 0..w_in {
+                t[(off + r) * w + air.ov_c(c)] = opened_row[c];
+            }
             t[(off + r) * w + air.qc(0)] = qc0;
             t[(off + r) * w + air.qc(1)] = qc1;
             for (cr, (group, _l, _p, _c)) in commit_data[q].iter().enumerate() {
@@ -3943,7 +4037,7 @@ pub(crate) fn monolith_build_trace(
                     t[(off + r) * w + air.cg(cr, k)] = group[k];
                 }
             }
-            if air.inner_counter {
+            if air.full_cap() {
                 for k in 0..4 {
                     t[(off + r) * w + air.cap_c(k)] = trace_cap_entry[k];
                     t[(off + r) * w + air.cap_c(4 + k)] = quot_cap_entry[k];
@@ -5798,7 +5892,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, fib: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -5910,6 +6004,7 @@ mod tests {
             column_window: true,
             k_instances: 1,
             fold: false,
+            fib: false,
         };
         let mut pis = Vec::new();
         for ch in &chs {
@@ -5960,7 +6055,7 @@ mod tests {
             }
         }
         let (counts, binds, index_binds, n_terms) = params.unwrap();
-        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true };
+        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, fib: false };
         let fw = air.fused_w();
         let w = air.fold_w();
         let inst_h = air.inst_h();
@@ -6101,7 +6196,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, fib: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6141,6 +6236,95 @@ mod tests {
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         (hh.trailing_zeros(), rss)
+    }
+
+    /// Phase 7.4: build + prove the MULTI-COLUMN monolith over a real 2-column `FibonacciAir` inner — the full
+    /// accept-iff-p3::verify at W=2. Exercises the W-wide opened-row carrier, 2·W reduced-opening terms with
+    /// px-sharing, the W-value input-Merkle leaf, the full-cap + cap-mux (non-constant inner), and the GENERAL
+    /// 5-constraint OOD epilogue (validated 7.2 fold). Returns (log2 height, RSS).
+    fn run_fib_monolith(n_queries: usize) -> (u32, u64) {
+        use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
+        use crate::recursion::native_fri::{fib_query_terms, gen_fib_proof, query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle};
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let mut per_query = Vec::new();
+        let mut quot_paths = Vec::new();
+        let mut commit_data = Vec::new();
+        let mut n_terms = 0;
+        let mut final0 = Challenge::ZERO;
+        for q in 0..n_queries {
+            let (terms, _x, alpha, ro, _w) = fib_query_terms(&config, &proof, &pvs, q);
+            let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
+            let (_leaf, path, _cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            let (_ql, qpath, _qce, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
+            let cm = query_commit_merkle_all(&config, &proof, &pvs, q);
+            if q == 0 {
+                final0 = f0;
+            }
+            n_terms = terms.len();
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            per_query.push(((index, terms, alpha, ro, rounds), Val::ZERO, path)); // opened row derived from terms
+            quot_paths.push(qpath);
+            commit_data.push(cm);
+        }
+        assert_eq!(n_terms, 2 * 2 + 2, "fib: 4 trace terms (2 cols × ζ/ζ_next) + 2 quotient terms (nqc=1)");
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, fib: true };
+        let mut pis = Vec::new();
+        for ch in &chs {
+            pis.push(ch[0]);
+            pis.push(ch[1]);
+        }
+        for f in &index_felts {
+            pis.push(*f);
+        }
+        let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+        pis.push(fp[0]);
+        pis.push(fp[1]);
+        // FULL caps (the cap-mux selects cap[index>>shift]): trace, quotient, then the 3 Fibonacci pubs, then 6 commit rounds.
+        for e in proof.commitments.trace.roots().iter() {
+            pis.extend_from_slice(e);
+        }
+        for e in proof.commitments.quotient_chunks.roots().iter() {
+            pis.extend_from_slice(e);
+        }
+        for &pv in &pvs {
+            pis.push(pv); // seed_a, seed_b, last_b
+        }
+        for r in 0..CM_ROUNDS {
+            for e in proof.opening_proof.commit_phase_commits[r].roots().iter() {
+                pis.extend_from_slice(e);
+            }
+        }
+        assert_eq!(pis.len(), air.pis_count(), "fib pis layout matches pis_count");
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
+        let hh = air.height();
+        println!("fib monolith @ {n_queries} queries: 2^{} rows (width {}, W=2 multi-column)", hh.trailing_zeros(), air.fused_w());
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith verifies a MULTI-COLUMN Fibonacci inner (accept-iff-p3::verify)");
+        // tamper a Fibonacci public (seed_a) ⇒ the general 5-constraint OOD fold ≠ quotient(ζ) ⇒ reject.
+        let mut bad = pis.clone();
+        bad[air.pub_pi()] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered Fibonacci pub ⇒ general epilogue rejects");
+        // tamper the FULL trace cap entry query 0 selects (index0>>4) ⇒ cap-mux ≠ real terminal ⇒ reject.
+        let cap_base = 2 * chs.len() + index_felts.len() + 2;
+        let sel0 = ((index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1)) >> 4;
+        let mut bad_cap = pis.clone();
+        bad_cap[cap_base + sel0 * 4] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad_cap).is_err(), "tampered selected trace cap ⇒ cap-mux reject");
+        let rss = peak_rss_bytes();
+        println!("  -> peak RSS {} MiB", rss / (1 << 20));
+        (hh.trailing_zeros(), rss)
+    }
+
+    #[test]
+    #[ignore = "slow: Phase 7.4 multi-column monolith (2-column Fibonacci, accept-iff-p3::verify)"]
+    fn phase7_fib_monolith() {
+        let (log2h, rss) = run_fib_monolith(MILESTONE_QUERIES);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "fib monolith within 8 GB / 2^18");
+        println!("Phase 7.4: the monolith verifies a MULTI-COLUMN (W=2) inner end-to-end at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     #[test]
