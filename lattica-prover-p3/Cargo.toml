@@ -22,15 +22,15 @@ p3-air = "0.6.1"
 p3-field = "0.6.1"
 p3-goldilocks = "0.6.1"
 p3-poseidon2 = "0.6.1"
-p3-poseidon2-air = "0.6.1"
+p3-poseidon2-air = { version = "0.6.1", features = ["parallel"] }
 p3-symmetric = "0.6.1"
 p3-challenger = "0.6.1"
 p3-commit = "0.6.1"
-p3-dft = "0.6.1"
+p3-dft = { version = "0.6.1", features = ["parallel"] }
 p3-fri = "0.6.1"
 p3-matrix = "0.6.1"
 p3-merkle-tree = "0.6.1"
-p3-uni-stark = "0.6.1"
+p3-uni-stark = { version = "0.6.1", features = ["parallel"] }
 p3-baby-bear = "0.6.1"
 rand = "0.10"
 rand_chacha = "0.10"
