@@ -2917,6 +2917,56 @@ fn commit_layout(log_global: usize, cap: usize, log_blowup: usize, leaf_blocks: 
     (cm_rounds, input_depth, m_input_term, m_quot_term, leaf, term, m_nblocks)
 }
 
+/// HIDING (is_zk=1) super-tile layout — the geometry the in-circuit hiding monolith needs (#86 AIR mode).
+/// Mirrors `commit_layout` but with THREE input rounds (random, trace, quotient) instead of two, each a
+/// SALTED multi-block leaf (preimage = committed_row ‖ salt, absorbed RATE felts/block) + a Merkle path of
+/// `input_depth` levels to its cap, then the commit rounds. The random round is structurally a COPY of the
+/// trace input-leaf region (prepended). Widths (validated by the native witness): the reduced-opening TERM
+/// widths use the MERGED row (public ‖ codewords, NO salt); the LEAF felt widths add SALT_ELEMS; the quotient
+/// leaf is the multi-matrix concat over nqc chunks. Returns (m_random_term, m_input_term, m_quot_term, cm_leaf,
+/// cm_term, m_nblocks, n_terms, [random_leaf_blocks, trace_leaf_blocks, quot_leaf_blocks]).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+fn hiding_commit_layout(
+    w_inner: usize,
+    nqc: usize,
+    log_global: usize,
+    cap: usize,
+    log_blowup: usize,
+) -> (usize, usize, usize, Vec<usize>, Vec<usize>, usize, usize, [usize; 3]) {
+    const NUM_CW: usize = 4; // HidingFriPcs num_random_codewords
+    const SALT: usize = 4; // MerkleTreeHidingMmcs SALT_ELEMS
+    const RAND_PUB: usize = 2; // random-round opened value width (one F_p²)
+    let cm_rounds = log_global - log_blowup;
+    let input_depth = log_global - cap;
+    // merged widths (public ‖ codewords) = the reduced-opening term widths (NO salt).
+    let random_merged = RAND_PUB + NUM_CW;
+    let trace_merged = w_inner + NUM_CW;
+    let quot_merged = 2 + NUM_CW; // per chunk: F_p² (2) + codewords
+    // leaf felt widths = committed row ‖ salt; the quotient leaf is the multi-matrix concat over nqc chunks.
+    let rlb = (random_merged + SALT).div_ceil(RATE);
+    let ilb = (trace_merged + SALT).div_ceil(RATE);
+    let qlb = (nqc * (quot_merged + SALT)).div_ceil(RATE);
+    // super-tile: block 0 reserved (arith/opened-row setup), then random-leaf, trace-leaf, quot-leaf, each a
+    // leaf-hash sponge + `input_depth` path merges; then the commit rounds. is_zk=0 would drop the random region
+    // (m_input_leaf back to 1), recovering `commit_layout`.
+    let m_random_term = M_INPUT_LEAF + (rlb - 1) + input_depth;
+    let m_input_term = (m_random_term + 1) + (ilb - 1) + input_depth;
+    let m_quot_term = (m_input_term + 1) + (qlb - 1) + input_depth;
+    let (mut leaf, mut term) = (Vec::with_capacity(cm_rounds), Vec::with_capacity(cm_rounds));
+    let mut blk = m_quot_term + 1;
+    for r in 0..cm_rounds {
+        let d = cm_depth_at(r, log_global, cap);
+        leaf.push(blk);
+        term.push(blk + d);
+        blk += d + 1;
+    }
+    let m_nblocks = term[cm_rounds - 1] + 1;
+    // reduced-opening terms: random (×1 point) + trace (×2 points ζ,ζ_next) + quotient (nqc chunks ×1 point).
+    let n_terms = random_merged + 2 * trace_merged + nqc * quot_merged;
+    (m_random_term, m_input_term, m_quot_term, leaf, term, m_nblocks, n_terms, [rlb, ilb, qlb])
+}
+
 /// Max inner proofs the tiled aggregator folds in ONE outer proof, mirroring `batch_joinsplit_air::
 /// MAX_BATCH_TILES`. K must be a power of two (the fold's Merkle–Damgård chain pads to pow2, as `batch_root`
 /// does); production rounds a short block up to the next pow2 with dummy-proof instances. NOTE: unlike the
@@ -7180,6 +7230,29 @@ mod tests {
         assert_eq!((m_input_term, m_quot_term), (15, 29)); // input leaf(5)+path(10); quot leaf(4)+path(10)
         assert_eq!((leaf[0], *leaf.last().unwrap(), *term.last().unwrap(), nb), (30, 86, 86, 87));
         println!("geometry configurable across all params: milestone → 23 blocks/6 rounds (== consts); real join-split (db=12/W=19/nqc=8) → 87 blocks/12 rounds (same formula)");
+    }
+
+    /// #86 AIR mode — the HIDING (is_zk=1) super-tile layout skeleton (de-risk the geometry, phase-4.0-style).
+    /// Validates `hiding_commit_layout` against the ground-truth witness geometry: an arity-2 hiding ConstAir
+    /// (W=1, nqc=4, log_global=11 = degree_bits 7 + blowup 4, cap 6). The layout has THREE salted leaf regions
+    /// (random/trace/quotient) before 7 commit rounds — the leaf block counts, term count, and block offsets
+    /// must match what the native witness produced (leaf felt widths 10/9/40 ⇒ 3/3/10 blocks; n_terms 40).
+    #[test]
+    fn hiding_super_tile_layout_matches_witness() {
+        use super::hiding_commit_layout;
+        let (rt, it, qt, leaf, term, nb, n_terms, [rlb, ilb, qlb]) = hiding_commit_layout(1, 4, 11, 6, 4);
+        // leaf block counts = ceil(leaf_felts/RATE): random 10→3, trace 9→3, quotient 40→10 (== the witness's
+        // hiding_query_{input,quotient}_merkle leaf widths and the batch-0 random leaf from hiding_proof_geometry).
+        assert_eq!([rlb, ilb, qlb], [3, 3, 10], "salted leaf blocks: random(10f)/trace(9f)/quot(40f)");
+        // reduced-opening term count == hiding_multicol_query_terms's 40 (random 6 + 2·trace 5 + nqc·quot 6).
+        assert_eq!(n_terms, 40, "hiding reduced-opening terms = 6 + 10 + 24");
+        // three disjoint leaf regions (each leaf + input_depth=5 path), then commit rounds.
+        assert_eq!((rt, it, qt), (8, 16, 31), "random/trace/quotient terminal blocks");
+        assert_eq!(leaf.len(), 7, "arity-2 cm_rounds = log_global − blowup = 7");
+        assert_eq!((leaf[0], nb), (32, 49), "commit rounds start after the quotient terminal; m_nblocks");
+        assert_eq!(*term.last().unwrap() + 1, nb, "m_nblocks == last commit term + 1");
+        assert!(rt < it && it < qt && qt < leaf[0], "regions are monotone and disjoint");
+        println!("hiding super-tile layout: 3 salted leaf regions (terms at blocks {rt}/{it}/{qt}, blocks {rlb}/{ilb}/{qlb}) + 7 commit rounds → m_nblocks={nb}, n_terms={n_terms} (matches the native witness)");
     }
 
     #[test]
