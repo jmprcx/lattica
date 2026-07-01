@@ -2885,6 +2885,12 @@ pub(crate) struct MonolithAir {
     /// super-tile (the counter's 64 cap entries differ per query), rather than ConstAir's single shared cap.
     /// `false` keeps the exact validated ConstAir path (phase4d) untouched.
     pub inner_counter: bool,
+    /// When true the inner-proof "public inputs" (challenges, indices, final_poly, caps, pub value) are read
+    /// from a WITNESS column window held constant across the whole monolith instead of `public_values()` — so
+    /// K instances can be TILED in one aggregator AIR (public inputs are global, witness columns can vary per
+    /// tile). The monolith's internal binds (squeeze↦challenge, terminal↦cap, SB↦index, OOD↦pub) pin the
+    /// window, so it stays sound; only the block tx-root is public in the aggregator. `false` = pis mode.
+    pub column_window: bool,
 }
 
 #[allow(dead_code)]
@@ -2947,6 +2953,29 @@ impl MonolithAir {
     fn n_cap_c(&self) -> usize {
         (2 + CM_ROUNDS) * 4 // input + quotient + 6 commit = 8 entries × 4 = 32
     }
+    // column-window: the inner-proof "pis" as a witness column window (held constant across the instance) so
+    // the monolith can be tiled. Placed after all other columns.
+    fn pw_base(&self) -> usize {
+        self.ov() + 3 + 4 * CM_ROUNDS + if self.inner_counter { self.n_cap_c() } else { 0 }
+    }
+    fn pw(&self, i: usize) -> usize {
+        self.pw_base() + i
+    }
+    // column-window: the ζ-squaring chain S_1..S_6 (6 ext = 12 felts) held after the pis window. In pis mode
+    // ζ is a degree-0 public constant so ζ^(2^6) is inline (degree 0); in column-window ζ is a degree-1 witness,
+    // so the epilogue's z_h uses these witnessed squares (each S_{i+1}=S_i², degree 2) to keep the degree bounded.
+    fn sch(&self, j: usize) -> usize {
+        self.pw_base() + self.pis_count() + j
+    }
+    // the inner-proof "pis" size: challenges + indices + final_poly + trace/quot caps + pub + commit caps
+    // (full caps in counter mode so the cap-mux can select; single entries for ConstAir).
+    fn pis_count(&self) -> usize {
+        if self.inner_counter {
+            self.ccap_base() + (0..CM_ROUNDS).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
+        } else {
+            self.ccap_base() + CM_ROUNDS * 4
+        }
+    }
     // pis cap layout — the FULL cap (2^cap_height entries) in counter mode (so the cap-mux can select
     // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
     // give the exact current offsets (cap, cap+4, cap+8, cap+9).
@@ -2984,7 +3013,7 @@ impl MonolithAir {
         self.ccap_base() + (0..r).map(|r2| self.commit_cap_size(r2) * 4).sum::<usize>()
     }
     fn fused_w(&self) -> usize {
-        self.ov() + 3 + 4 * CM_ROUNDS + if self.inner_counter { self.n_cap_c() } else { 0 }
+        self.pw_base() + if self.column_window { self.pis_count() + 2 * M_DEGREE_BITS } else { 0 } // + ζ-squaring chain
     }
     // Merkle columns overlay the arith Poseidon lanes on the Merkle rows (disjoint rows).
     fn m_sib(&self) -> usize {
@@ -3147,12 +3176,12 @@ impl BaseAir<Goldilocks> for MonolithAir {
         self.fused_w()
     }
     fn num_public_values(&self) -> usize {
-        // challenges + indices + final_poly[0] + trace/quot caps + pub + commit caps. Counter mode publishes the
-        // FULL caps (variable-size commit caps) so the cap-mux can select; ConstAir publishes single entries.
-        if self.inner_counter {
-            self.ccap_base() + (0..CM_ROUNDS).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
+        // in column-window mode the inner-proof pis live in witness columns; nothing public at the monolith
+        // level (the aggregator exposes only the block tx-root). Otherwise the full inner-proof pis.
+        if self.column_window {
+            0
         } else {
-            self.ccap_base() + CM_ROUNDS * 4
+            self.pis_count()
         }
     }
     fn num_periodic_columns(&self) -> usize {
@@ -3169,7 +3198,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
-        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        // COLUMN-WINDOW: read the inner-proof "pis" from the witness column window (held constant across the
+        // instance) instead of public inputs, so the monolith can be tiled. The internal binds pin the window.
+        let pis: Vec<AB::Expr> = if self.column_window {
+            (0..self.pis_count()).map(|i| cur[self.pw(i)].clone()).collect()
+        } else {
+            builder.public_values().iter().map(|&x| x.into()).collect()
+        };
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
         let half = AB::Expr::from(Goldilocks::ONE.halve());
@@ -3246,6 +3281,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         let alpha_bind = p[FT_BIND_START + 2].clone();
         builder.assert_zero(alpha_bind.clone() * (cur[carry].clone() - cur[3].clone()));
         builder.assert_zero(alpha_bind * (cur[carry + 1].clone() - cur[2].clone()));
+
+        // ---------- column-window: the inner-proof pis window is held constant across the whole instance ----
+        // (global-persistent for K=1; the aggregator resets it per instance). The binds/terminals/OOD pin it.
+        if self.column_window {
+            for i in 0..self.pis_count() {
+                builder.when_transition().assert_zero(nxt[self.pw(i)].clone() - cur[self.pw(i)].clone());
+            }
+            for j in 0..(2 * M_DEGREE_BITS) {
+                builder.when_transition().assert_zero(nxt[self.sch(j)].clone() - cur[self.sch(j)].clone());
+            }
+        }
 
         // ---------- super-tile arith (block 0, gated by M_TF / P_ROUND / M_TL) ----------
         for i in 0..DP_LOG_HEIGHT {
@@ -3360,12 +3406,26 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         {
             let alpha_stark = (pis[0].clone(), pis[1].clone());
             let zeta = (pis[2].clone(), pis[3].clone());
-            // S_6 = ζ^(2^degree_bits) via degree_bits emul-squares (public expression, degree 0)
-            let mut s = zeta.clone();
-            for _ in 0..M_DEGREE_BITS {
-                s = emul(s.clone(), s.clone());
-            }
-            let z_h = (s.0 - one.clone(), s.1);
+            // S_6 = ζ^(2^degree_bits). In pis mode ζ is a degree-0 public constant ⇒ inline squaring (degree 0).
+            // In column-window ζ is a degree-1 witness ⇒ use the witnessed squaring chain (S_{i+1}=S_i², bound
+            // degree 2) so z_h stays degree 1 and the OOD constraint doesn't blow up.
+            let z_h = if self.column_window {
+                let mut prev = zeta.clone();
+                for i in 0..M_DEGREE_BITS {
+                    let si = (cur[self.sch(2 * i)].clone(), cur[self.sch(2 * i) + 1].clone());
+                    let sq = emul(prev.clone(), prev.clone());
+                    builder.assert_zero(tf.clone() * (si.0.clone() - sq.0));
+                    builder.assert_zero(tf.clone() * (si.1.clone() - sq.1));
+                    prev = si;
+                }
+                (prev.0 - one.clone(), prev.1)
+            } else {
+                let mut s = zeta.clone();
+                for _ in 0..M_DEGREE_BITS {
+                    s = emul(s.clone(), s.clone());
+                }
+                (s.0 - one.clone(), s.1)
+            };
             let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS).inverse());
             let is_trans = (zeta.0.clone() - g_inv, zeta.1.clone());
             let zm1 = (zeta.0.clone() - one.clone(), zeta.1.clone());
@@ -3543,6 +3603,7 @@ pub(crate) fn monolith_build_trace(
     index_felts: &[Val],
     quot_paths: &[Vec<([Val; 4], bool)>],
     commit_data: &[Vec<([Val; 4], [Val; 4], Vec<([Val; 4], bool)>, [Val; 4])>],
+    pub_window: &[Val], // column-window mode: the inner-proof pis values (empty otherwise)
 ) -> RowMajorMatrix<Val> {
     use crate::recursion::fri_fold::native_fold;
     use p3_field::{BasedVectorSpace, PrimeField64};
@@ -3724,6 +3785,27 @@ pub(crate) fn monolith_build_trace(
     for r in 0..h {
         t[r * w + air.carry()] = alpha_fri[0];
         t[r * w + air.carry() + 1] = alpha_fri[1];
+    }
+    // column-window: fill the inner-proof pis window + the ζ-squaring chain (held constant across the trace).
+    if air.column_window {
+        use p3_field::BasedVectorSpace;
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let zeta = Challenge::from_basis_coefficients_fn(|k| pub_window[2 + k]); // ζ = pis[2,3]
+        let mut sch_vals = [[Val::ZERO; 2]; M_DEGREE_BITS];
+        let mut s = zeta;
+        for sv in sch_vals.iter_mut() {
+            s = s * s; // S_{i+1} = S_i²
+            *sv = cc(s);
+        }
+        for r in 0..h {
+            for (i, &v) in pub_window.iter().enumerate() {
+                t[r * w + air.pw(i)] = v;
+            }
+            for (i, sv) in sch_vals.iter().enumerate() {
+                t[r * w + air.sch(2 * i)] = sv[0];
+                t[r * w + air.sch(2 * i) + 1] = sv[1];
+            }
+        }
     }
     RowMajorMatrix::new(t, w)
 }
@@ -5260,7 +5342,7 @@ mod tests {
     /// Run the FULL monolith at `n_queries` queries: prove + verify + reject the whole tamper set. Returns
     /// (log2 height, peak RSS bytes) so callers can assert the 8 GB / 2^18 budget. Query-count-parameterized so
     /// the same fused AIR can be exercised at the milestone's 32 and at higher counts (the scaling check).
-    fn run_monolith(n_queries: usize) -> (u32, u64) {
+    fn run_monolith(n_queries: usize, column_window: bool) -> (u32, u64) {
         use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
         use crate::recursion::native_fri::{query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle, query_terms};
         use p3_field::{BasedVectorSpace, PrimeField64};
@@ -5299,7 +5381,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -5318,8 +5400,26 @@ mod tests {
         for ce in &ccap0 {
             pis.extend_from_slice(ce);
         }
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data);
         let hh = air.height();
+        if column_window {
+            // COLUMN-WINDOW: the inner-proof pis live in a held witness column window; NOTHING is public. The
+            // internal binds (squeeze↦challenge, terminal↦cap, SB↦index, OOD↦pub) pin the window. This is the
+            // tileable form the aggregator uses (per-instance witness data, only the tx-root public).
+            let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis);
+            println!("column-window monolith @ {n_queries} queries: 2^{} rows (width {})", hh.trailing_zeros(), air.fused_w());
+            let prf = prove(&config, &air, trace, &[]);
+            assert!(verify(&config, &air, &prf, &[]).is_ok(), "column-window monolith proves (inner pis in witness columns)");
+            // tamper a challenge felt in the window ⇒ the squeeze↦window bind fails ⇒ reject.
+            let mut bw = pis.clone();
+            bw[0] += Val::ONE;
+            let bt = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &bw);
+            let bp = prove(&config, &air, bt, &[]);
+            assert!(verify(&config, &air, &bp, &[]).is_err(), "tampered pis window ⇒ internal bind fails ⇒ reject");
+            let rss = peak_rss_bytes();
+            println!("  -> peak RSS {} MiB", rss / (1 << 20));
+            return (hh.trailing_zeros(), rss);
+        }
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
         println!("monolith @ {n_queries} queries: 2^{} rows (width {}, {} transcript blocks)", hh.trailing_zeros(), air.fused_w(), counts.len());
         let prf = prove(&config, &air, trace, &pis);
         assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith proves @ {n_queries}: transcript + super-tiles + all openings authenticate + OOD");
@@ -5347,8 +5447,19 @@ mod tests {
     #[test]
     #[ignore = "slow: Phase 4.D monolith (transcript + super-tiles, accept-iff-p3::verify) vs native"]
     fn phase4d_monolith_input_fusion() {
-        let (log2h, rss) = run_monolith(MILESTONE_QUERIES);
+        let (log2h, rss) = run_monolith(MILESTONE_QUERIES, false);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "budget: RSS ≤ 8 GB, height ≤ 2^18");
+    }
+
+    /// Phase 6.5: the COLUMN-WINDOW monolith — the same ConstAir verifier, but reading its inner-proof pis from
+    /// a held witness column window instead of public inputs (nothing public), so K instances can be tiled in
+    /// the aggregator. Proves at K=1 and rejects a tampered window (the squeeze↦window bind fails).
+    #[test]
+    #[ignore = "slow: Phase 6.5 column-window monolith (inner pis in witness columns)"]
+    fn phase6_column_window_monolith() {
+        let (log2h, rss) = run_monolith(MILESTONE_QUERIES, true);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "column-window monolith within 8 GB / 2^18");
+        println!("Phase 6.5: column-window monolith proves at 2^{log2h} / {} MiB (inner pis in witness columns)", rss / (1 << 20));
     }
 
     /// Phase 5 (scale within 8 GB): the monolith is query-count-agnostic. Doubling to 64 queries (the milestone
@@ -5358,7 +5469,7 @@ mod tests {
     #[test]
     #[ignore = "slow: Phase 5 monolith scaling to 64 queries within 8 GB"]
     fn phase5_monolith_scale_64() {
-        let (log2h, rss) = run_monolith(64);
+        let (log2h, rss) = run_monolith(64, false);
         println!("Phase 5 scale: monolith @ 64 queries proves at 2^{log2h} / {} MiB ≤ 8 GB", rss / (1 << 20));
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "64-query monolith within 8 GB / 2^18");
     }
@@ -5397,7 +5508,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -5422,7 +5533,7 @@ mod tests {
                 pis.extend_from_slice(e);
             }
         }
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data);
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
         let hh = air.height();
         println!("counter monolith @ {n_queries} queries: 2^{} rows (width {}, full caps + cap-mux)", hh.trailing_zeros(), air.fused_w());
         let prf = prove(&config, &air, trace, &pis);
