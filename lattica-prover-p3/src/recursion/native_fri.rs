@@ -827,6 +827,54 @@ pub(crate) fn fib_epilogue_oracle(
     (local, next, is_first, is_trans, is_last, inv_van, quotient, alpha, zeta)
 }
 
+/// Phase 7.5 (arbitrary-inner epilogue — GENERIC symbolic evaluator): recursively evaluate a p3
+/// `SymbolicExpression` (an AIR constraint tree extracted via `get_symbolic_constraints`, with the Lagrange
+/// selectors baked in as leaves) at the OOD openings. Main{offset 0/1} → local/next[index]; Public → pub;
+/// the selector leaves → their values at ζ; Add/Sub/Neg/Mul recurse. This is the AIR-INDEPENDENT constraint
+/// evaluator — the same tree the in-circuit epilogue walks — so the monolith can verify ANY inner AIR from
+/// its symbolic constraints rather than a hardcoded per-AIR fold.
+#[cfg(test)]
+pub(crate) fn eval_symbolic_native(
+    e: &p3_uni_stark::SymbolicExpression<Val>,
+    local: &[Challenge],
+    next: &[Challenge],
+    pubs: &[Challenge],
+    is_first: Challenge,
+    is_last: Challenge,
+    is_trans: Challenge,
+) -> Challenge {
+    use p3_uni_stark::{BaseEntry, BaseLeaf, SymbolicExpr};
+    match e {
+        SymbolicExpr::Leaf(leaf) => match leaf {
+            BaseLeaf::Variable(v) => match v.entry {
+                BaseEntry::Main { offset } => {
+                    if offset == 0 {
+                        local[v.index]
+                    } else {
+                        next[v.index]
+                    }
+                }
+                BaseEntry::Public => pubs[v.index],
+                _ => panic!("unsupported symbolic entry (preprocessed/periodic) for these inners"),
+            },
+            BaseLeaf::IsFirstRow => is_first,
+            BaseLeaf::IsLastRow => is_last,
+            BaseLeaf::IsTransition => is_trans,
+            BaseLeaf::Constant(c) => Challenge::from(*c),
+        },
+        SymbolicExpr::Add { x, y, .. } => {
+            eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans) + eval_symbolic_native(y, local, next, pubs, is_first, is_last, is_trans)
+        }
+        SymbolicExpr::Sub { x, y, .. } => {
+            eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans) - eval_symbolic_native(y, local, next, pubs, is_first, is_last, is_trans)
+        }
+        SymbolicExpr::Neg { x, .. } => -eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans),
+        SymbolicExpr::Mul { x, y, .. } => {
+            eval_symbolic_native(x, local, next, pubs, is_first, is_last, is_trans) * eval_symbolic_native(y, local, next, pubs, is_first, is_last, is_trans)
+        }
+    }
+}
+
 /// Per-query commit-phase oracle (Phase 3): mirrors `verify_query` for query `q`, returning the reduced
 /// opening e0 = ro, the per-round fold data `(sibling, β_r, bit, point s_r)` (bit = the arity-2 group slot
 /// of the running eval; s_r = g_{log+1}^reverse_bits(parent_index, log)), the resulting `folded_eval`, and
@@ -1325,5 +1373,32 @@ mod tests {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fib_epilogue_oracle(&config, &proof, &bad)));
         std::panic::set_hook(prev);
         assert!(r.is_err(), "general fold relation must break on a tampered public value");
+    }
+
+    /// Phase 7.5 (native): the GENERIC symbolic-constraint fold — extract the inner AIR's constraint trees via
+    /// p3's `get_symbolic_constraints` and evaluate them with `eval_symbolic_native` (data-driven, no hardcoded
+    /// per-AIR fold) — reproduces p3's `verify_constraints` for the multi-column Fibonacci, matching the
+    /// hand-written 7.1 fold. This is the AIR-independent path the monolith epilogue generalizes to.
+    #[test]
+    #[ignore = "slow: Phase 7.5 generic symbolic-constraint fold (get_symbolic_constraints) vs p3"]
+    fn phase7_fib_symbolic_fold_matches_p3() {
+        use super::super::native_verify::FibonacciAir;
+        use super::eval_symbolic_native;
+        use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+        let config = make_config(1, 32);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        let (local, next, is_first, is_trans, is_last, inv_van, quotient, alpha, _z) = fib_epilogue_oracle(&config, &proof, &pvs);
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        // extract the constraint trees (selectors baked in) directly from the AIR — no per-AIR hardcoding.
+        let layout = AirLayout::from_air::<Val>(&FibonacciAir);
+        let constraints = get_symbolic_constraints::<Val, FibonacciAir>(&FibonacciAir, layout);
+        assert_eq!(constraints.len(), 5, "FibonacciAir emits 5 constraints");
+        // Horner α-fold over the extracted constraints (emission order, first-emitted highest power).
+        let mut folded = Challenge::ZERO;
+        for c in &constraints {
+            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, is_first, is_last, is_trans);
+        }
+        assert_eq!(folded * inv_van, quotient, "GENERIC symbolic fold reproduces p3::verify_constraints (Fibonacci)");
+        println!("Phase 7.5: generic symbolic-constraint fold == p3 for Fibonacci ({} constraints, data-driven, no hardcoded fold)", constraints.len());
     }
 }
