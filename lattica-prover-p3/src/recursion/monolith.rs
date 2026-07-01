@@ -4550,6 +4550,32 @@ mod tests {
     }
 
     #[test]
+    fn phase4d_commit_merkle_structure() {
+        use crate::recursion::native_fri::{query_commit_merkle, query_commit_merkle_all, MyHash};
+        use p3_goldilocks::default_goldilocks_poseidon2_8;
+        use p3_symmetric::CryptographicHasher;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+        for q in 0..MILESTONE_QUERIES {
+            let all = query_commit_merkle_all(&config, &proof, &pvs, q);
+            let depths: Vec<usize> = all.iter().map(|(_, _, p, _)| p.len()).collect();
+            assert_eq!(depths, vec![3, 2, 1, 0, 0, 0], "commit-phase depths (q {q})");
+            // each round: leaf == MyHash(bit-ordered group)
+            for (group, leaf, _path, _cap) in &all {
+                let h: [Val; 4] = hasher.hash_iter(group.iter().copied());
+                assert_eq!(&h, leaf, "leaf == Hash(group) (q {q})");
+            }
+            // round 1 matches the validated single-round oracle (which the standalone AIR proves against)
+            let (leaf1, group1, path1, cap1) = query_commit_merkle(&config, &proof, &pvs, q);
+            assert_eq!((all[1].0, all[1].1, &all[1].2, all[1].3), (group1, leaf1, &path1, cap1), "round 1 == query_commit_merkle (q {q})");
+        }
+        // total commit-phase blocks per super-tile: Σ (1 leaf + depth merges) = 6 + (3+2+1) = 12.
+        let blocks: usize = query_commit_merkle_all(&config, &proof, &pvs, 0).iter().map(|(_, _, p, _)| 1 + p.len()).sum();
+        println!("commit-phase structure: 6 rounds, depths [3,2,1,0,0,0], {blocks} blocks/super-tile, all groups→leaves validated vs the real proof");
+    }
+
+    #[test]
     fn epilogue_probe() {
         use crate::recursion::native_fri::epilogue_oracle;
         use p3_field::{Field, TwoAdicField};

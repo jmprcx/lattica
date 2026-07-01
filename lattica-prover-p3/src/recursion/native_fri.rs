@@ -788,6 +788,50 @@ pub(crate) fn query_commit_merkle(
     (leaf, group, path, cap_entry)
 }
 
+/// Per-query commit-phase Merkle oracle for ALL rounds (the generalization of `query_commit_merkle` used by
+/// the monolith inline). For each fold round r returns `(group, leaf, path, cap_entry)`: `group` = the
+/// bit-ordered arity-2 pair {e_r, sib_r} (e_r = the running eval before round r's fold — reconstructed
+/// exactly as `query_fold_data`), `leaf = MyHash(group)`, `path` = the round's authentication path (parent
+/// index = index >> (r+1)), and `cap_entry = commit_phase_commits[r].roots()[parent >> depth]`. Depths for the
+/// milestone (log_global=10, cap_height=6) are [3,2,1,0,0,0]. This binds every fold sibling to the committed
+/// FRI codeword — the last opening the monolith must authenticate.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn query_commit_merkle_all(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> Vec<([Val; 4], [Val; 4], Vec<([Val; 4], bool)>, [Val; 4])> {
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_symmetric::CryptographicHasher;
+    let (_, _, _, _, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let (ro, rounds, _e_final, _f0) = query_fold_data(config, proof, pvs, q);
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+    let mut e = ro;
+    let mut start = index;
+    let mut out = Vec::new();
+    for (r, step) in fri.query_proofs[q].commit_phase_openings.iter().enumerate() {
+        let la = step.log_arity as usize;
+        let (sibling, beta, bit, s) = rounds[r];
+        let (g0, g1) = if !bit { (e, sibling) } else { (sibling, e) };
+        let flat: Vec<Val> = [g0, g1].iter().flat_map(|x| x.as_basis_coefficients_slice().to_vec()).collect();
+        let group: [Val; 4] = flat.clone().try_into().unwrap();
+        let leaf: [Val; 4] = hasher.hash_iter(flat);
+        start >>= la; // parent index at the folded height
+        let path_siblings = &step.opening_proof;
+        let path: Vec<([Val; 4], bool)> = path_siblings.iter().enumerate().map(|(lvl, &sb)| (sb, (start >> lvl) & 1 == 1)).collect();
+        let depth = path_siblings.len();
+        let cap_entry = fri.commit_phase_commits[r].roots()[start >> depth];
+        out.push((group, leaf, path, cap_entry));
+        e = crate::recursion::fri_fold::native_fold(g0, g1, beta, s);
+    }
+    out
+}
+
 /// THE COMPLETE NATIVE WIRING — a full STARK verify that uses my native FRI verify (`verify_fri_native`)
 /// in place of `pcs.verify`. Mirrors `p3_uni_stark::verify`'s orchestration for the non-ZK path (is_zk=0):
 /// transcript replay (observe → α → observe → ζ) → opening rounds → observe opened evals → MY FRI verify
