@@ -423,6 +423,28 @@ pub(crate) fn gen_counter_proof(config: &MyConfig, value: u64, log_height: usize
     (p3_uni_stark::prove(config, &CounterAir, trace, &pvs), pvs)
 }
 
+/// Generate a real inner proof for the MULTI-COLUMN `FibonacciAir` (2 cols `[a,b]`, seeds `a0=seed_a`,
+/// `b0=seed_b`). pvs = `[seed_a, seed_b, b_{n-1}]` (the last-row result). The inner proof used to exercise the
+/// GENERAL OOD epilogue (multi-column openings, cross-column constraints, all three selectors).
+#[cfg(test)]
+pub(crate) fn gen_fib_proof(config: &MyConfig, seed_a: u64, seed_b: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use super::native_verify::FibonacciAir;
+    use p3_matrix::dense::RowMajorMatrix;
+    let n = 1usize << log_height;
+    let (mut a, mut b) = (Val::from_u64(seed_a), Val::from_u64(seed_b));
+    let mut vals = Vec::with_capacity(n * 2);
+    for _ in 0..n {
+        vals.push(a);
+        vals.push(b);
+        let (na, nb) = (b, a + b); // a' = b, b' = a + b
+        a = na;
+        b = nb;
+    }
+    let last_b = vals[(n - 1) * 2 + 1]; // b at the last row
+    let pvs = vec![Val::from_u64(seed_a), Val::from_u64(seed_b), last_b];
+    (p3_uni_stark::prove(config, &FibonacciAir, RowMajorMatrix::new(vals, 2), &pvs), pvs)
+}
+
 /// A `MerkleCap` commitment flattened to its felt sequence (roots in order) — EXACTLY the felts the
 /// challenger observes via `observe(cap)`. The monolith transcript region must absorb this same sequence.
 #[cfg(test)]
@@ -666,6 +688,61 @@ pub(crate) fn epilogue_oracle(
         degree_bits, nqc, chunk_lens, quotient, local, next, chunks, alpha_stark, zeta,
         sel.is_first_row, sel.is_transition, sel.inv_vanishing,
     )
+}
+
+/// Phase 7 (arbitrary-inner epilogue — native reference): the GENERAL OOD constraint fold on a real
+/// MULTI-COLUMN `FibonacciAir` proof. Returns the fold inputs the in-circuit general epilogue consumes
+/// (openings `local[0..2]`/`next[0..2]` at ζ/ζ·g; the three Lagrange selectors is_first/is_trans/is_last +
+/// inv_van at ζ; quotient(ζ); α_stark; ζ) and INTERNALLY asserts the hand-written Horner α-fold
+/// `folded = Σ_i α^(4−i)·C_i` (C_i = selector_i·expr_i in FibonacciAir's emission order) satisfies
+/// `folded·inv_van == quotient(ζ)` — i.e. reproduces p3's `verify_constraints`. Non-circular reference for
+/// generalizing the monolith epilogue beyond the 1-column ConstAir/CounterAir (the B5 / real-join-split blocker).
+/// Returns (local, next, is_first, is_trans, is_last, inv_van, quotient, α_stark, ζ).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn fib_epilogue_oracle(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+) -> ([Challenge; 2], [Challenge; 2], Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge) {
+    use super::native_verify::FibonacciAir;
+    use p3_field::BasedVectorSpace;
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (alpha_p, zeta_p, _, _, _) = full_transcript_challenges(config, proof, pvs);
+    let alpha = to_ext(alpha_p);
+    let zeta = to_ext(zeta_p);
+    let air = FibonacciAir;
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
+    let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let layout = AirLayout::from_air::<Val>(&air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, FibonacciAir>(&air, layout, 0);
+    let nqc = 1usize << log_nqc;
+    let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    let quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta);
+    let local: [Challenge; 2] = proof.opened_values.trace_local[..2].try_into().unwrap();
+    let next: [Challenge; 2] = proof.opened_values.trace_next.as_ref().unwrap()[..2].try_into().unwrap();
+    let sel = trace_domain.selectors_at_point(zeta);
+    let (is_first, is_trans, is_last, inv_van) = (sel.is_first_row, sel.is_transition, sel.is_last_row, sel.inv_vanishing);
+    // hand-written GENERAL α-fold (Horner, first-emitted highest power), matching FibonacciAir's eval order.
+    let pub0 = to_ext([pvs[0], Val::ZERO]);
+    let pub1 = to_ext([pvs[1], Val::ZERO]);
+    let pub2 = to_ext([pvs[2], Val::ZERO]);
+    let cs = [
+        is_first * (local[0] - pub0),               // C0: first-row a
+        is_first * (local[1] - pub1),               // C1: first-row b
+        is_trans * (next[0] - local[1]),            // C2: a' − b
+        is_trans * (next[1] - local[0] - local[1]), // C3: b' − a − b
+        is_last * (local[1] - pub2),                // C4: last-row b
+    ];
+    let mut folded = Challenge::ZERO;
+    for c in cs {
+        folded = folded * alpha + c;
+    }
+    assert_eq!(folded * inv_van, quotient, "general α-fold: folded·inv_van == quotient(ζ) (matches p3 verify_constraints)");
+    (local, next, is_first, is_trans, is_last, inv_van, quotient, alpha, zeta)
 }
 
 /// Per-query commit-phase oracle (Phase 3): mirrors `verify_query` for query `q`, returning the reduced
@@ -1141,5 +1218,30 @@ mod tests {
         // corrupt a final_poly coefficient ⇒ reject (proves the final low-degree check is doing work).
         proof.opening_proof.final_poly[0] += Challenge::ONE;
         assert!(verify_proof(&config, &proof, &pvs).is_err(), "should reject tampered final_poly");
+    }
+
+    /// Phase 7 (arbitrary-inner epilogue, native reference): the GENERAL multi-column OOD α-fold on a real
+    /// `FibonacciAir` proof reproduces p3's `verify_constraints`, and breaks on a tampered public value.
+    #[test]
+    #[ignore = "slow: Phase 7 general OOD fold (multi-column FibonacciAir) vs p3::verify_constraints"]
+    fn phase7_fib_general_fold_matches_p3() {
+        use super::super::native_verify::FibonacciAir;
+        let config = make_config(1, 32);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        // p3 accepts the multi-column proof.
+        assert!(verify(&config, &FibonacciAir, &proof, &pvs).is_ok(), "p3::verify should accept the Fibonacci proof");
+        // the hand-written GENERAL Horner α-fold reproduces p3's verify_constraints (internal assert of the
+        // oracle: folded·inv_van == quotient(ζ)); the three selectors at ζ are distinct (all constraint types
+        // genuinely exercised).
+        let (_l, _n, is_first, is_trans, is_last, ..) = fib_epilogue_oracle(&config, &proof, &pvs);
+        assert!(is_first != is_trans && is_trans != is_last && is_first != is_last, "distinct is_first/is_trans/is_last at ζ");
+        // tampered public (wrong seed) ⇒ p3 rejects AND the general fold relation breaks.
+        let bad = vec![pvs[0] + Val::ONE, pvs[1], pvs[2]];
+        assert!(verify(&config, &FibonacciAir, &proof, &bad).is_err(), "p3 rejects wrong public value");
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fib_epilogue_oracle(&config, &proof, &bad)));
+        std::panic::set_hook(prev);
+        assert!(r.is_err(), "general fold relation must break on a tampered public value");
     }
 }

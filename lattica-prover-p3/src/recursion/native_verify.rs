@@ -78,6 +78,38 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CounterAir {
     }
 }
 
+/// A MULTI-COLUMN inner (Phase 7): the classic Fibonacci recurrence over 2 columns `[a, b]`. First row seeds
+/// `a=pub[0]`, `b=pub[1]`; transition `a'=b`, `b'=a+b`; last row `b=pub[2]`. Unlike the 1-column ConstAir/
+/// CounterAir, it exercises the GENERAL OOD epilogue: multi-column openings, CROSS-column constraints, and
+/// all three Lagrange selectors (first, transition, last) in the α-fold — the first bounded step toward the
+/// arbitrary-inner-AIR epilogue (the blocker for B5 recursion depth + folding real join-split statements).
+/// Constraint EMISSION ORDER (the α-fold is Horner, first-emitted gets the highest power): C0 first-row a,
+/// C1 first-row b, C2 transition a', C3 transition b', C4 last-row b.
+pub struct FibonacciAir;
+
+impl BaseAir<Goldilocks> for FibonacciAir {
+    fn width(&self) -> usize {
+        2
+    }
+    fn num_public_values(&self) -> usize {
+        3
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FibonacciAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0
+        builder.when_first_row().assert_zero(cur[1].clone() - pis[1].clone()); // C1
+        builder.when_transition().assert_zero(nxt[0].clone() - cur[1].clone()); // C2: a' = b
+        builder.when_transition().assert_zero(nxt[1].clone() - cur[0].clone() - cur[1].clone()); // C3: b' = a + b
+        builder.when_last_row().assert_zero(cur[1].clone() - pis[2].clone()); // C4
+    }
+}
+
 // --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
 //     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;
