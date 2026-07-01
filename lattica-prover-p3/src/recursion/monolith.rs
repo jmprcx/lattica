@@ -5275,6 +5275,24 @@ mod tests {
         println!("commit-phase structure: 6 rounds, depths [3,2,1,0,0,0], {blocks} blocks/super-tile, all groups→leaves validated vs the real proof");
     }
 
+    /// Phase 6.2 (epilogue): the OOD constraint for the NON-degenerate counter (`next − cur − 1`) — its folded
+    /// relation `(is_first·(local−pub) + is_trans·(next−local−1))·inv_van == quotient(ζ)` holds vs p3, and the
+    /// quotient(ζ) is NON-zero (unlike ConstAir's 0) — confirming the epilogue is exercised non-trivially.
+    #[test]
+    fn counter_epilogue_probe() {
+        use crate::recursion::native_fri::{epilogue_oracle, gen_counter_proof};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_counter_proof(&config, 42, 6);
+        let (_db, _nqc, _cl, quotient, local, next, _chunks, alpha, _zeta, is_first, is_trans, inv_van) =
+            epilogue_oracle(&config, &proof, &pvs);
+        let pub_val = Challenge::from(pvs[0]);
+        let c0 = is_first * (local - pub_val); // first-row: local − pub
+        let c1 = is_trans * (next - local - Challenge::ONE); // transition: next − cur − 1
+        assert_eq!((c0 * alpha + c1) * inv_van, quotient, "counter OOD: (A·α + B)·inv_van == quotient(ζ)");
+        assert!(quotient != Challenge::ZERO, "counter quotient(ζ) is NON-zero (non-degenerate)");
+        println!("Phase 6.2 epilogue: counter (next−cur−1) OOD check validated vs p3; quotient(ζ) non-zero");
+    }
+
     #[test]
     fn counter_probe() {
         use crate::recursion::native_fri::{gen_counter_proof, query_input_merkle};

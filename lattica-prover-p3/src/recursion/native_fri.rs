@@ -618,7 +618,9 @@ pub(crate) fn epilogue_oracle(
     let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
     // the ext generator element X (= 0 + 1·X); for the binomial ext with X²=W: c0 + c1·X in coords.
     let x_gen = Challenge::from_basis_coefficients_fn(|i| if i == 1 { Val::ONE } else { Val::ZERO });
-    let (_, zeta_p, alpha_p, _, _) = full_transcript_challenges(config, proof, pvs);
+    // α_stark (the constraint-combination challenge, sampled after the trace commit + pvs) is the FIRST
+    // returned challenge; the OOD fold uses it, NOT α_fri (the 3rd). (ConstAir's zero folded masked this.)
+    let (alpha_p, zeta_p, _, _, _) = full_transcript_challenges(config, proof, pvs);
     let zeta = to_ext(zeta_p);
     let alpha_stark = to_ext(alpha_p);
     let air = ConstAir;
