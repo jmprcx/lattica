@@ -918,6 +918,39 @@ pub(crate) fn general_fold_oracle(
     out
 }
 
+/// Aggregation domain tag for the per-inner statement digest — the SAME `DOM_TXROOT` the batch uses, so the
+/// aggregator's emitted root is node-seam compatible.
+#[cfg(test)]
+pub(crate) const DOM_AGG: u64 = crate::batch_joinsplit_air::DOM_TXROOT;
+
+/// Native aggregation oracle (Phase 6.3): the reference block **tx-root** for K inner proofs. Verifies each
+/// inner (via `p3::verify` — the ground truth the in-circuit monolith reproduces), forms its per-inner
+/// statement digest `s_k = merge([DOM_AGG,0,0,0], [pvs[0],0,0,0])` (a minimal MD-chain over the 1-value
+/// ConstAir statement — the placeholder for the real 26-field join-split `tx_statement_digest`), and folds
+/// into a running root exactly as `batch_joinsplit_air::batch_root`: IV=0, `root = merge(root, s_k)`, padded
+/// to a power of two with a dummy `s_k`. Returns the tx-root the aggregator AIR must emit.
+#[cfg(test)]
+pub(crate) fn agg_statement_digest(pv0: Val) -> [Val; 4] {
+    use crate::joinsplit_air::merge;
+    merge([Val::from_u64(DOM_AGG), Val::ZERO, Val::ZERO, Val::ZERO], [pv0, Val::ZERO, Val::ZERO, Val::ZERO])
+}
+
+#[cfg(test)]
+pub(crate) fn agg_root(config: &MyConfig, inners: &[(Proof<MyConfig>, Vec<Val>)]) -> [Val; 4] {
+    use crate::joinsplit_air::merge;
+    let dummy = agg_statement_digest(Val::ZERO); // canonical padding statement (pv0 = 0)
+    let mut root = [Val::ZERO; 4]; // IV = 0
+    for (proof, pvs) in inners {
+        assert!(p3_uni_stark::verify(config, &ConstAir, proof, pvs).is_ok(), "aggregated inner proof must verify");
+        root = merge(root, agg_statement_digest(pvs[0]));
+    }
+    let n_pad = inners.len().max(1).next_power_of_two();
+    for _ in inners.len()..n_pad {
+        root = merge(root, dummy);
+    }
+    root
+}
+
 /// GENERAL-ARITY fold CHAIN oracle (Phase 5 re-fusion): the full commit-phase fold for query `q` as the
 /// monolith runs it — the initial reduced opening `ro`, then per round `(evals, beta, xs, slot, folded)`
 /// where `slot = index % arity` is the running eval's position in the group, and finally `final_poly[0]`

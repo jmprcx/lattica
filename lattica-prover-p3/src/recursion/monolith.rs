@@ -4045,6 +4045,183 @@ pub(crate) fn build_arity4_fold_chain_trace(
     RowMajorMatrix::new(t, A4_W)
 }
 
+// =================================================================================================
+// Phase 6.4 — the AGGREGATION tx-root FOLD AIR. Given K inner statements (each a single felt `pvs0`), emit
+// the block tx-root EXACTLY as `batch_joinsplit_air::batch_root` / `native_fri::agg_root`: per tile a 2-block
+// Merkle–Damgård fold — `s_k = merge([DOM,0,0,0], [pvs0,0,0,0])` then `root = merge(root, s_k)` — over a
+// global-persistent ROOT column (IV=0), padded to a power of two (padding tiles use pvs0=0), with the tx-root
+// bound as the SINGLE public input on the last row. This is the node-seam-compatible root, reusing the batch
+// fold shape verbatim; validated vs `agg_root`. (In the full aggregator, each `pvs0` is the monolith tile's
+// verified inner public value rather than a public input.)
+// =================================================================================================
+const AF_ROOT: usize = W; // global-persistent running root (4 lanes) after the 8 Poseidon lanes
+const AF_W: usize = W + 4;
+const AF_DOM: u64 = 6; // = batch_joinsplit_air::DOM_TXROOT
+#[allow(dead_code)]
+pub(crate) struct AggFoldAir {
+    pub n_tiles: usize, // power of two
+}
+#[allow(dead_code)]
+impl AggFoldAir {
+    fn height(&self) -> usize {
+        (2 * self.n_tiles * BLOCK).next_power_of_two()
+    }
+    fn p_sk(&self, t: usize) -> usize {
+        12 + t // SK block (block 2t) first row, per tile
+    }
+    fn p_rootin(&self) -> usize {
+        12 + self.n_tiles // ROOT block (2t+1) first row (all tiles)
+    }
+    fn p_sklast(&self) -> usize {
+        self.p_rootin() + 1 // SK block last row (s_k → ROOT block rate-high link)
+    }
+    fn p_rootupd(&self) -> usize {
+        self.p_rootin() + 2 // ROOT block last row (ROOT column update)
+    }
+    fn p_term(&self) -> usize {
+        self.p_rootin() + 3 // last block last row (tx-root)
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round cols
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..(2 * self.n_tiles) {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl); // P_BLOCK_LAST (11)
+        for t in 0..self.n_tiles {
+            let mut c = vec![Val::ZERO; h];
+            c[(2 * t) * BLOCK] = Val::ONE;
+            cols.push(c); // P_SK(t)
+        }
+        let mut rootin = vec![Val::ZERO; h];
+        let mut sklast = vec![Val::ZERO; h];
+        let mut rootupd = vec![Val::ZERO; h];
+        for t in 0..self.n_tiles {
+            rootin[(2 * t + 1) * BLOCK] = Val::ONE;
+            sklast[(2 * t) * BLOCK + BLOCK - 1] = Val::ONE;
+            rootupd[(2 * t + 1) * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(rootin);
+        cols.push(sklast);
+        cols.push(rootupd);
+        let mut term = vec![Val::ZERO; h];
+        term[(2 * self.n_tiles - 1) * BLOCK + BLOCK - 1] = Val::ONE;
+        cols.push(term); // P_TERM
+        cols
+    }
+}
+impl BaseAir<Goldilocks> for AggFoldAir {
+    fn width(&self) -> usize {
+        AF_W
+    }
+    fn num_public_values(&self) -> usize {
+        self.n_tiles + 4 // K inner statements (pvs0) + the block tx-root
+    }
+    fn num_periodic_columns(&self) -> usize {
+        self.p_term() + 1
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AggFoldAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let dom = AB::Expr::from(Goldilocks::from_u64(AF_DOM));
+        // Poseidon2 rounds (every block hashes).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(step);
+        }
+        // SK block seed: [DOM, 0, 0, 0, pvs0_t, 0, 0, 0] (P_SK(t) selects the t-th statement).
+        for t in 0..self.n_tiles {
+            let ps = p[self.p_sk(t)].clone();
+            builder.assert_zero(ps.clone() * (cur[0].clone() - dom.clone()));
+            builder.assert_zero(ps.clone() * (cur[4].clone() - pis[t].clone()));
+            for i in [1usize, 2, 3, 5, 6, 7] {
+                builder.assert_zero(ps.clone() * cur[i].clone());
+            }
+        }
+        // SK block output → ROOT block rate-high (s_k link): nxt[4..8] == cur[0..4] on the SK block last row.
+        let skl = p[self.p_sklast()].clone();
+        for k in 0..4 {
+            builder.when_transition().assert_zero(skl.clone() * (nxt[4 + k].clone() - cur[k].clone()));
+        }
+        // ROOT block first row rate-low == the running ROOT column.
+        let rin = p[self.p_rootin()].clone();
+        for k in 0..4 {
+            builder.assert_zero(rin.clone() * (cur[k].clone() - cur[AF_ROOT + k].clone()));
+        }
+        // ROOT column: IV = 0; updated to the ROOT block output at P_ROOT_UPDATE; held otherwise.
+        for k in 0..4 {
+            builder.when_first_row().assert_zero(cur[AF_ROOT + k].clone());
+        }
+        let rupd = p[self.p_rootupd()].clone();
+        for k in 0..4 {
+            builder.when_transition().assert_zero((AB::Expr::ONE - rupd.clone()) * (nxt[AF_ROOT + k].clone() - cur[AF_ROOT + k].clone()));
+            builder.when_transition().assert_zero(rupd.clone() * (nxt[AF_ROOT + k].clone() - cur[k].clone()));
+        }
+        // tx-root: the last ROOT block output == the single public input.
+        let term = p[self.p_term()].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[self.n_tiles + k].clone()));
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_agg_fold_trace(n_tiles: usize, pvs0: &[Val], tx_root: [Val; 4]) -> RowMajorMatrix<Val> {
+    let air = AggFoldAir { n_tiles };
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * AF_W];
+    let mut root = [Val::ZERO; 4]; // IV = 0
+    for tile in 0..n_tiles {
+        let pv = pvs0.get(tile).copied().unwrap_or(Val::ZERO); // padding tiles fold pvs0 = 0
+        // SK block (2·tile): merge([DOM,0,0,0], [pv,0,0,0]) → s_k; ROOT column holds the running root.
+        let mut sk_in = [Val::ZERO; W];
+        sk_in[0] = Val::from_u64(AF_DOM);
+        sk_in[4] = pv;
+        let sk_rows = native_steps(sk_in);
+        for r in 0..BLOCK {
+            let base = ((2 * tile) * BLOCK + r) * AF_W;
+            t[base..base + W].copy_from_slice(&sk_rows[r]);
+            t[base + AF_ROOT..base + AF_ROOT + 4].copy_from_slice(&root);
+        }
+        let s_k: [Val; 4] = native_permute(sk_in)[..4].try_into().unwrap();
+        // ROOT block (2·tile+1): merge(root, s_k) → root'; ROOT column still holds the OLD root here.
+        let mut rt_in = [Val::ZERO; W];
+        rt_in[..4].copy_from_slice(&root);
+        rt_in[4..].copy_from_slice(&s_k);
+        let rt_rows = native_steps(rt_in);
+        for r in 0..BLOCK {
+            let base = ((2 * tile + 1) * BLOCK + r) * AF_W;
+            t[base..base + W].copy_from_slice(&rt_rows[r]);
+            t[base + AF_ROOT..base + AF_ROOT + 4].copy_from_slice(&root);
+        }
+        root = native_permute(rt_in)[..4].try_into().unwrap(); // update for the next tile
+    }
+    debug_assert_eq!(root, tx_root, "built fold root == expected tx-root");
+    RowMajorMatrix::new(t, AF_W)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -5117,6 +5294,31 @@ mod tests {
         let (_l1, _p1, e1) = query_input_merkle(&config, &proof, &pvs, 1);
         println!("counter per-query cap entries differ across q0/q1: {}", e0 != e1);
         assert!(cap_distinct && !const_distinct, "counter has distinct cap entries; ConstAir does not");
+    }
+
+    /// Phase 6.3+6.4: the in-circuit aggregation tx-root FOLD (`AggFoldAir`) emits exactly the reference
+    /// block tx-root from `native_fri::agg_root` (the batch fold shape — node-seam compatible), and rejects a
+    /// tampered tx-root. K inner statements folded via s_k = merge([DOM,0,0,0],[pvs0,0,0,0]) → running root.
+    #[test]
+    #[ignore = "slow: Phase 6.4 aggregation tx-root fold vs agg_root oracle"]
+    fn phase6_agg_fold_matches_oracle() {
+        use super::{build_agg_fold_trace, AggFoldAir};
+        use crate::recursion::native_fri::{agg_root, gen_const_proof};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let inners: Vec<_> = [42u64, 99, 7].iter().map(|&v| gen_const_proof(&config, v, 6)).collect();
+        let tx_root = agg_root(&config, &inners);
+        let n_tiles = inners.len().next_power_of_two(); // 4 (pads with a pvs0=0 dummy tile)
+        let pvs0: Vec<Val> = inners.iter().map(|(_, pvs)| pvs[0]).collect();
+        let air = AggFoldAir { n_tiles };
+        let mut pis: Vec<Val> = (0..n_tiles).map(|t| pvs0.get(t).copied().unwrap_or(Val::ZERO)).collect();
+        pis.extend_from_slice(&tx_root);
+        let trace = build_agg_fold_trace(n_tiles, &pvs0, tx_root);
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "agg fold emits the tx-root matching agg_root");
+        let mut bad = pis.clone();
+        bad[n_tiles] += Val::ONE; // tamper the tx-root
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered tx-root ⇒ reject");
+        println!("Phase 6.4: aggregation tx-root fold (K={} → pow2 {n_tiles}) == agg_root oracle, node-seam compatible", inners.len());
     }
 
     #[test]
