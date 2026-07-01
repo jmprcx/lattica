@@ -873,4 +873,160 @@ mod tests {
         );
         println!("native hiding oracle: salted-leaf INPUT Merkle (row ‖ 4 salt) + reduced opening + fold validated vs p3::verify");
     }
+
+    // ---------------- in-circuit hiding monolith harness (#86) — transcript witness ----------------
+    // A copy of the monolith's transcript simulator `Sim`, driving the HIDING transcript so the in-circuit
+    // transcript region's block schedule can be derived from a hiding proof. Poseidon2 sponge (W=8, RATE=4,
+    // overwrite-mode duplex) — identical to monolith::tests::Sim.
+    use crate::poseidon2_air::{native_permute, W as SPONGE_W};
+    const RATE: usize = 4;
+    const CAP_LANE: usize = RATE;
+
+    struct Sim {
+        state: [Val; SPONGE_W],
+        input: Vec<Val>,
+        output: Vec<Val>,
+        block_inputs: Vec<[Val; SPONGE_W]>,
+        counts: Vec<u8>,
+    }
+    impl Sim {
+        fn new() -> Self {
+            Self { state: [Val::ZERO; SPONGE_W], input: vec![], output: vec![], block_inputs: vec![], counts: vec![] }
+        }
+        fn duplex(&mut self) {
+            let num = self.input.len();
+            for (i, v) in self.input.drain(..).enumerate() {
+                self.state[i] = v;
+            }
+            if num > 0 {
+                for i in num..RATE {
+                    self.state[i] = Val::ZERO;
+                }
+                self.state[CAP_LANE] += Val::from_u64(num as u64);
+            }
+            self.block_inputs.push(self.state);
+            self.counts.push(num as u8);
+            self.state = native_permute(self.state);
+            self.output = self.state[..RATE].to_vec();
+        }
+        fn observe(&mut self, v: Val) {
+            self.output.clear();
+            self.input.push(v);
+            if self.input.len() == RATE {
+                self.duplex();
+            }
+        }
+        fn observe_ext(&mut self, x: Challenge) {
+            use p3_field::BasedVectorSpace;
+            for &c in x.as_basis_coefficients_slice() {
+                self.observe(c);
+            }
+        }
+        fn sample_base(&mut self) -> Val {
+            if !self.input.is_empty() || self.output.is_empty() {
+                self.duplex();
+            }
+            self.output.pop().unwrap()
+        }
+        fn sample_ext(&mut self) -> [Val; 2] {
+            let c0 = self.sample_base();
+            let c1 = self.sample_base();
+            [c0, c1]
+        }
+    }
+
+    fn cap_felts_h(commit: &<ValMmcs as p3_commit::Mmcs<Val>>::Commitment) -> Vec<Val> {
+        commit.roots().iter().flatten().copied().collect()
+    }
+
+    /// The HIDING analog of monolith::tests::sim_full: replay the is_zk=1 transcript in the block-based Sim
+    /// (the random-commitment absorb after the quotient commitment, and the codeword-MERGED opened-value
+    /// absorb before α_fri), returning the Poseidon2 block schedule + the challenges [α_stark, ζ, α_fri, β_r].
+    fn sim_full_hiding(config: &MyConfig, proof: &Proof<MyConfig>, pvs: &[Val]) -> (Vec<[Val; SPONGE_W]>, Vec<u8>, Vec<[Val; 2]>) {
+        let pcs = config.pcs();
+        let is_zk = config.is_zk();
+        let degree_bits = proof.degree_bits;
+        let (base_degree_bits, _) =
+            validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).expect("degree bits");
+        let mut s = Sim::new();
+        // preamble → α_stark
+        s.observe(Val::from_usize(degree_bits));
+        s.observe(Val::from_usize(base_degree_bits));
+        s.observe(Val::from_usize(0));
+        for f in cap_felts_h(&proof.commitments.trace) {
+            s.observe(f);
+        }
+        for &p in pvs {
+            s.observe(p);
+        }
+        let a_stark = s.sample_ext();
+        // quotient + RANDOM commitments → ζ
+        for f in cap_felts_h(&proof.commitments.quotient_chunks) {
+            s.observe(f);
+        }
+        if let Some(r) = &proof.commitments.random {
+            for f in cap_felts_h(r) {
+                s.observe(f);
+            }
+        }
+        let zeta = s.sample_ext();
+        // codeword-merged opened-value absorb (round order [random?, trace{ζ,ζ_next}, quotient chunks])
+        let rand_cws = &proof.opening_proof.0;
+        let mut round = 0usize;
+        let observe_merged = |s: &mut Sim, public: &[Challenge], cw: &[Challenge]| {
+            for &x in public {
+                s.observe_ext(x);
+            }
+            for &x in cw {
+                s.observe_ext(x);
+            }
+        };
+        if let Some(rv) = &proof.opened_values.random {
+            observe_merged(&mut s, rv, &rand_cws[round][0][0]);
+            round += 1;
+        }
+        observe_merged(&mut s, &proof.opened_values.trace_local, &rand_cws[round][0][0]);
+        if let Some(tn) = &proof.opened_values.trace_next {
+            observe_merged(&mut s, tn, &rand_cws[round][0][1]);
+        }
+        round += 1;
+        for (i, c) in proof.opened_values.quotient_chunks.iter().enumerate() {
+            observe_merged(&mut s, c, &rand_cws[round][i][0]);
+        }
+        let a_fri = s.sample_ext();
+        // β_r (commit-pow is 0 bits ⇒ check_witness is a no-op, matching sim_full)
+        let fri = &proof.opening_proof.1;
+        let mut chs = vec![a_stark, zeta, a_fri];
+        for comm in &fri.commit_phase_commits {
+            for f in cap_felts_h(comm) {
+                s.observe(f);
+            }
+            chs.push(s.sample_ext());
+        }
+        (s.block_inputs, s.counts, chs)
+    }
+
+    /// Native hiding monolith harness (#86, step 1): the block-based transcript Sim reproduces the HIDING
+    /// challenges (α_stark, ζ, α_fri, β_r) that the real challenger produces (hiding_transcript_challenges).
+    /// This validates the Poseidon2 block schedule the in-circuit transcript region will replay — including
+    /// the two is_zk=1 deltas (random-commitment absorb + codeword-merged opened-value absorb).
+    #[test]
+    #[ignore = "slow: hiding transcript Sim (block schedule) vs the real challenger"]
+    fn hiding_transcript_sim_matches() {
+        use p3_field::BasedVectorSpace;
+        let config = make_config();
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        let (blocks, counts, chs) = sim_full_hiding(&config, &proof, &pvs);
+        assert_eq!(blocks.len(), counts.len());
+        let (a_stark, zeta, a_fri, betas, _idx) = hiding_transcript_challenges(&config, &proof, &pvs);
+        let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        assert_eq!(chs[0], c(a_stark), "Sim α_stark != challenger");
+        assert_eq!(chs[1], c(zeta), "Sim ζ != challenger");
+        assert_eq!(chs[2], c(a_fri), "Sim α_fri != challenger (random absorb + codeword merge)");
+        assert_eq!(chs.len(), 3 + betas.len(), "β count");
+        for (i, b) in betas.iter().enumerate() {
+            assert_eq!(chs[3 + i], c(*b), "Sim β_{i} != challenger");
+        }
+        println!("hiding transcript Sim: {} blocks reproduce α_stark/ζ/α_fri/{} β_r vs the real challenger", blocks.len(), betas.len());
+    }
 }
