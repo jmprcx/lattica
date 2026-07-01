@@ -4929,6 +4929,194 @@ pub(crate) fn build_general_epilogue_trace(local: [Challenge; 2], next: [Challen
     RowMajorMatrix::new(vals, w)
 }
 
+// =================================================================================================
+// GENERIC SYMBOLIC EPILOGUE (Phase 7.5) — a DATA-DRIVEN in-circuit OOD constraint check that verifies ANY
+// inner AIR from its p3 `get_symbolic_constraints` trees (no hardcoded per-AIR fold). The three Lagrange
+// selectors are WITNESSED (is_first/is_last/inv_van) and bound to their ζ-definitions (is_first·(ζ−1)=z_h;
+// is_last·(ζ−g^{-1})=z_h; inv_van·z_h=1; is_trans=ζ−g^{-1}), so the constraint tree is evaluated directly
+// (selectors as leaf VALUES — no per-constraint inverse-clearing) and the check is folded·inv_van == quot(ζ),
+// exactly p3's verify_constraints. `eval_symbolic_circuit` mirrors `eval_symbolic_native`. Validated for
+// Fibonacci. ζ/α/pubs are public; the openings + witnessed selectors are witness.
+// =================================================================================================
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn eval_symbolic_circuit<AB: AirBuilder<F = Goldilocks>>(
+    e: &p3_uni_stark::SymbolicExpression<Val>,
+    local: &[(AB::Expr, AB::Expr)],
+    next: &[(AB::Expr, AB::Expr)],
+    pubs: &[(AB::Expr, AB::Expr)],
+    is_first: &(AB::Expr, AB::Expr),
+    is_last: &(AB::Expr, AB::Expr),
+    is_trans: &(AB::Expr, AB::Expr),
+    w_ext: &AB::Expr,
+) -> (AB::Expr, AB::Expr) {
+    use p3_uni_stark::{BaseEntry, BaseLeaf, SymbolicExpr};
+    let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+        (a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+    };
+    match e {
+        SymbolicExpr::Leaf(leaf) => match leaf {
+            BaseLeaf::Variable(v) => match v.entry {
+                BaseEntry::Main { offset } => {
+                    if offset == 0 {
+                        local[v.index].clone()
+                    } else {
+                        next[v.index].clone()
+                    }
+                }
+                BaseEntry::Public => pubs[v.index].clone(),
+                _ => panic!("unsupported symbolic entry (preprocessed/periodic)"),
+            },
+            BaseLeaf::IsFirstRow => is_first.clone(),
+            BaseLeaf::IsLastRow => is_last.clone(),
+            BaseLeaf::IsTransition => is_trans.clone(),
+            BaseLeaf::Constant(c) => (AB::Expr::from(*c), AB::Expr::ZERO),
+        },
+        SymbolicExpr::Add { x, y, .. } => {
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            (a.0 + b.0, a.1 + b.1)
+        }
+        SymbolicExpr::Sub { x, y, .. } => {
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            (a.0 - b.0, a.1 - b.1)
+        }
+        SymbolicExpr::Neg { x, .. } => {
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            (AB::Expr::ZERO - a.0, AB::Expr::ZERO - a.1)
+        }
+        SymbolicExpr::Mul { x, y, .. } => {
+            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, is_first, is_last, is_trans, w_ext);
+            emul(a, b)
+        }
+    }
+}
+
+#[cfg(test)]
+struct SymbolicEpilogueAir {
+    constraints: Vec<p3_uni_stark::SymbolicExpression<Val>>,
+    w: usize,
+    n_pub: usize,
+}
+#[cfg(test)]
+impl SymbolicEpilogueAir {
+    fn c_local(&self, c: usize) -> usize {
+        2 * c
+    }
+    fn c_next(&self, c: usize) -> usize {
+        2 * self.w + 2 * c
+    }
+    fn c_quot(&self) -> usize {
+        4 * self.w
+    }
+    fn c_isf(&self) -> usize {
+        4 * self.w + 2
+    }
+    fn c_isl(&self) -> usize {
+        4 * self.w + 4
+    }
+    fn c_iv(&self) -> usize {
+        4 * self.w + 6
+    }
+    fn w_cols(&self) -> usize {
+        4 * self.w + 8
+    }
+}
+#[cfg(test)]
+impl BaseAir<Goldilocks> for SymbolicEpilogueAir {
+    fn width(&self) -> usize {
+        self.w_cols()
+    }
+    fn num_public_values(&self) -> usize {
+        4 + self.n_pub // ζ(2), α(2), pubs
+    }
+}
+#[cfg(test)]
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SymbolicEpilogueAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let w_ext = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let zeta = (pis[0].clone(), pis[1].clone());
+        let alpha = (pis[2].clone(), pis[3].clone());
+        let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub).map(|i| (pis[4 + i].clone(), AB::Expr::ZERO)).collect();
+        let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS).inverse());
+        let mut s = zeta.clone();
+        for _ in 0..M_DEGREE_BITS {
+            s = emul(s.clone(), s.clone());
+        }
+        let z_h = (s.0 - one.clone(), s.1);
+        let is_trans = (zeta.0.clone() - g_inv, zeta.1.clone());
+        let zm1 = (zeta.0.clone() - one.clone(), zeta.1.clone());
+        let is_first = (cur[self.c_isf()].clone(), cur[self.c_isf() + 1].clone());
+        let is_last = (cur[self.c_isl()].clone(), cur[self.c_isl() + 1].clone());
+        let inv_van = (cur[self.c_iv()].clone(), cur[self.c_iv() + 1].clone());
+        let local: Vec<(AB::Expr, AB::Expr)> = (0..self.w).map(|c| (cur[self.c_local(c)].clone(), cur[self.c_local(c) + 1].clone())).collect();
+        let next: Vec<(AB::Expr, AB::Expr)> = (0..self.w).map(|c| (cur[self.c_next(c)].clone(), cur[self.c_next(c) + 1].clone())).collect();
+        let quot = (cur[self.c_quot()].clone(), cur[self.c_quot() + 1].clone());
+        let mut fr = builder.when_first_row();
+        // witnessed selectors bound to their ζ-definitions.
+        let b_isf = emul(is_first.clone(), zm1.clone());
+        fr.assert_zero(b_isf.0 - z_h.0.clone());
+        fr.assert_zero(b_isf.1 - z_h.1.clone());
+        let b_isl = emul(is_last.clone(), is_trans.clone());
+        fr.assert_zero(b_isl.0 - z_h.0.clone());
+        fr.assert_zero(b_isl.1 - z_h.1.clone());
+        let b_iv = emul(inv_van.clone(), z_h.clone());
+        fr.assert_zero(b_iv.0 - one.clone());
+        fr.assert_zero(b_iv.1);
+        // Horner α-fold over the extracted symbolic constraints (data-driven tree walk).
+        let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for c in &self.constraints {
+            let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &is_first, &is_last, &is_trans, &w_ext);
+            let fa = emul(folded.clone(), alpha.clone());
+            folded = (fa.0 + ci.0, fa.1 + ci.1);
+        }
+        // folded·inv_van == quot(ζ).
+        let chk = emul(folded, inv_van);
+        fr.assert_zero(chk.0 - quot.0);
+        fr.assert_zero(chk.1 - quot.1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_symbolic_epilogue_trace(
+    w: usize,
+    local: &[Challenge],
+    next: &[Challenge],
+    quot: Challenge,
+    is_first: Challenge,
+    is_last: Challenge,
+    inv_van: Challenge,
+) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let width = 4 * w + 8;
+    let height = 16;
+    let mut r0 = vec![Val::ZERO; width];
+    for c in 0..w {
+        r0[2 * c..2 * c + 2].copy_from_slice(&cc(local[c]));
+        r0[2 * w + 2 * c..2 * w + 2 * c + 2].copy_from_slice(&cc(next[c]));
+    }
+    r0[4 * w..4 * w + 2].copy_from_slice(&cc(quot));
+    r0[4 * w + 2..4 * w + 4].copy_from_slice(&cc(is_first));
+    r0[4 * w + 4..4 * w + 6].copy_from_slice(&cc(is_last));
+    r0[4 * w + 6..4 * w + 8].copy_from_slice(&cc(inv_van));
+    let mut vals = Vec::with_capacity(height * width);
+    for _ in 0..height {
+        vals.extend_from_slice(&r0);
+    }
+    RowMajorMatrix::new(vals, width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -6454,6 +6642,38 @@ mod tests {
         let bp = prove(&config, &air, bad, &pis);
         assert!(verify(&config, &air, &bp, &pis).is_err(), "tampered quotient ⇒ reject");
         println!("Phase 7.2: in-circuit general OOD epilogue (multi-column Fibonacci, 5 constraints, 3 selectors) matches p3");
+    }
+
+    /// Phase 7.5: the in-circuit GENERIC symbolic epilogue — a DATA-DRIVEN tree walk over the inner AIR's p3
+    /// `get_symbolic_constraints` (witnessed selectors bound to ζ; folded·inv_van==quot) — verifies the
+    /// multi-column Fibonacci with NO hardcoded per-AIR fold, matching `eval_symbolic_native` (⟺ p3), and
+    /// rejects a tampered quotient. This is the arbitrary-inner constraint core (any AIR from its constraints).
+    #[test]
+    #[ignore = "slow: Phase 7.5 in-circuit generic symbolic epilogue (data-driven) vs p3"]
+    fn phase7_symbolic_epilogue_matches_oracle() {
+        use super::{build_symbolic_epilogue_trace, SymbolicEpilogueAir};
+        use crate::recursion::native_fri::{fib_epilogue_oracle, gen_fib_proof};
+        use crate::recursion::native_verify::FibonacciAir;
+        use p3_field::BasedVectorSpace;
+        use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        let (local, next, is_first, _is_trans, is_last, inv_van, quotient, alpha, zeta) = fib_epilogue_oracle(&config, &proof, &pvs);
+        // extract the inner AIR's constraint trees — the ONLY inner-specific input, now data not code.
+        let layout = AirLayout::from_air::<Val>(&FibonacciAir);
+        let constraints = get_symbolic_constraints::<Val, FibonacciAir>(&FibonacciAir, layout);
+        let air = SymbolicEpilogueAir { constraints, w: 2, n_pub: 3 };
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let (za, al) = (cc(zeta), cc(alpha));
+        let mut pis = vec![za[0], za[1], al[0], al[1]];
+        pis.extend_from_slice(&pvs);
+        let trace = build_symbolic_epilogue_trace(2, &local, &next, quotient, is_first, is_last, inv_van);
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "generic symbolic epilogue (data-driven tree walk) == p3 for Fibonacci");
+        let bad = build_symbolic_epilogue_trace(2, &local, &next, quotient + Challenge::ONE, is_first, is_last, inv_van);
+        let bp = prove(&config, &air, bad, &pis);
+        assert!(verify(&config, &air, &bp, &pis).is_err(), "tampered quotient ⇒ reject");
+        println!("Phase 7.5: in-circuit generic symbolic epilogue verifies Fibonacci from its constraint trees (data-driven)");
     }
 
     /// Phase 7.3: the in-circuit MULTI-COLUMN reduced opening reproduces the native `ro` for a 2-column
