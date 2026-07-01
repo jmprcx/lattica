@@ -623,6 +623,76 @@ pub(crate) fn query_terms(
     (terms, x_out, alpha, ro)
 }
 
+/// Phase 7.3 (multi-column reduced opening — native reference): the DEEP reduced-opening terms + `ro` for a
+/// MULTI-COLUMN `FibonacciAir` query, mirroring `open_input` exactly like `query_terms` but for the 2-column
+/// trace. Returns `(terms=[(z, p_z, p_x)], x, α_fri, ro, w)` where `w` = trace width (2). The trace batch
+/// contributes `2·w` terms — `w` columns × {ζ, ζ_next} — and the opened row value `p_x` is SHARED between a
+/// column's ζ and ζ_next terms (`terms[c].px == terms[w+c].px` = the authenticated row value), the multi-column
+/// soundness point. Internally asserts that px-sharing structure. Reference for the in-circuit gadget.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn fib_query_terms(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    q: usize,
+) -> (Vec<(Challenge, Challenge, Val)>, Val, Challenge, Challenge, usize) {
+    use super::native_verify::FibonacciAir;
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
+    let (_, zeta_p, alpha_p, _, index_felts) = full_transcript_challenges(config, proof, pvs);
+    let zeta = to_ext(zeta_p);
+    let alpha = to_ext(alpha_p);
+    let air = FibonacciAir;
+    let width = air.width();
+    let pcs = config.pcs();
+    let degree_bits = proof.degree_bits;
+    let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
+    let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
+    let layout = AirLayout::from_air::<Val>(&air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, FibonacciAir>(&air, layout, 0);
+    let nqc = 1usize << log_nqc;
+    let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    let zeta_next = trace_domain.next_point(zeta).unwrap();
+    let trace_pts = vec![(zeta, proof.opened_values.trace_local.clone()), (zeta_next, proof.opened_values.trace_next.clone().unwrap())];
+    let coms: ComOpenings = vec![
+        (proof.commitments.trace.clone(), vec![(trace_domain, trace_pts)]),
+        (proof.commitments.quotient_chunks.clone(), qcd.iter().zip(&proof.opened_values.quotient_chunks).map(|(d, v)| (*d, vec![(zeta, v.clone())])).collect()),
+    ];
+    let fri = &proof.opening_proof;
+    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+    let input_proof = &fri.query_proofs[q].input_proof;
+    let mut terms = Vec::new();
+    let mut alpha_pow = Challenge::ONE;
+    let mut ro = Challenge::ZERO;
+    let mut x_out = Val::ZERO;
+    for (batch_opening, (_, mats)) in input_proof.iter().zip(coms.iter()) {
+        for (mat_opening, (mat_domain, mat_pts)) in batch_opening.opened_values.iter().zip(mats.iter()) {
+            let log_height = log2_strict(mat_domain.size()) + 4;
+            let bits_reduced = log_global - log_height;
+            let rev = reverse_bits_len(index >> bits_reduced, log_height);
+            let x = Val::GENERATOR * Val::two_adic_generator(log_height).exp_u64(rev as u64);
+            x_out = x;
+            for (z, ps_at_z) in mat_pts.iter() {
+                let inv = (*z - x).inverse();
+                for (&p_x, &p_z) in mat_opening.iter().zip(ps_at_z.iter()) {
+                    terms.push((*z, p_z, p_x));
+                    ro += alpha_pow * (p_z - p_x) * inv;
+                    alpha_pow *= alpha;
+                }
+            }
+        }
+    }
+    // px-sharing: the first 2·w terms are the trace's {ζ:cols, ζ_next:cols}; column c's two openings share the
+    // one authenticated row value terms[c].px == terms[w+c].px.
+    for c in 0..width {
+        assert_eq!(terms[c].2, terms[width + c].2, "trace column {c}: ζ and ζ_next openings share the authenticated p_x");
+    }
+    (terms, x_out, alpha, ro, width)
+}
+
 /// Epilogue probe/oracle: the OOD constraint-check inputs + the recomposed quotient(ζ), plus p3's OWN
 /// Lagrange selectors at ζ on the real trace domain (the non-circular anchor for the in-circuit selector
 /// chain). Internally asserts the in-circuit recompose kernel `Σ_i zps_i·(c_{i,0}+c_{i,1}·X)` matches p3's

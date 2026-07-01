@@ -4687,6 +4687,135 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralEpilogueAir {
     }
 }
 
+// =================================================================================================
+// MULTI-COLUMN REDUCED OPENING (Phase 7.3) — the DEEP reduced-opening `ro = Σ_k α^k·(p_z(k)−p_x(k))·inv(k)`
+// for a W-column trace, as a standalone gadget validated vs `fib_query_terms`. The reduced-opening arithmetic
+// is already n_terms-generic (the monolith's arith block); the genuinely NEW multi-column property is
+// PX-SHARING: the trace batch contributes 2·W terms (W columns × {ζ, ζ_next}) and column c's two openings
+// reuse the SAME authenticated row value (`opened_row[c]`) — so one Merkle-authenticated value feeds two DEEP
+// terms. Modelled structurally (opened_row[c] is used directly for terms k with k%W==c), so tampering one
+// opened value breaks BOTH that column's terms. α/ro/x are public; z/pz/inv (+ quotient px) are witness.
+// =================================================================================================
+#[cfg(test)]
+struct MultiColReducedOpeningAir {
+    w: usize,       // trace width (columns)
+    n_quot: usize,  // quotient DEEP terms
+}
+#[cfg(test)]
+impl MultiColReducedOpeningAir {
+    fn n_terms(&self) -> usize {
+        2 * self.w + self.n_quot
+    }
+    fn trace_off(&self, k: usize) -> usize {
+        self.w + k * 6 // trace term k: z(2), pz(2), inv(2)
+    }
+    fn quot_off(&self, j: usize) -> usize {
+        self.w + 2 * self.w * 6 + j * 7 // quotient term j: z(2), pz(2), inv(2), px(1)
+    }
+    fn width(&self) -> usize {
+        self.w + 2 * self.w * 6 + self.n_quot * 7
+    }
+}
+#[cfg(test)]
+impl BaseAir<Goldilocks> for MultiColReducedOpeningAir {
+    fn width(&self) -> usize {
+        MultiColReducedOpeningAir::width(self)
+    }
+    fn num_public_values(&self) -> usize {
+        5 // α(2), ro(2), x
+    }
+}
+#[cfg(test)]
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MultiColReducedOpeningAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let w_ext = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let alpha = (pis[0].clone(), pis[1].clone());
+        let ro_pub = (pis[2].clone(), pis[3].clone());
+        let x = pis[4].clone();
+        // α powers 0..n_terms
+        let mut ap = vec![(one.clone(), AB::Expr::ZERO)];
+        for k in 1..self.n_terms() {
+            ap.push(emul(ap[k - 1].clone(), alpha.clone()));
+        }
+        let mut fr = builder.when_first_row();
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        // per-term contribution given (z, pz, px, k): check inv·(z−x)==1, add α^k·(pz−px)·inv.
+        let add_term = |fr: &mut _, ro: &mut (AB::Expr, AB::Expr), z: (AB::Expr, AB::Expr), pz: (AB::Expr, AB::Expr), inv: (AB::Expr, AB::Expr), px: AB::Expr, k: usize| {
+            let chk = emul(inv.clone(), (z.0.clone() - x.clone(), z.1.clone()));
+            AirBuilder::assert_zero(fr, chk.0 - one.clone());
+            AirBuilder::assert_zero(fr, chk.1);
+            let d = (pz.0.clone() - px, pz.1.clone());
+            let t = emul(emul(ap[k].clone(), d), inv);
+            *ro = (ro.0.clone() + t.0, ro.1.clone() + t.1);
+        };
+        // trace terms 0..2w — px = opened_row[k % w] (the SHARED authenticated value).
+        for k in 0..(2 * self.w) {
+            let off = self.trace_off(k);
+            let z = (cur[off].clone(), cur[off + 1].clone());
+            let pz = (cur[off + 2].clone(), cur[off + 3].clone());
+            let inv = (cur[off + 4].clone(), cur[off + 5].clone());
+            let px = cur[k % self.w].clone();
+            add_term(&mut fr, &mut ro, z, pz, inv, px, k);
+        }
+        // quotient terms — px is a per-term witness (authenticated to the quotient commitment elsewhere).
+        for j in 0..self.n_quot {
+            let off = self.quot_off(j);
+            let z = (cur[off].clone(), cur[off + 1].clone());
+            let pz = (cur[off + 2].clone(), cur[off + 3].clone());
+            let inv = (cur[off + 4].clone(), cur[off + 5].clone());
+            let px = cur[off + 6].clone();
+            add_term(&mut fr, &mut ro, z, pz, inv, px, 2 * self.w + j);
+        }
+        fr.assert_zero(ro.0 - ro_pub.0);
+        fr.assert_zero(ro.1 - ro_pub.1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn build_multicol_ro_trace(w: usize, terms: &[(Challenge, Challenge, Val)], x: Val, alpha: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let cc = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let n_quot = terms.len() - 2 * w;
+    let air = MultiColReducedOpeningAir { w, n_quot };
+    let width = BaseAir::<Goldilocks>::width(&air);
+    let height = 16;
+    let mut r0 = vec![Val::ZERO; width];
+    // opened_row[c] = the authenticated row value = terms[c].px (shared with terms[w+c]).
+    for c in 0..w {
+        r0[c] = terms[c].2;
+    }
+    let fill = |r0: &mut [Val], off: usize, z: Challenge, pz: Challenge, px_col: Option<usize>, px: Val| {
+        r0[off..off + 2].copy_from_slice(&cc(z));
+        r0[off + 2..off + 4].copy_from_slice(&cc(pz));
+        r0[off + 4..off + 6].copy_from_slice(&cc((z - Challenge::from(x)).inverse()));
+        if let Some(pc) = px_col {
+            r0[pc] = px;
+        }
+    };
+    for k in 0..(2 * w) {
+        let (z, pz, _px) = terms[k];
+        fill(&mut r0, air.trace_off(k), z, pz, None, Val::ZERO);
+    }
+    for j in 0..n_quot {
+        let (z, pz, px) = terms[2 * w + j];
+        let off = air.quot_off(j);
+        fill(&mut r0, off, z, pz, Some(off + 6), px);
+    }
+    let _ = alpha;
+    let mut vals = Vec::with_capacity(height * width);
+    for _ in 0..height {
+        vals.extend_from_slice(&r0);
+    }
+    RowMajorMatrix::new(vals, width)
+}
+
 #[cfg(test)]
 pub(crate) fn build_general_epilogue_trace(local: [Challenge; 2], next: [Challenge; 2], quotient: Challenge) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
@@ -6141,6 +6270,40 @@ mod tests {
         let bp = prove(&config, &air, bad, &pis);
         assert!(verify(&config, &air, &bp, &pis).is_err(), "tampered quotient ⇒ reject");
         println!("Phase 7.2: in-circuit general OOD epilogue (multi-column Fibonacci, 5 constraints, 3 selectors) matches p3");
+    }
+
+    /// Phase 7.3: the in-circuit MULTI-COLUMN reduced opening reproduces the native `ro` for a 2-column
+    /// FibonacciAir query — 2·W trace DEEP terms with the opened row value SHARED per column across ζ/ζ_next
+    /// (px-sharing), validated vs `fib_query_terms`. Tampering ONE authenticated opened value breaks BOTH that
+    /// column's DEEP terms ⇒ reject, the multi-column soundness property the full monolith fusion needs.
+    #[test]
+    #[ignore = "slow: Phase 7.3 multi-column reduced opening (px-sharing) vs fib_query_terms"]
+    fn phase7_multicol_reduced_opening_matches_oracle() {
+        use super::{build_multicol_ro_trace, MultiColReducedOpeningAir};
+        use crate::recursion::native_fri::{fib_query_terms, gen_fib_proof};
+        use p3_field::BasedVectorSpace;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        let cc = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+        let mut checked = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES / 2, MILESTONE_QUERIES - 1] {
+            let (terms, x, alpha, ro, w) = fib_query_terms(&config, &proof, &pvs, q);
+            let n_quot = terms.len() - 2 * w;
+            let air = MultiColReducedOpeningAir { w, n_quot };
+            let (al, roc) = (cc(alpha), cc(ro));
+            let pis = vec![al[0], al[1], roc[0], roc[1], x];
+            let trace = build_multicol_ro_trace(w, &terms, x, alpha);
+            let prf = prove(&config, &air, trace, &pis);
+            assert!(verify(&config, &air, &prf, &pis).is_ok(), "multi-column reduced opening == native ro (q {q})");
+            // tamper column 0's authenticated opened value ⇒ breaks its ζ AND ζ_next DEEP terms ⇒ ro wrong ⇒ reject.
+            let mut bad_terms = terms.clone();
+            bad_terms[0].2 += Val::ONE;
+            let bad = build_multicol_ro_trace(w, &bad_terms, x, alpha);
+            let bp = prove(&config, &air, bad, &pis);
+            assert!(verify(&config, &air, &bp, &pis).is_err(), "tampered opened value ⇒ reject (q {q})");
+            checked += 1;
+        }
+        println!("Phase 7.3: multi-column reduced opening (W=2, px shared across ζ/ζ_next) matches native ro — {checked} queries");
     }
 
     /// Phase 6.3+6.4: the in-circuit aggregation tx-root FOLD (`AggFoldAir`) emits exactly the reference
