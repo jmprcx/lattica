@@ -2871,14 +2871,18 @@ const M_INPUT_TERM: usize = M_INPUT_LEAF + INPUT_DEPTH; // 1 + 4 = 5
 const M_QUOT_LEAF: usize = M_INPUT_TERM + 1; // 6
 const M_QUOT_TERM: usize = M_QUOT_LEAF + INPUT_DEPTH; // 6 + 4 = 10 (single-block quotient leaf, nqc = 1)
 // commit round r folds the codeword to log-height DP_LOG_HEIGHT−(r+1); its Merkle path is that many levels
-// above the cap (0 once the codeword ≤ 2^cap_height). depths at db=6: [3,2,1,0,0,0].
-const fn cm_depth(r: usize) -> usize {
-    let h = DP_LOG_HEIGHT - (r + 1);
-    if h > CM_CAP_HEIGHT {
-        h - CM_CAP_HEIGHT
+// above the cap (0 once the codeword ≤ 2^cap_height). depths at db=6: [3,2,1,0,0,0]. Parameterized by
+// (log_global, cap) so the formula is validated at other configs (see `commit_layout_generalizes`).
+const fn cm_depth_at(r: usize, log_global: usize, cap: usize) -> usize {
+    let h = log_global - (r + 1);
+    if h > cap {
+        h - cap
     } else {
         0
     }
+}
+const fn cm_depth(r: usize) -> usize {
+    cm_depth_at(r, DP_LOG_HEIGHT, CM_CAP_HEIGHT)
 }
 // commit-phase blocks after the quotient-Merkle: each round = 1 leaf-hash block + cm_depth(r) merge blocks.
 const fn cm_leaf_blocks() -> [usize; CM_ROUNDS] {
@@ -2906,6 +2910,29 @@ const CM_LEAF: [usize; CM_ROUNDS] = cm_leaf_blocks(); // db=6: [11,15,18,20,21,2
 const CM_TERM: [usize; CM_ROUNDS] = cm_term_blocks(); // db=6: [14,17,19,20,21,22] — terminal block per round
 const M_NBLOCKS: usize = CM_TERM[CM_ROUNDS - 1] + 1; // db=6: 23
 const M_PERIOD: usize = M_NBLOCKS * BLOCK; // db=6: 736
+
+// Runtime twin of the compile-time geometry derivation, parameterized by (log_global, cap_height, log_blowup),
+// for the single-block-leaf / nqc=1 baseline. Used only to VALIDATE the derivation matches the consts at db=6
+// and generalizes to other depths (see `commit_layout_generalizes`); the monolith itself uses the consts.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+fn commit_layout(log_global: usize, cap: usize, log_blowup: usize) -> (usize, usize, Vec<usize>, Vec<usize>, usize) {
+    let cm_rounds = log_global - log_blowup;
+    let input_depth = log_global - cap;
+    let m_input_term = M_INPUT_LEAF + input_depth;
+    let m_quot_leaf = m_input_term + 1;
+    let m_quot_term = m_quot_leaf + input_depth;
+    let (mut leaf, mut term) = (Vec::with_capacity(cm_rounds), Vec::with_capacity(cm_rounds));
+    let mut blk = m_quot_term + 1;
+    for r in 0..cm_rounds {
+        let d = cm_depth_at(r, log_global, cap);
+        leaf.push(blk);
+        term.push(blk + d);
+        blk += d + 1;
+    }
+    let m_nblocks = term[cm_rounds - 1] + 1;
+    (cm_rounds, input_depth, leaf, term, m_nblocks)
+}
 
 /// Max inner proofs the tiled aggregator folds in ONE outer proof, mirroring `batch_joinsplit_air::
 /// MAX_BATCH_TILES`. K must be a power of two (the fold's Merkle–Damgård chain pads to pow2, as `batch_root`
@@ -6751,6 +6778,25 @@ mod tests {
         assert_eq!(CM_TERM, [14, 17, 19, 20, 21, 22]);
         assert_eq!([cm_depth(0), cm_depth(1), cm_depth(2), cm_depth(3), cm_depth(4), cm_depth(5)], [3, 2, 1, 0, 0, 0]);
         assert_eq!((M_NBLOCKS, M_PERIOD), (23, 736));
+    }
+
+    /// Demonstrates the geometry is genuinely CONFIGURABLE: the runtime layout twin matches the compile-time
+    /// consts at db=6, and the SAME formula yields a correct (single-block-leaf/nqc=1 baseline) layout at
+    /// db=12 (log_global=16) — the FRI-depth re-pin target. So re-pinning is changing DP_LOG_HEIGHT, not
+    /// rewriting the layout. (A full db=12 join-split additionally needs multi-block leaves + nqc>1.)
+    #[test]
+    fn commit_layout_generalizes() {
+        use super::{cm_depth_at, commit_layout, CM_LEAF, CM_TERM, M_NBLOCKS};
+        // db=6: the runtime twin == the compile-time consts (single source of truth, no drift).
+        let (rounds, id, leaf, term, nb) = commit_layout(10, 6, 4);
+        assert_eq!((rounds, id, nb), (6, 4, M_NBLOCKS));
+        assert_eq!((leaf, term), (CM_LEAF.to_vec(), CM_TERM.to_vec()));
+        // db=12 (log_global=16): the SAME formula → CM_ROUNDS=12, depths [9,8,…,0], 80 blocks.
+        let (rounds, id, leaf, term, nb) = commit_layout(16, 6, 4);
+        assert_eq!((rounds, id, nb), (12, 10, 80));
+        assert_eq!((cm_depth_at(0, 16, 6), cm_depth_at(9, 16, 6), cm_depth_at(11, 16, 6)), (9, 0, 0));
+        assert_eq!((leaf[0], *leaf.last().unwrap(), *term.last().unwrap()), (23, 79, 79));
+        println!("geometry configurable: db=6 → 23 blocks/6 rounds (== consts); db=12 → 80 blocks/12 rounds (same formula)");
     }
 
     #[test]
