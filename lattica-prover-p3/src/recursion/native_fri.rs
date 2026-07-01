@@ -643,34 +643,36 @@ pub(crate) fn query_terms(
     (terms, x_out, alpha, ro)
 }
 
-/// Phase 7.3 (multi-column reduced opening — native reference): the DEEP reduced-opening terms + `ro` for a
-/// MULTI-COLUMN `FibonacciAir` query, mirroring `open_input` exactly like `query_terms` but for the 2-column
-/// trace. Returns `(terms=[(z, p_z, p_x)], x, α_fri, ro, w)` where `w` = trace width (2). The trace batch
-/// contributes `2·w` terms — `w` columns × {ζ, ζ_next} — and the opened row value `p_x` is SHARED between a
-/// column's ζ and ζ_next terms (`terms[c].px == terms[w+c].px` = the authenticated row value), the multi-column
-/// soundness point. Internally asserts that px-sharing structure. Reference for the in-circuit gadget.
+/// Phase 7.3/7.6 (multi-column reduced opening — native reference, AIR-GENERIC): the DEEP reduced-opening
+/// terms + `ro` for a MULTI-COLUMN inner AIR query, mirroring `open_input` like `query_terms`. Returns
+/// `(terms=[(z, p_z, p_x)], x, α_fri, ro, w)` where `w` = trace width. The trace batch contributes `2·w`
+/// terms — `w` columns × {ζ, ζ_next} — and the opened row value `p_x` is SHARED between a column's ζ and
+/// ζ_next terms (`terms[c].px == terms[w+c].px` = the authenticated row value), the multi-column soundness
+/// point. Internally asserts that px-sharing structure. Reference for the in-circuit reduced opening.
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
-pub(crate) fn fib_query_terms(
+pub(crate) fn multicol_query_terms<A>(
     config: &MyConfig,
+    air: &A,
     proof: &Proof<MyConfig>,
     pvs: &[Val],
     q: usize,
-) -> (Vec<(Challenge, Challenge, Val)>, Val, Challenge, Challenge, usize) {
-    use super::native_verify::FibonacciAir;
+) -> (Vec<(Challenge, Challenge, Val)>, Val, Challenge, Challenge, usize)
+where
+    A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
+{
     use p3_field::{BasedVectorSpace, PrimeField64};
     let to_ext = |p: [Val; 2]| Challenge::from_basis_coefficients_fn(|i| p[i]);
     let (_, zeta_p, alpha_p, _, index_felts) = full_transcript_challenges(config, proof, pvs);
     let zeta = to_ext(zeta_p);
     let alpha = to_ext(alpha_p);
-    let air = FibonacciAir;
     let width = air.width();
     let pcs = config.pcs();
     let degree_bits = proof.degree_bits;
     let (_, degree) = validate_degree_bits(None, degree_bits, 0, <MyPcs as Pcs<Challenge, Chal>>::log_max_lde_height(pcs)).unwrap();
     let trace_domain = <MyPcs as Pcs<Challenge, Chal>>::natural_domain_for_degree(pcs, degree);
-    let layout = AirLayout::from_air::<Val>(&air);
-    let log_nqc = get_log_num_quotient_chunks::<Val, FibonacciAir>(&air, layout, 0);
+    let layout = AirLayout::from_air::<Val>(air);
+    let log_nqc = get_log_num_quotient_chunks::<Val, A>(air, layout, 0);
     let nqc = 1usize << log_nqc;
     let qd = trace_domain.create_disjoint_domain(1 << (degree_bits + log_nqc));
     let qcd = qd.split_domains(nqc);

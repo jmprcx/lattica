@@ -2910,37 +2910,54 @@ pub(crate) struct MonolithAir {
     /// [pvs0,0,0,0])` then `root = merge(root, s_k)` (IV=0), exactly as `agg_root`/`batch_root`. The root's 4
     /// lanes are the ONLY public inputs (the node-seam block tx-root); every inner datum stays witness.
     pub fold: bool,
-    /// When true the inner AIR is the MULTI-COLUMN `FibonacciAir` (W=2, `[a,b]` with a'=b, b'=a+b + first/
-    /// last-row): the opened-row carrier widens to W felts, the trace batch contributes 2·W reduced-opening
-    /// terms (px shared per column across ζ/ζ_next), the input-Merkle leaf absorbs W values, and the OOD
-    /// epilogue uses the GENERAL Horner α-fold (the validated 7.2 form) over the 5 cross-column constraints.
-    /// Being non-constant, it reuses the counter's full-cap + cap-mux machinery (`full_cap`). `false` keeps the
-    /// 1-column ConstAir/CounterAir paths byte-for-byte.
-    pub fib: bool,
+    /// The inner AIR's constraints as p3 `SymbolicExpression` trees (from `get_symbolic_constraints`). When
+    /// NON-EMPTY, the monolith verifies a general MULTI-COLUMN inner data-driven: the OOD epilogue walks these
+    /// trees (`eval_symbolic_circuit`) with witnessed selectors (folded·inv_van==quot), the opened-row carrier
+    /// widens to `w_inner_f` felts (2·W reduced-opening terms + px-sharing, W-value leaf), and it reuses the
+    /// non-constant full-cap + cap-mux machinery. EMPTY keeps the 1-column ConstAir/CounterAir paths (the
+    /// hardcoded cleared-form epilogue) byte-for-byte.
+    pub constraints: Vec<p3_uni_stark::SymbolicExpression<Val>>,
+    /// Inner trace width W (columns) when `constraints` is non-empty; ignored (treated as 1) otherwise.
+    pub w_inner_f: usize,
+    /// Inner public-value count when `constraints` is non-empty; ignored (treated as 1) otherwise.
+    pub n_pub_f: usize,
 }
 
 #[allow(dead_code)]
 impl MonolithAir {
-    // inner trace width (columns): Fibonacci = 2, ConstAir/CounterAir = 1.
+    // symbolic (data-driven multi-column) mode iff the inner AIR's constraint trees are provided.
+    fn symbolic(&self) -> bool {
+        !self.constraints.is_empty()
+    }
+    // inner trace width W (columns): the provided width in symbolic mode, else 1 (ConstAir/CounterAir).
     fn w_inner(&self) -> usize {
-        if self.fib {
-            2
+        if self.symbolic() {
+            self.w_inner_f
         } else {
             1
         }
     }
-    // inner public-value count: Fibonacci = 3 (seed_a, seed_b, last_b), else 1.
+    // inner public-value count: the provided count in symbolic mode, else 1.
     fn n_pub(&self) -> usize {
-        if self.fib {
-            3
+        if self.symbolic() {
+            self.n_pub_f
         } else {
             1
         }
     }
-    // a NON-CONSTANT inner (counter or Fibonacci) needs the full committed cap + the index-selecting cap-mux
-    // (per-query cap entries differ), rather than ConstAir's single shared cap entry.
+    // a NON-CONSTANT inner (counter or any symbolic multi-column) needs the full committed cap + the
+    // index-selecting cap-mux (per-query cap entries differ), rather than ConstAir's single shared entry.
     fn full_cap(&self) -> bool {
-        self.inner_counter || self.fib
+        self.inner_counter || self.symbolic()
+    }
+    // symbolic mode witnesses the three Lagrange selectors at ζ (is_first, is_last, inv_van = 3 ext = 6 felts),
+    // bound to their ζ-definitions, so the constraint tree is evaluated with selector VALUES (no per-constraint
+    // inverse-clearing). Placed after the column window; is_trans = ζ−g^{-1} is computed inline (no column).
+    fn sel_base(&self) -> usize {
+        self.pw_base() + if self.column_window { self.pis_count() + 2 * M_DEGREE_BITS } else { 0 }
+    }
+    fn sel(&self, i: usize) -> usize {
+        self.sel_base() + i // 0,1 = is_first; 2,3 = is_last; 4,5 = inv_van
     }
     // quotient DEEP terms = n_terms − the 2·W trace terms.
     fn n_quot(&self) -> usize {
@@ -3072,7 +3089,7 @@ impl MonolithAir {
         self.ccap_base() + (0..r).map(|r2| self.commit_cap_size(r2) * 4).sum::<usize>()
     }
     fn fused_w(&self) -> usize {
-        self.pw_base() + if self.column_window { self.pis_count() + 2 * M_DEGREE_BITS } else { 0 } // + ζ-squaring chain
+        self.sel_base() + if self.symbolic() { 6 } else { 0 } // sel_base = pw_base (+ column-window window); + 3 witnessed selectors (symbolic)
     }
     // aggregator fold columns (only when `fold`): 8 Poseidon lanes (the two merge permutations) + 4 lanes for
     // the global-persistent running root, appended after the column-window window.
@@ -3590,39 +3607,39 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let is_trans = (zeta.0.clone() - g_inv, zeta.1.clone());
             let zm1 = (zeta.0.clone() - one.clone(), zeta.1.clone());
             let w_in = self.w_inner();
-            if self.fib {
-                // MULTI-COLUMN: the GENERAL Horner α-fold (validated 7.2), inverse-cleared by D=(ζ−1)(ζ−g^{-1}),
-                // over FibonacciAir's 5 cross-column constraints (emission order C0..C4). local[c]=pz(c) (ζ),
-                // next[c]=pz(W+c) (ζ_next); quotient = pz(2W)+pz(2W+1)·X; pubs at pub_pi()+i.
-                //   is_first·D = z_h·(ζ−g^{-1}); is_trans·D = (ζ−1)(ζ−g^{-1})^2; is_last·D = z_h·(ζ−1).
+            if self.symbolic() {
+                // DATA-DRIVEN MULTI-COLUMN: verify the inner from its p3 SymbolicExpression trees. Witness the
+                // three Lagrange selectors + bind them to their ζ-definitions (is_first·(ζ−1)=z_h;
+                // is_last·(ζ−g^{-1})=z_h; inv_van·z_h=1; is_trans=ζ−g^{-1} inline), then walk each constraint tree
+                // (eval_symbolic_circuit) with the selector VALUES, Horner-fold, and check folded·inv_van==quot(ζ)
+                // — exactly p3::verify_constraints, no per-constraint inverse-clearing. Handles ANY inner AIR.
+                let is_first = gg(self.sel(0));
+                let is_last = gg(self.sel(2));
+                let inv_van = gg(self.sel(4));
+                let bif = emul(is_first.clone(), zm1.clone());
+                builder.assert_zero(tf.clone() * (bif.0 - z_h.0.clone()));
+                builder.assert_zero(tf.clone() * (bif.1 - z_h.1.clone()));
+                let bil = emul(is_last.clone(), is_trans.clone());
+                builder.assert_zero(tf.clone() * (bil.0 - z_h.0.clone()));
+                builder.assert_zero(tf.clone() * (bil.1 - z_h.1.clone()));
+                let biv = emul(inv_van.clone(), z_h.clone());
+                builder.assert_zero(tf.clone() * (biv.0 - one.clone()));
+                builder.assert_zero(tf.clone() * biv.1);
                 let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(c))).collect();
                 let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(w_in + c))).collect();
                 let c0 = gg(self.pz(2 * w_in));
                 let c1 = gg(self.pz(2 * w_in + 1));
                 let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone());
-                let pb = |i: usize| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO);
-                let zmg2 = emul(is_trans.clone(), is_trans.clone());
-                let mut ap = vec![(one.clone(), AB::Expr::ZERO)];
-                for k in 1..5 {
-                    ap.push(emul(ap[k - 1].clone(), alpha_stark.clone()));
+                let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub()).map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO)).collect();
+                let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
+                for c in &self.constraints {
+                    let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &is_first, &is_last, &is_trans, &w);
+                    let fa = emul(folded.clone(), alpha_stark.clone());
+                    folded = (fa.0 + ci.0, fa.1 + ci.1);
                 }
-                let coeff0 = emul(emul(ap[4].clone(), z_h.clone()), is_trans.clone());
-                let coeff1 = emul(emul(ap[3].clone(), z_h.clone()), is_trans.clone());
-                let coeff2 = emul(emul(ap[2].clone(), zm1.clone()), zmg2.clone());
-                let coeff3 = emul(emul(ap[1].clone(), zm1.clone()), zmg2.clone());
-                let coeff4 = emul(z_h.clone(), zm1.clone());
-                let rhs_coeff = emul(emul(z_h.clone(), zm1.clone()), is_trans.clone());
-                let t0 = emul(coeff0, (local[0].0.clone() - pb(0).0, local[0].1.clone()));
-                let t1 = emul(coeff1, (local[1].0.clone() - pb(1).0, local[1].1.clone()));
-                let t2 = emul(coeff2, (next[0].0.clone() - local[1].0.clone(), next[0].1.clone() - local[1].1.clone()));
-                let t3 = emul(
-                    coeff3,
-                    (next[1].0.clone() - local[0].0.clone() - local[1].0.clone(), next[1].1.clone() - local[0].1.clone() - local[1].1.clone()),
-                );
-                let t4 = emul(coeff4, (local[1].0.clone() - pb(2).0, local[1].1.clone()));
-                let rhs = emul(rhs_coeff, quot);
-                builder.assert_zero(tf.clone() * (t0.0 + t1.0 + t2.0 + t3.0 + t4.0 - rhs.0));
-                builder.assert_zero(tf.clone() * (t0.1 + t1.1 + t2.1 + t3.1 + t4.1 - rhs.1));
+                let chk = emul(folded, inv_van);
+                builder.assert_zero(tf.clone() * (chk.0 - quot.0));
+                builder.assert_zero(tf.clone() * (chk.1 - quot.1));
             } else {
                 // 1-COLUMN ConstAir/CounterAir: the 2-constraint form (1 first-row + 1 transition):
                 //   z_h·α·(local−pub) + is_trans·(ζ−1)·(next−local[−1]) == z_h·(ζ−1)·(c0+c1·X).
@@ -4938,7 +4955,8 @@ pub(crate) fn build_general_epilogue_trace(local: [Challenge; 2], next: [Challen
 // exactly p3's verify_constraints. `eval_symbolic_circuit` mirrors `eval_symbolic_native`. Validated for
 // Fibonacci. ζ/α/pubs are public; the openings + witnessed selectors are witness.
 // =================================================================================================
-#[cfg(test)]
+// (not #[cfg(test)]: the fused monolith epilogue calls this when it verifies an inner from its symbolic
+// constraints; in non-symbolic builds the monolith's `constraints` is empty so it is never invoked at runtime.)
 #[allow(clippy::too_many_arguments)]
 fn eval_symbolic_circuit<AB: AirBuilder<F = Goldilocks>>(
     e: &p3_uni_stark::SymbolicExpression<Val>,
@@ -6080,7 +6098,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, fib: false };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6192,7 +6210,9 @@ mod tests {
             column_window: true,
             k_instances: 1,
             fold: false,
-            fib: false,
+            constraints: vec![],
+            w_inner_f: 1,
+            n_pub_f: 1,
         };
         let mut pis = Vec::new();
         for ch in &chs {
@@ -6243,7 +6263,7 @@ mod tests {
             }
         }
         let (counts, binds, index_binds, n_terms) = params.unwrap();
-        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, fib: false };
+        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, constraints: vec![], w_inner_f: 1, n_pub_f: 1 };
         let fw = air.fused_w();
         let w = air.fold_w();
         let inst_h = air.inst_h();
@@ -6384,7 +6404,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, fib: false };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6430,13 +6450,20 @@ mod tests {
     /// accept-iff-p3::verify at W=2. Exercises the W-wide opened-row carrier, 2·W reduced-opening terms with
     /// px-sharing, the W-value input-Merkle leaf, the full-cap + cap-mux (non-constant inner), and the GENERAL
     /// 5-constraint OOD epilogue (validated 7.2 fold). Returns (log2 height, RSS).
-    fn run_fib_monolith(n_queries: usize) -> (u32, u64) {
+    /// Phase 7.6: verify an ARBITRARY multi-column inner AIR `A` through the monolith via the DATA-DRIVEN
+    /// symbolic epilogue (accept-iff-p3::verify). The inner's constraint trees (`get_symbolic_constraints`) drive
+    /// the OOD fold; `w_inner`/`n_pub` size the opened-row carrier + pub range. Same code for Fibonacci and
+    /// MulAir — no hardcoded per-AIR fold. Returns (log2 height, RSS).
+    fn run_symbolic_monolith<A>(config: &MyConfig, inner: &A, proof: &Proof<MyConfig>, pvs: &[Val], w_inner: usize, n_pub: usize, label: &str) -> (u32, u64)
+    where
+        A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
+    {
         use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
-        use crate::recursion::native_fri::{fib_query_terms, gen_fib_proof, query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle};
+        use crate::recursion::native_fri::{epilogue_openings, eval_symbolic_native, multicol_query_terms, query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle};
         use p3_field::{BasedVectorSpace, PrimeField64};
-        let config = make_config(1, n_queries);
-        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
-        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+        let n_queries = proof.opening_proof.query_proofs.len();
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(config, proof, pvs);
         let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
         let mut per_query = Vec::new();
         let mut quot_paths = Vec::new();
@@ -6444,22 +6471,25 @@ mod tests {
         let mut n_terms = 0;
         let mut final0 = Challenge::ZERO;
         for q in 0..n_queries {
-            let (terms, _x, alpha, ro, _w) = fib_query_terms(&config, &proof, &pvs, q);
-            let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
-            let (_leaf, path, _cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
-            let (_ql, qpath, _qce, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
-            let cm = query_commit_merkle_all(&config, &proof, &pvs, q);
+            let (terms, _x, alpha, ro, _w) = multicol_query_terms(config, inner, proof, pvs, q);
+            let (_ro2, rounds, _folded, f0) = query_fold_data(config, proof, pvs, q);
+            let (_leaf, path, _cap_entry) = query_input_merkle(config, proof, pvs, q);
+            let (_ql, qpath, _qce, _qw) = query_quotient_merkle(config, proof, pvs, q);
+            let cm = query_commit_merkle_all(config, proof, pvs, q);
             if q == 0 {
                 final0 = f0;
             }
             n_terms = terms.len();
             let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
-            per_query.push(((index, terms, alpha, ro, rounds), Val::ZERO, path)); // opened row derived from terms
+            per_query.push(((index, terms, alpha, ro, rounds), Val::ZERO, path));
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        assert_eq!(n_terms, 2 * 2 + 2, "fib: 4 trace terms (2 cols × ζ/ζ_next) + 2 quotient terms (nqc=1)");
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, fib: true };
+        assert_eq!(n_terms, 2 * w_inner + 2, "{label}: 2·W trace terms + 2 quotient terms (nqc=1)");
+        let layout = AirLayout::from_air::<Val>(inner);
+        let constraints = get_symbolic_constraints::<Val, A>(inner, layout);
+        assert!(!constraints.is_empty(), "{label}: symbolic constraints extracted");
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, constraints, w_inner_f: w_inner, n_pub_f: n_pub };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6471,48 +6501,94 @@ mod tests {
         let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
         pis.push(fp[0]);
         pis.push(fp[1]);
-        // FULL caps (the cap-mux selects cap[index>>shift]): trace, quotient, then the 3 Fibonacci pubs, then 6 commit rounds.
+        // FULL caps (cap-mux selects cap[index>>shift]): trace, quotient, then the n_pub inner pubs, then commit rounds.
         for e in proof.commitments.trace.roots().iter() {
             pis.extend_from_slice(e);
         }
         for e in proof.commitments.quotient_chunks.roots().iter() {
             pis.extend_from_slice(e);
         }
-        for &pv in &pvs {
-            pis.push(pv); // seed_a, seed_b, last_b
+        for &pv in pvs {
+            pis.push(pv);
         }
         for r in 0..CM_ROUNDS {
             for e in proof.opening_proof.commit_phase_commits[r].roots().iter() {
                 pis.extend_from_slice(e);
             }
         }
-        assert_eq!(pis.len(), air.pis_count(), "fib pis layout matches pis_count");
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
+        assert_eq!(pis.len(), air.pis_count(), "{label} pis layout matches pis_count");
+        let mut trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
+        // fill the witnessed Lagrange selectors at ζ (is_first/is_last/inv_van), bound in-circuit to their ζ-defs.
+        let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z) = epilogue_openings(config, inner, proof, pvs);
+        {
+            // native pre-check: the symbolic fold on the SAME openings/selectors == quot (localizes wiring bugs).
+            let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+            let mut folded = Challenge::ZERO;
+            for c in &air.constraints {
+                folded = folded * eo_alpha + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, is_first, is_last, is_trans);
+            }
+            assert_eq!(folded * inv_van, eo_quot, "{label} PRE-CHECK: native symbolic fold == quot(ζ)");
+        }
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let (isf, isl, iv) = (cc(is_first), cc(is_last), cc(inv_van));
+        let fw = air.fused_w();
+        let sb = air.sel_base();
+        for r in 0..air.height() {
+            trace.values[r * fw + sb..r * fw + sb + 2].copy_from_slice(&isf);
+            trace.values[r * fw + sb + 2..r * fw + sb + 4].copy_from_slice(&isl);
+            trace.values[r * fw + sb + 4..r * fw + sb + 6].copy_from_slice(&iv);
+        }
         let hh = air.height();
-        println!("fib monolith @ {n_queries} queries: 2^{} rows (width {}, W=2 multi-column)", hh.trailing_zeros(), air.fused_w());
-        let prf = prove(&config, &air, trace, &pis);
-        assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith verifies a MULTI-COLUMN Fibonacci inner (accept-iff-p3::verify)");
-        // tamper a Fibonacci public (seed_a) ⇒ the general 5-constraint OOD fold ≠ quotient(ζ) ⇒ reject.
+        println!("{label} monolith @ {n_queries} queries: 2^{} rows (width {fw}, W={w_inner}, DATA-DRIVEN symbolic epilogue)", hh.trailing_zeros());
+        let prf = prove(config, &air, trace, &pis);
+        if let Err(e) = verify(config, &air, &prf, &pis) {
+            panic!("{label}: fused monolith rejected a valid proof: {e:?}");
+        }
+        // tamper an inner public ⇒ the symbolic OOD fold ≠ quotient(ζ) ⇒ reject.
         let mut bad = pis.clone();
         bad[air.pub_pi()] += Val::ONE;
-        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered Fibonacci pub ⇒ general epilogue rejects");
+        assert!(verify(config, &air, &prf, &bad).is_err(), "{label}: tampered inner pub ⇒ symbolic epilogue rejects");
         // tamper the FULL trace cap entry query 0 selects (index0>>4) ⇒ cap-mux ≠ real terminal ⇒ reject.
         let cap_base = 2 * chs.len() + index_felts.len() + 2;
         let sel0 = ((index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1)) >> 4;
         let mut bad_cap = pis.clone();
         bad_cap[cap_base + sel0 * 4] += Val::ONE;
-        assert!(verify(&config, &air, &prf, &bad_cap).is_err(), "tampered selected trace cap ⇒ cap-mux reject");
+        assert!(verify(config, &air, &prf, &bad_cap).is_err(), "{label}: tampered selected trace cap ⇒ cap-mux reject");
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         (hh.trailing_zeros(), rss)
     }
 
+    fn run_fib_monolith(n_queries: usize) -> (u32, u64) {
+        use crate::recursion::native_fri::gen_fib_proof;
+        use crate::recursion::native_verify::FibonacciAir;
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        run_symbolic_monolith(&config, &FibonacciAir, &proof, &pvs, 2, 3, "fib")
+    }
+
+    fn run_mul_monolith(n_queries: usize) -> (u32, u64) {
+        use crate::recursion::native_fri::gen_mul_proof;
+        use crate::recursion::native_verify::MulAir;
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_mul_proof(&config, 3, 5, 6);
+        run_symbolic_monolith(&config, &MulAir, &proof, &pvs, 3, 2, "mul")
+    }
+
     #[test]
-    #[ignore = "slow: Phase 7.4 multi-column monolith (2-column Fibonacci, accept-iff-p3::verify)"]
+    #[ignore = "slow: Phase 7.6 multi-column monolith (2-column Fibonacci) via the data-driven symbolic epilogue"]
     fn phase7_fib_monolith() {
         let (log2h, rss) = run_fib_monolith(MILESTONE_QUERIES);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "fib monolith within 8 GB / 2^18");
-        println!("Phase 7.4: the monolith verifies a MULTI-COLUMN (W=2) inner end-to-end at 2^{log2h} / {} MiB", rss / (1 << 20));
+        println!("Phase 7.6: the monolith verifies Fibonacci (W=2) via the DATA-DRIVEN symbolic epilogue at 2^{log2h} / {} MiB", rss / (1 << 20));
+    }
+
+    #[test]
+    #[ignore = "slow: Phase 7.6 multi-column monolith (3-column degree-2 MulAir) via the data-driven symbolic epilogue"]
+    fn phase7_mul_monolith() {
+        let (log2h, rss) = run_mul_monolith(MILESTONE_QUERIES);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "mul monolith within 8 GB / 2^18");
+        println!("Phase 7.6: the monolith verifies the degree-2 MulAir (W=3) via the SAME symbolic epilogue at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     #[test]
@@ -6715,14 +6791,15 @@ mod tests {
     #[ignore = "slow: Phase 7.3 multi-column reduced opening (px-sharing) vs fib_query_terms"]
     fn phase7_multicol_reduced_opening_matches_oracle() {
         use super::{build_multicol_ro_trace, MultiColReducedOpeningAir};
-        use crate::recursion::native_fri::{fib_query_terms, gen_fib_proof};
+        use crate::recursion::native_fri::{gen_fib_proof, multicol_query_terms};
+        use crate::recursion::native_verify::FibonacciAir;
         use p3_field::BasedVectorSpace;
         let config = make_config(1, MILESTONE_QUERIES);
         let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
         let cc = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
         let mut checked = 0;
         for q in [0usize, 1, MILESTONE_QUERIES / 2, MILESTONE_QUERIES - 1] {
-            let (terms, x, alpha, ro, w) = fib_query_terms(&config, &proof, &pvs, q);
+            let (terms, x, alpha, ro, w) = multicol_query_terms(&config, &FibonacciAir, &proof, &pvs, q);
             let n_quot = terms.len() - 2 * w;
             let air = MultiColReducedOpeningAir { w, n_quot };
             let (al, roc) = (cc(alpha), cc(ro));
