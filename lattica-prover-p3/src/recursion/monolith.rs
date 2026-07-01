@@ -2947,11 +2947,12 @@ impl MonolithAir {
     fn n_cap_c(&self) -> usize {
         (2 + CM_ROUNDS) * 4 // input + quotient + 6 commit = 8 entries × 4 = 32
     }
-    // pis cap layout — per-query (stride n_queries·4) in counter mode, single (stride 4) for ConstAir. For
-    // ConstAir these give the exact current offsets (cap, cap+4, cap+8, cap+9).
+    // pis cap layout — the FULL cap (2^cap_height entries) in counter mode (so the cap-mux can select
+    // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
+    // give the exact current offsets (cap, cap+4, cap+8, cap+9).
     fn cap_stride(&self) -> usize {
         if self.inner_counter {
-            self.n_queries * 4
+            (1 << CM_CAP_HEIGHT) * 4 // full trace/quotient cap: 64 entries × 4
         } else {
             4
         }
@@ -2967,6 +2968,20 @@ impl MonolithAir {
     }
     fn ccap_base(&self) -> usize {
         self.pub_pi() + 1
+    }
+    // commit-phase round r cap: the codeword folds to height 2^(log_global−(r+1)); its cap has
+    // 2^min(cap_height, that) entries, and the selecting index is `index >> ((r+1)+depth_r)`.
+    fn commit_bits(&self, r: usize) -> usize {
+        core::cmp::min(CM_CAP_HEIGHT, DP_LOG_HEIGHT - (r + 1))
+    }
+    fn commit_cap_size(&self, r: usize) -> usize {
+        1 << self.commit_bits(r)
+    }
+    fn commit_shift(&self, r: usize) -> usize {
+        (r + 1) + (DP_LOG_HEIGHT - (r + 1)).saturating_sub(CM_CAP_HEIGHT)
+    }
+    fn commit_cap_base(&self, r: usize) -> usize {
+        self.ccap_base() + (0..r).map(|r2| self.commit_cap_size(r2) * 4).sum::<usize>()
     }
     fn fused_w(&self) -> usize {
         self.ov() + 3 + 4 * CM_ROUNDS + if self.inner_counter { self.n_cap_c() } else { 0 }
@@ -3132,8 +3147,13 @@ impl BaseAir<Goldilocks> for MonolithAir {
         self.fused_w()
     }
     fn num_public_values(&self) -> usize {
-        // challenges + indices + final_poly[0] + trace/quot/commit caps (per-query in counter mode) + pub value
-        self.ccap_base() + if self.inner_counter { self.n_queries * (CM_ROUNDS * 4) } else { CM_ROUNDS * 4 }
+        // challenges + indices + final_poly[0] + trace/quot caps + pub + commit caps. Counter mode publishes the
+        // FULL caps (variable-size commit caps) so the cap-mux can select; ConstAir publishes single entries.
+        if self.inner_counter {
+            self.ccap_base() + (0..CM_ROUNDS).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
+        } else {
+            self.ccap_base() + CM_ROUNDS * 4
+        }
     }
     fn num_periodic_columns(&self) -> usize {
         self.c_term(CM_ROUNDS - 1) + 1
@@ -3464,31 +3484,31 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                     builder.assert_zero(ct.clone() * (cur[k].clone() - cur[self.cap_c(8 + 4 * r + k)].clone()));
                 }
             }
-            // hold the cap carriers across the super-tile; seed them at the arith head (M_TF) from the q-th
-            // per-query cap pis (Σ_q p_query(q)·pis[…]).
+            // hold the cap carriers across the super-tile; SEED them at the arith head (M_TF) via the CAP-MUX:
+            // cap_c[opening][k] = Σ_{e} (Π_j sel_bit_j(e)) · pis[cap_base + e·4 + k], selecting entry
+            // `index >> shift` from the FULL cap by the index bits [shift .. shift+bits] (the validated
+            // SampleBits bits sb_b). This BINDS each terminal to the index-selected committed cap entry.
             let hold = p[self.s_query()].clone() * (one.clone() - p[self.p_st_last()].clone());
             for g in 0..self.n_cap_c() {
                 builder.when_transition().assert_zero(hold.clone() * (nxt[self.cap_c(g)].clone() - cur[self.cap_c(g)].clone()));
             }
-            let (cb, qb, cc) = (self.cap_base(), self.qcap_base(), self.ccap_base());
-            for k in 0..4 {
-                let mut sel_tr = AB::Expr::ZERO;
-                let mut sel_q = AB::Expr::ZERO;
-                for q in 0..self.n_queries {
-                    let pq = p[self.p_query(q)].clone();
-                    sel_tr = sel_tr + pq.clone() * pis[cb + q * 4 + k].clone();
-                    sel_q = sel_q + pq * pis[qb + q * 4 + k].clone();
-                }
-                builder.assert_zero(tf.clone() * (cur[self.cap_c(k)].clone() - sel_tr));
-                builder.assert_zero(tf.clone() * (cur[self.cap_c(4 + k)].clone() - sel_q));
-            }
+            // (cg_offset, shift, bits, cap_base) per opening: trace, quotient, then 6 commit rounds.
+            let mut openings = vec![(0usize, 4usize, CM_CAP_HEIGHT, self.cap_base()), (4, 4, CM_CAP_HEIGHT, self.qcap_base())];
             for r in 0..CM_ROUNDS {
+                openings.push((8 + 4 * r, self.commit_shift(r), self.commit_bits(r), self.commit_cap_base(r)));
+            }
+            for (cg_off, shift, bits, cbase) in openings {
                 for k in 0..4 {
-                    let mut sel_c = AB::Expr::ZERO;
-                    for q in 0..self.n_queries {
-                        sel_c = sel_c + p[self.p_query(q)].clone() * pis[cc + q * (CM_ROUNDS * 4) + r * 4 + k].clone();
+                    let mut acc = AB::Expr::ZERO;
+                    for e in 0..(1usize << bits) {
+                        let mut sel = AB::Expr::ONE;
+                        for j in 0..bits {
+                            let b = cur[self.sb_b(shift + j)].clone();
+                            sel = sel * if (e >> j) & 1 == 1 { b } else { one.clone() - b };
+                        }
+                        acc = acc + sel * pis[cbase + e * 4 + k].clone();
                     }
-                    builder.assert_zero(tf.clone() * (cur[self.cap_c(8 + 4 * r + k)].clone() - sel_c));
+                    builder.assert_zero(tf.clone() * (cur[self.cap_c(cg_off + k)].clone() - acc));
                 }
             }
         } else {
@@ -5359,30 +5379,20 @@ mod tests {
         let mut per_query = Vec::new();
         let mut quot_paths = Vec::new();
         let mut commit_data = Vec::new();
-        let mut trace_caps = Vec::new();
-        let mut quot_caps = Vec::new();
-        let mut commit_caps = Vec::new();
         let mut n_terms = 0;
         let mut final0 = Challenge::ZERO;
         for q in 0..n_queries {
             let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
             let (_ro2, rounds, _folded, f0) = query_fold_data(&config, &proof, &pvs, q);
             let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
-            let (_leaf, path, cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
-            let (_ql, qpath, qcap_entry, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
+            let (_leaf, path, _cap_entry) = query_input_merkle(&config, &proof, &pvs, q);
+            let (_ql, qpath, _qce, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
             let cm = query_commit_merkle_all(&config, &proof, &pvs, q);
             if q == 0 {
                 final0 = f0;
             }
             n_terms = terms.len();
             let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
-            trace_caps.push(cap_entry);
-            quot_caps.push(qcap_entry);
-            let mut ccs = [[Val::ZERO; 4]; CM_ROUNDS];
-            for (r, (_g, _l, _p, ce)) in cm.iter().enumerate() {
-                ccs[r] = *ce;
-            }
-            commit_caps.push(ccs);
             per_query.push(((index, terms, alpha, ro, rounds), v, path));
             quot_paths.push(qpath);
             commit_data.push(cm);
@@ -5399,27 +5409,31 @@ mod tests {
         let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
         pis.push(fp[0]);
         pis.push(fp[1]);
-        for tc in &trace_caps {
-            pis.extend_from_slice(tc);
+        // FULL caps (the cap-mux selects cap[index>>shift] from these): trace, quotient, pub, 6 commit rounds.
+        for e in proof.commitments.trace.roots().iter() {
+            pis.extend_from_slice(e);
         }
-        for qc in &quot_caps {
-            pis.extend_from_slice(qc);
+        for e in proof.commitments.quotient_chunks.roots().iter() {
+            pis.extend_from_slice(e);
         }
         pis.push(pvs[0]);
-        for cc in &commit_caps {
-            for r in 0..CM_ROUNDS {
-                pis.extend_from_slice(&cc[r]);
+        for r in 0..CM_ROUNDS {
+            for e in proof.opening_proof.commit_phase_commits[r].roots().iter() {
+                pis.extend_from_slice(e);
             }
         }
         let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data);
         let hh = air.height();
-        println!("counter monolith @ {n_queries} queries: 2^{} rows (width {})", hh.trailing_zeros(), air.fused_w());
+        println!("counter monolith @ {n_queries} queries: 2^{} rows (width {}, full caps + cap-mux)", hh.trailing_zeros(), air.fused_w());
         let prf = prove(&config, &air, trace, &pis);
-        assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith verifies a NON-degenerate counter inner");
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith verifies a NON-degenerate counter inner (cap-mux)");
+        // tamper the FULL trace cap entry that query 0 selects (index0 >> 4) ⇒ the mux ≠ the real terminal ⇒ reject.
         let cap_base = 2 * chs.len() + index_felts.len() + 2;
+        let index0 = (index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+        let sel0 = index0 >> 4;
         let mut bad = pis.clone();
-        bad[cap_base] += Val::ONE; // tamper the first query's trace cap entry
-        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered per-query trace cap ⇒ reject");
+        bad[cap_base + sel0 * 4] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered selected trace cap entry ⇒ cap-mux reject");
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         (hh.trailing_zeros(), rss)
@@ -5475,6 +5489,34 @@ mod tests {
         assert_eq!((c0 * alpha + c1) * inv_van, quotient, "counter OOD: (A·α + B)·inv_van == quotient(ζ)");
         assert!(quotient != Challenge::ZERO, "counter quotient(ζ) is NON-zero (non-degenerate)");
         println!("Phase 6.2 epilogue: counter (next−cur−1) OOD check validated vs p3; quotient(ζ) non-zero");
+    }
+
+    /// Phase 6.2b: verify the per-opening cap-selection index shifts (the counter's REAL distinct caps make
+    /// this testable). For each opening, `cap.roots()[index >> shift] == the oracle's selected cap entry`:
+    /// trace/quotient shift = log_global − cap_height = 4; commit round r shift = (r+1) + path_len(r).
+    #[test]
+    fn counter_cap_shifts_probe() {
+        use crate::recursion::native_fri::{full_transcript_challenges, gen_counter_proof, query_commit_merkle_all, query_input_merkle, query_quotient_merkle};
+        use p3_field::PrimeField64;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_counter_proof(&config, 42, 6);
+        let (_, _, _, _, index_felts) = full_transcript_challenges(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let tcap = proof.commitments.trace.roots();
+        let qcap = proof.commitments.quotient_chunks.roots();
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            let (_, _, tce) = query_input_merkle(&config, &proof, &pvs, q);
+            assert_eq!(tcap[index >> 4], tce, "trace cap shift 4 (q {q})");
+            let (_, _, qce, _) = query_quotient_merkle(&config, &proof, &pvs, q);
+            assert_eq!(qcap[index >> 4], qce, "quotient cap shift 4 (q {q})");
+            for (r, (_g, _l, path, cce)) in query_commit_merkle_all(&config, &proof, &pvs, q).iter().enumerate() {
+                let shift = (r + 1) + path.len();
+                let ccap = proof.opening_proof.commit_phase_commits[r].roots();
+                assert_eq!(ccap[index >> shift], *cce, "commit r{r} cap shift {shift} (q {q}); cap has {} entries", ccap.len());
+            }
+        }
+        println!("Phase 6.2b: cap-selection shifts verified vs oracle — trace/quot=4, commit r=(r+1)+depth_r");
     }
 
     #[test]
