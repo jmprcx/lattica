@@ -2863,8 +2863,13 @@ pub(crate) fn cm2_build_trace(group: [Val; 4], path: &[([Val; 4], bool)]) -> (Ro
 //    literal (guarded by the `geometry_matches_milestone` test). Layout: block 0 arith | input-Merkle |
 //    quotient-Merkle | commit-phase Merkle (CM_ROUNDS rounds). ──
 const LOG_BLOWUP: usize = 4; // FRI rate (log); log_global = degree_bits + LOG_BLOWUP
+// MonolithAir derives these at RUNTIME per-inner (cm_rounds()=nb−3, lg()=cm_rounds()+LOG_BLOWUP); these consts
+// are the db=6 milestone reference values, now used only by the guard/aggregator tests.
+#[cfg(test)]
 const M_DEGREE_BITS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // inner-trace degree_bits (10 − 4 = 6)
+#[cfg(test)]
 const CM_ROUNDS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // FRI commit rounds = folds to the rate floor = degree_bits
+#[cfg(test)]
 const INPUT_DEPTH: usize = DP_LOG_HEIGHT - CM_CAP_HEIGHT; // input/quotient Merkle path depth to the cap (10 − 6 = 4)
 const M_INPUT_LEAF: usize = 1; // first input-leaf block; the leaf spans M_INPUT_LEAF .. +leaf_blocks (runtime)
 // The LEAF-BLOCK / nqc dimensions of the layout (input-Merkle leaf blocks = ceil(W_inner/RATE), quotient-Merkle
@@ -2884,6 +2889,7 @@ const fn cm_depth_at(r: usize, log_global: usize, cap: usize) -> usize {
         0
     }
 }
+#[cfg(test)]
 const fn cm_depth(r: usize) -> usize {
     cm_depth_at(r, DP_LOG_HEIGHT, CM_CAP_HEIGHT)
 }
@@ -3005,28 +3011,36 @@ impl MonolithAir {
     fn quot_leaf_blocks(&self) -> usize {
         (2 * self.nqc()).div_ceil(RATE)
     }
+    // input/quotient Merkle path depth to the cap (= log_global − cap_height), runtime with the FRI depth.
+    fn input_depth(&self) -> usize {
+        self.lg() - CM_CAP_HEIGHT
+    }
+    // commit round r's Merkle-path depth, runtime with the FRI depth (was the DP_LOG_HEIGHT-pinned cm_depth(r)).
+    fn cm_depth_r(&self, r: usize) -> usize {
+        cm_depth_at(r, self.lg(), CM_CAP_HEIGHT)
+    }
     fn m_input_term(&self) -> usize {
-        M_INPUT_LEAF + (self.leaf_blocks() - 1) + INPUT_DEPTH
+        M_INPUT_LEAF + (self.leaf_blocks() - 1) + self.input_depth()
     }
     fn m_quot_leaf(&self) -> usize {
         self.m_input_term() + 1
     }
     fn m_quot_term(&self) -> usize {
-        self.m_quot_leaf() + (self.quot_leaf_blocks() - 1) + INPUT_DEPTH
+        self.m_quot_leaf() + (self.quot_leaf_blocks() - 1) + self.input_depth()
     }
-    // commit round r: leaf-hash block then cm_depth(r) merges, laid out cumulatively after the quotient terminal.
+    // commit round r: leaf-hash block then cm_depth_r(r) merges, laid out cumulatively after the quotient terminal.
     fn cm_leaf(&self, r: usize) -> usize {
         let mut blk = self.m_quot_term() + 1;
         for r2 in 0..r {
-            blk += cm_depth(r2) + 1;
+            blk += self.cm_depth_r(r2) + 1;
         }
         blk
     }
     fn cm_term(&self, r: usize) -> usize {
-        self.cm_leaf(r) + cm_depth(r)
+        self.cm_leaf(r) + self.cm_depth_r(r)
     }
     fn m_nblocks(&self) -> usize {
-        self.cm_term(CM_ROUNDS - 1) + 1
+        self.cm_term(self.cm_rounds() - 1) + 1
     }
     fn m_period(&self) -> usize {
         self.m_nblocks() * BLOCK
@@ -3040,7 +3054,7 @@ impl MonolithAir {
     // bound to their ζ-definitions, so the constraint tree is evaluated with selector VALUES (no per-constraint
     // inverse-clearing). Placed after the column window; is_trans = ζ−g^{-1} is computed inline (no column).
     fn sel_base(&self) -> usize {
-        self.pw_base() + if self.column_window { self.pis_count() + 2 * M_DEGREE_BITS } else { 0 }
+        self.pw_base() + if self.column_window { self.pis_count() + 2 * self.cm_rounds() } else { 0 }
     }
     fn sel(&self, i: usize) -> usize {
         self.sel_base() + i // 0,1 = is_first; 2,3 = is_last; 4,5 = inv_van
@@ -3063,9 +3077,30 @@ impl MonolithAir {
     fn ni(&self) -> usize {
         self.index_binds.len()
     }
+    // ---- RUNTIME FRI depth, derived from the transcript binds ([α_stark, ζ, α_fri, β_0..β_{cm_rounds−1}] ⇒
+    // nb = 3 + cm_rounds). So the whole FRI geometry is per-inner: log_global = cm_rounds + LOG_BLOWUP and the
+    // inner's degree_bits = cm_rounds. No field / no constructor change (db=6: nb=9 ⇒ cm_rounds=6, lg=10 —
+    // exactly the old DP_LOG_HEIGHT=10 / CM_ROUNDS=6 / M_DEGREE_BITS=6 consts). ----
+    fn cm_rounds(&self) -> usize {
+        self.nb() - 3
+    }
+    fn lg(&self) -> usize {
+        self.cm_rounds() + LOG_BLOWUP
+    }
+    // arith-tile column layout (was the QT_ACC/QT_ALPHA/QT_TERMS consts): the DEEP index bits + acc chain scale
+    // with log_global, so the per-term region base is runtime.
+    fn qt_acc(&self) -> usize {
+        QT_DBITS + self.lg()
+    }
+    fn qt_alpha(&self) -> usize {
+        self.qt_acc() + self.lg()
+    }
+    fn qt_terms(&self) -> usize {
+        self.qt_alpha() + 2
+    }
     // arith (super-tile block 0) — the QT_* layout
     fn z(&self, k: usize) -> usize {
-        QT_TERMS + 9 * k
+        self.qt_terms() + 9 * k
     }
     fn pz(&self, k: usize) -> usize {
         self.z(k) + 2
@@ -3080,7 +3115,7 @@ impl MonolithAir {
         self.z(k) + 7
     }
     fn tile_w(&self) -> usize {
-        QT_TERMS + 9 * self.n_terms
+        self.qt_terms() + 9 * self.n_terms
     }
     // index decomposition (SB) on the super-tile arith head + the fold-bit shift register
     fn sb_x(&self) -> usize {
@@ -3110,15 +3145,15 @@ impl MonolithAir {
     // full-cap mode only: per-super-tile cap-entry carriers (8 openings × 4 felts) — the index-selected cap
     // entry (input, quotient, 6 commit rounds), seeded at the arith head, held to each opening's terminal.
     fn cap_c(&self, g: usize) -> usize {
-        self.carriers_base() + 4 * CM_ROUNDS + g // g: input 0..4, quotient 4..8, commit r 8+4r..8+4r+4
+        self.carriers_base() + 4 * self.cm_rounds() + g // g: input 0..4, quotient 4..8, commit r 8+4r..8+4r+4
     }
     fn n_cap_c(&self) -> usize {
-        (2 + CM_ROUNDS) * 4 // input + quotient + 6 commit = 8 entries × 4 = 32
+        (2 + self.cm_rounds()) * 4 // input + quotient + cm_rounds commit = (2+R) entries × 4
     }
     // column-window: the inner-proof "pis" as a witness column window (held constant across the instance) so
     // the monolith can be tiled. Placed after all other columns.
     fn pw_base(&self) -> usize {
-        self.carriers_base() + 4 * CM_ROUNDS + if self.full_cap() { self.n_cap_c() } else { 0 }
+        self.carriers_base() + 4 * self.cm_rounds() + if self.full_cap() { self.n_cap_c() } else { 0 }
     }
     fn pw(&self, i: usize) -> usize {
         self.pw_base() + i
@@ -3140,9 +3175,9 @@ impl MonolithAir {
     }
     fn commit_caps_len(&self) -> usize {
         if self.full_cap() {
-            (0..CM_ROUNDS).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
+            (0..self.cm_rounds()).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
         } else {
-            CM_ROUNDS * 4
+            self.cm_rounds() * 4
         }
     }
     // periodic column values at ζ (2 felts each): a pis region AFTER the commit caps (symbolic mode only).
@@ -3191,13 +3226,13 @@ impl MonolithAir {
     // commit-phase round r cap: the codeword folds to height 2^(log_global−(r+1)); its cap has
     // 2^min(cap_height, that) entries, and the selecting index is `index >> ((r+1)+depth_r)`.
     fn commit_bits(&self, r: usize) -> usize {
-        core::cmp::min(CM_CAP_HEIGHT, DP_LOG_HEIGHT - (r + 1))
+        core::cmp::min(CM_CAP_HEIGHT, self.lg() - (r + 1))
     }
     fn commit_cap_size(&self, r: usize) -> usize {
         1 << self.commit_bits(r)
     }
     fn commit_shift(&self, r: usize) -> usize {
-        (r + 1) + (DP_LOG_HEIGHT - (r + 1)).saturating_sub(CM_CAP_HEIGHT)
+        (r + 1) + (self.lg() - (r + 1)).saturating_sub(CM_CAP_HEIGHT)
     }
     fn commit_cap_base(&self, r: usize) -> usize {
         self.ccap_base() + (0..r).map(|r2| self.commit_cap_size(r2) * 4).sum::<usize>()
@@ -3233,10 +3268,10 @@ impl MonolithAir {
         FT_BIND_START + self.nb() + self.ni() + r
     }
     fn p_query(&self, q: usize) -> usize {
-        FT_BIND_START + self.nb() + self.ni() + 6 + q
+        FT_BIND_START + self.nb() + self.ni() + self.cm_rounds() + q // after the cm_rounds P_ROUND one-hots
     }
     fn m_base(&self) -> usize {
-        FT_BIND_START + self.nb() + self.ni() + 6 + self.n_queries
+        FT_BIND_START + self.nb() + self.ni() + self.cm_rounds() + self.n_queries
     }
     fn m_tf(&self) -> usize {
         self.m_base()
@@ -3275,7 +3310,7 @@ impl MonolithAir {
         self.m_base() + 11 + r // commit-phase leaf-hash one-hots (6)
     }
     fn c_term(&self, r: usize) -> usize {
-        self.m_base() + 11 + CM_ROUNDS + r // commit-phase terminal one-hots (6)
+        self.m_base() + 11 + self.cm_rounds() + r // commit-phase terminal one-hots (cm_rounds)
     }
     fn tr(&self) -> usize {
         self.counts.len().next_power_of_two() * BLOCK
@@ -3296,7 +3331,7 @@ impl MonolithAir {
     // short-final rate-carry boundary. ALL absent (0 columns) at leaf_blocks=1 (W≤RATE), so the milestone
     // periodic layout is byte-for-byte and every downstream index (fold/inst) is unshifted.
     fn leaf_absorb_base(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 1
+        self.c_term(self.cm_rounds() - 1) + 1
     }
     fn n_in_absorb(&self) -> usize {
         if self.leaf_blocks() > 1 {
@@ -3433,8 +3468,8 @@ impl MonolithAir {
         }
         let mp = self.m_period();
         let st_off = |q: usize, row: usize| tr + q * mp + row;
-        // P_ROUND_0..5 — block 0 rows 0..5 of every super-tile (the fold rows)
-        for r in 0..6 {
+        // P_ROUND_0..cm_rounds−1 — block 0 rows 0..cm_rounds of every super-tile (the FRI-fold rows)
+        for r in 0..self.cm_rounds() {
             let mut col = vec![Val::ZERO; h];
             for q in 0..self.n_queries {
                 col[st_off(q, r)] = Val::ONE;
@@ -3455,7 +3490,7 @@ impl MonolithAir {
             col
         };
         cols.push(tiled(0)); // M_TF (arith head)
-        cols.push(tiled(6)); // M_TL (folded_eval / accept row)
+        cols.push(tiled(self.cm_rounds())); // M_TL (folded_eval / accept row: E_{cm_rounds})
         cols.push(tiled(M_INPUT_LEAF * BLOCK)); // M_LEAF
         cols.push(tiled(self.m_input_term() * BLOCK + BLOCK - 1)); // M_TERM
         let mut s_trans = vec![Val::ZERO; h];
@@ -3483,10 +3518,10 @@ impl MonolithAir {
         cols.push(tiled(mp - 1)); // P_ST_LAST (super-tile carrier boundary)
         cols.push(tiled(self.m_quot_leaf() * BLOCK)); // Q_LEAF
         cols.push(tiled(self.m_quot_term() * BLOCK + BLOCK - 1)); // Q_TERM
-        for r in 0..CM_ROUNDS {
+        for r in 0..self.cm_rounds() {
             cols.push(tiled(self.cm_leaf(r) * BLOCK)); // C_LEAF_r (commit-phase leaf-hash head)
         }
-        for r in 0..CM_ROUNDS {
+        for r in 0..self.cm_rounds() {
             cols.push(tiled(self.cm_term(r) * BLOCK + BLOCK - 1)); // C_TERM_r (commit-phase terminal)
         }
         // MULTI-BLOCK input-leaf one-hots (only leaf_blocks>1): absorb heads for blocks 1..leaf_blocks, the
@@ -3587,7 +3622,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
         let half = AB::Expr::from(Goldilocks::ONE.halve());
-        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let g = Goldilocks::two_adic_generator(self.lg());
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
@@ -3671,28 +3706,28 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for i in 0..self.pis_count() {
                 builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[self.pw(i)].clone() - cur[self.pw(i)].clone()));
             }
-            for j in 0..(2 * M_DEGREE_BITS) {
+            for j in 0..(2 * self.cm_rounds()) {
                 builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[self.sch(j)].clone() - cur[self.sch(j)].clone()));
             }
         }
 
         // ---------- super-tile arith (block 0, gated by M_TF / P_ROUND / M_TL) ----------
-        for i in 0..DP_LOG_HEIGHT {
+        for i in 0..self.lg() {
             let b = cur[QT_DBITS + i].clone();
             builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
         }
         let mut prev = one.clone();
-        for i in 0..DP_LOG_HEIGHT {
-            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+        for i in 0..self.lg() {
+            let ci = AB::Expr::from(g.exp_power_of_2(self.lg() - 1 - i));
             let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
-            builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
-            prev = cur[QT_ACC + i].clone();
+            builder.assert_zero(tf.clone() * (cur[self.qt_acc() + i].clone() - prev * factor));
+            prev = cur[self.qt_acc() + i].clone();
         }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
-        // QT_ALPHA bound to the carried α_fri
-        builder.assert_zero(tf.clone() * (cur[QT_ALPHA].clone() - cur[carry].clone()));
-        builder.assert_zero(tf.clone() * (cur[QT_ALPHA + 1].clone() - cur[carry + 1].clone()));
-        let alpha = gg(QT_ALPHA);
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[self.qt_acc() + self.lg() - 1].clone();
+        // self.qt_alpha() bound to the carried α_fri
+        builder.assert_zero(tf.clone() * (cur[self.qt_alpha()].clone() - cur[carry].clone()));
+        builder.assert_zero(tf.clone() * (cur[self.qt_alpha() + 1].clone() - cur[carry + 1].clone()));
+        let alpha = gg(self.qt_alpha());
         builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
         builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
         for k in 1..self.n_terms {
@@ -3745,11 +3780,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             lo = lo + cur[self.sb_b(i)].clone() * pow2(i);
         }
         builder.assert_zero(tf.clone() * (cur[self.sb_q(30)].clone() * lo));
-        for i in 0..DP_LOG_HEIGHT {
+        for i in 0..self.lg() {
             builder.assert_zero(tf.clone() * (cur[QT_DBITS + i].clone() - cur[self.sb_b(i)].clone()));
         }
         let mut qidx = AB::Expr::ZERO;
-        for i in 0..DP_LOG_HEIGHT {
+        for i in 0..self.lg() {
             qidx = qidx + cur[self.sb_b(i)].clone() * pow2(i);
         }
         builder.assert_zero(tf.clone() * (cur[self.idx_rem()].clone() - qidx));
@@ -3794,7 +3829,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             // degree 2) so z_h stays degree 1 and the OOD constraint doesn't blow up.
             let z_h = if self.column_window {
                 let mut prev = zeta.clone();
-                for i in 0..M_DEGREE_BITS {
+                for i in 0..self.cm_rounds() {
                     let si = (cur[self.sch(2 * i)].clone(), cur[self.sch(2 * i) + 1].clone());
                     let sq = emul(prev.clone(), prev.clone());
                     builder.assert_zero(tf.clone() * (si.0.clone() - sq.0));
@@ -3804,12 +3839,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 (prev.0 - one.clone(), prev.1)
             } else {
                 let mut s = zeta.clone();
-                for _ in 0..M_DEGREE_BITS {
+                for _ in 0..self.cm_rounds() {
                     s = emul(s.clone(), s.clone());
                 }
                 (s.0 - one.clone(), s.1)
             };
-            let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS).inverse());
+            let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(self.cm_rounds()).inverse());
             let is_trans = (zeta.0.clone() - g_inv, zeta.1.clone());
             let zm1 = (zeta.0.clone() - one.clone(), zeta.1.clone());
             let w_in = self.w_inner();
@@ -3887,7 +3922,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             }
             // z-term binding: the trace opening z's are ζ (columns 0..W) and ζ·g_trace (columns W..2W); the
             // quotient z's are ζ (terms 2W..). So each QT_pz(k) is genuinely the opening AT its point.
-            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS));
+            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(self.cm_rounds()));
             for c in 0..w_in {
                 builder.assert_zero(tf.clone() * (cur[self.z(c)].clone() - zeta.0.clone()));
                 builder.assert_zero(tf.clone() * (cur[self.z(c) + 1].clone() - zeta.1.clone()));
@@ -3921,7 +3956,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         }
         // commit-phase group carriers: seed the bit-ordered fold group {e_r, sib_r} at fold row r (p_round(r));
         // held within the super-tile so round r's leaf-hash block can absorb it (group[0..2]=lo, [2..4]=hi).
-        for r in 0..CM_ROUNDS {
+        for r in 0..self.cm_rounds() {
             let pr = p[self.p_round(r)].clone();
             let bit = cur[QT_BIT].clone();
             let nbit = one.clone() - bit.clone();
@@ -4004,7 +4039,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             }
         }
         // commit-phase leaves (blocks CM_LEAF[r]): absorb the bit-ordered fold group carried in cg(r,·).
-        for r in 0..CM_ROUNDS {
+        for r in 0..self.cm_rounds() {
             let cl = p[self.c_leaf(r)].clone();
             for k in 0..4 {
                 builder.assert_zero(cl.clone() * (cur[k].clone() - cur[self.cg(r, k)].clone()));
@@ -4018,7 +4053,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             // bit-ordered merge link across Merkle block boundaries, EXCEPT after any terminal (input/quotient/
             // commit) — the block after a terminal is a fresh leaf-hash seeded from its carrier, not a merge.
             let mut not_term = (one.clone() - p[self.m_term()].clone()) * (one.clone() - p[self.q_term()].clone());
-            for r in 0..CM_ROUNDS {
+            for r in 0..self.cm_rounds() {
                 not_term = not_term * (one.clone() - p[self.c_term(r)].clone());
             }
             // a multi-block leaf's INTERNAL boundary is a sponge absorb-continuation, not a merge — exclude it
@@ -4048,7 +4083,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 builder.assert_zero(term.clone() * (cur[k].clone() - cur[self.cap_c(k)].clone())); // input
                 builder.assert_zero(qterm.clone() * (cur[k].clone() - cur[self.cap_c(4 + k)].clone())); // quotient
             }
-            for r in 0..CM_ROUNDS {
+            for r in 0..self.cm_rounds() {
                 let ct = p[self.c_term(r)].clone();
                 for k in 0..4 {
                     builder.assert_zero(ct.clone() * (cur[k].clone() - cur[self.cap_c(8 + 4 * r + k)].clone()));
@@ -4062,10 +4097,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for g in 0..self.n_cap_c() {
                 builder.when_transition().assert_zero(hold.clone() * (nxt[self.cap_c(g)].clone() - cur[self.cap_c(g)].clone()));
             }
-            // (cg_offset, shift, bits, cap_base) per opening: trace, quotient, then CM_ROUNDS commit rounds.
-            // trace/quotient are at the max height, so the cap-selecting shift is INPUT_DEPTH (log_global−cap).
-            let mut openings = vec![(0usize, INPUT_DEPTH, CM_CAP_HEIGHT, self.cap_base()), (4, INPUT_DEPTH, CM_CAP_HEIGHT, self.qcap_base())];
-            for r in 0..CM_ROUNDS {
+            // (cg_offset, shift, bits, cap_base) per opening: trace, quotient, then self.cm_rounds() commit rounds.
+            // trace/quotient are at the max height, so the cap-selecting shift is input_depth (log_global−cap), runtime.
+            let mut openings = vec![(0usize, self.input_depth(), CM_CAP_HEIGHT, self.cap_base()), (4, self.input_depth(), CM_CAP_HEIGHT, self.qcap_base())];
+            for r in 0..self.cm_rounds() {
                 openings.push((8 + 4 * r, self.commit_shift(r), self.commit_bits(r), self.commit_cap_base(r)));
             }
             for (cg_off, shift, bits, cbase) in openings {
@@ -4090,7 +4125,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 builder.assert_zero(term.clone() * (cur[k].clone() - pis[cap + k].clone()));
                 builder.assert_zero(qterm.clone() * (cur[k].clone() - pis[qcap + k].clone()));
             }
-            for r in 0..CM_ROUNDS {
+            for r in 0..self.cm_rounds() {
                 let ct = p[self.c_term(r)].clone();
                 for k in 0..4 {
                     builder.assert_zero(ct.clone() * (cur[k].clone() - pis[ccap + 4 * r + k].clone()));
@@ -4175,7 +4210,7 @@ pub(crate) fn monolith_build_trace(
     let h = air.height();
     let w = air.fused_w();
     let tr = air.tr();
-    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let g = Goldilocks::two_adic_generator(air.lg());
     let n_rounds = air.nb() - 3;
     let mut t = vec![Val::ZERO; h * w];
     // transcript region
@@ -4189,9 +4224,9 @@ pub(crate) fn monolith_build_trace(
     for (q, ((index, terms, alpha, ro, rounds), _v, path)) in per_query.iter().enumerate() {
         let off = tr + q * air.m_period();
         // (the opened row is derived from the first W reduced-opening terms below — px-sharing)
-        // arith block 0: fold chain E_0..E_6
+        // arith block 0: fold chain E_0..E_{cm_rounds} (runtime with the FRI depth)
         let mut e = *ro;
-        for r in 0..=6 {
+        for r in 0..=air.cm_rounds() {
             let base = (off + r) * w;
             let ec = c(e);
             t[base + QT_E] = ec[0];
@@ -4213,16 +4248,16 @@ pub(crate) fn monolith_build_trace(
         // arith head (row 0): DEEP + reduced + α/term columns
         let base0 = off * w;
         let mut acc = Val::ONE;
-        for i in 0..DP_LOG_HEIGHT {
+        for i in 0..air.lg() {
             let bit = (index >> i) & 1;
             t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
-            acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
-            t[base0 + QT_ACC + i] = acc;
+            acc *= if bit == 1 { g.exp_power_of_2(air.lg() - 1 - i) } else { Val::ONE };
+            t[base0 + air.qt_acc() + i] = acc;
         }
         let x = <Goldilocks as Field>::GENERATOR * acc;
         let ac = c(*alpha);
-        t[base0 + QT_ALPHA] = ac[0];
-        t[base0 + QT_ALPHA + 1] = ac[1];
+        t[base0 + air.qt_alpha()] = ac[0];
+        t[base0 + air.qt_alpha() + 1] = ac[1];
         let mut apow = Challenge::ONE;
         for (k, &(z, pz, px)) in terms.iter().enumerate() {
             let (zc, pzc) = (c(z), c(pz));
@@ -4251,7 +4286,7 @@ pub(crate) fn monolith_build_trace(
             qq &= (vv >> (32 + k)) & 1;
             t[base0 + air.sb_q(k - 1)] = Val::from_u64(qq);
         }
-        let mut rem = vv & ((1u64 << DP_LOG_HEIGHT) - 1);
+        let mut rem = vv & ((1u64 << air.lg()) - 1);
         for r in 0..=n_rounds {
             t[(off + r) * w + air.idx_rem()] = Val::from_u64(rem);
             if r < n_rounds {
@@ -4324,7 +4359,7 @@ pub(crate) fn monolith_build_trace(
         let quot_cap_entry = qnode; // the quotient-Merkle terminal == the selected quotient cap entry
         // inline commit-phase Merkle: 6 rounds, each a leaf-hash (absorb the bit-ordered fold group) + `depth`
         // merges, authenticating every fold sibling to commit_phase_commits[r].
-        let mut commit_cap_entries = [[Val::ZERO; 4]; CM_ROUNDS];
+        let mut commit_cap_entries = vec![[Val::ZERO; 4]; air.cm_rounds()];
         for (r, (group, _leaf, cpath, _cap)) in commit_data[q].iter().enumerate() {
             let mut cinput = [Val::ZERO; W];
             cinput[..4].copy_from_slice(group);
@@ -4357,7 +4392,7 @@ pub(crate) fn monolith_build_trace(
                 for k in 0..4 {
                     t[(off + r) * w + air.cap_c(k)] = trace_cap_entry[k];
                     t[(off + r) * w + air.cap_c(4 + k)] = quot_cap_entry[k];
-                    for cr in 0..CM_ROUNDS {
+                    for cr in 0..air.cm_rounds() {
                         t[(off + r) * w + air.cap_c(8 + 4 * cr + k)] = commit_cap_entries[cr][k];
                     }
                 }
@@ -4374,7 +4409,7 @@ pub(crate) fn monolith_build_trace(
         use p3_field::BasedVectorSpace;
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
         let zeta = Challenge::from_basis_coefficients_fn(|k| pub_window[2 + k]); // ζ = pis[2,3]
-        let mut sch_vals = [[Val::ZERO; 2]; M_DEGREE_BITS];
+        let mut sch_vals = vec![[Val::ZERO; 2]; air.cm_rounds()];
         let mut s = zeta;
         for sv in sch_vals.iter_mut() {
             s = s * s; // S_{i+1} = S_i²
@@ -6808,7 +6843,7 @@ mod tests {
     where
         A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
     {
-        use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
+        use super::{monolith_build_trace, MonolithAir};
         use crate::recursion::native_fri::{epilogue_openings, eval_symbolic_native, multicol_query_terms, query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle};
         use p3_field::{BasedVectorSpace, PrimeField64};
         use p3_uni_stark::{get_symbolic_constraints, AirLayout};
@@ -6867,8 +6902,8 @@ mod tests {
         for &pv in pvs {
             pis.push(pv);
         }
-        for r in 0..CM_ROUNDS {
-            for e in proof.opening_proof.commit_phase_commits[r].roots().iter() {
+        for cm in proof.opening_proof.commit_phase_commits.iter() {
+            for e in cm.roots().iter() {
                 pis.extend_from_slice(e);
             }
         }
@@ -6936,10 +6971,17 @@ mod tests {
     }
 
     fn run_fib_monolith(n_queries: usize) -> (u32, u64) {
+        run_fib_monolith_at(n_queries, 6)
+    }
+
+    // Verify a Fibonacci inner at an arbitrary trace `log_height` (⇒ inner degree_bits = log_height,
+    // log_global = log_height + LOG_BLOWUP, cm_rounds = log_height). The monolith is fully proof-driven and its
+    // FRI geometry is runtime (cm_rounds()=nb−3), so a higher-db inner exercises the FRI-depth re-pin end-to-end.
+    fn run_fib_monolith_at(n_queries: usize, log_height: usize) -> (u32, u64) {
         use crate::recursion::native_fri::gen_fib_proof;
         use crate::recursion::native_verify::FibonacciAir;
         let config = make_config(1, n_queries);
-        let (proof, pvs) = gen_fib_proof(&config, 1, 1, 6);
+        let (proof, pvs) = gen_fib_proof(&config, 1, 1, log_height);
         run_symbolic_monolith(&config, &FibonacciAir, &proof, &pvs, 2, 3, 0, "fib")
     }
 
@@ -6989,6 +7031,20 @@ mod tests {
         let (log2h, rss) = run_fib_monolith(MILESTONE_QUERIES);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "fib monolith within 8 GB / 2^18");
         println!("Phase 7.6: the monolith verifies Fibonacci (W=2) via the DATA-DRIVEN symbolic epilogue at 2^{log2h} / {} MiB", rss / (1 << 20));
+    }
+
+    /// Phase 7 (FRI-DEPTH RE-PIN): the monolith verifies a HIGHER-DEPTH inner — a db=8 Fibonacci proof
+    /// (log_global=12, cm_rounds=8, vs the milestone's db=6/lg=10/6-round). The whole FRI geometry (arith-tile
+    /// column layout, DEEP acc chain, index reconstruction, commit-round count + caps) is now RUNTIME, derived
+    /// from the transcript binds (cm_rounds()=nb−3) — no compile-time db=6 assumption. Reduced queries (8) keep
+    /// RSS in budget; this decouples the FRI-depth generality from the query-count RSS, exactly as the leaf-block
+    /// / nqc wiring decoupled from the FRI depth. The real join-split (db=12) is the same machinery at lg=16.
+    #[test]
+    #[ignore = "slow: Phase 7 FRI-depth re-pin — a db=8 inner (log_global=12, cm_rounds=8) through the monolith"]
+    fn phase7_fri_depth_db8() {
+        let (log2h, rss) = run_fib_monolith_at(4, 8); // 4 queries (RSS budget), db=8 inner
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "db=8 monolith within 8 GB / 2^18");
+        println!("Phase 7 (FRI re-pin): the monolith verifies a db=8 inner (log_global=12, cm_rounds=8) at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     #[test]
@@ -7080,12 +7136,12 @@ mod tests {
     }
 
     /// A minimal `MonolithAir` for exercising the runtime geometry methods (no constraints ⇒ a ConstAir-shape
-    /// milestone inner: leaf_blocks=1, nqc=1). The geometry methods depend only on w_inner()/nqc(), so the other
-    /// fields are placeholders.
+    /// milestone inner: leaf_blocks=1, nqc=1). Geometry depends on w_inner()/nqc() AND nb() (the FRI depth is
+    /// derived from the transcript binds: nb = 3 + cm_rounds); db=6 ⇒ cm_rounds=6 ⇒ nb=9.
     fn milestone_geom_air() -> super::MonolithAir {
         super::MonolithAir {
             counts: vec![],
-            binds: vec![],
+            binds: vec![0; 9], // nb=9 ⇒ cm_rounds=6, lg=10 (the db=6 milestone)
             index_binds: vec![],
             n_queries: 1,
             n_terms: 4,
