@@ -5039,6 +5039,8 @@ struct SymbolicEpilogueAir {
     constraints: Vec<p3_uni_stark::SymbolicExpression<Val>>,
     w: usize,
     n_pub: usize,
+    n_periodic: usize,
+    degree_bits: usize, // the inner's degree_bits (for z_h = ζ^(2^db)−1 and g^{-1})
 }
 #[cfg(test)]
 impl SymbolicEpilogueAir {
@@ -5070,7 +5072,7 @@ impl BaseAir<Goldilocks> for SymbolicEpilogueAir {
         self.w_cols()
     }
     fn num_public_values(&self) -> usize {
-        4 + self.n_pub // ζ(2), α(2), pubs
+        4 + self.n_pub + 2 * self.n_periodic // ζ(2), α(2), pubs, periodic values at ζ
     }
 }
 #[cfg(test)]
@@ -5087,9 +5089,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SymbolicEpilogueAir {
         let zeta = (pis[0].clone(), pis[1].clone());
         let alpha = (pis[2].clone(), pis[3].clone());
         let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub).map(|i| (pis[4 + i].clone(), AB::Expr::ZERO)).collect();
-        let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(M_DEGREE_BITS).inverse());
+        // z_h = ζ^(2^db) − 1 and g^{-1} use the INNER's degree_bits (the standalone gadget verifies inners at
+        // any height, unlike the monolith which is pinned to M_DEGREE_BITS).
+        let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(self.degree_bits).inverse());
         let mut s = zeta.clone();
-        for _ in 0..M_DEGREE_BITS {
+        for _ in 0..self.degree_bits {
             s = emul(s.clone(), s.clone());
         }
         let z_h = (s.0 - one.clone(), s.1);
@@ -5112,11 +5116,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SymbolicEpilogueAir {
         let b_iv = emul(inv_van.clone(), z_h.clone());
         fr.assert_zero(b_iv.0 - one.clone());
         fr.assert_zero(b_iv.1);
+        // periodic column values at ζ (public, after ζ/α/pubs).
+        let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic).map(|i| (pis[4 + self.n_pub + 2 * i].clone(), pis[4 + self.n_pub + 2 * i + 1].clone())).collect();
         // Horner α-fold over the extracted symbolic constraints (data-driven tree walk).
-        let no_periodic: Vec<(AB::Expr, AB::Expr)> = Vec::new(); // this standalone gadget's inners have no periodic columns
         let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
         for c in &self.constraints {
-            let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &no_periodic, &is_first, &is_last, &is_trans, &w_ext);
+            let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w_ext);
             let fa = emul(folded.clone(), alpha.clone());
             folded = (fa.0 + ci.0, fa.1 + ci.1);
         }
@@ -6790,7 +6795,7 @@ mod tests {
         // extract the inner AIR's constraint trees — the ONLY inner-specific input, now data not code.
         let layout = AirLayout::from_air::<Val>(&FibonacciAir);
         let constraints = get_symbolic_constraints::<Val, FibonacciAir>(&FibonacciAir, layout);
-        let air = SymbolicEpilogueAir { constraints, w: 2, n_pub: 3 };
+        let air = SymbolicEpilogueAir { constraints, w: 2, n_pub: 3, n_periodic: 0, degree_bits: 6 };
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
         let (za, al) = (cc(zeta), cc(alpha));
         let mut pis = vec![za[0], za[1], al[0], al[1]];
@@ -6821,7 +6826,7 @@ mod tests {
         let (local, next, is_first, is_last, _is_trans, inv_van, quotient, alpha, zeta, _periodic) = epilogue_openings(&config, &MulAir, &proof, &pvs);
         let layout = AirLayout::from_air::<Val>(&MulAir);
         let constraints = get_symbolic_constraints::<Val, MulAir>(&MulAir, layout);
-        let air = SymbolicEpilogueAir { constraints, w: 3, n_pub: 2 };
+        let air = SymbolicEpilogueAir { constraints, w: 3, n_pub: 2, n_periodic: 0, degree_bits: 6 };
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
         let (za, al) = (cc(zeta), cc(alpha));
         let mut pis = vec![za[0], za[1], al[0], al[1]];
@@ -6833,6 +6838,59 @@ mod tests {
         let bp = prove(&config, &air, bad, &pis);
         assert!(verify(&config, &air, &bp, &pis).is_err(), "tampered quotient ⇒ reject");
         println!("Phase 7.5: in-circuit generic symbolic epilogue verifies the degree-2 MulAir (c=a·b, W=3) — same code, different constraints");
+    }
+
+    /// Phase 7.8: the IN-CIRCUIT symbolic epilogue scales to the REAL production `JoinSplitAir` — 81
+    /// constraints, W=19, 33 periodic columns, 26 pubs, degree-7 Poseidon. The data-driven tree walk
+    /// (`eval_symbolic_circuit`) folds ALL of them and checks folded·inv_van==quot(ζ), matching p3 — the same
+    /// gadget code that verified Fibonacci/Mul/Periodic, now on the production constraint set.
+    #[test]
+    #[ignore = "slow: Phase 7.8 in-circuit symbolic epilogue on the REAL JoinSplitAir vs p3"]
+    fn phase7_joinsplit_symbolic_epilogue() {
+        use super::{build_symbolic_epilogue_trace, SymbolicEpilogueAir};
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::native_fri::{epilogue_openings, eval_symbolic_native};
+        use p3_field::BasedVectorSpace;
+        use p3_uni_stark::{get_symbolic_constraints, prove as p3_prove, verify as p3_verify, AirLayout};
+        let config = make_config(1, MILESTONE_QUERIES);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = p3_prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        assert!(p3_verify(&config, &JoinSplitAir, &proof, &pvs).is_ok(), "p3 accepts the non-hiding join-split proof");
+        let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, zeta, periodic) = epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
+        assert_eq!((local.len(), periodic.len(), pvs.len()), (WIDTH, N_PERIODIC, N_PUBLIC));
+        let layout = AirLayout::from_air::<Val>(&JoinSplitAir);
+        let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, layout);
+        let n_c = constraints.len();
+        {
+            // native pre-check on THIS proof's openings (isolates in-circuit eval vs the extracted values).
+            let pubs_e: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+            let mut folded = Challenge::ZERO;
+            for c in &constraints {
+                folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs_e, &periodic, is_first, is_last, is_trans);
+            }
+            assert_eq!(folded * inv_van, quotient, "PRE-CHECK: native fold on this proof's openings == quot");
+        }
+        let air = SymbolicEpilogueAir { constraints, w: WIDTH, n_pub: N_PUBLIC, n_periodic: N_PERIODIC, degree_bits: proof.degree_bits };
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let (za, al) = (cc(zeta), cc(alpha));
+        let mut pis = vec![za[0], za[1], al[0], al[1]];
+        pis.extend_from_slice(&pvs);
+        for pv in &periodic {
+            let c = cc(*pv);
+            pis.push(c[0]);
+            pis.push(c[1]);
+        }
+        assert_eq!(pis.len(), 4 + N_PUBLIC + 2 * N_PERIODIC, "gadget pis: ζ+α+pubs+periodic");
+        let trace = build_symbolic_epilogue_trace(WIDTH, &local, &next, quotient, is_first, is_last, inv_van);
+        let prf = prove(&config, &air, trace, &pis);
+        if let Err(e) = verify(&config, &air, &prf, &pis) {
+            panic!("join-split in-circuit epilogue rejected (n_c={n_c}): {e:?}");
+        }
+        let bad = build_symbolic_epilogue_trace(WIDTH, &local, &next, quotient + Challenge::ONE, is_first, is_last, inv_van);
+        let bp = prove(&config, &air, bad, &pis);
+        assert!(verify(&config, &air, &bp, &pis).is_err(), "tampered quotient ⇒ reject");
+        println!("Phase 7.8: in-circuit symbolic epilogue verifies the REAL JoinSplitAir ({n_c} constraints, W={WIDTH}, {N_PERIODIC} periodic, {N_PUBLIC} pubs, degree-7)");
     }
 
     /// Phase 7.3: the in-circuit MULTI-COLUMN reduced opening reproduces the native `ro` for a 2-column

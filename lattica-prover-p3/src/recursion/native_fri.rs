@@ -1532,4 +1532,40 @@ mod tests {
         assert_eq!(folded * inv_van, quotient, "generic symbolic fold reproduces p3 for a PERIODIC-column AIR");
         println!("Phase 7.7: generic symbolic fold == p3 for PeriodicAir (a'=a+p reads the periodic value at ζ)");
     }
+
+    /// Phase 7.8 (native): the symbolic epilogue scales to the REAL production `JoinSplitAir` — W=19 columns,
+    /// 33 periodic columns (round constants), 26 public inputs, degree-7 Poseidon constraints, degree_bits=12.
+    /// Proven NON-HIDING (the recursion path) + extracted via `epilogue_openings`/`get_symbolic_constraints`;
+    /// the generic Horner fold over ALL its constraint trees reproduces p3's `verify_constraints`. This is the
+    /// production inner's constraint set — the same evaluator that handled Fibonacci/Mul/Periodic.
+    #[test]
+    #[ignore = "slow: Phase 7.8 symbolic epilogue on the REAL JoinSplitAir vs p3"]
+    fn phase7_joinsplit_symbolic_fold_matches_p3() {
+        use super::{epilogue_openings, eval_symbolic_native};
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use p3_uni_stark::{get_symbolic_constraints, prove, verify, AirLayout};
+        let config = make_config(1, 16); // recursion NON-HIDING config (arity-2); the monolith's verify path
+        let w = demo_witness();
+        let pis = public_values(&w);
+        let trace = build_trace(&w);
+        let proof = prove(&config, &JoinSplitAir, trace, &pis);
+        assert!(verify(&config, &JoinSplitAir, &proof, &pis).is_ok(), "p3 accepts the (non-hiding) join-split proof");
+        let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, _z, periodic) = epilogue_openings(&config, &JoinSplitAir, &proof, &pis);
+        assert_eq!(local.len(), WIDTH, "W=19 trace openings");
+        assert_eq!(periodic.len(), N_PERIODIC, "33 periodic columns at ζ");
+        assert_eq!(pis.len(), N_PUBLIC, "26 public inputs");
+        let pubs: Vec<Challenge> = pis.iter().map(|&p| Challenge::from(p)).collect();
+        let layout = AirLayout::from_air::<Val>(&JoinSplitAir);
+        let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, layout);
+        let mut folded = Challenge::ZERO;
+        for c in &constraints {
+            folded = folded * alpha + eval_symbolic_native(c, &local, &next, &pubs, &periodic, is_first, is_last, is_trans);
+        }
+        assert_eq!(folded * inv_van, quotient, "generic symbolic fold reproduces p3 for the REAL JoinSplitAir");
+        println!(
+            "Phase 7.8: symbolic epilogue == p3 for the REAL JoinSplitAir — {} constraints, W={WIDTH}, {N_PERIODIC} periodic, {N_PUBLIC} pubs, degree_bits={}",
+            constraints.len(),
+            proof.degree_bits
+        );
+    }
 }
