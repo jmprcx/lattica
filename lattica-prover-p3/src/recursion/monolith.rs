@@ -5099,6 +5099,27 @@ mod tests {
     }
 
     #[test]
+    fn counter_probe() {
+        use crate::recursion::native_fri::{gen_counter_proof, query_input_merkle};
+        use crate::recursion::native_verify::CounterAir;
+        let config = make_config(1, MILESTONE_QUERIES);
+        let (proof, pvs) = gen_counter_proof(&config, 42, 6);
+        assert!(verify(&config, &CounterAir, &proof, &pvs).is_ok(), "counter proof valid (p3)");
+        let cap = proof.commitments.trace.roots();
+        let cap_distinct = cap.windows(2).any(|w| w[0] != w[1]);
+        let (cproof, _) = gen_const_proof(&config, 42, 6);
+        let ccap = cproof.commitments.trace.roots();
+        let const_distinct = ccap.windows(2).any(|w| w[0] != w[1]);
+        println!("counter: {} cap entries, distinct={cap_distinct}; ConstAir distinct={const_distinct}", cap.len());
+        // the ConstAir-shaped oracles read proof data (same layout: 1 col, nqc=1) — confirm they run + the
+        // per-query cap entries DIFFER for the counter (they were all-equal for ConstAir).
+        let (_l0, _p0, e0) = query_input_merkle(&config, &proof, &pvs, 0);
+        let (_l1, _p1, e1) = query_input_merkle(&config, &proof, &pvs, 1);
+        println!("counter per-query cap entries differ across q0/q1: {}", e0 != e1);
+        assert!(cap_distinct && !const_distinct, "counter has distinct cap entries; ConstAir does not");
+    }
+
+    #[test]
     fn arity4_probe() {
         use crate::recursion::native_fri::verify_proof;
         let config = make_config(2, MILESTONE_QUERIES); // max_log_arity=2 → arity-4 folds

@@ -52,6 +52,32 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstAir {
     }
 }
 
+/// Minimal NON-DEGENERATE AIR (Phase 6): a single column counting up — `cur = pub` on the first row,
+/// `next = cur + 1` on every transition. Unlike `ConstAir`, its trace is NON-constant, so the committed
+/// Merkle leaves (hence the cap entries) differ per query and the quotient at ζ is non-zero — this is what
+/// exercises the cap-mux and the OOD epilogue that `ConstAir`'s degeneracy masks.
+pub struct CounterAir;
+
+impl BaseAir<Goldilocks> for CounterAir {
+    fn width(&self) -> usize {
+        1
+    }
+    fn num_public_values(&self) -> usize {
+        1
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CounterAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone());
+        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE);
+    }
+}
+
 // --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
 //     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;

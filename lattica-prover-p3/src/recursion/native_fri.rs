@@ -410,6 +410,19 @@ pub(crate) fn gen_const_proof(config: &MyConfig, value: u64, log_height: usize) 
     (p3_uni_stark::prove(config, &ConstAir, trace, &pvs), pvs)
 }
 
+/// Generate a real inner proof for the NON-DEGENERATE `CounterAir` (one column counting up from `value`) —
+/// a non-constant trace, so per-query cap entries DIFFER and the quotient at ζ is non-zero. The inner proof
+/// used to exercise the cap-mux + OOD epilogue + FS absorb-binding (test/oracle helper).
+#[cfg(test)]
+pub(crate) fn gen_counter_proof(config: &MyConfig, value: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use super::native_verify::CounterAir;
+    use p3_matrix::dense::RowMajorMatrix;
+    let n = 1usize << log_height;
+    let trace = RowMajorMatrix::new((0..n).map(|i| Val::from_u64(value + i as u64)).collect(), 1);
+    let pvs = vec![Val::from_u64(value)];
+    (p3_uni_stark::prove(config, &CounterAir, trace, &pvs), pvs)
+}
+
 /// A `MerkleCap` commitment flattened to its felt sequence (roots in order) — EXACTLY the felts the
 /// challenger observes via `observe(cap)`. The monolith transcript region must absorb this same sequence.
 #[cfg(test)]
