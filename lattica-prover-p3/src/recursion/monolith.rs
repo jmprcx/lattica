@@ -2873,6 +2873,15 @@ const CM_ROUNDS: usize = 6;
 const CM_LEAF: [usize; CM_ROUNDS] = [11, 15, 18, 20, 21, 22]; // leaf-hash block per round
 const CM_TERM: [usize; CM_ROUNDS] = [14, 17, 19, 20, 21, 22]; // terminal block per round (leaf + depth)
 
+/// Max inner proofs the tiled aggregator folds in ONE outer proof, mirroring `batch_joinsplit_air::
+/// MAX_BATCH_TILES`. K must be a power of two (the fold's Merkle–Damgård chain pads to pow2, as `batch_root`
+/// does); production rounds a short block up to the next pow2 with dummy-proof instances. NOTE: unlike the
+/// audited batch, this RESEARCH aggregator runs a reduced-query milestone config (arity-2, ≤32 queries), so
+/// it does NOT clear the ≥100-bit proven-security floor — production raises the outer config to the batch's
+/// 96-query params (where `proven_security_bits(MAX_BATCH_TILES) ≥ 100`) before this bound is load-bearing.
+#[allow(dead_code)]
+pub(crate) const MAX_AGG_TILES: usize = 64;
+
 #[allow(dead_code)]
 pub(crate) struct MonolithAir {
     pub counts: Vec<u8>,
@@ -5686,12 +5695,13 @@ mod tests {
     /// iff all K inners verify and their statements fold to the emitted root; rejects a corrupted instance and
     /// a wrong tx-root. Returns (log2 height, RSS).
     fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
-        use super::{MonolithAir, M_PERIOD};
+        use super::{MonolithAir, MAX_AGG_TILES, M_PERIOD};
         use crate::joinsplit_air::merge;
         use crate::poseidon2_air::{native_permute, native_steps};
         use crate::recursion::native_fri::{agg_statement_digest, DOM_AGG};
         use p3_matrix::dense::RowMajorMatrix;
         assert!(k.is_power_of_two(), "K must be a power of two (no fold padding needed), matching batch_root");
+        assert!(k <= MAX_AGG_TILES, "K exceeds MAX_AGG_TILES ({MAX_AGG_TILES}); split into multiple aggregate proofs");
         let config = make_config(1, n_queries);
         // build each instance's monolith columns (width fused_w) + collect the inner public values (fold seeds).
         let mut insts: Vec<Vec<Val>> = Vec::new();
