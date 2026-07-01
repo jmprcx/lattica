@@ -11,16 +11,17 @@
 //! count). Transcript, openings, quotient, constraints are all exercised end-to-end.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_challenger::{CanObserve, DuplexChallenger, FieldChallenger};
-use p3_commit::{ExtensionMmcs, Pcs, PolynomialSpace};
+use p3_challenger::{CanObserve, CanSampleBits, DuplexChallenger, FieldChallenger, GrindingChallenger};
+use p3_commit::{BatchOpening, ExtensionMmcs, Mmcs, Pcs, PolynomialSpace};
 use p3_dft::Radix2DitParallel;
 use p3_field::extension::BinomialExtensionField;
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_fri::HidingFriPcs;
+use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
+use p3_fri::{FriParameters, HidingFriPcs, TwoAdicFriFolding};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use rand_chacha::ChaCha20Rng;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+use super::native_fri::{eval_final_poly, final_query_point, reverse_bits_len, verify_query, CommitStep};
 use p3_uni_stark::{
     get_log_num_quotient_chunks, recompose_quotient_from_chunks, validate_degree_bits, verify_constraints,
     AirLayout, Proof, StarkConfig, StarkGenericConfig,
@@ -480,6 +481,195 @@ pub(crate) fn hiding_transcript_challenges(
     (alpha_stark, zeta, alpha_fri, betas, index_felts)
 }
 
+/// Native hiding reduced-opening oracle — the `HidingFriPcs` analog of native_fri's `open_input`. For one
+/// query it computes the DEEP reduced opening `ro = Σ_matrices Σ_points Σ_cols α^k (p_z − p_x)/(z − x)` per
+/// height, from the query rows `p_x` (input_proof) and the MERGED opened values `p_z` (public ‖ hidden random
+/// codewords — see `hiding_transcript_challenges`). The arithmetic is identical to the non-hiding open_input;
+/// the hiding structure is entirely in the caller-supplied `merged_coms` (the extra random round + the 2×
+/// quotient chunks over randomized domains, with codewords appended). The salted-leaf INPUT Merkle
+/// authentication is a SEPARATE oracle piece (reverify covers it); this focuses on the reduced opening.
+///
+/// `merged_coms[batch] = mats`, each mat `(log_domain_size, points[(z, values_with_codewords)])`, in the same
+/// round order as `input_proof`: `[random?, trace{ζ, ζ_next}, quotient{chunks}]`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn hiding_query_terms(
+    log_blowup: usize,
+    log_global_max_height: usize,
+    index: usize,
+    input_proof: &[BatchOpening<Val, ValMmcs>],
+    alpha: Challenge,
+    merged_coms: &[Vec<(usize, Vec<(Challenge, Vec<Challenge>)>)>],
+) -> Result<Vec<(usize, Challenge)>, String> {
+    use std::collections::BTreeMap;
+    let mut reduced: BTreeMap<usize, (Challenge, Challenge)> = BTreeMap::new();
+    if input_proof.len() != merged_coms.len() {
+        return Err(format!("batch count {} != {}", input_proof.len(), merged_coms.len()));
+    }
+    for (batch_opening, mats) in input_proof.iter().zip(merged_coms.iter()) {
+        if batch_opening.opened_values.len() != mats.len() {
+            return Err("batch matrix count mismatch".into());
+        }
+        for (mat_opening, (log_dom, mat_pts)) in batch_opening.opened_values.iter().zip(mats.iter()) {
+            let log_height = log_dom + log_blowup;
+            let bits_reduced = log_global_max_height - log_height;
+            let rev = reverse_bits_len(index >> bits_reduced, log_height);
+            let x = Val::GENERATOR * Val::two_adic_generator(log_height).exp_u64(rev as u64);
+            let (alpha_pow, ro) = reduced.entry(log_height).or_insert((Challenge::ONE, Challenge::ZERO));
+            for (z, ps_at_z) in mat_pts.iter() {
+                if mat_opening.len() != ps_at_z.len() {
+                    return Err(format!("col count {} != {} (merge shape)", mat_opening.len(), ps_at_z.len()));
+                }
+                let quotient = (*z - x).try_inverse().ok_or("opening point matches query point")?;
+                for (&p_at_x, &p_at_z) in mat_opening.iter().zip(ps_at_z.iter()) {
+                    *ro += *alpha_pow * (p_at_z - p_at_x) * quotient;
+                    *alpha_pow *= alpha;
+                }
+            }
+        }
+    }
+    Ok(reduced.into_iter().rev().map(|(lh, (_, ro))| (lh, ro)).collect())
+}
+
+/// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
+/// hiding monolith's query region will reproduce). Replays the hiding transcript (random-commitment absorb +
+/// codeword-merged opened values, as in `hiding_transcript_challenges`), then per query computes the reduced
+/// opening via `hiding_query_terms` and folds it down the commit phase to `final_poly` (reusing the generic
+/// `verify_query`, which re-checks each round's salted commit-phase Merkle). Accepts iff the reduced-opening
+/// oracle is correct — the fold only reaches `final_poly` when `ro` is the true DEEP-combined opening, so a
+/// wrong `hiding_query_terms` (missing the random round / codeword merge / randomized quotient domains) fails.
+#[cfg_attr(not(test), allow(dead_code))]
+fn hiding_verify_fri_native(
+    config: &MyConfig,
+    fri_params: &FriParameters<ChallengeMmcs>,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+) -> Result<(), String> {
+    let air = ConstAir;
+    let Proof { commitments, opened_values, opening_proof, degree_bits } = proof;
+    let degree_bits = *degree_bits;
+    let pcs = config.pcs();
+    let is_zk = config.is_zk();
+
+    let (base_degree_bits, degree) =
+        validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs))
+            .map_err(|e| format!("degree bits: {e:?}"))?;
+    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+    let layout = AirLayout::from_air::<Val>(&air);
+    let log_num_quotient_chunks = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, is_zk);
+    let num_quotient_chunks = 1usize << (log_num_quotient_chunks + is_zk);
+    let quotient_domain_size = 1usize << (degree_bits + log_num_quotient_chunks);
+    let quotient_domain = trace_domain.create_disjoint_domain(quotient_domain_size);
+    let quotient_chunks_domains = quotient_domain.split_domains(num_quotient_chunks);
+    let randomized_quotient_chunks_domains: Vec<_> = quotient_chunks_domains
+        .iter()
+        .map(|d| <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk))
+        .collect();
+
+    // ---- transcript preamble → ζ (mirrors reverify) ----
+    let mut ch = config.initialise_challenger();
+    ch.observe(Val::from_usize(degree_bits));
+    ch.observe(Val::from_usize(base_degree_bits));
+    ch.observe(Val::from_usize(0)); // preprocessed_width (ConstAir: none)
+    ch.observe(commitments.trace.clone());
+    ch.observe_slice(public_values);
+    let _alpha_stark: Challenge = ch.sample_algebra_element();
+    ch.observe(commitments.quotient_chunks.clone());
+    if let Some(r) = commitments.random.clone() {
+        ch.observe(r);
+    }
+    let zeta: Challenge = ch.sample_algebra_element();
+    let main_next = !air.main_next_row_columns().is_empty();
+    let zeta_next = init_trace_domain.next_point(zeta).ok_or("no next point")?;
+
+    // ---- build the un-merged rounds (round order = coms_to_verify) ----
+    let ld_trace = degree_bits;
+    let mut rounds_um: Vec<Vec<(usize, Vec<(Challenge, Vec<Challenge>)>)>> = Vec::new();
+    if let Some(rv) = &opened_values.random {
+        rounds_um.push(vec![(ld_trace, vec![(zeta, rv.clone())])]);
+    }
+    {
+        let mut pts = vec![(zeta, opened_values.trace_local.clone())];
+        if main_next {
+            pts.push((zeta_next, opened_values.trace_next.clone().ok_or("missing trace_next")?));
+        }
+        rounds_um.push(vec![(ld_trace, pts)]);
+    }
+    rounds_um.push(
+        randomized_quotient_chunks_domains
+            .iter()
+            .zip(&opened_values.quotient_chunks)
+            .map(|(d, v)| (d.size().trailing_zeros() as usize, vec![(zeta, v.clone())]))
+            .collect(),
+    );
+
+    // ---- merge codewords into each opened value + observe (α_fri absorb) ----
+    let rand_cws = &opening_proof.0;
+    let fri = &opening_proof.1;
+    let mut merged: Vec<Vec<(usize, Vec<(Challenge, Vec<Challenge>)>)>> = Vec::new();
+    for (r, round_mats) in rounds_um.iter().enumerate() {
+        let mut mround = Vec::new();
+        for (m, (ld, pts)) in round_mats.iter().enumerate() {
+            let mut mpts = Vec::new();
+            for (p, (z, vals)) in pts.iter().enumerate() {
+                let mut mv = vals.clone();
+                mv.extend_from_slice(&rand_cws[r][m][p]);
+                ch.observe_algebra_slice(&mv);
+                mpts.push((*z, mv));
+            }
+            mround.push((*ld, mpts));
+        }
+        merged.push(mround);
+    }
+    let alpha_fri: Challenge = ch.sample_algebra_element();
+
+    // ---- β_r (per commit-phase round) ----
+    let mut betas: Vec<Challenge> = Vec::new();
+    for (comm, w) in fri.commit_phase_commits.iter().zip(&fri.commit_pow_witnesses) {
+        ch.observe(comm.clone());
+        if !ch.check_witness(fri_params.commit_proof_of_work_bits, *w) {
+            return Err("invalid commit pow".into());
+        }
+        betas.push(ch.sample_algebra_element());
+    }
+    if fri.final_poly.len() != fri_params.final_poly_len() {
+        return Err("final poly length mismatch".into());
+    }
+    ch.observe_algebra_slice(&fri.final_poly);
+    let log_arities: Vec<usize> =
+        fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+    for &la in &log_arities {
+        ch.observe(Val::from_usize(la));
+    }
+    if !ch.check_witness(fri_params.query_proof_of_work_bits, fri.query_pow_witness) {
+        return Err("invalid query pow".into());
+    }
+
+    // ---- per-query: reduced opening (hiding_query_terms) → fold → final_poly ----
+    let total: usize = log_arities.iter().sum();
+    let log_global_max_height = total + fri_params.log_blowup + fri_params.log_final_poly_len;
+    let log_final_height = fri_params.log_blowup + fri_params.log_final_poly_len;
+    let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> =
+        TwoAdicFriFolding(core::marker::PhantomData);
+    for qp in fri.query_proofs.iter() {
+        let index = ch.sample_bits(log_global_max_height);
+        let ro = hiding_query_terms(fri_params.log_blowup, log_global_max_height, index, &qp.input_proof, alpha_fri, &merged)?;
+        let mut domain_index = index;
+        let fold_data: Vec<CommitStep<'_, ChallengeMmcs>> = betas
+            .iter()
+            .zip(fri.commit_phase_commits.iter())
+            .zip(qp.commit_phase_openings.iter())
+            .map(|((&beta, commit), opening)| CommitStep { beta, commit, opening })
+            .collect();
+        let folded = verify_query(fri_params, &folding, &mut domain_index, &fold_data, ro, log_global_max_height, log_final_height)?;
+        let x = final_query_point(domain_index, log_global_max_height);
+        if eval_final_poly(&fri.final_poly, x) != folded {
+            return Err("final poly mismatch".into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +768,46 @@ mod tests {
             "a wrong ζ must fail the OOD relation"
         );
         println!("native hiding oracle: transcript α_stark/ζ (with the random-commitment absorb) validated via the OOD constraint check");
+    }
+
+    /// Native hiding oracle (step 2): `hiding_query_terms` (the reduced-opening extraction) + the native
+    /// hiding FRI verify (`hiding_verify_fri_native`). Validated NON-CIRCULARLY against `p3::verify`: the
+    /// native verifier reconstructs the reduced opening from the merged (public ‖ codeword) openings + the
+    /// randomized quotient domains + the extra random round, then folds it to `final_poly`. The fold reaches
+    /// `final_poly` iff `ro` is the TRUE DEEP-combined opening — so accepting the same proof p3 accepts
+    /// validates the whole reduced-opening oracle. A tamper (wrong opened value) must break the fold.
+    #[test]
+    #[ignore = "slow: native hiding FRI verify (reduced opening + fold) vs p3::verify"]
+    fn hiding_query_terms_folds_to_final_poly() {
+        let config = make_config();
+        let (mut proof, pvs) = gen_proof(&config, 42, 6);
+        assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "sanity: p3::verify accepts");
+
+        // Rebuild the hiding FRI parameters the driver/verify_query need (deterministic — Poseidon2 + the
+        // literals are fixed; the ChaCha rng only salts on the PROVE side, so any seed verifies identically).
+        let perm = default_goldilocks_poseidon2_8();
+        let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::seed_from_u64(0));
+        let fri_params = FriParameters {
+            log_blowup: 4,
+            log_final_poly_len: 0,
+            max_log_arity: 4,
+            num_queries: 96,
+            commit_proof_of_work_bits: 0,
+            query_proof_of_work_bits: 16,
+            mmcs: ChallengeMmcs::new(val_mmcs),
+        };
+
+        // the native hiding FRI verifier accepts the valid proof (⇒ hiding_query_terms is the true reduced opening).
+        if let Err(e) = hiding_verify_fri_native(&config, &fri_params, &proof, &pvs) {
+            panic!("native hiding FRI verify rejected a valid proof: {e}");
+        }
+
+        // tamper: corrupt an opened trace value ⇒ the reduced opening is wrong ⇒ the fold misses final_poly.
+        proof.opened_values.trace_local[0] += Challenge::ONE;
+        assert!(
+            hiding_verify_fri_native(&config, &fri_params, &proof, &pvs).is_err(),
+            "a tampered opened value must break the fold to final_poly"
+        );
+        println!("native hiding oracle: reduced opening (hiding_query_terms) + fold validated vs p3::verify");
     }
 }
