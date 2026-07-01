@@ -3319,9 +3319,34 @@ impl MonolithAir {
     fn in_last_carry(&self) -> usize {
         self.in_boundary() + 1
     }
-    // base of the fold selectors (shifted past the multi-block leaf-absorb one-hots).
-    fn fold_base(&self) -> usize {
+    // MULTI-BLOCK QUOTIENT leaf one-hots (2·nqc > RATE), appended after the input-leaf ones — same machinery
+    // as ia_in/in_boundary/in_last_carry but for the quotient-Merkle leaf (blocks m_quot_leaf..+quot_leaf_blocks).
+    // All absent (0 columns) at quot_leaf_blocks=1 (2·nqc ≤ RATE), so nqc≤2 is byte-for-byte.
+    fn quot_absorb_base(&self) -> usize {
         self.leaf_absorb_base() + self.n_in_absorb()
+    }
+    fn n_quot_absorb(&self) -> usize {
+        if self.quot_leaf_blocks() > 1 {
+            (self.quot_leaf_blocks() - 1) // iq_(1..quot_leaf_blocks): absorb heads
+                + 1 // q_boundary: capacity carry (union)
+                + usize::from((2 * self.nqc()) % RATE != 0) // q_last_carry: short-final
+        } else {
+            0
+        }
+    }
+    // absorb head for quotient-leaf block b (b in 1..quot_leaf_blocks): block (m_quot_leaf+b) first row.
+    fn iq_(&self, b: usize) -> usize {
+        self.quot_absorb_base() + (b - 1)
+    }
+    fn q_boundary(&self) -> usize {
+        self.quot_absorb_base() + (self.quot_leaf_blocks() - 1)
+    }
+    fn q_last_carry(&self) -> usize {
+        self.q_boundary() + 1
+    }
+    // base of the fold selectors (shifted past BOTH the input- and quotient-leaf absorb one-hots).
+    fn fold_base(&self) -> usize {
+        self.quot_absorb_base() + self.n_quot_absorb()
     }
     fn n_fold_p(&self) -> usize {
         if self.fold { 5 } else { 0 }
@@ -3480,6 +3505,22 @@ impl MonolithAir {
             cols.push(boundary); // in_boundary
             if self.w_inner() % RATE != 0 {
                 cols.push(tiled((M_INPUT_LEAF + self.leaf_blocks() - 1) * BLOCK - 1)); // in_last_carry (into the short final block)
+            }
+        }
+        // MULTI-BLOCK quotient-leaf one-hots (only quot_leaf_blocks>1), mirroring the input-leaf ones.
+        if self.quot_leaf_blocks() > 1 {
+            for b in 1..self.quot_leaf_blocks() {
+                cols.push(tiled((self.m_quot_leaf() + b) * BLOCK)); // iq_(b): block (m_quot_leaf+b) head
+            }
+            let mut qboundary = vec![Val::ZERO; h];
+            for q in 0..self.n_queries {
+                for b in 1..self.quot_leaf_blocks() {
+                    qboundary[st_off(q, (self.m_quot_leaf() + b) * BLOCK - 1)] = Val::ONE; // block (m_quot_leaf+b−1) last row
+                }
+            }
+            cols.push(qboundary); // q_boundary
+            if (2 * self.nqc()) % RATE != 0 {
+                cols.push(tiled((self.m_quot_leaf() + self.quot_leaf_blocks() - 1) * BLOCK - 1)); // q_last_carry
             }
         }
         if self.fold {
@@ -3930,9 +3971,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 }
             }
         }
-        // quotient-Merkle leaf: absorb the 2·nqc-felt quotient row (the nqc chunk-openings) into the rate. Single
-        // block for nqc≤2 (2·nqc≤RATE — the nqc=1 milestone absorbs [qc0,qc1] exactly); B2 adds the multi-block
-        // quotient leaf for nqc≥3.
+        // quotient-Merkle leaf (blocks m_quot_leaf..+quot_leaf_blocks): a PaddingFreeSponge over the 2·nqc-felt
+        // quotient row (the nqc chunk-openings), RATE felts/block — the SAME multi-block machinery as the input
+        // leaf. First block: rate 0..min(2·nqc,RATE) = qc, rest 0. Single block for nqc≤2 (2·nqc≤RATE).
         let qleaf = p[self.q_leaf()].clone();
         let qlc0 = core::cmp::min(self.n_quot(), RATE);
         for k in 0..qlc0 {
@@ -3940,6 +3981,27 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         }
         for i in qlc0..W {
             builder.assert_zero(qleaf.clone() * cur[i].clone());
+        }
+        // subsequent quotient-leaf blocks (2·nqc>RATE): absorb the next chunk + carry capacity / short-final rate.
+        for b in 1..self.quot_leaf_blocks() {
+            let iq = p[self.iq_(b)].clone();
+            let clen = core::cmp::min(RATE, self.n_quot() - b * RATE);
+            for k in 0..clen {
+                builder.assert_zero(iq.clone() * (cur[k].clone() - cur[self.qc(b * RATE + k)].clone()));
+            }
+        }
+        if self.quot_leaf_blocks() > 1 {
+            let bnd = p[self.q_boundary()].clone();
+            for k in RATE..W {
+                builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+            }
+            if (2 * self.nqc()) % RATE != 0 {
+                let lc = p[self.q_last_carry()].clone();
+                let rem = self.n_quot() - (self.quot_leaf_blocks() - 1) * RATE;
+                for k in rem..RATE {
+                    builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
+                }
+            }
         }
         // commit-phase leaves (blocks CM_LEAF[r]): absorb the bit-ordered fold group carried in cg(r,·).
         for r in 0..CM_ROUNDS {
@@ -3959,9 +4021,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for r in 0..CM_ROUNDS {
                 not_term = not_term * (one.clone() - p[self.c_term(r)].clone());
             }
-            // a multi-block leaf's INTERNAL boundary is a sponge absorb-continuation, not a merge — exclude it.
+            // a multi-block leaf's INTERNAL boundary is a sponge absorb-continuation, not a merge — exclude it
+            // (both the input leaf and the quotient leaf).
             if self.leaf_blocks() > 1 {
                 not_term = not_term * (one.clone() - p[self.in_boundary()].clone());
+            }
+            if self.quot_leaf_blocks() > 1 {
+                not_term = not_term * (one.clone() - p[self.q_boundary()].clone());
             }
             let link = s_merkle.clone() * p[FT_P_BLOCK_LAST].clone() * (one.clone() - p[self.p_st_last()].clone()) * not_term;
             let nb_ = nxt[self.m_bit()].clone();
@@ -6909,6 +6975,14 @@ mod tests {
         run_symbolic_monolith(&config, &CubeAir, &proof, &pvs, 2, 1, 0, "cube") // W=2, degree-3 ⇒ nqc=2 (4 quotient terms)
     }
 
+    fn run_quart_monolith(n_queries: usize) -> (u32, u64) {
+        use crate::recursion::native_fri::gen_quart_proof;
+        use crate::recursion::native_verify::QuartAir;
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_quart_proof(&config, 2, 6);
+        run_symbolic_monolith(&config, &QuartAir, &proof, &pvs, 2, 1, 0, "quart") // W=2, degree-4 ⇒ nqc=4 (2-block quotient leaf)
+    }
+
     #[test]
     #[ignore = "slow: Phase 7.6 multi-column monolith (2-column Fibonacci) via the data-driven symbolic epilogue"]
     fn phase7_fib_monolith() {
@@ -6961,6 +7035,18 @@ mod tests {
         let (log2h, rss) = run_cube_monolith(MILESTONE_QUERIES);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "cube monolith within 8 GB / 2^18");
         println!("Phase 7 (wire it): the monolith verifies a DEGREE-3 inner (nqc=2) via the multi-chunk quotient recompose at 2^{log2h} / {} MiB", rss / (1 << 20));
+    }
+
+    /// Phase 7 ("wire it", quotient half B2): the monolith verifies a DEGREE-4 inner (`QuartAir`, c=a⁴ ⇒ nqc=4)
+    /// whose quotient-Merkle leaf spans 2 Poseidon blocks (2·nqc=8 > RATE) — exercising the MULTI-BLOCK quotient
+    /// leaf (iq_/q_boundary one-hots, capacity carry, merge-link exclusion) on top of the multi-chunk recompose.
+    /// The real join-split (degree-7, nqc=8 ⇒ 4-block quotient leaf) is the same machinery at larger nqc.
+    #[test]
+    #[ignore = "slow: Phase 7 monolith verifies a DEGREE-4 inner via the MULTI-BLOCK quotient leaf (nqc=4)"]
+    fn phase7_quart_monolith() {
+        let (log2h, rss) = run_quart_monolith(MILESTONE_QUERIES);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "quart monolith within 8 GB / 2^18");
+        println!("Phase 7 (wire it): the monolith verifies a DEGREE-4 inner (nqc=4) via the MULTI-BLOCK (2-block) quotient leaf at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     #[test]

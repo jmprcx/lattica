@@ -241,6 +241,35 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CubeAir {
     }
 }
 
+/// A DEGREE-4 inner (Phase 7 "wire it", quotient half B2): 2 columns `[a, c]` with a counter `a'=a+1` and a
+/// QUARTIC constraint `c = a⁴` (every row). Max constraint degree 4 ⇒ nqc = next_pow2(4−1) = 4 chunks, so
+/// 2·nqc = 8 > RATE = 4: the quotient-Merkle leaf spans ceil(8/4) = 2 Poseidon blocks — the smallest inner
+/// that exercises the monolith's MULTI-BLOCK QUOTIENT leaf (on top of the multi-chunk recompose). Emission:
+/// C0 first-row a-seed, C1 quartic c−a⁴, C2 a'−a−1.
+pub struct QuartAir;
+
+impl BaseAir<Goldilocks> for QuartAir {
+    fn width(&self) -> usize {
+        2
+    }
+    fn num_public_values(&self) -> usize {
+        1 // seed a
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QuartAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0: a = pub
+        let a2 = cur[0].clone() * cur[0].clone();
+        builder.assert_zero(cur[1].clone() - a2.clone() * a2); // C1: c = a⁴ (degree 4, every row)
+        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C2: a' = a + 1
+    }
+}
+
 // --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
 //     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;

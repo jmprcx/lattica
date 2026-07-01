@@ -518,6 +518,24 @@ pub(crate) fn gen_cube_proof(config: &MyConfig, seed: u64, log_height: usize) ->
     (p3_uni_stark::prove(config, &CubeAir, RowMajorMatrix::new(vals, 2), &pvs), pvs)
 }
 
+/// Generate a real inner proof for the DEGREE-4 `QuartAir` (2 cols `[a, c]`, a'=a+1, c=a⁴) — max constraint
+/// degree 4 ⇒ nqc=4 quotient chunks ⇒ 2·nqc=8 > RATE, exercising the monolith's MULTI-BLOCK quotient leaf.
+/// pvs = `[seed]`.
+#[cfg(test)]
+pub(crate) fn gen_quart_proof(config: &MyConfig, seed: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use super::native_verify::QuartAir;
+    use p3_matrix::dense::RowMajorMatrix;
+    let n = 1usize << log_height;
+    let mut vals = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let a = Val::from_u64(seed + i as u64);
+        vals.push(a);
+        vals.push(a * a * a * a); // c = a⁴
+    }
+    let pvs = vec![Val::from_u64(seed)];
+    (p3_uni_stark::prove(config, &QuartAir, RowMajorMatrix::new(vals, 2), &pvs), pvs)
+}
+
 /// The nqc quotient-recompose weights — EXACTLY p3's `recompose_quotient_from_chunks`:
 /// `zps_i = Π_{j≠i} vanishing_j(ζ) · vanishing_j(domain_i.first_point())⁻¹`. These verifier-computed public
 /// F_p² scalars are what the monolith's epilogue consumes to recompose quotient(ζ) = Σ_i zps_i·chunk_i.
