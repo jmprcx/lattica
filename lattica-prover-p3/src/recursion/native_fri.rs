@@ -482,6 +482,24 @@ pub(crate) fn gen_periodic_proof(config: &MyConfig, seed: u64, log_height: usize
     (p3_uni_stark::prove(config, &PeriodicAir, RowMajorMatrix::new(vals, 1), &pvs), pvs)
 }
 
+/// Generate a real inner proof for the WIDE `WideAir` (WIDE_W=8 independent counters, `col_i(r)=seed0+i+r`) —
+/// W=8 > RATE, so each committed trace row hashes to a 2-block Merkle leaf, exercising the monolith's
+/// MULTI-BLOCK input-leaf hashing. pvs = the WIDE_W column seeds.
+#[cfg(test)]
+pub(crate) fn gen_wide_proof(config: &MyConfig, seed0: u64, log_height: usize) -> (Proof<MyConfig>, Vec<Val>) {
+    use super::native_verify::{WideAir, WIDE_W};
+    use p3_matrix::dense::RowMajorMatrix;
+    let n = 1usize << log_height;
+    let mut vals = Vec::with_capacity(n * WIDE_W);
+    for r in 0..n {
+        for i in 0..WIDE_W {
+            vals.push(Val::from_u64(seed0 + i as u64 + r as u64)); // col_i(r) = seed0 + i + r
+        }
+    }
+    let pvs: Vec<Val> = (0..WIDE_W).map(|i| Val::from_u64(seed0 + i as u64)).collect();
+    (p3_uni_stark::prove(config, &WideAir, RowMajorMatrix::new(vals, WIDE_W), &pvs), pvs)
+}
+
 /// A `MerkleCap` commitment flattened to its felt sequence (roots in order) — EXACTLY the felts the
 /// challenger observes via `observe(cap)`. The monolith transcript region must absorb this same sequence.
 #[cfg(test)]

@@ -2866,15 +2866,13 @@ const LOG_BLOWUP: usize = 4; // FRI rate (log); log_global = degree_bits + LOG_B
 const M_DEGREE_BITS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // inner-trace degree_bits (10 − 4 = 6)
 const CM_ROUNDS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // FRI commit rounds = folds to the rate floor = degree_bits
 const INPUT_DEPTH: usize = DP_LOG_HEIGHT - CM_CAP_HEIGHT; // input/quotient Merkle path depth to the cap (10 − 6 = 4)
-// LEAF_BLOCKS = ceil(W_inner / RATE) input-Merkle leaf-hash blocks; QUOT_LEAF_BLOCKS = ceil(2·nqc / RATE)
-// quotient-Merkle leaf blocks. Both 1 here (the current inners are W ≤ RATE, nqc = 1); a wide/high-degree
-// inner (e.g. join-split W=19/nqc=8 → 5/4) re-pins these, and the layout below follows (multi-block leaf: 7.9).
-const LEAF_BLOCKS: usize = 1;
-const QUOT_LEAF_BLOCKS: usize = 1;
-const M_INPUT_LEAF: usize = 1; // first input-leaf block; the leaf spans M_INPUT_LEAF .. +LEAF_BLOCKS
-const M_INPUT_TERM: usize = M_INPUT_LEAF + (LEAF_BLOCKS - 1) + INPUT_DEPTH; // 1 + 0 + 4 = 5
-const M_QUOT_LEAF: usize = M_INPUT_TERM + 1; // 6
-const M_QUOT_TERM: usize = M_QUOT_LEAF + (QUOT_LEAF_BLOCKS - 1) + INPUT_DEPTH; // 6 + 0 + 4 = 10
+const M_INPUT_LEAF: usize = 1; // first input-leaf block; the leaf spans M_INPUT_LEAF .. +leaf_blocks (runtime)
+// The LEAF-BLOCK / nqc dimensions of the layout (input-Merkle leaf blocks = ceil(W_inner/RATE), quotient-Merkle
+// leaf blocks = ceil(2·nqc/RATE), and everything downstream: M_INPUT_TERM, M_QUOT_LEAF/TERM, CM_LEAF/TERM,
+// M_NBLOCKS, M_PERIOD) vary PER INNER, so they are RUNTIME methods on `MonolithAir` (m_input_term()/…/m_period())
+// rather than consts — see the geometry methods on the impl. At the milestone (W≤RATE, nqc=1 ⇒ leaf_blocks=1)
+// they equal the db=6 literals (guarded by `geometry_matches_milestone`; validated across configs by
+// `commit_layout_generalizes`). Only the FRI-depth scalars below stay compile-time (one pinned config).
 // commit round r folds the codeword to log-height DP_LOG_HEIGHT−(r+1); its Merkle path is that many levels
 // above the cap (0 once the codeword ≤ 2^cap_height). depths at db=6: [3,2,1,0,0,0]. Parameterized by
 // (log_global, cap) so the formula is validated at other configs (see `commit_layout_generalizes`).
@@ -2889,32 +2887,6 @@ const fn cm_depth_at(r: usize, log_global: usize, cap: usize) -> usize {
 const fn cm_depth(r: usize) -> usize {
     cm_depth_at(r, DP_LOG_HEIGHT, CM_CAP_HEIGHT)
 }
-// commit-phase blocks after the quotient-Merkle: each round = 1 leaf-hash block + cm_depth(r) merge blocks.
-const fn cm_leaf_blocks() -> [usize; CM_ROUNDS] {
-    let mut leaf = [0usize; CM_ROUNDS];
-    let mut blk = M_QUOT_TERM + 1;
-    let mut r = 0;
-    while r < CM_ROUNDS {
-        leaf[r] = blk;
-        blk += cm_depth(r) + 1;
-        r += 1;
-    }
-    leaf
-}
-const fn cm_term_blocks() -> [usize; CM_ROUNDS] {
-    let leaf = cm_leaf_blocks();
-    let mut term = [0usize; CM_ROUNDS];
-    let mut r = 0;
-    while r < CM_ROUNDS {
-        term[r] = leaf[r] + cm_depth(r);
-        r += 1;
-    }
-    term
-}
-const CM_LEAF: [usize; CM_ROUNDS] = cm_leaf_blocks(); // db=6: [11,15,18,20,21,22] — leaf-hash block per round
-const CM_TERM: [usize; CM_ROUNDS] = cm_term_blocks(); // db=6: [14,17,19,20,21,22] — terminal block per round
-const M_NBLOCKS: usize = CM_TERM[CM_ROUNDS - 1] + 1; // db=6: 23
-const M_PERIOD: usize = M_NBLOCKS * BLOCK; // db=6: 736
 
 // Runtime twin of the compile-time geometry derivation, parameterized by (log_global, cap_height, log_blowup),
 // for the single-block-leaf / nqc=1 baseline. Used only to VALIDATE the derivation matches the consts at db=6
@@ -3014,6 +2986,49 @@ impl MonolithAir {
         } else {
             1
         }
+    }
+    // ---- RUNTIME super-tile geometry (the leaf-block / nqc dimensions vary per inner; the FRI depth stays
+    // compile-time). All derived from the SAME formula as `commit_layout`/the compile-time consts, so at
+    // leaf_blocks=1/nqc=1 (every current inner: W≤RATE, degree-≤2 ⇒ nqc=1) they EQUAL M_INPUT_TERM/…/M_PERIOD
+    // byte-for-byte; a wide inner (W>RATE) grows leaf_blocks and the whole super-tile follows. ----
+    // input-Merkle leaf-hash blocks = ceil(W_inner / RATE) (PaddingFreeSponge absorbs RATE felts/block).
+    fn leaf_blocks(&self) -> usize {
+        self.w_inner().div_ceil(RATE)
+    }
+    // quotient chunks (p3 num_quotient_chunks = 1<<log2_ceil(max_constraint_degree−1)); nqc=1 for every current
+    // inner (degree ≤ 2). Increment B lifts this to the real value (join-split degree-7 ⇒ nqc=8).
+    fn nqc(&self) -> usize {
+        1
+    }
+    // quotient-Merkle leaf-hash blocks = ceil(2·nqc / RATE) (each chunk opens a 2-felt F_p² value at the query row).
+    fn quot_leaf_blocks(&self) -> usize {
+        (2 * self.nqc()).div_ceil(RATE)
+    }
+    fn m_input_term(&self) -> usize {
+        M_INPUT_LEAF + (self.leaf_blocks() - 1) + INPUT_DEPTH
+    }
+    fn m_quot_leaf(&self) -> usize {
+        self.m_input_term() + 1
+    }
+    fn m_quot_term(&self) -> usize {
+        self.m_quot_leaf() + (self.quot_leaf_blocks() - 1) + INPUT_DEPTH
+    }
+    // commit round r: leaf-hash block then cm_depth(r) merges, laid out cumulatively after the quotient terminal.
+    fn cm_leaf(&self, r: usize) -> usize {
+        let mut blk = self.m_quot_term() + 1;
+        for r2 in 0..r {
+            blk += cm_depth(r2) + 1;
+        }
+        blk
+    }
+    fn cm_term(&self, r: usize) -> usize {
+        self.cm_leaf(r) + cm_depth(r)
+    }
+    fn m_nblocks(&self) -> usize {
+        self.cm_term(CM_ROUNDS - 1) + 1
+    }
+    fn m_period(&self) -> usize {
+        self.m_nblocks() * BLOCK
     }
     // a NON-CONSTANT inner (counter or any symbolic multi-column) needs the full committed cap + the
     // index-selecting cap-mux (per-query cap entries differ), rather than ConstAir's single shared entry.
@@ -3251,7 +3266,7 @@ impl MonolithAir {
         self.counts.len().next_power_of_two() * BLOCK
     }
     fn inst_h(&self) -> usize {
-        (self.tr() + self.n_queries * M_PERIOD).next_power_of_two() // one inner-proof instance
+        (self.tr() + self.n_queries * self.m_period()).next_power_of_two() // one inner-proof instance
     }
     fn height(&self) -> usize {
         self.k_instances * self.inst_h() // K instances tiled row-disjoint
@@ -3261,26 +3276,58 @@ impl MonolithAir {
     // fold periodic selectors (only when `fold`), appended in single_periodic after the commit terminals so
     // they tile per-instance: active on both fold blocks (Poseidon step gate), and the four block-boundary
     // one-hots (SK seed / s_k link / ROOT-in / ROOT update).
+    // multi-block input-leaf periodic one-hots (appended after the commit terminals, before the fold/inst
+    // selectors): the subsequent-block absorb heads + the leaf-internal capacity-carry boundary + the
+    // short-final rate-carry boundary. ALL absent (0 columns) at leaf_blocks=1 (W≤RATE), so the milestone
+    // periodic layout is byte-for-byte and every downstream index (fold/inst) is unshifted.
+    fn leaf_absorb_base(&self) -> usize {
+        self.c_term(CM_ROUNDS - 1) + 1
+    }
+    fn n_in_absorb(&self) -> usize {
+        if self.leaf_blocks() > 1 {
+            (self.leaf_blocks() - 1) // ia_in(1..leaf_blocks): absorb heads
+                + 1 // in_boundary: leaf-internal capacity carry (union)
+                + usize::from(self.w_inner() % RATE != 0) // in_last_carry: short-final rate carry
+        } else {
+            0
+        }
+    }
+    // absorb head for input-leaf block b (b in 1..leaf_blocks): block (M_INPUT_LEAF+b) first row.
+    fn ia_in(&self, b: usize) -> usize {
+        self.leaf_absorb_base() + (b - 1)
+    }
+    // capacity-carry one-hot at the leaf-internal block boundaries (union of blocks M_INPUT_LEAF..+leaf_blocks−2 last rows).
+    fn in_boundary(&self) -> usize {
+        self.leaf_absorb_base() + (self.leaf_blocks() - 1)
+    }
+    // short-final rate-carry one-hot: the boundary INTO the short final block (only when W % RATE ≠ 0).
+    fn in_last_carry(&self) -> usize {
+        self.in_boundary() + 1
+    }
+    // base of the fold selectors (shifted past the multi-block leaf-absorb one-hots).
+    fn fold_base(&self) -> usize {
+        self.leaf_absorb_base() + self.n_in_absorb()
+    }
     fn n_fold_p(&self) -> usize {
         if self.fold { 5 } else { 0 }
     }
     fn p_fold_active(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 1
+        self.fold_base()
     }
     fn p_fold_sk(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 2
+        self.fold_base() + 1
     }
     fn p_fold_sklast(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 3
+        self.fold_base() + 2
     }
     fn p_fold_rootin(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 4
+        self.fold_base() + 3
     }
     fn p_fold_rootupd(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 5
+        self.fold_base() + 4
     }
     fn p_inst_first(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 1 + self.n_fold_p()
+        self.fold_base() + self.n_fold_p()
     }
     fn p_inst_last(&self) -> usize {
         self.p_inst_first() + 1
@@ -3344,7 +3391,8 @@ impl MonolithAir {
             col[blk * BLOCK + BLOCK - 1] = Val::ONE;
             cols.push(col);
         }
-        let st_off = |q: usize, row: usize| tr + q * M_PERIOD + row;
+        let mp = self.m_period();
+        let st_off = |q: usize, row: usize| tr + q * mp + row;
         // P_ROUND_0..5 — block 0 rows 0..5 of every super-tile (the fold rows)
         for r in 0..6 {
             let mut col = vec![Val::ZERO; h];
@@ -3369,7 +3417,7 @@ impl MonolithAir {
         cols.push(tiled(0)); // M_TF (arith head)
         cols.push(tiled(6)); // M_TL (folded_eval / accept row)
         cols.push(tiled(M_INPUT_LEAF * BLOCK)); // M_LEAF
-        cols.push(tiled(M_INPUT_TERM * BLOCK + BLOCK - 1)); // M_TERM
+        cols.push(tiled(self.m_input_term() * BLOCK + BLOCK - 1)); // M_TERM
         let mut s_trans = vec![Val::ZERO; h];
         for r in 0..tr {
             s_trans[r] = Val::ONE;
@@ -3378,10 +3426,10 @@ impl MonolithAir {
         let mut s_query = vec![Val::ZERO; h];
         let mut s_merkle = vec![Val::ZERO; h];
         for q in 0..self.n_queries {
-            for r in 0..M_PERIOD {
+            for r in 0..mp {
                 s_query[st_off(q, r)] = Val::ONE;
                 if r >= BLOCK {
-                    s_merkle[st_off(q, r)] = Val::ONE; // Merkle blocks 1..15 (not the arith block 0)
+                    s_merkle[st_off(q, r)] = Val::ONE; // Merkle blocks 1..(nblocks−1) (not the arith block 0)
                 }
             }
         }
@@ -3392,14 +3440,32 @@ impl MonolithAir {
             s_trans_trans[r] = Val::ONE;
         }
         cols.push(s_trans_trans);
-        cols.push(tiled(M_PERIOD - 1)); // P_ST_LAST (super-tile carrier boundary)
-        cols.push(tiled(M_QUOT_LEAF * BLOCK)); // Q_LEAF
-        cols.push(tiled(M_QUOT_TERM * BLOCK + BLOCK - 1)); // Q_TERM
+        cols.push(tiled(mp - 1)); // P_ST_LAST (super-tile carrier boundary)
+        cols.push(tiled(self.m_quot_leaf() * BLOCK)); // Q_LEAF
+        cols.push(tiled(self.m_quot_term() * BLOCK + BLOCK - 1)); // Q_TERM
         for r in 0..CM_ROUNDS {
-            cols.push(tiled(CM_LEAF[r] * BLOCK)); // C_LEAF_r (commit-phase leaf-hash head)
+            cols.push(tiled(self.cm_leaf(r) * BLOCK)); // C_LEAF_r (commit-phase leaf-hash head)
         }
         for r in 0..CM_ROUNDS {
-            cols.push(tiled(CM_TERM[r] * BLOCK + BLOCK - 1)); // C_TERM_r (commit-phase terminal)
+            cols.push(tiled(self.cm_term(r) * BLOCK + BLOCK - 1)); // C_TERM_r (commit-phase terminal)
+        }
+        // MULTI-BLOCK input-leaf one-hots (only leaf_blocks>1): absorb heads for blocks 1..leaf_blocks, the
+        // leaf-internal capacity-carry boundary (union), and — if the final block is short — its rate-carry
+        // boundary. Absent at leaf_blocks=1, so the milestone layout is unchanged.
+        if self.leaf_blocks() > 1 {
+            for b in 1..self.leaf_blocks() {
+                cols.push(tiled((M_INPUT_LEAF + b) * BLOCK)); // ia_in(b): block (M_INPUT_LEAF+b) head
+            }
+            let mut boundary = vec![Val::ZERO; h];
+            for q in 0..self.n_queries {
+                for b in 1..self.leaf_blocks() {
+                    boundary[st_off(q, (M_INPUT_LEAF + b) * BLOCK - 1)] = Val::ONE; // block (M_INPUT_LEAF+b−1) last row
+                }
+            }
+            cols.push(boundary); // in_boundary
+            if self.w_inner() % RATE != 0 {
+                cols.push(tiled((M_INPUT_LEAF + self.leaf_blocks() - 1) * BLOCK - 1)); // in_last_carry (into the short final block)
+            }
         }
         if self.fold {
             // two fold blocks in the tail slack: SK block (fb) then ROOT block (fb+1, ends at inst_h-1).
@@ -3798,13 +3864,39 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         }
 
         // ---------- super-tile inline Merkle (input + quotient blocks, gated by S_MERKLE) ----------
-        // input-Merkle leaf (block 1): absorb the W-value opened trace row (lanes 0..W = opened_row, W..8 = 0).
+        // input-Merkle leaf (blocks M_INPUT_LEAF..+leaf_blocks): a PaddingFreeSponge over the W-value opened
+        // trace row, RATE felts absorbed per block. First block: rate lanes 0..min(W,RATE) = opened_row, the
+        // rest = 0 (fresh state). At W≤RATE this is the single-block milestone leaf (byte-for-byte).
         let leaf = p[self.m_leaf()].clone();
-        for c in 0..w_in {
+        let lc0 = core::cmp::min(w_in, RATE);
+        for c in 0..lc0 {
             builder.assert_zero(leaf.clone() * (cur[c].clone() - cur[self.ov_c(c)].clone()));
         }
-        for i in w_in..W {
+        for i in lc0..W {
             builder.assert_zero(leaf.clone() * cur[i].clone());
+        }
+        // subsequent leaf blocks (W>RATE): each absorb head overwrites the rate lanes with the next chunk of the
+        // opened row; the leaf-internal boundary carries the sponge capacity (and, for a short final block, the
+        // rate lanes that chunk doesn't overwrite) — exactly PaddingFreeSponge's overwrite-mode duplex.
+        for b in 1..self.leaf_blocks() {
+            let ia = p[self.ia_in(b)].clone();
+            let clen = core::cmp::min(RATE, w_in - b * RATE);
+            for k in 0..clen {
+                builder.assert_zero(ia.clone() * (cur[k].clone() - cur[self.ov_c(b * RATE + k)].clone()));
+            }
+        }
+        if self.leaf_blocks() > 1 {
+            let bnd = p[self.in_boundary()].clone();
+            for k in RATE..W {
+                builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+            }
+            if w_in % RATE != 0 {
+                let lc = p[self.in_last_carry()].clone();
+                let rem = w_in - (self.leaf_blocks() - 1) * RATE;
+                for k in rem..RATE {
+                    builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
+                }
+            }
         }
         // quotient-Merkle leaf (block 6): absorb the 2-felt quotient row [qc0, qc1].
         let qleaf = p[self.q_leaf()].clone();
@@ -3830,6 +3922,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let mut not_term = (one.clone() - p[self.m_term()].clone()) * (one.clone() - p[self.q_term()].clone());
             for r in 0..CM_ROUNDS {
                 not_term = not_term * (one.clone() - p[self.c_term(r)].clone());
+            }
+            // a multi-block leaf's INTERNAL boundary is a sponge absorb-continuation, not a merge — exclude it.
+            if self.leaf_blocks() > 1 {
+                not_term = not_term * (one.clone() - p[self.in_boundary()].clone());
             }
             let link = s_merkle.clone() * p[FT_P_BLOCK_LAST].clone() * (one.clone() - p[self.p_st_last()].clone()) * not_term;
             let nb_ = nxt[self.m_bit()].clone();
@@ -3989,7 +4085,7 @@ pub(crate) fn monolith_build_trace(
     }
     // super-tile region
     for (q, ((index, terms, alpha, ro, rounds), _v, path)) in per_query.iter().enumerate() {
-        let off = tr + q * M_PERIOD;
+        let off = tr + q * air.m_period();
         // (the opened row is derived from the first W reduced-opening terms below — px-sharing)
         // arith block 0: fold chain E_0..E_6
         let mut e = *ro;
@@ -4082,20 +4178,28 @@ pub(crate) fn monolith_build_trace(
         // the W-value opened trace row (px shared per column) = the first W terms' p_x.
         let w_in = air.w_inner();
         let opened_row: Vec<Val> = (0..w_in).map(|c| terms[c].2).collect();
-        // inline input-Merkle: leaf-hash (block M_INPUT_LEAF) absorbs the W-value opened row; then 4 merges.
-        let mut input = [Val::ZERO; W];
-        input[..w_in].copy_from_slice(&opened_row);
-        let rows = native_steps(input);
-        for r in 0..BLOCK {
-            let base = (off + M_INPUT_LEAF * BLOCK + r) * w;
-            t[base..base + W].copy_from_slice(&rows[r]);
+        // inline input-Merkle: MULTI-BLOCK leaf-hash (blocks M_INPUT_LEAF .. +leaf_blocks) absorbs the W-value
+        // opened row RATE felts/block (PaddingFreeSponge: overwrite the rate, carry the capacity; a short final
+        // block absorbs the remainder and carries the un-overwritten rate lanes), then INPUT_DEPTH merges. At
+        // W≤RATE this is one block (== the milestone leaf, byte-for-byte).
+        let n_leaf = air.leaf_blocks();
+        let mut state = [Val::ZERO; W];
+        for b in 0..n_leaf {
+            let clen = core::cmp::min(RATE, w_in - b * RATE); // chunk length: RATE, or the short final remainder
+            state[..clen].copy_from_slice(&opened_row[b * RATE..b * RATE + clen]); // overwrite rate lanes 0..clen
+            let rows = native_steps(state);
+            for r in 0..BLOCK {
+                let base = (off + (M_INPUT_LEAF + b) * BLOCK + r) * w;
+                t[base..base + W].copy_from_slice(&rows[r]);
+            }
+            state = native_permute(state);
         }
-        let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+        let mut node: [Val; 4] = state[..4].try_into().unwrap();
         for (l, &(sib, b)) in path.iter().enumerate() {
-            node = merge_block(&mut t, off, M_INPUT_LEAF + 1 + l, node, sib, b);
+            node = merge_block(&mut t, off, M_INPUT_LEAF + n_leaf + l, node, sib, b);
         }
         let trace_cap_entry = node; // the input-Merkle terminal == the query's selected trace cap entry
-        // inline quotient-Merkle: leaf-hash (block M_QUOT_LEAF) absorbs the 2-felt quotient row (terms 2W, 2W+1).
+        // inline quotient-Merkle: leaf-hash (block m_quot_leaf) absorbs the 2-felt quotient row (terms 2W, 2W+1).
         let qc0 = terms[2 * w_in].2;
         let qc1 = terms[2 * w_in + 1].2;
         let mut qinput = [Val::ZERO; W];
@@ -4103,12 +4207,12 @@ pub(crate) fn monolith_build_trace(
         qinput[1] = qc1;
         let rows = native_steps(qinput);
         for r in 0..BLOCK {
-            let base = (off + M_QUOT_LEAF * BLOCK + r) * w;
+            let base = (off + air.m_quot_leaf() * BLOCK + r) * w;
             t[base..base + W].copy_from_slice(&rows[r]);
         }
         let mut qnode: [Val; 4] = native_permute(qinput)[..4].try_into().unwrap();
         for (l, &(sib, b)) in quot_paths[q].iter().enumerate() {
-            qnode = merge_block(&mut t, off, M_QUOT_LEAF + 1 + l, qnode, sib, b);
+            qnode = merge_block(&mut t, off, air.m_quot_leaf() + 1 + l, qnode, sib, b);
         }
         let quot_cap_entry = qnode; // the quotient-Merkle terminal == the selected quotient cap entry
         // inline commit-phase Merkle: 6 rounds, each a leaf-hash (absorb the bit-ordered fold group) + `depth`
@@ -4119,18 +4223,18 @@ pub(crate) fn monolith_build_trace(
             cinput[..4].copy_from_slice(group);
             let rows = native_steps(cinput);
             for row in 0..BLOCK {
-                let base = (off + CM_LEAF[r] * BLOCK + row) * w;
+                let base = (off + air.cm_leaf(r) * BLOCK + row) * w;
                 t[base..base + W].copy_from_slice(&rows[row]);
             }
             let mut cnode: [Val; 4] = native_permute(cinput)[..4].try_into().unwrap();
             for (l, &(sib, b)) in cpath.iter().enumerate() {
-                cnode = merge_block(&mut t, off, CM_LEAF[r] + 1 + l, cnode, sib, b);
+                cnode = merge_block(&mut t, off, air.cm_leaf(r) + 1 + l, cnode, sib, b);
             }
             commit_cap_entries[r] = cnode; // this round's commit-Merkle terminal == the selected commit cap
         }
         // carriers held within this super-tile: the W-value opened row + the quotient row [qc0, qc1] + the 6
         // fold groups (+ the 8 per-query cap-entry carriers when verifying a non-constant inner).
-        for r in 0..M_PERIOD {
+        for r in 0..air.m_period() {
             for c in 0..w_in {
                 t[(off + r) * w + air.ov_c(c)] = opened_row[c];
             }
@@ -6380,7 +6484,7 @@ mod tests {
     /// iff all K inners verify and their statements fold to the emitted root; rejects a corrupted instance and
     /// a wrong tx-root. Returns (log2 height, RSS).
     fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
-        use super::{MonolithAir, MAX_AGG_TILES, M_PERIOD};
+        use super::{MonolithAir, MAX_AGG_TILES};
         use crate::joinsplit_air::merge;
         use crate::poseidon2_air::{native_permute, native_steps};
         use crate::recursion::native_fri::{agg_statement_digest, DOM_AGG};
@@ -6407,7 +6511,7 @@ mod tests {
         let inst_h = air.inst_h();
         let hh = air.height();
         let fb = air.fold_sk_block();
-        assert!(fb * BLOCK >= air.tr() + n_queries * M_PERIOD, "fold blocks must land in the instance's tail slack");
+        assert!(fb * BLOCK >= air.tr() + n_queries * air.m_period(), "fold blocks must land in the instance's tail slack");
         // lay the K instances' monolith columns row-disjoint into the wide (fold) trace, then fill the fold
         // columns: AF_ROOT = the running root over all of instance i's rows; two Poseidon blocks in the slack.
         let mut all = vec![Val::ZERO; hh * w];
@@ -6729,6 +6833,14 @@ mod tests {
         run_symbolic_monolith(&config, &PeriodicAir, &proof, &pvs, 1, 1, 1, "periodic") // W=1, 1 pub, 1 periodic column
     }
 
+    fn run_wide_monolith(n_queries: usize) -> (u32, u64) {
+        use crate::recursion::native_fri::gen_wide_proof;
+        use crate::recursion::native_verify::{WideAir, WIDE_W};
+        let config = make_config(1, n_queries);
+        let (proof, pvs) = gen_wide_proof(&config, 100, 6);
+        run_symbolic_monolith(&config, &WideAir, &proof, &pvs, WIDE_W, WIDE_W, 0, "wide") // W=8 > RATE ⇒ 2-block leaf
+    }
+
     #[test]
     #[ignore = "slow: Phase 7.6 multi-column monolith (2-column Fibonacci) via the data-driven symbolic epilogue"]
     fn phase7_fib_monolith() {
@@ -6757,6 +6869,19 @@ mod tests {
         println!("Phase 7.7: the monolith verifies a PERIODIC-column inner via the symbolic epilogue at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
+    /// Phase 7 ("wire it"): the monolith verifies a WIDE inner (`WideAir`, W=8 > RATE) whose trace-commitment
+    /// leaf spans 2 Poseidon blocks — exercising the MULTI-BLOCK input-leaf hashing wired into the super-tile
+    /// (runtime geometry: leaf_blocks=2 ⇒ M_INPUT_TERM/M_NBLOCKS/M_PERIOD grow, the leaf absorbs RATE felts/block
+    /// with capacity carry, the leaf-internal boundary is excluded from the merge link). The join-split blocker
+    /// (W=19 ⇒ 5 blocks) is the same machinery at larger leaf_blocks. Rejects a tampered pub + trace cap.
+    #[test]
+    #[ignore = "slow: Phase 7 monolith verifies a WIDE (W=8) inner via the MULTI-BLOCK (2-block) input leaf"]
+    fn phase7_wide_monolith() {
+        let (log2h, rss) = run_wide_monolith(MILESTONE_QUERIES);
+        assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "wide monolith within 8 GB / 2^18");
+        println!("Phase 7 (wire it): the monolith verifies a WIDE W=8 inner via the MULTI-BLOCK (2-block) input leaf at 2^{log2h} / {} MiB", rss / (1 << 20));
+    }
+
     #[test]
     #[ignore = "slow: Phase 6.2 monolith verifies the non-degenerate counter inner (per-query caps)"]
     fn phase6_counter_monolith() {
@@ -6770,19 +6895,42 @@ mod tests {
     /// so the derivation stays honest (and documents what the literals used to be).
     #[test]
     fn geometry_matches_milestone() {
-        use super::{cm_depth, CM_CAP_HEIGHT, CM_LEAF, CM_ROUNDS, CM_TERM, DP_LOG_HEIGHT, INPUT_DEPTH, LOG_BLOWUP, M_DEGREE_BITS, M_INPUT_LEAF, M_INPUT_TERM, M_NBLOCKS, M_PERIOD, M_QUOT_LEAF, M_QUOT_TERM};
+        use super::{cm_depth, CM_CAP_HEIGHT, CM_ROUNDS, DP_LOG_HEIGHT, INPUT_DEPTH, LOG_BLOWUP, M_DEGREE_BITS, M_INPUT_LEAF};
         // base params (the milestone config)
         assert_eq!((DP_LOG_HEIGHT, CM_CAP_HEIGHT, LOG_BLOWUP), (10, 6, 4));
-        // derived scalars
-        assert_eq!(M_DEGREE_BITS, 6);
-        assert_eq!(CM_ROUNDS, 6);
-        assert_eq!(INPUT_DEPTH, 4);
-        assert_eq!((M_INPUT_LEAF, M_INPUT_TERM, M_QUOT_LEAF, M_QUOT_TERM), (1, 5, 6, 10));
-        // derived commit-phase block layout + per-round depths
-        assert_eq!(CM_LEAF, [11, 15, 18, 20, 21, 22]);
-        assert_eq!(CM_TERM, [14, 17, 19, 20, 21, 22]);
+        // derived FRI-depth scalars (compile-time — one pinned config)
+        assert_eq!((M_DEGREE_BITS, CM_ROUNDS, INPUT_DEPTH, M_INPUT_LEAF), (6, 6, 4, 1));
         assert_eq!([cm_depth(0), cm_depth(1), cm_depth(2), cm_depth(3), cm_depth(4), cm_depth(5)], [3, 2, 1, 0, 0, 0]);
-        assert_eq!((M_NBLOCKS, M_PERIOD), (23, 736));
+        // the RUNTIME geometry methods (the SINGLE SOURCE the monolith uses) reproduce the db=6 milestone layout
+        // byte-for-byte at a ConstAir inner (leaf_blocks=1, nqc=1). The literals here are what the derived geometry
+        // consts used to be — this guard pins them so a re-pin can't silently drift the layout.
+        let air = milestone_geom_air();
+        assert_eq!((air.leaf_blocks(), air.nqc(), air.quot_leaf_blocks()), (1, 1, 1));
+        assert_eq!((air.m_input_term(), air.m_quot_leaf(), air.m_quot_term()), (5, 6, 10));
+        assert_eq!(core::array::from_fn::<_, CM_ROUNDS, _>(|r| air.cm_leaf(r)), [11, 15, 18, 20, 21, 22]);
+        assert_eq!(core::array::from_fn::<_, CM_ROUNDS, _>(|r| air.cm_term(r)), [14, 17, 19, 20, 21, 22]);
+        assert_eq!((air.m_nblocks(), air.m_period()), (23, 736));
+    }
+
+    /// A minimal `MonolithAir` for exercising the runtime geometry methods (no constraints ⇒ a ConstAir-shape
+    /// milestone inner: leaf_blocks=1, nqc=1). The geometry methods depend only on w_inner()/nqc(), so the other
+    /// fields are placeholders.
+    fn milestone_geom_air() -> super::MonolithAir {
+        super::MonolithAir {
+            counts: vec![],
+            binds: vec![],
+            index_binds: vec![],
+            n_queries: 1,
+            n_terms: 4,
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            constraints: vec![],
+            w_inner_f: 0,
+            n_pub_f: 0,
+            n_periodic_f: 0,
+        }
     }
 
     /// Demonstrates the geometry is genuinely CONFIGURABLE across ALL its parameters — FRI depth AND the
@@ -6793,11 +6941,12 @@ mod tests {
     /// leaf-block / nqc (the re-pin's eval side).
     #[test]
     fn commit_layout_generalizes() {
-        use super::{cm_depth_at, commit_layout, CM_LEAF, CM_TERM, M_NBLOCKS};
-        // milestone (db=6, single-block leaf, nqc=1): the runtime twin == the compile-time consts (no drift).
+        use super::{cm_depth_at, commit_layout};
+        // milestone (db=6, single-block leaf, nqc=1): the formula reproduces the db=6 layout (== the runtime methods,
+        // which `geometry_matches_milestone` pins to these same literals).
         let (rounds, id, m_input_term, m_quot_term, leaf, term, nb) = commit_layout(10, 6, 4, 1, 1);
-        assert_eq!((rounds, id, m_input_term, m_quot_term, nb), (6, 4, 5, 10, M_NBLOCKS));
-        assert_eq!((leaf, term), (CM_LEAF.to_vec(), CM_TERM.to_vec()));
+        assert_eq!((rounds, id, m_input_term, m_quot_term, nb), (6, 4, 5, 10, 23));
+        assert_eq!((leaf, term), (vec![11, 15, 18, 20, 21, 22], vec![14, 17, 19, 20, 21, 22]));
         // FRI-depth only (db=12, still single-block leaf/nqc=1): 12 rounds, depths [9,…,0].
         let (rounds, ..) = commit_layout(16, 6, 4, 1, 1);
         assert_eq!(rounds, 12);

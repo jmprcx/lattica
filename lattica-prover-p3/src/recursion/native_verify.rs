@@ -177,6 +177,40 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PeriodicAir {
     }
 }
 
+/// A WIDE inner (Phase 7 "wire it"): `WIDE_W`=8 independent counter columns (`col_i' = col_i + 1`, first row
+/// `col_i = pub_i`). W=8 > RATE=4, so the trace-commitment leaf at a query row spans `ceil(8/4)=2` Poseidon
+/// blocks — the smallest inner that exercises the MONOLITH'S MULTI-BLOCK input-leaf hashing (the real
+/// join-split needs W=19 ⇒ 5 blocks). Still degree-1 (nqc=1), so ONLY the leaf-block dimension is new (the
+/// quotient stays single-block). Emission order: C0..C7 first-row seeds, then C8..C15 transitions.
+pub struct WideAir;
+
+/// Trace width of `WideAir` (chosen > RATE=4 to force a 2-block Merkle leaf).
+pub const WIDE_W: usize = 8;
+
+impl BaseAir<Goldilocks> for WideAir {
+    fn width(&self) -> usize {
+        WIDE_W
+    }
+    fn num_public_values(&self) -> usize {
+        WIDE_W // one seed per column
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for WideAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        for i in 0..WIDE_W {
+            builder.when_first_row().assert_zero(cur[i].clone() - pis[i].clone()); // C_i: seed col_i = pub_i
+        }
+        for i in 0..WIDE_W {
+            builder.when_transition().assert_zero(nxt[i].clone() - cur[i].clone() - AB::Expr::ONE); // C_{W+i}: col_i' = col_i + 1
+        }
+    }
+}
+
 // --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
 //     validated against the real ZK path: random commitment + hiding opening structure).
 type Perm = Poseidon2Goldilocks<8>;
