@@ -2895,6 +2895,12 @@ pub(crate) struct MonolithAir {
     /// monolith (transcript + super-tiles) laid out row-disjoint; the periodic pattern repeats per instance,
     /// the transcript IV / carrier holds become per-instance (p_inst_first / p_inst_last). 1 = single monolith.
     pub k_instances: usize,
+    /// When true (aggregator only; requires `column_window`), a global-persistent tx-root fold is fused in:
+    /// each instance folds its verified inner public value `pvs[0]` (the `pw(pub_pi)` carrier) into a running
+    /// Merkle–Damgård root via two Poseidon blocks in the instance's tail slack — `s_k = merge([DOM,0,0,0],
+    /// [pvs0,0,0,0])` then `root = merge(root, s_k)` (IV=0), exactly as `agg_root`/`batch_root`. The root's 4
+    /// lanes are the ONLY public inputs (the node-seam block tx-root); every inner datum stays witness.
+    pub fold: bool,
 }
 
 #[allow(dead_code)]
@@ -3019,6 +3025,22 @@ impl MonolithAir {
     fn fused_w(&self) -> usize {
         self.pw_base() + if self.column_window { self.pis_count() + 2 * M_DEGREE_BITS } else { 0 } // + ζ-squaring chain
     }
+    // aggregator fold columns (only when `fold`): 8 Poseidon lanes (the two merge permutations) + 4 lanes for
+    // the global-persistent running root, appended after the column-window window.
+    fn fold_w(&self) -> usize {
+        self.fused_w() + if self.fold { W + 4 } else { 0 }
+    }
+    fn af_p(&self, i: usize) -> usize {
+        self.fused_w() + i // fold Poseidon state lane i (0..W)
+    }
+    fn af_root(&self, k: usize) -> usize {
+        self.fused_w() + W + k // running-root lane k (0..4)
+    }
+    // the two fold blocks live in the instance's tail slack: SK block = block (inst_h/BLOCK − 2), ROOT block
+    // = block (inst_h/BLOCK − 1); ROOT block's last row == inst_h−1 (coincident with P_INST_LAST).
+    fn fold_sk_block(&self) -> usize {
+        self.inst_h() / BLOCK - 2
+    }
     // Merkle columns overlay the arith Poseidon lanes on the Merkle rows (disjoint rows).
     fn m_sib(&self) -> usize {
         8
@@ -3086,11 +3108,32 @@ impl MonolithAir {
     }
     // per-instance first/last row one-hots (appended after the single-instance periodic columns): the
     // transcript IV fires at each instance's first row; the carrier holds reset at each instance's last row.
-    fn p_inst_first(&self) -> usize {
+    // fold periodic selectors (only when `fold`), appended in single_periodic after the commit terminals so
+    // they tile per-instance: active on both fold blocks (Poseidon step gate), and the four block-boundary
+    // one-hots (SK seed / s_k link / ROOT-in / ROOT update).
+    fn n_fold_p(&self) -> usize {
+        if self.fold { 5 } else { 0 }
+    }
+    fn p_fold_active(&self) -> usize {
         self.c_term(CM_ROUNDS - 1) + 1
     }
-    fn p_inst_last(&self) -> usize {
+    fn p_fold_sk(&self) -> usize {
         self.c_term(CM_ROUNDS - 1) + 2
+    }
+    fn p_fold_sklast(&self) -> usize {
+        self.c_term(CM_ROUNDS - 1) + 3
+    }
+    fn p_fold_rootin(&self) -> usize {
+        self.c_term(CM_ROUNDS - 1) + 4
+    }
+    fn p_fold_rootupd(&self) -> usize {
+        self.c_term(CM_ROUNDS - 1) + 5
+    }
+    fn p_inst_first(&self) -> usize {
+        self.c_term(CM_ROUNDS - 1) + 1 + self.n_fold_p()
+    }
+    fn p_inst_last(&self) -> usize {
+        self.p_inst_first() + 1
     }
     fn periodic(&self) -> Vec<Vec<Val>> {
         // build the single-instance pattern, then tile it K× + append the per-instance first/last one-hots.
@@ -3208,25 +3251,48 @@ impl MonolithAir {
         for r in 0..CM_ROUNDS {
             cols.push(tiled(CM_TERM[r] * BLOCK + BLOCK - 1)); // C_TERM_r (commit-phase terminal)
         }
+        if self.fold {
+            // two fold blocks in the tail slack: SK block (fb) then ROOT block (fb+1, ends at inst_h-1).
+            let fb = self.fold_sk_block();
+            let mut active = vec![Val::ZERO; h];
+            let mut sk = vec![Val::ZERO; h];
+            let mut sklast = vec![Val::ZERO; h];
+            let mut rootin = vec![Val::ZERO; h];
+            let mut rootupd = vec![Val::ZERO; h];
+            for r in 0..(2 * BLOCK) {
+                active[fb * BLOCK + r] = Val::ONE; // both fold blocks (Poseidon step gate)
+            }
+            sk[fb * BLOCK] = Val::ONE; // SK block first row (DOM/pvs0 seed)
+            sklast[fb * BLOCK + BLOCK - 1] = Val::ONE; // SK block last row (s_k → ROOT rate-high)
+            rootin[(fb + 1) * BLOCK] = Val::ONE; // ROOT block first row (rate-low = running root)
+            rootupd[(fb + 1) * BLOCK + BLOCK - 1] = Val::ONE; // ROOT block last row (root update)
+            cols.push(active);
+            cols.push(sk);
+            cols.push(sklast);
+            cols.push(rootin);
+            cols.push(rootupd);
+        }
         cols
     }
 }
 
 impl BaseAir<Goldilocks> for MonolithAir {
     fn width(&self) -> usize {
-        self.fused_w()
+        self.fold_w()
     }
     fn num_public_values(&self) -> usize {
-        // in column-window mode the inner-proof pis live in witness columns; nothing public at the monolith
-        // level (the aggregator exposes only the block tx-root). Otherwise the full inner-proof pis.
-        if self.column_window {
+        // fold (aggregator): only the block tx-root (4 lanes) is public. column-window (K=1): nothing public —
+        // the inner-proof pis live in witness columns. Otherwise the full inner-proof pis.
+        if self.fold {
+            4
+        } else if self.column_window {
             0
         } else {
             self.pis_count()
         }
     }
     fn num_periodic_columns(&self) -> usize {
-        self.c_term(CM_ROUNDS - 1) + 1 + 2 // single-instance columns + P_INST_FIRST + P_INST_LAST
+        self.p_inst_last() + 1 // single-instance columns (+ fold selectors) + P_INST_FIRST + P_INST_LAST
     }
     fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
         self.periodic()
@@ -3629,6 +3695,59 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 for k in 0..4 {
                     builder.assert_zero(ct.clone() * (cur[k].clone() - pis[ccap + 4 * r + k].clone()));
                 }
+            }
+        }
+
+        // ---------- aggregator tx-root fold (only when `fold`) ----------
+        // Two Poseidon blocks in each instance's tail slack fold the verified inner public value (the
+        // `pw(pub_pi)` carrier) into a global-persistent Merkle–Damgård root: `s_k = merge([DOM,0,0,0],
+        // [pvs0,0,0,0])` (SK block) then `root = merge(root, s_k)` (ROOT block). IV=0 at global row 0, held
+        // except at each instance's ROOT update (which writes the new root into the next instance's first
+        // row), and the final root == the block tx-root — the ONLY public input. Matches agg_root/batch_root.
+        if self.fold {
+            let txroot: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+            let dom = AB::Expr::from(Goldilocks::from_u64(6)); // DOM_AGG = DOM_TXROOT
+            // fold Poseidon step (reuses the period-BLOCK round schedule is_init/is_full/is_partial/rc),
+            // gated to the two fold blocks by P_FOLD_ACTIVE.
+            let fa = p[self.p_fold_active()].clone();
+            let mut f_init: [AB::Expr; W] = core::array::from_fn(|i| cur[self.af_p(i)].clone());
+            ext_linear(&mut f_init);
+            let mut f_full: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[self.af_p(i)].clone() + rc[i].clone()));
+            ext_linear(&mut f_full);
+            let mut f_part: [AB::Expr; W] =
+                core::array::from_fn(|i| if i == 0 { pow7(cur[self.af_p(0)].clone() + rc[0].clone()) } else { cur[self.af_p(i)].clone() });
+            int_linear(&mut f_part);
+            for i in 0..W {
+                let step = is_init.clone() * (nxt[self.af_p(i)].clone() - f_init[i].clone())
+                    + is_full.clone() * (nxt[self.af_p(i)].clone() - f_full[i].clone())
+                    + is_partial.clone() * (nxt[self.af_p(i)].clone() - f_part[i].clone());
+                builder.when_transition().assert_zero(fa.clone() * step);
+            }
+            // SK block seed: [DOM, 0,0,0, pvs0, 0,0,0].
+            let psk = p[self.p_fold_sk()].clone();
+            builder.assert_zero(psk.clone() * (cur[self.af_p(0)].clone() - dom.clone()));
+            builder.assert_zero(psk.clone() * (cur[self.af_p(4)].clone() - cur[self.pw(self.pub_pi())].clone()));
+            for i in [1usize, 2, 3, 5, 6, 7] {
+                builder.assert_zero(psk.clone() * cur[self.af_p(i)].clone());
+            }
+            // SK block last row: s_k (output lanes 0..4) → ROOT block rate-high (next row lanes 4..8).
+            let pskl = p[self.p_fold_sklast()].clone();
+            for k in 0..4 {
+                builder.when_transition().assert_zero(pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()));
+            }
+            // ROOT block first row: rate-low == the running root column.
+            let prin = p[self.p_fold_rootin()].clone();
+            for k in 0..4 {
+                builder.assert_zero(prin.clone() * (cur[self.af_p(k)].clone() - cur[self.af_root(k)].clone()));
+            }
+            // running root: IV=0 at global row 0; held except at each instance's ROOT update; the ROOT block
+            // output at the global last row == the block tx-root (the single public input).
+            let prup = p[self.p_fold_rootupd()].clone();
+            for k in 0..4 {
+                builder.when_first_row().assert_zero(cur[self.af_root(k)].clone());
+                builder.when_transition().assert_zero((one.clone() - prup.clone()) * (nxt[self.af_root(k)].clone() - cur[self.af_root(k)].clone()));
+                builder.when_transition().assert_zero(prup.clone() * (nxt[self.af_root(k)].clone() - cur[self.af_p(k)].clone()));
+                builder.when_last_row().assert_zero(cur[self.af_p(k)].clone() - txroot[k].clone());
             }
         }
     }
@@ -5426,7 +5545,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1 };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -5488,11 +5607,11 @@ mod tests {
         (hh.trailing_zeros(), rss)
     }
 
-    /// Build ONE column-window monolith instance trace (height `inst_h`, width the column-window width) for a
-    /// ConstAir proof of `value`, returning the flat trace values + the (shared) AIR params. The aggregator
-    /// concatenates K of these row-disjoint.
+    /// Build ONE column-window monolith instance trace (height `inst_h`, width `fused_w`) for a ConstAir proof
+    /// of `value`, returning the flat trace values + the (shared) AIR params + the inner public value `pvs[0]`
+    /// (the fold seed). The aggregator lays K of these row-disjoint and fills the fold columns around them.
     #[allow(clippy::type_complexity)]
-    fn build_inner_window(config: &MyConfig, value: u64, n_queries: usize) -> (Vec<Val>, Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize) {
+    fn build_inner_window(config: &MyConfig, value: u64, n_queries: usize) -> (Vec<Val>, Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize, Val) {
         use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
         use crate::recursion::native_fri::{query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle, query_terms};
         use p3_field::{BasedVectorSpace, PrimeField64};
@@ -5537,6 +5656,7 @@ mod tests {
             inner_counter: false,
             column_window: true,
             k_instances: 1,
+            fold: false,
         };
         let mut pis = Vec::new();
         for ch in &chs {
@@ -5556,56 +5676,110 @@ mod tests {
             pis.extend_from_slice(ce);
         }
         let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis);
-        (trace.values, counts, binds, index_binds, n_terms)
+        (trace.values, counts, binds, index_binds, n_terms, pvs[0])
     }
 
-    /// Phase 6.6: the TILED AGGREGATOR — K column-window monolith instances in ONE AIR (each verifies a
-    /// distinct inner proof). Proves iff ALL K inners verify; rejects a corrupted instance. This is the
-    /// aggregation harness (verify K inners succinctly); wiring each instance's pub into the tx-root fold is
-    /// the final step. Returns (log2 height, RSS).
+    /// Phase 6.6: the TILED AGGREGATOR — K column-window monolith instances FUSED with the block tx-root fold
+    /// in ONE AIR. Each instance verifies a distinct inner ConstAir proof (accept-iff-p3::verify) AND folds its
+    /// verified public value `pvs[0]` into a global-persistent Merkle–Damgård root; the ONLY public input is
+    /// the block tx-root, matching `agg_root`/`batch_root` (so the node consensus seam is unchanged). Proves
+    /// iff all K inners verify and their statements fold to the emitted root; rejects a corrupted instance and
+    /// a wrong tx-root. Returns (log2 height, RSS).
     fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
-        use super::MonolithAir;
+        use super::{MonolithAir, M_PERIOD};
+        use crate::joinsplit_air::merge;
+        use crate::poseidon2_air::{native_permute, native_steps};
+        use crate::recursion::native_fri::{agg_statement_digest, DOM_AGG};
         use p3_matrix::dense::RowMajorMatrix;
+        assert!(k.is_power_of_two(), "K must be a power of two (no fold padding needed), matching batch_root");
         let config = make_config(1, n_queries);
-        let mut all = Vec::new();
+        // build each instance's monolith columns (width fused_w) + collect the inner public values (fold seeds).
+        let mut insts: Vec<Vec<Val>> = Vec::new();
+        let mut pvs0s: Vec<Val> = Vec::new();
         let mut params: Option<(Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize)> = None;
         for i in 0..k {
-            let (tr, counts, binds, ib, nt) = build_inner_window(&config, 42 + i as u64, n_queries);
-            all.extend_from_slice(&tr);
+            let (tr, counts, binds, ib, nt, pv0) = build_inner_window(&config, 42 + i as u64, n_queries);
+            insts.push(tr);
+            pvs0s.push(pv0);
             if i == 0 {
                 params = Some((counts, binds, ib, nt));
             }
         }
         let (counts, binds, index_binds, n_terms) = params.unwrap();
-        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k };
-        let w = air.fused_w();
-        let hh = air.height();
+        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true };
+        let fw = air.fused_w();
+        let w = air.fold_w();
         let inst_h = air.inst_h();
+        let hh = air.height();
+        let fb = air.fold_sk_block();
+        assert!(fb * BLOCK >= air.tr() + n_queries * M_PERIOD, "fold blocks must land in the instance's tail slack");
+        // lay the K instances' monolith columns row-disjoint into the wide (fold) trace, then fill the fold
+        // columns: AF_ROOT = the running root over all of instance i's rows; two Poseidon blocks in the slack.
+        let mut all = vec![Val::ZERO; hh * w];
+        let mut root = [Val::ZERO; 4]; // IV = 0
+        for i in 0..k {
+            let tr = &insts[i];
+            for r in 0..inst_h {
+                let dst = (i * inst_h + r) * w;
+                all[dst..dst + fw].copy_from_slice(&tr[r * fw..r * fw + fw]);
+                all[dst + air.af_root(0)..dst + air.af_root(0) + 4].copy_from_slice(&root);
+            }
+            // SK block: merge([DOM,0,0,0],[pvs0,0,0,0]) → s_k.
+            let mut sk_in = [Val::ZERO; W];
+            sk_in[0] = Val::from_u64(DOM_AGG);
+            sk_in[4] = pvs0s[i];
+            let sk_rows = native_steps(sk_in);
+            for r in 0..BLOCK {
+                let base = (i * inst_h + fb * BLOCK + r) * w + air.af_p(0);
+                all[base..base + W].copy_from_slice(&sk_rows[r]);
+            }
+            let s_k: [Val; 4] = native_permute(sk_in)[..4].try_into().unwrap();
+            // ROOT block: merge(root, s_k) → root'.
+            let mut rt_in = [Val::ZERO; W];
+            rt_in[..4].copy_from_slice(&root);
+            rt_in[4..].copy_from_slice(&s_k);
+            let rt_rows = native_steps(rt_in);
+            for r in 0..BLOCK {
+                let base = (i * inst_h + (fb + 1) * BLOCK + r) * w + air.af_p(0);
+                all[base..base + W].copy_from_slice(&rt_rows[r]);
+            }
+            root = native_permute(rt_in)[..4].try_into().unwrap();
+        }
+        // independent oracle cross-check: the built root == fold of agg_statement_digest(pvs0) (K pow2 ⇒ no pad).
+        let mut ref_root = [Val::ZERO; 4];
+        for &pv in &pvs0s {
+            ref_root = merge(ref_root, agg_statement_digest(pv));
+        }
+        assert_eq!(root, ref_root, "built tx-root == agg oracle root");
+        let txroot: Vec<Val> = root.to_vec();
         let trace = RowMajorMatrix::new(all, w);
-        println!("aggregator: {k} inners × 2^{} = 2^{} rows (width {w})", inst_h.trailing_zeros(), hh.trailing_zeros());
-        let prf = prove(&config, &air, trace.clone(), &[]);
-        assert!(verify(&config, &air, &prf, &[]).is_ok(), "aggregator: {k} inner proofs verify in ONE AIR");
-        // tamper instance 1's α_stark window column across all its rows ⇒ that instance's squeeze↦window bind
-        // fails ⇒ reject (a corrupted inner is caught).
+        println!("aggregator+fold: {k} inners × 2^{} = 2^{} rows (width {w}); tx-root emitted", inst_h.trailing_zeros(), hh.trailing_zeros());
+        let prf = prove(&config, &air, trace.clone(), &txroot);
+        assert!(verify(&config, &air, &prf, &txroot).is_ok(), "{k} inners verify + fold to the block tx-root in ONE AIR");
+        // wrong tx-root ⇒ the global-last-row bind fails ⇒ reject.
+        let mut bad_root = txroot.clone();
+        bad_root[0] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad_root).is_err(), "tampered tx-root ⇒ reject");
+        // corrupted instance 1 (its α_stark window column across all rows) ⇒ its squeeze↦window bind fails ⇒ reject.
         let mut bad_vals = trace.values.clone();
         for r in inst_h..(2 * inst_h) {
             bad_vals[r * w + air.pw(0)] += Val::ONE;
         }
         let bad = RowMajorMatrix::new(bad_vals, w);
-        let bp = prove(&config, &air, bad, &[]);
-        assert!(verify(&config, &air, &bp, &[]).is_err(), "corrupted instance 1 window ⇒ reject");
+        let bp = prove(&config, &air, bad, &txroot);
+        assert!(verify(&config, &air, &bp, &txroot).is_err(), "corrupted instance 1 ⇒ reject");
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         (hh.trailing_zeros(), rss)
     }
 
     #[test]
-    #[ignore = "slow: Phase 6.6 tiled aggregator (K inner proofs verified in one AIR)"]
+    #[ignore = "slow: Phase 6.6 tiled aggregator (K inners verified + folded to tx-root in one AIR)"]
     fn phase6_tiled_aggregator() {
         // K=2 at 16 queries/inner keeps 2 instances × 2^15 = 2^16 within the 8 GB budget.
         let (log2h, rss) = run_aggregator(2, 16);
         assert!(rss <= EIGHT_GB && (1usize << log2h) <= (1 << 18), "tiled aggregator within 8 GB / 2^18");
-        println!("Phase 6.6: tiled aggregator verifies K=2 inner proofs in ONE AIR at 2^{log2h} / {} MiB", rss / (1 << 20));
+        println!("Phase 6.6: K=2 inners verified + folded to the block tx-root in ONE AIR at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
     /// Phase 4.D: THE MONOLITH — transcript + 32 super-tiles in ONE AIR that accepts iff p3::verify accepts.
@@ -5673,7 +5847,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1 };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
