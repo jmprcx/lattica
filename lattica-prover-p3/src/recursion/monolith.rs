@@ -7566,8 +7566,13 @@ mod tests {
     /// are NOT multiples of RATE, including the real join-split trace-row width W=19 (5 blocks, short final
     /// 3-felt chunk). This is the input-Merkle leaf a W=19 inner needs (the current monolith leaf is single-
     /// block, W≤8). Exercises rem ∈ {1,3,4}; rejects a tampered leaf.
+    ///
+    /// HIDING (is_zk=1) coverage: the salted input leaf is preimage = `row ‖ 4 salt` (SALT_ELEMS=4;
+    /// MerkleTreeHidingMmcs hashes `row ‖ salt` — validated natively in native_verify::hiding_verify_fri_native).
+    /// So the hiding leaf needs NO new gadget — it is this width-generic sponge at width W+4. The `+4` widths
+    /// below cover exactly the salted preimages: 5 = ConstAir(1)+4, 12 = W=8+4, 23 = join-split(19)+4.
     #[test]
-    #[ignore = "slow: Phase 7.9 wide multi-block leaf (W not a multiple of RATE, incl. join-split W=19) vs MyHash"]
+    #[ignore = "slow: Phase 7.9 wide multi-block leaf (W not a multiple of RATE, incl. join-split W=19 + hiding row‖4-salt) vs MyHash"]
     fn phase7_wide_leaf_matches_myhash() {
         use super::{build_general_leaf_trace, GeneralLeafHashAir};
         use crate::recursion::native_fri::MyHash;
@@ -7575,7 +7580,8 @@ mod tests {
         use p3_symmetric::CryptographicHasher;
         let pcfg = make_config(1, MILESTONE_QUERIES);
         let hasher = MyHash::new(default_goldilocks_poseidon2_8());
-        for n in [5usize, 7, 12, 13, 19] {
+        // 5,12,23 = the is_zk=1 salted-leaf preimage widths (ConstAir/W=8/join-split rows + 4 salt felts).
+        for n in [5usize, 7, 12, 13, 19, 23] {
             let group: Vec<Val> = (0..n).map(|i| Val::from_u64(0x1234 + 7 * i as u64)).collect();
             let leaf: [Val; 4] = hasher.hash_iter(group.iter().copied());
             let air = GeneralLeafHashAir { n_felts: n };
@@ -7589,7 +7595,7 @@ mod tests {
             bad[m - 1] += Val::ONE;
             assert!(verify(&pcfg, &air, &prf, &bad).is_err(), "tampered leaf ⇒ reject (n={n})");
         }
-        println!("Phase 7.9: multi-block leaf hash (incl. W=19 join-split row, short final chunk) validated vs MyHash");
+        println!("Phase 7.9: multi-block leaf hash (incl. W=19 join-split + hiding salted-leaf widths 5/12/23) validated vs MyHash");
     }
 
     /// Phase 5 re-fusion: the in-circuit arity-4 fold CHAIN carries E_0=ro through 3 barycentric folds and
