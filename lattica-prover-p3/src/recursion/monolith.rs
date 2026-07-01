@@ -3741,6 +3741,142 @@ pub(crate) fn build_general_fold_trace(log_arity: usize, evals: &[Challenge], be
     RowMajorMatrix::new(vals, w)
 }
 
+// =================================================================================================
+// Phase 5 — general-arity commit-phase LEAF hash. The commit-phase MMCS leaf is `MyHash(group)` over the
+// arity-2^la fold group (2·arity = 2^(la+1) felts, always a multiple of RATE). The arity-2 leaf is the
+// single-block case the monolith already inlines; higher arity needs a MULTI-block rate-overwrite sponge
+// (absorb RATE felts, permute, overwrite rate + carry capacity, repeat). The Merkle PATH above the leaf is
+// arity-independent (binary tree — already validated). Validated vs `MyHash` on a real arity-4 group.
+// =================================================================================================
+#[allow(dead_code)]
+pub(crate) struct GeneralLeafHashAir {
+    pub n_felts: usize, // = 2·arity, a multiple of RATE
+}
+#[allow(dead_code)]
+impl GeneralLeafHashAir {
+    fn n_blocks(&self) -> usize {
+        self.n_felts / RATE
+    }
+    fn height(&self) -> usize {
+        (self.n_blocks() * BLOCK).next_power_of_two()
+    }
+    fn p_absorb(&self, b: usize) -> usize {
+        12 + (b - 1) // absorb one-hots for blocks 1..n_blocks (after 11 round cols + P_BLOCK_LAST)
+    }
+    fn p_term(&self) -> usize {
+        12 + (self.n_blocks() - 1) // terminal one-hot
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round cols
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..self.n_blocks() {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl); // P_BLOCK_LAST (index 11)
+        for b in 1..self.n_blocks() {
+            let mut c = vec![Val::ZERO; h];
+            c[b * BLOCK] = Val::ONE;
+            cols.push(c); // P_ABSORB_b (block b first row)
+        }
+        let mut term = vec![Val::ZERO; h];
+        term[(self.n_blocks() - 1) * BLOCK + BLOCK - 1] = Val::ONE;
+        cols.push(term); // P_TERM
+        cols
+    }
+}
+impl BaseAir<Goldilocks> for GeneralLeafHashAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        self.n_felts + 4 // the group preimage + the 4-felt leaf
+    }
+    fn num_periodic_columns(&self) -> usize {
+        self.p_term() + 1
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralLeafHashAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        // Poseidon2 rounds (all blocks hash).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(step);
+        }
+        // block 0: absorb group[0..RATE] into the rate, zero capacity.
+        {
+            let mut fr = builder.when_first_row();
+            for k in 0..RATE {
+                fr.assert_zero(cur[k].clone() - pis[k].clone());
+            }
+            for k in RATE..W {
+                fr.assert_zero(cur[k].clone());
+            }
+        }
+        // blocks 1..n: overwrite rate with the next RATE group felts (P_ABSORB_b) + carry capacity (P_BLOCK_LAST).
+        for b in 1..self.n_blocks() {
+            let pa = p[self.p_absorb(b)].clone();
+            for k in 0..RATE {
+                builder.assert_zero(pa.clone() * (cur[k].clone() - pis[b * RATE + k].clone()));
+            }
+        }
+        {
+            let bl = p[11].clone(); // P_BLOCK_LAST → capacity carry across every block boundary
+            for k in RATE..W {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - cur[k].clone()));
+            }
+        }
+        // terminal: the last block's output rate == the committed leaf.
+        let term = p[self.p_term()].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[self.n_felts + k].clone()));
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_general_leaf_trace(n_felts: usize, group: &[Val], leaf: [Val; 4]) -> RowMajorMatrix<Val> {
+    let air = GeneralLeafHashAir { n_felts };
+    let n_blocks = air.n_blocks();
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * W];
+    let mut cap = [Val::ZERO; W - RATE];
+    for b in 0..n_blocks {
+        let mut input = [Val::ZERO; W];
+        input[0..RATE].copy_from_slice(&group[b * RATE..b * RATE + RATE]);
+        input[RATE..].copy_from_slice(&cap);
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (b * BLOCK + r) * W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        cap.copy_from_slice(&native_permute(input)[RATE..]);
+    }
+    let _ = leaf; // (the terminal is bound to the public leaf; the trace's last-block output IS it)
+    RowMajorMatrix::new(t, W)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ft_build_trace, preamble_build_trace, FullTranscriptAir, PreambleAir, CAP_LANE, RATE};
@@ -4827,6 +4963,43 @@ mod tests {
             }
         }
         println!("Phase 5: in-circuit general-arity fold validated vs p3 fold_row — {checked} arity-4 rounds");
+    }
+
+    /// Phase 5: the general-arity commit-phase LEAF hash (multi-block rate-overwrite sponge over the arity-4
+    /// fold group = 8 felts / 2 blocks) reproduces MyHash, and rejects a tampered leaf. The Merkle path above
+    /// the leaf is arity-independent (already validated); this completes the commit-phase generalization.
+    #[test]
+    #[ignore = "slow: Phase 5 general-arity commit leaf hash vs MyHash (arity-4)"]
+    fn phase5_general_leaf_matches_myhash() {
+        use super::{build_general_leaf_trace, GeneralLeafHashAir};
+        use crate::recursion::native_fri::{general_fold_oracle, MyHash};
+        use p3_field::BasedVectorSpace;
+        use p3_goldilocks::default_goldilocks_poseidon2_8;
+        use p3_symmetric::CryptographicHasher;
+        let config = make_config(2, MILESTONE_QUERIES); // arity-4 data source
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let pcfg = make_config(1, MILESTONE_QUERIES);
+        let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+        let mut checked = 0;
+        for q in [0usize, 1, MILESTONE_QUERIES - 1] {
+            for (evals, _b, _x, _f) in general_fold_oracle(&config, &proof, &pvs, q) {
+                let group: Vec<Val> = evals.iter().flat_map(|e| e.as_basis_coefficients_slice().to_vec()).collect();
+                assert_eq!(group.len(), 8, "arity-4 group = 8 felts");
+                let leaf: [Val; 4] = hasher.hash_iter(group.iter().copied());
+                let air = GeneralLeafHashAir { n_felts: group.len() };
+                let mut pis = group.clone();
+                pis.extend_from_slice(&leaf);
+                let trace = build_general_leaf_trace(group.len(), &group, leaf);
+                let prf = prove(&pcfg, &air, trace, &pis);
+                assert!(verify(&pcfg, &air, &prf, &pis).is_ok(), "arity-4 commit leaf == MyHash (q {q})");
+                let mut bad = pis.clone();
+                let n = bad.len();
+                bad[n - 1] += Val::ONE;
+                assert!(verify(&pcfg, &air, &prf, &bad).is_err(), "tampered leaf ⇒ reject (q {q})");
+                checked += 1;
+            }
+        }
+        println!("Phase 5: general-arity commit leaf hash (2-block sponge) validated vs MyHash — {checked} groups");
     }
 
     #[test]
