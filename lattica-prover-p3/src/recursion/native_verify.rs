@@ -396,6 +396,90 @@ pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val
     Ok(())
 }
 
+// =================================================================================================
+// NATIVE HIDING (is_zk=1) ORACLE — the HidingFriPcs analog of native_fri's non-hiding oracle
+// (full_transcript_challenges / multicol_query_terms). Extracts, from a hiding proof, exactly the values the
+// in-circuit hiding monolith will reproduce: the challenges (with the RANDOM-commitment absorb) and the
+// per-query reduced-opening terms (the extra RANDOM opening round + the trace + the 2·is_zk-doubled quotient
+// chunks over randomized domains). Salt (in the MMCS opening_proof, not opened_values) is a leaf-hash concern
+// deferred to the in-circuit increment — it does not affect the challenges or the reduced opening. Validated
+// natively: the reduced opening folds to final_poly via the FRI (§ tests::hiding_oracle_folds_to_final_poly).
+// =================================================================================================
+
+/// The Fiat–Shamir challenges of a HIDING proof (α_stark, ζ, α_fri, β_r, query index felts). Same sequence as
+/// the non-hiding `full_transcript_challenges` PLUS the two `is_zk=1` insertions: `observe(random_commitment)`
+/// after the quotient commitment (before ζ), and `observe(random_opened_values)` FIRST in the pre-α_fri
+/// opened-value absorb (the random round is coms_to_verify[0] in `reverify`).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn hiding_transcript_challenges(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+) -> (Challenge, Challenge, Challenge, Vec<Challenge>, Vec<Val>) {
+    use p3_challenger::{CanSample, FieldChallenger, GrindingChallenger};
+    let pcs = config.pcs();
+    let is_zk = config.is_zk();
+    let degree_bits = proof.degree_bits;
+    let (base_degree_bits, _) =
+        validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).expect("degree bits");
+    let mut ch = config.initialise_challenger();
+    // preamble → α_stark
+    ch.observe(Val::from_usize(degree_bits));
+    ch.observe(Val::from_usize(base_degree_bits));
+    ch.observe(Val::from_usize(0)); // preprocessed width (ConstAir)
+    ch.observe(proof.commitments.trace.clone());
+    ch.observe_slice(public_values);
+    let alpha_stark: Challenge = ch.sample_algebra_element();
+    // quotient + RANDOM commitments → ζ
+    ch.observe(proof.commitments.quotient_chunks.clone());
+    if let Some(r) = proof.commitments.random.clone() {
+        ch.observe(r);
+    }
+    let zeta: Challenge = ch.sample_algebra_element();
+    // pre-α_fri opened-value absorb. HidingFriPcs::verify MERGES each round's public openings with the hidden
+    // random codewords (opening_proof.0, indexed [round][matrix][point]) BEFORE the inner TwoAdicFriPcs::verify
+    // observes them — so the transcript absorbs `public ‖ codewords`. Round order = coms_to_verify:
+    // [random?, trace{ζ, ζ_next}, quotient{chunks}].
+    let rand_cws = &proof.opening_proof.0;
+    let mut round = 0usize;
+    let observe_merged = |ch: &mut Challenger, public: &[Challenge], cw: &[Challenge]| {
+        let mut m = public.to_vec();
+        m.extend_from_slice(cw);
+        ch.observe_algebra_slice(&m);
+    };
+    if let Some(rv) = &proof.opened_values.random {
+        observe_merged(&mut ch, rv, &rand_cws[round][0][0]);
+        round += 1;
+    }
+    observe_merged(&mut ch, &proof.opened_values.trace_local, &rand_cws[round][0][0]);
+    if let Some(tn) = &proof.opened_values.trace_next {
+        observe_merged(&mut ch, tn, &rand_cws[round][0][1]);
+    }
+    round += 1;
+    for (i, c) in proof.opened_values.quotient_chunks.iter().enumerate() {
+        observe_merged(&mut ch, c, &rand_cws[round][i][0]);
+    }
+    let alpha_fri: Challenge = ch.sample_algebra_element();
+    // per commit round → β_r (hiding opening_proof = (random-poly openings, FriProof); the FriProof is .1)
+    let fri = &proof.opening_proof.1;
+    let mut betas = Vec::new();
+    for (comm, w) in fri.commit_phase_commits.iter().zip(&fri.commit_pow_witnesses) {
+        ch.observe(comm.clone());
+        assert!(ch.check_witness(0, *w), "commit pow (0 bits)");
+        betas.push(ch.sample_algebra_element::<Challenge>());
+    }
+    // final_poly + arities + query-PoW → the query index felts
+    ch.observe_algebra_slice(&fri.final_poly);
+    let log_arities: Vec<usize> = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+    for &la in &log_arities {
+        ch.observe(Val::from_usize(la));
+    }
+    assert!(ch.check_witness(16, fri.query_pow_witness), "query pow");
+    let index_felts: Vec<Val> = (0..fri.query_proofs.len()).map(|_| ch.sample()).collect();
+    (alpha_stark, zeta, alpha_fri, betas, index_felts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +530,53 @@ mod tests {
         let bad_pvs = vec![Val::from_u64(43)];
         assert!(verify(&config, &ConstAir, &proof, &bad_pvs).is_err());
         assert!(reverify(&config, &proof, &bad_pvs).is_err(), "reverify should reject wrong public value");
+    }
+
+    /// Native hiding oracle (step 1): `hiding_transcript_challenges` extracts α_stark/ζ from a HIDING proof
+    /// (the transcript with the RANDOM-commitment absorb — the defining is_zk=1 delta before ζ). Validated
+    /// NON-CIRCULARLY: the proof's opened values are at the PROVER's ζ, so the OOD constraint relation
+    /// (recompose quotient(ζ) + verify_constraints on the is_zk-halved init_trace_domain) holds iff the
+    /// extracted ζ/α_stark equal the prover's — i.e., the hiding transcript (incl. the random absorb) is right.
+    #[test]
+    #[ignore = "slow: native hiding transcript oracle (α_stark/ζ + random absorb) vs the OOD constraint check"]
+    fn hiding_transcript_matches_ood() {
+        let config = make_config();
+        let (proof, pvs) = gen_proof(&config, 42, 6);
+        assert!(reverify(&config, &proof, &pvs).is_ok(), "sanity: reverify accepts the hiding proof");
+
+        let (alpha_stark, zeta, _alpha_fri, _betas, index_felts) = hiding_transcript_challenges(&config, &proof, &pvs);
+        assert_eq!(index_felts.len(), 96, "one index felt per FRI query");
+
+        // OOD check with the ORACLE's α_stark/ζ — replicates reverify's constraint step (is_zk-aware domains).
+        let air = ConstAir;
+        let pcs = config.pcs();
+        let is_zk = config.is_zk();
+        let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
+        let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+        let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+        let layout = AirLayout::from_air::<Val>(&air);
+        let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, is_zk);
+        let nqc = 1usize << (log_nqc + is_zk);
+        let qd = trace_domain.create_disjoint_domain(1 << (proof.degree_bits + log_nqc));
+        let qcd = qd.split_domains(nqc);
+        let quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta);
+        let zeros = Challenge::zero_vec(air.width());
+        let trace_next: &[Challenge] = proof.opened_values.trace_next.as_deref().unwrap_or(&zeros);
+        let periodic: Vec<Challenge> = air.periodic_columns().iter().map(|c| init_trace_domain.evaluate_periodic_column_at(c, zeta)).collect();
+        verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
+            &air, &proof.opened_values.trace_local, trace_next, None, None, &periodic, &pvs, init_trace_domain, zeta, alpha_stark, quotient,
+        )
+        .expect("OOD check with the oracle's α_stark/ζ must hold ⇒ the hiding transcript (incl. random absorb) is correct");
+
+        // wrong ζ ⇒ the OOD relation fails (guards against a vacuous check).
+        let bad_quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta + Challenge::ONE);
+        assert!(
+            verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
+                &air, &proof.opened_values.trace_local, trace_next, None, None, &periodic, &pvs, init_trace_domain, zeta + Challenge::ONE, alpha_stark, bad_quotient,
+            )
+            .is_err(),
+            "a wrong ζ must fail the OOD relation"
+        );
+        println!("native hiding oracle: transcript α_stark/ζ (with the random-commitment absorb) validated via the OOD constraint check");
     }
 }
