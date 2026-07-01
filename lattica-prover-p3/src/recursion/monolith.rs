@@ -4254,8 +4254,20 @@ pub(crate) struct GeneralLeafHashAir {
 }
 #[allow(dead_code)]
 impl GeneralLeafHashAir {
+    // ceil(n_felts / RATE): the number of absorb permutations PaddingFreeSponge does. The LAST block absorbs
+    // `rem` felts (1..=RATE); if rem < RATE the remaining rate lanes carry the previous block's output.
     fn n_blocks(&self) -> usize {
-        self.n_felts / RATE
+        self.n_felts.div_ceil(RATE)
+    }
+    fn rem(&self) -> usize {
+        self.n_felts - (self.n_blocks() - 1) * RATE // final-block chunk length, 1..=RATE
+    }
+    fn chunk_len(&self, b: usize) -> usize {
+        if b == self.n_blocks() - 1 {
+            self.rem()
+        } else {
+            RATE
+        }
     }
     fn height(&self) -> usize {
         (self.n_blocks() * BLOCK).next_power_of_two()
@@ -4266,22 +4278,33 @@ impl GeneralLeafHashAir {
     fn p_term(&self) -> usize {
         12 + (self.n_blocks() - 1) // terminal one-hot
     }
+    // one-hot at the boundary INTO the short final block (its predecessor's last row), to carry the rate lanes
+    // the short chunk doesn't overwrite. Present only when rem < RATE.
+    fn p_last_carry(&self) -> usize {
+        self.p_term() + 1
+    }
     fn periodic(&self) -> Vec<Vec<Val>> {
         let h = self.height();
+        let n = self.n_blocks();
         let mut cols = periodic_table(); // 11 round cols
         let mut bl = vec![Val::ZERO; h];
-        for blk in 0..self.n_blocks() {
+        for blk in 0..n {
             bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
         }
         cols.push(bl); // P_BLOCK_LAST (index 11)
-        for b in 1..self.n_blocks() {
+        for b in 1..n {
             let mut c = vec![Val::ZERO; h];
             c[b * BLOCK] = Val::ONE;
             cols.push(c); // P_ABSORB_b (block b first row)
         }
         let mut term = vec![Val::ZERO; h];
-        term[(self.n_blocks() - 1) * BLOCK + BLOCK - 1] = Val::ONE;
+        term[(n - 1) * BLOCK + BLOCK - 1] = Val::ONE;
         cols.push(term); // P_TERM
+        if self.rem() < RATE {
+            let mut lc = vec![Val::ZERO; h];
+            lc[(n - 2) * BLOCK + BLOCK - 1] = Val::ONE; // predecessor of the short final block, last row
+            cols.push(lc); // P_LAST_CARRY
+        }
         cols
     }
 }
@@ -4293,7 +4316,11 @@ impl BaseAir<Goldilocks> for GeneralLeafHashAir {
         self.n_felts + 4 // the group preimage + the 4-felt leaf
     }
     fn num_periodic_columns(&self) -> usize {
-        self.p_term() + 1
+        if self.rem() < RATE {
+            self.p_last_carry() + 1
+        } else {
+            self.p_term() + 1
+        }
     }
     fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
         self.periodic()
@@ -4334,10 +4361,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralLeafHashAir {
                 fr.assert_zero(cur[k].clone());
             }
         }
-        // blocks 1..n: overwrite rate with the next RATE group felts (P_ABSORB_b) + carry capacity (P_BLOCK_LAST).
+        // blocks 1..n: overwrite the rate with this block's group felts (P_ABSORB_b) + carry capacity
+        // (P_BLOCK_LAST). The final block absorbs only `rem` felts (matching PaddingFreeSponge's short chunk).
         for b in 1..self.n_blocks() {
             let pa = p[self.p_absorb(b)].clone();
-            for k in 0..RATE {
+            for k in 0..self.chunk_len(b) {
                 builder.assert_zero(pa.clone() * (cur[k].clone() - pis[b * RATE + k].clone()));
             }
         }
@@ -4345,6 +4373,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralLeafHashAir {
             let bl = p[11].clone(); // P_BLOCK_LAST → capacity carry across every block boundary
             for k in RATE..W {
                 builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - cur[k].clone()));
+            }
+        }
+        // short final block: the rate lanes it does NOT overwrite (rem..RATE) carry the previous block's output.
+        if self.rem() < RATE {
+            let lc = p[self.p_last_carry()].clone();
+            for k in self.rem()..RATE {
+                builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone()));
             }
         }
         // terminal: the last block's output rate == the committed leaf.
@@ -4361,17 +4396,24 @@ pub(crate) fn build_general_leaf_trace(n_felts: usize, group: &[Val], leaf: [Val
     let n_blocks = air.n_blocks();
     let h = air.height();
     let mut t = vec![Val::ZERO; h * W];
-    let mut cap = [Val::ZERO; W - RATE];
-    for b in 0..n_blocks {
-        let mut input = [Val::ZERO; W];
-        input[0..RATE].copy_from_slice(&group[b * RATE..b * RATE + RATE]);
-        input[RATE..].copy_from_slice(&cap);
-        let rows = native_steps(input);
+    // PaddingFreeSponge: state starts at 0; each block overwrites rate[0..chunk_len] (rate[chunk_len..RATE] +
+    // capacity carry the previous permutation output), then permutes. Blocks past n_blocks are PADDING (height
+    // rounds to a power of two): they run a valid permutation continuation so the round constraints hold (only
+    // the round schedule fires there — no absorb; the terminal is bound at the last REAL block).
+    let n_total = h / BLOCK;
+    let mut state = [Val::ZERO; W];
+    for b in 0..n_total {
+        if b < n_blocks {
+            for k in 0..air.chunk_len(b) {
+                state[k] = group[b * RATE + k];
+            }
+        }
+        let rows = native_steps(state);
         for r in 0..BLOCK {
             let base = (b * BLOCK + r) * W;
             t[base..base + W].copy_from_slice(&rows[r]);
         }
-        cap.copy_from_slice(&native_permute(input)[RATE..]);
+        state = native_permute(state);
     }
     let _ = leaf; // (the terminal is bound to the public leaf; the trace's last-block output IS it)
     RowMajorMatrix::new(t, W)
@@ -7034,6 +7076,36 @@ mod tests {
             }
         }
         println!("Phase 5: general-arity commit leaf hash (2-block sponge) validated vs MyHash — {checked} groups");
+    }
+
+    /// Phase 7.9 (join-split path — multi-block leaf): the leaf-hash sponge reproduces `MyHash` for widths that
+    /// are NOT multiples of RATE, including the real join-split trace-row width W=19 (5 blocks, short final
+    /// 3-felt chunk). This is the input-Merkle leaf a W=19 inner needs (the current monolith leaf is single-
+    /// block, W≤8). Exercises rem ∈ {1,3,4}; rejects a tampered leaf.
+    #[test]
+    #[ignore = "slow: Phase 7.9 wide multi-block leaf (W not a multiple of RATE, incl. join-split W=19) vs MyHash"]
+    fn phase7_wide_leaf_matches_myhash() {
+        use super::{build_general_leaf_trace, GeneralLeafHashAir};
+        use crate::recursion::native_fri::MyHash;
+        use p3_goldilocks::default_goldilocks_poseidon2_8;
+        use p3_symmetric::CryptographicHasher;
+        let pcfg = make_config(1, MILESTONE_QUERIES);
+        let hasher = MyHash::new(default_goldilocks_poseidon2_8());
+        for n in [5usize, 7, 12, 13, 19] {
+            let group: Vec<Val> = (0..n).map(|i| Val::from_u64(0x1234 + 7 * i as u64)).collect();
+            let leaf: [Val; 4] = hasher.hash_iter(group.iter().copied());
+            let air = GeneralLeafHashAir { n_felts: n };
+            let mut pis = group.clone();
+            pis.extend_from_slice(&leaf);
+            let trace = build_general_leaf_trace(n, &group, leaf);
+            let prf = prove(&pcfg, &air, trace, &pis);
+            assert!(verify(&pcfg, &air, &prf, &pis).is_ok(), "multi-block leaf == MyHash (n={n}, {} blocks)", air.n_blocks());
+            let mut bad = pis.clone();
+            let m = bad.len();
+            bad[m - 1] += Val::ONE;
+            assert!(verify(&pcfg, &air, &prf, &bad).is_err(), "tampered leaf ⇒ reject (n={n})");
+        }
+        println!("Phase 7.9: multi-block leaf hash (incl. W=19 join-split row, short final chunk) validated vs MyHash");
     }
 
     /// Phase 5 re-fusion: the in-circuit arity-4 fold CHAIN carries E_0=ro through 3 barycentric folds and
