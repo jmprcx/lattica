@@ -64,7 +64,7 @@ use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::{prove, verify};
 
-use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK};
+use crate::poseidon2_air::{ext_linear, int_linear, native_permute, periodic_table, pow7, BLOCK};
 
 // Shared spend geometry + native primitives (single-sourced in crate::spend_common; re-exported so
 // every `htlc_air::{N_IN, DIGEST, commit, merge, …}` path keeps resolving). `commit` is the canonical
@@ -801,11 +801,7 @@ pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(builder: &mut AB, statement: &
 use crate::config::make_config;
 
 fn set_block(t: &mut [Val], block: usize, input: [Val; 8]) {
-    let rows = native_steps(input);
-    for (r, row) in rows.iter().enumerate() {
-        let base = (block * BLOCK + r) * WIDTH;
-        t[base..base + 8].copy_from_slice(row);
-    }
+    crate::poseidon2_air::write_perm_block(t, block * BLOCK, WIDTH, input);
 }
 
 /// Range-decompose `value` into the running-remainder columns starting at row `seed`.

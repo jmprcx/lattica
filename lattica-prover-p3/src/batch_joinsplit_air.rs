@@ -24,7 +24,7 @@ use p3_matrix::dense::RowMajorMatrix;
 #[cfg(test)]
 use p3_uni_stark::prove;
 
-use crate::poseidon2_air::{native_permute, BLOCK};
+use crate::poseidon2_air::BLOCK;
 use crate::joinsplit_air::{
     build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST,
     HEIGHT, M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_MINT, PI_NF,
@@ -44,18 +44,32 @@ pub use crate::domains::DOM_TXROOT;
 pub fn tx_statement_digest(pv: &[Val]) -> [Val; DIGEST] {
     debug_assert_eq!(pv.len(), N_PUBLIC);
     debug_assert_eq!(PI_TXBIND + DIGEST, N_PUBLIC);
-    let chunk = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
+    let chunks = statement_chunks(pv);
     let dom = [Val::from_u64(DOM_TXROOT), Val::ZERO, Val::ZERO, Val::ZERO];
-    let mut c = merge(dom, chunk(PI_ANCHOR));
+    let mut c = merge(dom, chunks[0]);
+    for chunk in &chunks[1..] {
+        c = merge(c, *chunk);
+    }
+    c
+}
+
+/// The ordered 4-element statement chunks the s_k fold absorbs, in fold order (anchor, each nullifier,
+/// each out_cm, `[fee, mint, 0, 0]`, tx_binding). The SINGLE native source of the consensus chunk
+/// order: `tx_statement_digest` folds these, and the trace builder feeds them to the in-circuit fold
+/// (`write_fold_blocks`). Must stay in lockstep with the AIR's chunk selectors (`chunk_stage`).
+fn statement_chunks(pv: &[Val]) -> Vec<[Val; DIGEST]> {
+    let chunk = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
+    let mut v = Vec::with_capacity(FOLD_SK_BLOCKS);
+    v.push(chunk(PI_ANCHOR));
     for i in 0..N_IN {
-        c = merge(c, chunk(PI_NF + i * DIGEST));
+        v.push(chunk(PI_NF + i * DIGEST));
     }
     for j in 0..M_OUT {
-        c = merge(c, chunk(PI_OUTCM + j * DIGEST));
+        v.push(chunk(PI_OUTCM + j * DIGEST));
     }
-    c = merge(c, [pv[PI_FEE], pv[PI_MINT], Val::ZERO, Val::ZERO]);
-    c = merge(c, chunk(PI_TXBIND));
-    c
+    v.push([pv[PI_FEE], pv[PI_MINT], Val::ZERO, Val::ZERO]);
+    v.push(chunk(PI_TXBIND));
+    v
 }
 
 /// The canonical padding tile: a VALID 0-value 2-in/2-out spend (two identical zero notes folding to a
@@ -94,7 +108,7 @@ pub fn dummy_sk() -> [Val; DIGEST] {
 /// power of two with dummy tiles. `root_k = H(root_{k-1} ‖ s_k)`. This is the single public input of the
 /// batch proof; the node recomputes it from the block's transactions to verify one proof per block.
 pub fn batch_root(ws: &[Witness]) -> [Val; DIGEST] {
-    let n_padded = ws.len().max(1).next_power_of_two();
+    let n_padded = padded_tiles(ws.len());
     let mut root = [Val::ZERO; DIGEST]; // IV
     for w in ws {
         root = merge(root, tx_statement_digest(&public_values(w)));
@@ -140,17 +154,15 @@ const FOLD_BLOCKS: usize = FOLD_SK_BLOCKS + 1; // + the root-chain block
 const FOLD_BASE: usize = NUM_BLOCKS - FOLD_BLOCKS; // robust: at the very end (joinsplit uses blocks 0..80)
 const ROOT_BLOCK: usize = FOLD_BASE + FOLD_SK_BLOCKS;
 
-const fn fold_in_row(bi: usize) -> usize {
-    (FOLD_BASE + bi) * BLOCK
-}
-const fn fold_out_row(bi: usize) -> usize {
-    (FOLD_BASE + bi) * BLOCK + BLOCK - 1
-}
-const fn root_in_row() -> usize {
-    ROOT_BLOCK * BLOCK
-}
+// The fold-block input/output rows are now computed inside `batch_common::append_batch_selectors`
+// (periodic) and `write_fold_blocks` (trace); only the root block's OUTPUT row is still needed here,
+// to know where `root_{k-1}` ends when threading the ROOT column.
 const fn root_out_row() -> usize {
     ROOT_BLOCK * BLOCK + BLOCK - 1
+}
+#[cfg(test)]
+const fn fold_in_row(bi: usize) -> usize {
+    (FOLD_BASE + bi) * BLOCK
 }
 
 // --- batch periodic selectors (appended after joinsplit's N_PERIODIC tile-periodic columns) ---
@@ -187,23 +199,9 @@ use crate::config::make_config;
 /// Plonky3) plus `P_TILE_LAST` = a one-hot at the tile's last row (also repeated per tile).
 fn batch_periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic();
-    let oh = |rows: &[usize]| {
-        let mut c = vec![Val::ZERO; TILE_HEIGHT];
-        for &r in rows {
-            c[r] = Val::ONE;
-        }
-        c
-    };
-    // order MUST match the P_* indices above
-    cols.push(oh(&[TILE_HEIGHT - 1])); // P_TILE_LAST
-    for bi in 0..FOLD_SK_BLOCKS {
-        cols.push(oh(&[fold_in_row(bi)])); // P_FOLD_IN + bi
-    }
-    let sk_link: Vec<usize> = (0..FOLD_SK_BLOCKS - 1).map(fold_out_row).collect();
-    cols.push(oh(&sk_link)); // P_SK_LINK
-    cols.push(oh(&[fold_out_row(FOLD_SK_BLOCKS - 1)])); // P_SK_TO_ROOT
-    cols.push(oh(&[root_in_row()])); // P_ROOT_IN
-    cols.push(oh(&[root_out_row()])); // P_ROOT_UPDATE
+    // P_TILE_LAST, the FOLD_SK_BLOCKS chunk-injection one-hots, then s_k-link / s_k→root / root-in /
+    // root-update — the order MUST match the P_* indices above (shared machinery, geometry as data).
+    crate::batch_common::append_batch_selectors(&mut cols, TILE_HEIGHT, FOLD_SK_BLOCKS, FOLD_BASE, ROOT_BLOCK);
     cols
 }
 
@@ -356,22 +354,6 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
 /// Write the Poseidon2 permutation of `input` into fold `block`'s state columns (cols 0..8), tile `toff`.
 /// The 4-element statement chunk absorbed by s_k fold block `bi` (mirrors `chunk_stage` / the oracle's
 /// `tx_statement_digest` order: anchor, nf_i, out_cm_j, [fee,mint,0,0], tx_binding).
-fn chunk_vals(pv: &[Val], bi: usize) -> [Val; DIGEST] {
-    if bi == 0 {
-        pv[PI_ANCHOR..PI_ANCHOR + DIGEST].try_into().unwrap()
-    } else if bi < 1 + N_IN {
-        let i = bi - 1;
-        pv[PI_NF + i * DIGEST..PI_NF + (i + 1) * DIGEST].try_into().unwrap()
-    } else if bi < 1 + N_IN + M_OUT {
-        let j = bi - 1 - N_IN;
-        pv[PI_OUTCM + j * DIGEST..PI_OUTCM + (j + 1) * DIGEST].try_into().unwrap()
-    } else if bi == 1 + N_IN + M_OUT {
-        [pv[PI_FEE], pv[PI_MINT], Val::ZERO, Val::ZERO]
-    } else {
-        pv[PI_TXBIND..PI_TXBIND + DIGEST].try_into().unwrap()
-    }
-}
-
 /// Tile `ws.len()` single-tile traces into one batch trace, fill each tile's staging columns, run the
 /// in-circuit tx-root fold, and thread the running ROOT across tiles. Power-of-two count for now (dummy
 /// tiles arrive in Phase 4). Each tile reuses the audited `joinsplit_air::build_trace`.
@@ -403,24 +385,8 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
             t[b + S_TXBIND..b + S_TXBIND + DIGEST].copy_from_slice(&pv[PI_TXBIND..PI_TXBIND + DIGEST]);
         }
         // 3. fold blocks (overwrite the trailing padding blocks): s_k MD-chain, then root chain.
-        let mut inp = [Val::ZERO; 8];
-        inp[0] = Val::from_u64(DOM_TXROOT);
-        inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, 0));
-        crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE, BATCH_WIDTH, inp);
-        let mut c: [Val; DIGEST] = native_permute(inp)[..DIGEST].try_into().unwrap();
-        for bi in 1..FOLD_SK_BLOCKS {
-            let mut inp = [Val::ZERO; 8];
-            inp[..DIGEST].copy_from_slice(&c);
-            inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, bi));
-            crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE + bi, BATCH_WIDTH, inp);
-            c = native_permute(inp)[..DIGEST].try_into().unwrap();
-        }
-        // root block: perm([root_{k-1} ‖ s_k])
-        let mut rinp = [Val::ZERO; 8];
-        rinp[..DIGEST].copy_from_slice(&root);
-        rinp[DIGEST..].copy_from_slice(&c);
-        crate::batch_common::set_fold_block(&mut t, toff, ROOT_BLOCK, BATCH_WIDTH, rinp);
-        let new_root: [Val; DIGEST] = native_permute(rinp)[..DIGEST].try_into().unwrap();
+        let new_root =
+            crate::batch_common::write_fold_blocks(&mut t, toff, BATCH_WIDTH, &statement_chunks(&pv), root, FOLD_BASE, ROOT_BLOCK);
         // 4. ROOT column: root_{k-1} up to (and incl.) the root block output row, then root_k onward.
         let rout = root_out_row();
         for r in 0..TILE_HEIGHT {

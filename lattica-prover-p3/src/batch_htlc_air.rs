@@ -17,7 +17,7 @@ use p3_uni_stark::prove;
 
 use crate::batch_common::padded_tiles;
 use crate::domains::DOM_TXROOT;
-use crate::poseidon2_air::{native_permute, BLOCK};
+use crate::poseidon2_air::BLOCK;
 use crate::htlc_air::{
     build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST, HEIGHT,
     M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_HASHLOCK, PI_HEIGHT, PI_MINT, PI_NF, PI_OUTCM,
@@ -31,20 +31,34 @@ type Val = Goldilocks;
 /// `[current_height,0,0,0]` and `redeem_hashlock`. Must match the (later) `batch_htlc_air` circuit.
 pub fn tx_statement_digest(pv: &[Val]) -> [Val; DIGEST] {
     debug_assert_eq!(pv.len(), N_PUBLIC);
-    let chunk = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
+    let chunks = statement_chunks(pv);
     let dom = [Val::from_u64(DOM_TXROOT), Val::ZERO, Val::ZERO, Val::ZERO];
-    let mut c = merge(dom, chunk(PI_ANCHOR));
+    let mut c = merge(dom, chunks[0]);
+    for chunk in &chunks[1..] {
+        c = merge(c, *chunk);
+    }
+    c
+}
+
+/// The ordered 4-element statement chunks the HTLC s_k fold absorbs (the join-split chunks — anchor,
+/// each nullifier, each out_cm, `[fee,mint,0,0]`, tx_binding — plus `[current_height,0,0,0]` and
+/// redeem_hashlock). The SINGLE native source of the consensus chunk order: `tx_statement_digest`
+/// folds these and the trace builder feeds them to the in-circuit fold. Lockstep with `chunk_src`.
+fn statement_chunks(pv: &[Val]) -> Vec<[Val; DIGEST]> {
+    let chunk = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
+    let mut v = Vec::with_capacity(FOLD_SK_BLOCKS);
+    v.push(chunk(PI_ANCHOR));
     for i in 0..N_IN {
-        c = merge(c, chunk(PI_NF + i * DIGEST));
+        v.push(chunk(PI_NF + i * DIGEST));
     }
     for j in 0..M_OUT {
-        c = merge(c, chunk(PI_OUTCM + j * DIGEST));
+        v.push(chunk(PI_OUTCM + j * DIGEST));
     }
-    c = merge(c, [pv[PI_FEE], pv[PI_MINT], Val::ZERO, Val::ZERO]);
-    c = merge(c, chunk(PI_TXBIND));
-    c = merge(c, [pv[PI_HEIGHT], Val::ZERO, Val::ZERO, Val::ZERO]);
-    c = merge(c, chunk(PI_HASHLOCK));
-    c
+    v.push([pv[PI_FEE], pv[PI_MINT], Val::ZERO, Val::ZERO]);
+    v.push(chunk(PI_TXBIND));
+    v.push([pv[PI_HEIGHT], Val::ZERO, Val::ZERO, Val::ZERO]);
+    v.push(chunk(PI_HASHLOCK));
+    v
 }
 
 /// The canonical padding tile: a valid 0-value **PLAIN** 2-in/2-out spend (`htlc_air` is a superset that
@@ -128,15 +142,8 @@ const FOLD_BLOCKS: usize = FOLD_SK_BLOCKS + 1;
 const FOLD_BASE: usize = NUM_BLOCKS - FOLD_BLOCKS;
 const ROOT_BLOCK: usize = FOLD_BASE + FOLD_SK_BLOCKS;
 
-const fn fold_in_row(bi: usize) -> usize {
-    (FOLD_BASE + bi) * BLOCK
-}
-const fn fold_out_row(bi: usize) -> usize {
-    (FOLD_BASE + bi) * BLOCK + BLOCK - 1
-}
-const fn root_in_row() -> usize {
-    ROOT_BLOCK * BLOCK
-}
+// Fold-block rows are now computed inside `batch_common::{append_batch_selectors, write_fold_blocks}`;
+// only the root block's OUTPUT row is needed here, for threading the ROOT column.
 const fn root_out_row() -> usize {
     ROOT_BLOCK * BLOCK + BLOCK - 1
 }
@@ -179,22 +186,9 @@ use crate::config::make_config;
 
 fn batch_periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic();
-    let oh = |rows: &[usize]| {
-        let mut c = vec![Val::ZERO; TILE_HEIGHT];
-        for &r in rows {
-            c[r] = Val::ONE;
-        }
-        c
-    };
-    cols.push(oh(&[TILE_HEIGHT - 1])); // P_TILE_LAST
-    for bi in 0..FOLD_SK_BLOCKS {
-        cols.push(oh(&[fold_in_row(bi)])); // P_FOLD_IN + bi
-    }
-    let sk_link: Vec<usize> = (0..FOLD_SK_BLOCKS - 1).map(fold_out_row).collect();
-    cols.push(oh(&sk_link)); // P_SK_LINK
-    cols.push(oh(&[fold_out_row(FOLD_SK_BLOCKS - 1)])); // P_SK_TO_ROOT
-    cols.push(oh(&[root_in_row()])); // P_ROOT_IN
-    cols.push(oh(&[root_out_row()])); // P_ROOT_UPDATE
+    // Same shared selectors as batch_joinsplit (geometry as data); the HTLC delta is only that
+    // FOLD_SK_BLOCKS is larger (9 vs 7) — order MUST match the P_* indices above.
+    crate::batch_common::append_batch_selectors(&mut cols, TILE_HEIGHT, FOLD_SK_BLOCKS, FOLD_BASE, ROOT_BLOCK);
     cols
 }
 
@@ -332,26 +326,6 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcBatchAir {
     }
 }
 
-/// The 4-element statement chunk for s_k fold block `ci` (mirrors the oracle's chunk order).
-fn chunk_vals(pv: &[Val], ci: usize) -> [Val; DIGEST] {
-    let g = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
-    if ci == 0 {
-        g(PI_ANCHOR)
-    } else if ci < 1 + N_IN {
-        g(PI_NF + (ci - 1) * DIGEST)
-    } else if ci < 1 + N_IN + M_OUT {
-        g(PI_OUTCM + (ci - 1 - N_IN) * DIGEST)
-    } else if ci == 1 + N_IN + M_OUT {
-        [pv[PI_FEE], pv[PI_MINT], Val::ZERO, Val::ZERO]
-    } else if ci == 2 + N_IN + M_OUT {
-        g(PI_TXBIND)
-    } else if ci == 3 + N_IN + M_OUT {
-        [pv[PI_HEIGHT], Val::ZERO, Val::ZERO, Val::ZERO]
-    } else {
-        g(PI_HASHLOCK)
-    }
-}
-
 /// Tile `ws.len()` single-tile HTLC traces into one batch trace, fill staging, run the fold, thread ROOT.
 pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
     let n = padded_tiles(ws.len());
@@ -379,23 +353,8 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
             t[b + S_HEIGHT] = pv[PI_HEIGHT];
             t[b + S_HASHLOCK..b + S_HASHLOCK + DIGEST].copy_from_slice(&pv[PI_HASHLOCK..PI_HASHLOCK + DIGEST]);
         }
-        let mut inp = [Val::ZERO; 8];
-        inp[0] = Val::from_u64(DOM_TXROOT);
-        inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, 0));
-        crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE, BATCH_WIDTH, inp);
-        let mut c: [Val; DIGEST] = native_permute(inp)[..DIGEST].try_into().unwrap();
-        for bi in 1..FOLD_SK_BLOCKS {
-            let mut inp = [Val::ZERO; 8];
-            inp[..DIGEST].copy_from_slice(&c);
-            inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, bi));
-            crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE + bi, BATCH_WIDTH, inp);
-            c = native_permute(inp)[..DIGEST].try_into().unwrap();
-        }
-        let mut rinp = [Val::ZERO; 8];
-        rinp[..DIGEST].copy_from_slice(&root);
-        rinp[DIGEST..].copy_from_slice(&c);
-        crate::batch_common::set_fold_block(&mut t, toff, ROOT_BLOCK, BATCH_WIDTH, rinp);
-        let new_root: [Val; DIGEST] = native_permute(rinp)[..DIGEST].try_into().unwrap();
+        let new_root =
+            crate::batch_common::write_fold_blocks(&mut t, toff, BATCH_WIDTH, &statement_chunks(&pv), root, FOLD_BASE, ROOT_BLOCK);
         let rout = root_out_row();
         for r in 0..TILE_HEIGHT {
             let b = (toff + r) * BATCH_WIDTH;

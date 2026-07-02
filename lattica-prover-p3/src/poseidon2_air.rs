@@ -80,6 +80,17 @@ pub(crate) fn native_steps(input: [Val; W]) -> [[Val; W]; BLOCK] {
     rows
 }
 
+/// Write the `BLOCK` permutation rows of `input` into columns 0..W starting at trace row `first_row`,
+/// in a `width`-column row-major trace. The single permutation-block trace writer — used by both
+/// spend circuits' `set_block` and by the batch fold-block writer (`batch_common::write_fold_blocks`).
+pub(crate) fn write_perm_block(t: &mut [Val], first_row: usize, width: usize, input: [Val; W]) {
+    let rows = native_steps(input);
+    for (r, row) in rows.iter().enumerate() {
+        let base = (first_row + r) * width;
+        t[base..base + W].copy_from_slice(row);
+    }
+}
+
 pub fn native_permute(input: [Val; W]) -> [Val; W] {
     let mut s = input;
     default_goldilocks_poseidon2_8().permute_mut(&mut s);
