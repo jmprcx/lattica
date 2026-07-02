@@ -22,14 +22,11 @@ use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::{prove, verify, Proof};
 
-use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, pow7, BLOCK};
+use crate::poseidon2_air::{native_permute, native_steps, BLOCK};
 use crate::joinsplit_air::{
-    build_trace, merge, periodic, public_values, Input, Output, Witness, ASSET, BIT, DEPTH, DIGEST,
-    DOM_CM, DOM_NF, DOM_OWN, HEIGHT, M_OUT, N_IN, N_PERIODIC, NK, NK1, NUM_PUBLIC_INPUTS, PI_ANCHOR, PI_FEE, PI_MINT,
-    PI_NF, PI_OUTCM, PI_TXBIND, POSACC, P_CHAIN_LINK, P_COMMIT_A_IN, P_COMMIT_B, P_FEE_IN, P_FINAL, P_MEM_LINK,
-    P_MINT_IN, P_NULLOUT, P_NULL_IN, P_OUTOUT, P_OUT_A_IN, P_OWN_IN, P_POS_COEFF, P_RANGE_ACTIVE,
-    P_RANGE_CLOSE, P_RANGE_SEED, P_RECIP_LINK, P_REGION_LAST, P_ROOT, P_ROW0, REM, RBIT, RHO, RHO1, VAL,
-    VALACC, WIDTH,
+    build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST,
+    HEIGHT, M_OUT, N_IN, N_PERIODIC, NUM_PUBLIC_INPUTS, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_MINT, PI_NF,
+    PI_OUTCM, PI_TXBIND, WIDTH,
 };
 
 type Val = Goldilocks;
@@ -229,154 +226,39 @@ impl BaseAir<Goldilocks> for JoinSplitBatchAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
     fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
-        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = builder.main().next_slice().iter().map(|&x| x.into()).collect();
         let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
-        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
-        let two = AB::Expr::TWO;
-        let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
-        let dom_cm = AB::Expr::from(Goldilocks::from_u64(DOM_CM));
-        let dom_nf = AB::Expr::from(Goldilocks::from_u64(DOM_NF));
-
-        let is_init = p[0].clone();
-        let is_full = p[1].clone();
-        let is_partial = p[2].clone();
-        let rc: Vec<AB::Expr> = (0..8).map(|i| p[3 + i].clone()).collect();
-        // TILE EDIT: 1 at each tile's last row — frees the cross-tile-leaking persistence below.
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        // 1 at each tile's last row — frees the cross-tile-leaking persistence inside eval_spend.
         let tile_last = p[P_TILE_LAST].clone();
 
-        // ---- Poseidon2 round constraints (period-32 schedule; vacuous at every block's last row) ----
-        let mut init_s: [AB::Expr; 8] = core::array::from_fn(|i| cur[i].clone());
-        ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; 8] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
-        ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; 8] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
-        int_linear(&mut part_s);
-        for i in 0..8 {
-            let round = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
-                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
-                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
-            builder.when_transition().assert_zero(round);
-        }
-
-        // ---- local-persistent columns: constant within a region, free at region AND tile boundaries ----
-        // TILE EDIT: subtract `tile_last` so tile k's keys/rho do not bleed into tile k+1's first row.
-        let not_last = one.clone() - p[P_REGION_LAST].clone() - tile_last.clone();
-        for &c in &[NK, NK1, RHO, RHO1, VAL] {
-            builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
-        }
-        // TILE EDIT: ASSET is per-TILE-persistent now (each tx its own hidden asset) — gate off at the
-        // tile boundary so distinct tiles may carry distinct assets.
-        builder
-            .when_transition()
-            .assert_zero((one.clone() - tile_last.clone()) * (nxt[ASSET].clone() - cur[ASSET].clone()));
-        // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
-        let bit = nxt[BIT].clone();
-        builder.when_transition().assert_zero(
-            not_last.clone()
-                * (nxt[POSACC].clone() - cur[POSACC].clone() - p[P_MEM_LINK].clone() * (bit.clone() * p[P_POS_COEFF].clone())),
-        );
-        builder.assert_zero(p[P_OWN_IN].clone() * cur[POSACC].clone());
-
-        // ---- value accumulator: per-tile (P_ROW0/P_FINAL are tile-periodic; acc_delta=0 at boundary) ----
-        builder.assert_zero(p[P_ROW0].clone() * cur[VALACC].clone());
-        let acc_delta = (p[P_COMMIT_A_IN].clone() + p[P_MINT_IN].clone() - p[P_OUT_A_IN].clone() - p[P_FEE_IN].clone())
-            * cur[VAL].clone();
-        builder.when_transition().assert_zero(nxt[VALACC].clone() - cur[VALACC].clone() - acc_delta);
-        builder.assert_zero(p[P_FINAL].clone() * cur[VALACC].clone());
-
-        // ---- range (A3) ----
-        builder.assert_zero(p[P_RANGE_SEED].clone() * (cur[REM].clone() - cur[VAL].clone()));
-        let ra = p[P_RANGE_ACTIVE].clone();
-        builder
-            .when_transition()
-            .assert_zero(ra.clone() * (cur[REM].clone() - (two.clone() * nxt[REM].clone() + cur[RBIT].clone())));
-        builder.when_transition().assert_zero(ra.clone() * (cur[RBIT].clone() * (one.clone() - cur[RBIT].clone())));
-        builder.assert_zero(p[P_RANGE_CLOSE].clone() * cur[REM].clone());
-
-        // ---- ownership input ----
-        let own = p[P_OWN_IN].clone();
-        builder.assert_zero(own.clone() * (cur[0].clone() - dom_own.clone()));
-        builder.assert_zero(own.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(own.clone() * (cur[2].clone() - cur[NK1].clone()));
-        for i in 4..8 {
-            builder.assert_zero(own.clone() * cur[i].clone());
-        }
-
-        // ---- recipient link ----
-        let rl = p[P_RECIP_LINK].clone();
+        // 1. the per-tile statement = this tile's staging columns (layout parallels the public inputs).
+        let mut statement = vec![AB::Expr::ZERO; N_PUBLIC];
         for k in 0..DIGEST {
-            builder.when_transition().assert_zero(rl.clone() * (nxt[1 + k].clone() - cur[k].clone()));
-        }
-
-        // ---- commit_a input ----
-        let ca = p[P_COMMIT_A_IN].clone();
-        builder.assert_zero(ca.clone() * (cur[0].clone() - dom_cm.clone()));
-        builder.assert_zero(ca.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone()));
-        builder.assert_zero(ca.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone()));
-        builder.assert_zero(ca.clone() * (cur[3 + DIGEST].clone() - cur[RHO1].clone()));
-
-        // ---- chain link ----
-        let cl = p[P_CHAIN_LINK].clone();
-        for k in 0..DIGEST {
-            builder.when_transition().assert_zero(cl.clone() * (nxt[k].clone() - cur[k].clone()));
-        }
-
-        // ---- commit_b input ----
-        let cb = p[P_COMMIT_B].clone();
-        builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone()));
-        builder.assert_zero(cb.clone() * cur[DIGEST + 3].clone());
-
-        // ---- membership links ----
-        let ml = p[P_MEM_LINK].clone();
-        for k in 0..DIGEST {
-            let placed = (one.clone() - bit.clone()) * (nxt[k].clone() - cur[k].clone())
-                + bit.clone() * (nxt[DIGEST + k].clone() - cur[k].clone());
-            builder.when_transition().assert_zero(ml.clone() * placed);
-        }
-        builder.when_transition().assert_zero(ml.clone() * (bit.clone() * (one.clone() - bit.clone())));
-
-        // ---- root: each tile folds to its OWN staged anchor (S_ANCHOR) ----
-        let pr = p[P_ROOT].clone();
-        for k in 0..DIGEST {
-            builder.assert_zero(pr.clone() * (cur[k].clone() - cur[S_ANCHOR + k].clone()));
-        }
-
-        // ---- nullifier input ----
-        let ni = p[P_NULL_IN].clone();
-        builder.assert_zero(ni.clone() * (cur[0].clone() - dom_nf.clone()));
-        builder.assert_zero(ni.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(ni.clone() * (cur[2].clone() - cur[NK1].clone()));
-        builder.assert_zero(ni.clone() * (cur[3].clone() - cur[RHO].clone()));
-        builder.assert_zero(ni.clone() * (cur[4].clone() - cur[RHO1].clone()));
-        builder.assert_zero(ni.clone() * (cur[5].clone() - cur[POSACC].clone()));
-        for i in 6..8 {
-            builder.assert_zero(ni.clone() * cur[i].clone());
+            statement[PI_ANCHOR + k] = cur[S_ANCHOR + k].clone();
         }
         for i in 0..N_IN {
-            let sel = p[P_NULLOUT + i].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - cur[S_NF + i * DIGEST + k].clone()));
+                statement[PI_NF + i * DIGEST + k] = cur[S_NF + i * DIGEST + k].clone();
             }
         }
-
-        // ---- output commitment ----
-        let oa = p[P_OUT_A_IN].clone();
-        builder.assert_zero(oa.clone() * (cur[0].clone() - dom_cm.clone()));
-        builder.assert_zero(oa.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone()));
         for j in 0..M_OUT {
-            let sel = p[P_OUTOUT + j].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - cur[S_OUTCM + j * DIGEST + k].clone()));
+                statement[PI_OUTCM + j * DIGEST + k] = cur[S_OUTCM + j * DIGEST + k].clone();
             }
         }
+        statement[PI_FEE] = cur[S_FEE].clone();
+        statement[PI_MINT] = cur[S_MINT].clone();
+        for k in 0..DIGEST {
+            statement[PI_TXBIND + k] = cur[S_TXBIND + k].clone();
+        }
 
-        // ---- fee / mint (bound to the staged values) ----
-        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - cur[S_FEE].clone()));
-        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - cur[S_MINT].clone()));
+        // 2. the per-tile join-split spend constraints — joinsplit_air's audited body reused verbatim,
+        //    fed the staging statement + tile_last (the cur == statement[..] bindings inside eval_spend
+        //    double as the staging bindings).
+        eval_spend(builder, &statement, tile_last.clone());
 
         // =====================================================================================
         // Batch: per-tile staging + the in-circuit tx-root fold.
@@ -598,7 +480,7 @@ pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::joinsplit_air::demo_witness;
+    use crate::joinsplit_air::{demo_witness, ASSET};
 
     // Distinct, well-formed witnesses (vary tx_binding ⇒ distinct public statements). batch_root only
     // hashes public_values, so the witnesses need not balance for these oracle tests.
