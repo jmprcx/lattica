@@ -128,8 +128,8 @@ fn sim_full(
     (s.block_inputs, s.counts, binds, chs, index_binds, index_felts)
 }
 
-const CAP_HEIGHT: usize = 6; // MerkleTreeMmcs cap (build_mmcs_and_params)
-const LOG_BLOWUP: usize = 4;
+// single-sourced from the module geometry (the tests' historical local names kept via aliasing)
+use super::{CM_CAP_HEIGHT as CAP_HEIGHT, LOG_BLOWUP};
 const LOG_FINAL_POLY_LEN: usize = 0;
 const EIGHT_GB: u64 = 8u64 << 30;
 // The milestone uses a REDUCED query count: at the production 96 queries the (cap-dominated)
