@@ -52,31 +52,73 @@ fn push_digest(b: &[u8], out: &mut Vec<Goldilocks>) -> Option<()> {
 const JS_PUBLIC_INPUTS_LEN: usize =
     DIGEST_BYTES * (2 + joinsplit_air::N_IN + joinsplit_air::M_OUT) + 8 + 8; // … ‖ fee(8) ‖ mint(8)
 
-/// Parse the join-split public-input bytes into the circuit's vector
-/// `anchor ‖ nf_i ‖ out_cm_j ‖ fee ‖ tx_binding`. Fail-closed on length / non-canonical limbs.
-fn parse_joinsplit_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
-    if b.len() != JS_PUBLIC_INPUTS_LEN {
-        return None;
-    }
-    let mut pis = Vec::with_capacity(joinsplit_air::N_PUBLIC);
+/// Parse the shared **spend-statement head** — `anchor(32) ‖ N·nf(32) ‖ M·out_cm(32) ‖ tx_binding(32)
+/// ‖ fee(8) ‖ mint(8)` — into the circuit pis vector `[anchor, nf.., out_cm.., fee, mint, tx_binding]`
+/// (this IS the full join-split statement; the HTLC statement is this head + current_height +
+/// redeem_hashlock). Returns the pis and the byte offset consumed. The CALLER checks total length
+/// first (fail-closed) so the fixed-slice reads here cannot index past the end.
+fn parse_spend_statement_head(b: &[u8], n_in: usize, m_out: usize) -> Option<(Vec<Goldilocks>, usize)> {
+    let mut pis = Vec::new();
     let mut off = 0;
     push_digest(&b[off..off + 32], &mut pis)?; // anchor
     off += 32;
-    for _ in 0..joinsplit_air::N_IN {
+    for _ in 0..n_in {
         push_digest(&b[off..off + 32], &mut pis)?; // nf_i
         off += 32;
     }
-    for _ in 0..joinsplit_air::M_OUT {
+    for _ in 0..m_out {
         push_digest(&b[off..off + 32], &mut pis)?; // out_cm_j
         off += 32;
     }
     let mut txb = Vec::with_capacity(4);
-    push_digest(&b[off..off + 32], &mut txb)?; // tx_binding (appended after fee/mint, circuit order)
+    push_digest(&b[off..off + 32], &mut txb)?; // tx_binding (bytes order: before fee/mint)
     off += 32;
     pis.push(parse_felt(&b[off..off + 8])?); // fee
     off += 8;
     pis.push(parse_felt(&b[off..off + 8])?); // mint
-    pis.extend_from_slice(&txb);
+    off += 8;
+    pis.extend_from_slice(&txb); // tx_binding (circuit order: after fee/mint)
+    Some((pis, off))
+}
+
+/// Encode the spend-statement head into `out` (inverse of `parse_spend_statement_head`); returns the
+/// byte offset written. `pis` is the circuit vector `[anchor, nf.., out_cm.., fee, mint, tx_binding..]`.
+fn encode_spend_statement_head(out: &mut [u8], pis: &[Goldilocks], n_in: usize, m_out: usize) -> usize {
+    let d = crate::spend_common::DIGEST;
+    let put = |dst: &mut [u8], felts: &[Goldilocks]| {
+        for (k, f) in felts.iter().enumerate() {
+            dst[k * 8..k * 8 + 8].copy_from_slice(&f.as_canonical_u64().to_le_bytes());
+        }
+    };
+    let mut off = 0;
+    put(&mut out[off..off + 32], &pis[0..d]); // anchor
+    off += 32;
+    for i in 0..n_in {
+        put(&mut out[off..off + 32], &pis[d + i * d..d + (i + 1) * d]); // nf_i
+        off += 32;
+    }
+    let oc = d + n_in * d;
+    for j in 0..m_out {
+        put(&mut out[off..off + 32], &pis[oc + j * d..oc + (j + 1) * d]); // out_cm_j
+        off += 32;
+    }
+    let fee_idx = oc + m_out * d;
+    put(&mut out[off..off + 32], &pis[fee_idx + 2..fee_idx + 2 + d]); // tx_binding
+    off += 32;
+    out[off..off + 8].copy_from_slice(&pis[fee_idx].as_canonical_u64().to_le_bytes()); // fee
+    off += 8;
+    out[off..off + 8].copy_from_slice(&pis[fee_idx + 1].as_canonical_u64().to_le_bytes()); // mint
+    off += 8;
+    off
+}
+
+/// Parse the join-split public-input bytes into the circuit's vector
+/// `anchor ‖ nf_i ‖ out_cm_j ‖ fee ‖ mint ‖ tx_binding`. Fail-closed on length / non-canonical limbs.
+fn parse_joinsplit_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
+    if b.len() != JS_PUBLIC_INPUTS_LEN {
+        return None;
+    }
+    let (pis, _) = parse_spend_statement_head(b, joinsplit_air::N_IN, joinsplit_air::M_OUT)?;
     Some(pis)
 }
 
@@ -211,33 +253,8 @@ pub fn encode_joinsplit_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
     if pis.len() != joinsplit_air::N_PUBLIC {
         return None;
     }
-    let d = joinsplit_air::DIGEST;
-    let n = joinsplit_air::N_IN;
-    let m = joinsplit_air::M_OUT;
     let mut out = vec![0u8; JS_PUBLIC_INPUTS_LEN];
-    let put = |dst: &mut [u8], felts: &[Goldilocks]| {
-        for (k, f) in felts.iter().enumerate() {
-            dst[k * 8..k * 8 + 8].copy_from_slice(&f.as_canonical_u64().to_le_bytes());
-        }
-    };
-    let mut off = 0;
-    put(&mut out[off..off + 32], &pis[0..d]); // anchor
-    off += 32;
-    for i in 0..n {
-        put(&mut out[off..off + 32], &pis[d + i * d..d + (i + 1) * d]); // nf_i
-        off += 32;
-    }
-    let oc = d + n * d;
-    for j in 0..m {
-        put(&mut out[off..off + 32], &pis[oc + j * d..oc + (j + 1) * d]); // out_cm_j
-        off += 32;
-    }
-    let fee_idx = oc + m * d;
-    put(&mut out[off..off + 32], &pis[fee_idx + 2..fee_idx + 2 + d]); // tx_binding
-    off += 32;
-    out[off..off + 8].copy_from_slice(&pis[fee_idx].as_canonical_u64().to_le_bytes()); // fee
-    off += 8;
-    out[off..off + 8].copy_from_slice(&pis[fee_idx + 1].as_canonical_u64().to_le_bytes()); // mint
+    encode_spend_statement_head(&mut out, pis, joinsplit_air::N_IN, joinsplit_air::M_OUT);
     Some(out)
 }
 
@@ -253,26 +270,8 @@ fn parse_htlc_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
     if b.len() != HTLC_PUBLIC_INPUTS_LEN {
         return None;
     }
-    let mut pis = Vec::with_capacity(htlc_air::N_PUBLIC);
-    let mut off = 0;
-    push_digest(&b[off..off + 32], &mut pis)?; // anchor
-    off += 32;
-    for _ in 0..htlc_air::N_IN {
-        push_digest(&b[off..off + 32], &mut pis)?; // nf_i
-        off += 32;
-    }
-    for _ in 0..htlc_air::M_OUT {
-        push_digest(&b[off..off + 32], &mut pis)?; // out_cm_j
-        off += 32;
-    }
-    let mut txb = Vec::with_capacity(4);
-    push_digest(&b[off..off + 32], &mut txb)?; // tx_binding (bytes order: before fee/mint)
-    off += 32;
-    pis.push(parse_felt(&b[off..off + 8])?); // fee
-    off += 8;
-    pis.push(parse_felt(&b[off..off + 8])?); // mint
-    off += 8;
-    pis.extend_from_slice(&txb); // tx_binding (circuit order: after fee/mint)
+    // HTLC statement = the shared spend head + current_height + redeem_hashlock.
+    let (mut pis, mut off) = parse_spend_statement_head(b, htlc_air::N_IN, htlc_air::M_OUT)?;
     pis.push(parse_felt(&b[off..off + 8])?); // current_height
     off += 8;
     push_digest(&b[off..off + 32], &mut pis)?; // redeem_hashlock
@@ -285,37 +284,15 @@ pub fn encode_htlc_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
         return None;
     }
     let d = htlc_air::DIGEST;
-    let n = htlc_air::N_IN;
-    let m = htlc_air::M_OUT;
     let mut out = vec![0u8; HTLC_PUBLIC_INPUTS_LEN];
-    let put = |dst: &mut [u8], felts: &[Goldilocks]| {
-        for (k, f) in felts.iter().enumerate() {
-            dst[k * 8..k * 8 + 8].copy_from_slice(&f.as_canonical_u64().to_le_bytes());
-        }
-    };
-    let mut off = 0;
-    put(&mut out[off..off + 32], &pis[0..d]); // anchor
-    off += 32;
-    for i in 0..n {
-        put(&mut out[off..off + 32], &pis[d + i * d..d + (i + 1) * d]); // nf_i
-        off += 32;
-    }
-    let oc = d + n * d;
-    for j in 0..m {
-        put(&mut out[off..off + 32], &pis[oc + j * d..oc + (j + 1) * d]); // out_cm_j
-        off += 32;
-    }
-    // circuit order from fee_idx: fee, mint, tx_binding(d), current_height, redeem_hashlock(d)
-    let fee_idx = oc + m * d;
-    put(&mut out[off..off + 32], &pis[fee_idx + 2..fee_idx + 2 + d]); // tx_binding
-    off += 32;
-    out[off..off + 8].copy_from_slice(&pis[fee_idx].as_canonical_u64().to_le_bytes()); // fee
-    off += 8;
-    out[off..off + 8].copy_from_slice(&pis[fee_idx + 1].as_canonical_u64().to_le_bytes()); // mint
-    off += 8;
+    let mut off = encode_spend_statement_head(&mut out, pis, htlc_air::N_IN, htlc_air::M_OUT);
+    // HTLC tail: the circuit-order fields after tx_binding are current_height then redeem_hashlock.
+    let fee_idx = d + (htlc_air::N_IN + htlc_air::M_OUT) * d;
     out[off..off + 8].copy_from_slice(&pis[fee_idx + 2 + d].as_canonical_u64().to_le_bytes()); // current_height
     off += 8;
-    put(&mut out[off..off + 32], &pis[fee_idx + 2 + d + 1..fee_idx + 2 + d + 1 + d]); // redeem_hashlock
+    for (k, f) in pis[fee_idx + 2 + d + 1..fee_idx + 2 + d + 1 + d].iter().enumerate() {
+        out[off + k * 8..off + k * 8 + 8].copy_from_slice(&f.as_canonical_u64().to_le_bytes()); // redeem_hashlock
+    }
     Some(out)
 }
 
@@ -394,9 +371,42 @@ fn rd_felt2(b: &[u8], off: &mut usize) -> Option<[Goldilocks; 2]> {
     Some([rd_felt(b, off)?, rd_felt(b, off)?])
 }
 
+/// Read a membership path — `DEPTH` sibling digests then `DEPTH` path bits (each a strict 0/1 byte,
+/// audit M-03). The shared witness-record tail present in both circuits. `DEPTH` is the same for both.
+fn rd_path(b: &[u8], off: &mut usize) -> Option<([[Goldilocks; 4]; crate::spend_common::DEPTH], [bool; crate::spend_common::DEPTH])> {
+    use crate::spend_common::DEPTH;
+    let mut sib = Vec::with_capacity(DEPTH);
+    for _ in 0..DEPTH {
+        sib.push(rd_digest(b, off)?);
+    }
+    let sib: [[Goldilocks; 4]; DEPTH] = sib.try_into().ok()?;
+    let mut bits = [false; DEPTH];
+    for bit in bits.iter_mut() {
+        *bit = match b[*off] {
+            0 => false,
+            1 => true,
+            _ => return None, // path bits must be canonical 0/1 (audit M-03)
+        };
+        *off += 1;
+    }
+    Some((sib, bits))
+}
+
+/// Encode a membership path (inverse of `rd_path`): `DEPTH` sibling digests then `DEPTH` 0/1 bit bytes.
+fn put_path(out: &mut Vec<u8>, sib: &[[Goldilocks; 4]], bits: &[bool]) {
+    for row in sib {
+        for &f in row {
+            out.extend_from_slice(&f.as_canonical_u64().to_le_bytes());
+        }
+    }
+    for &bit in bits {
+        out.push(bit as u8);
+    }
+}
+
 /// Parse the witness byte layout into a circuit witness. Fail-closed on wrong length / non-canonical.
 fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
-    use joinsplit_air::{Input, Output, Witness, DEPTH, M_OUT, N_IN};
+    use joinsplit_air::{Input, Output, Witness, M_OUT, N_IN};
     if b.len() != JS_WITNESS_LEN {
         return None;
     }
@@ -409,20 +419,7 @@ fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
         let value = rd_u64(b, &mut off);
         let rho = rd_felt2(b, &mut off)?;
         let rcm = rd_felt2(b, &mut off)?;
-        let mut sib = Vec::with_capacity(DEPTH);
-        for _ in 0..DEPTH {
-            sib.push(rd_digest(b, &mut off)?);
-        }
-        let sib: [[Goldilocks; 4]; DEPTH] = sib.try_into().ok()?;
-        let mut bits = [false; DEPTH];
-        for bit in bits.iter_mut() {
-            *bit = match b[off] {
-                0 => false,
-                1 => true,
-                _ => return None, // path bits must be canonical 0/1 (audit M-03)
-            };
-            off += 1;
-        }
+        let (sib, bits) = rd_path(b, &mut off)?;
         inputs.push(Input { nk, div, asset, value, rho, rcm, sib, bits });
     }
     let inputs: [Input; N_IN] = inputs.try_into().ok()?;
@@ -458,14 +455,7 @@ pub fn encode_joinsplit_witness(w: &joinsplit_air::Witness) -> Vec<u8> {
         put_felt(&mut out, inp.rho[1]);
         put_felt(&mut out, inp.rcm[0]);
         put_felt(&mut out, inp.rcm[1]);
-        for row in &inp.sib {
-            for &f in row {
-                put_felt(&mut out, f);
-            }
-        }
-        for &bit in &inp.bits {
-            out.push(bit as u8);
-        }
+        put_path(&mut out, &inp.sib, &inp.bits);
     }
     for o in &w.outputs {
         for &f in &o.recipient {
@@ -690,7 +680,7 @@ const fn htlc_witness_len() -> usize {
 const HTLC_WITNESS_LEN: usize = htlc_witness_len();
 
 fn parse_htlc_witness(b: &[u8]) -> Option<htlc_air::Witness> {
-    use htlc_air::{Input, Output, Witness, DEPTH, M_OUT, N_IN};
+    use htlc_air::{Input, Output, Witness, M_OUT, N_IN};
     if b.len() != HTLC_WITNESS_LEN {
         return None;
     }
@@ -704,20 +694,7 @@ fn parse_htlc_witness(b: &[u8]) -> Option<htlc_air::Witness> {
         let value = rd_u64(b, &mut off);
         let rho = rd_felt2(b, &mut off)?;
         let rcm = rd_felt2(b, &mut off)?;
-        let mut sib = Vec::with_capacity(DEPTH);
-        for _ in 0..DEPTH {
-            sib.push(rd_digest(b, &mut off)?);
-        }
-        let sib: [[Goldilocks; 4]; DEPTH] = sib.try_into().ok()?;
-        let mut bits = [false; DEPTH];
-        for bit in bits.iter_mut() {
-            *bit = match b[off] {
-                0 => false,
-                1 => true,
-                _ => return None, // canonical path bits (audit M-03)
-            };
-            off += 1;
-        }
+        let (sib, bits) = rd_path(b, &mut off)?;
         let mode = rd_felt(b, &mut off)?;
         let redeem_tag = rd_digest(b, &mut off)?;
         let refund_tag = rd_digest(b, &mut off)?;
@@ -767,14 +744,7 @@ pub fn encode_htlc_witness(w: &htlc_air::Witness) -> Vec<u8> {
         put_felt(&mut out, inp.rho[1]);
         put_felt(&mut out, inp.rcm[0]);
         put_felt(&mut out, inp.rcm[1]);
-        for row in &inp.sib {
-            for &f in row {
-                put_felt(&mut out, f);
-            }
-        }
-        for &bit in &inp.bits {
-            out.push(bit as u8);
-        }
+        put_path(&mut out, &inp.sib, &inp.bits);
         put_felt(&mut out, inp.mode);
         put_digest(&mut out, &inp.redeem_tag);
         put_digest(&mut out, &inp.refund_tag);

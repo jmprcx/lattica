@@ -62,7 +62,7 @@ use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing};
 use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_uni_stark::{prove, verify, Proof};
+use p3_uni_stark::{prove, verify};
 
 use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK};
 
@@ -798,7 +798,7 @@ pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(builder: &mut AB, statement: &
 
 // --- trace + ZK config: the production family lives in crate::config (single audited source) ----
 
-use crate::config::{make_config, MyConfig};
+use crate::config::make_config;
 
 fn set_block(t: &mut [Val], block: usize, input: [Val; 8]) {
     let rows = native_steps(input);
@@ -1086,24 +1086,14 @@ pub fn prove_verify(w: &Witness) -> Result<(), String> {
 }
 
 
-/// Prove a join-split and return canonical (postcard) proof bytes.
+/// Prove an HTLC spend and return canonical (postcard) proof bytes.
 pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {
-    let config = make_config();
-    let trace = build_trace(w);
-    let proof = prove(&config, &HtlcAir, trace, &public_values(w));
-    postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+    crate::config::proof_to_bytes(&HtlcAir, build_trace(w), &public_values(w))
 }
 
 /// Verify canonical proof bytes against public inputs. **Fail-closed** on any error.
 pub fn verify_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
-    if pis.len() != N_PUBLIC {
-        return false;
-    }
-    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    verify(&make_config(), &HtlcAir, &proof, pis).is_ok()
+    crate::config::verify_proof_bytes(&HtlcAir, N_PUBLIC, proof_bytes, pis)
 }
 
 /// A representative valid join-split witness (2 inputs at tree positions 0,1; balanced).

@@ -17,7 +17,9 @@
 //! of them.
 
 use p3_air::symbolic::SymbolicAirBuilder;
-use p3_air::Air;
+use p3_air::{Air, DebugConstraintBuilder};
+use p3_matrix::dense::RowMajorMatrix;
+use p3_uni_stark::{prove, verify, Proof, ProverConstraintFolder, VerifierConstraintFolder};
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
@@ -100,6 +102,38 @@ where
     let layout = AirLayout::from_air::<Val>(air);
     let params = StarkSecurityParams::from_air::<Val, Challenge, A, ChallengeMmcs>(&fri, air, layout, 127, 128, 2);
     ProvenSecurity::compute(&params, 1usize << (trace_height.trailing_zeros() as usize + 1)).security_bits()
+}
+
+/// Prove `air` over `trace` with public inputs `pis` under the production config, returning the
+/// canonical `postcard(Proof<MyConfig>)` bytes. The ONE audited prove-and-serialize path behind the
+/// circuits' `prove_to_bytes` / `prove_batch_to_bytes` shims (their per-circuit AIR + trace + pis are
+/// the only difference).
+pub fn proof_to_bytes<A>(air: &A, trace: RowMajorMatrix<Val>, pis: &[Val]) -> Vec<u8>
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<ProverConstraintFolder<'a, MyConfig>>
+        + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+{
+    let proof = prove(&make_config(), air, trace, pis);
+    postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+}
+
+/// Deserialize a `postcard(Proof<MyConfig>)` and verify it against `pis` under the production config.
+/// **Fail-closed**: a public-input count ≠ `n_expected_pis`, malformed proof bytes, or a verify error
+/// all return `false`. The ONE audited deserialize-bound verify gate behind the circuits'
+/// `verify_bytes` / `verify_batch_bytes` shims.
+pub fn verify_proof_bytes<A>(air: &A, n_expected_pis: usize, proof_bytes: &[u8], pis: &[Val]) -> bool
+where
+    A: Air<SymbolicAirBuilder<Val>> + for<'a> Air<VerifierConstraintFolder<'a, MyConfig>>,
+{
+    if pis.len() != n_expected_pis {
+        return false;
+    }
+    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    verify(&make_config(), air, &proof, pis).is_ok()
 }
 
 /// Dev/demo config family — deterministic salts, reduced parameters. NOT for production proofs.

@@ -21,7 +21,8 @@ use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
 use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_uni_stark::{prove, verify, Proof};
+#[cfg(test)]
+use p3_uni_stark::prove;
 
 use crate::poseidon2_air::{native_permute, BLOCK};
 use crate::joinsplit_air::{
@@ -179,7 +180,8 @@ const fn chunk_stage(ci: usize) -> Option<usize> {
 
 // FRI / ZK config — the production family from crate::config (single audited source; the trace height
 // is runtime, so one config + one AIR proves/verifies every batch size).
-use crate::config::{make_config, MyConfig};
+#[cfg(test)]
+use crate::config::make_config;
 
 /// The tile-periodic columns: joinsplit's `periodic()` (each length `HEIGHT` ⇒ repeated per tile by
 /// Plonky3) plus `P_TILE_LAST` = a one-hot at the tile's last row (also repeated per tile).
@@ -438,9 +440,7 @@ pub fn prove_batch_to_bytes(ws: &[Witness]) -> Vec<u8> {
         padded_tiles(ws.len()) <= MAX_BATCH_TILES,
         "batch exceeds MAX_BATCH_TILES ({MAX_BATCH_TILES}); split the block into multiple batch proofs"
     );
-    let pis = batch_root(ws);
-    let proof = prove(&make_config(), &JoinSplitBatchAir, build_batch_trace(ws), &pis);
-    postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+    crate::config::proof_to_bytes(&JoinSplitBatchAir, build_batch_trace(ws), &batch_root(ws))
 }
 
 /// The batch tile cap — shared batch machinery (re-exported so existing paths keep working); the
@@ -456,14 +456,7 @@ pub fn proven_security_bits(n: usize) -> usize {
 
 /// Verify a batch proof against the block tx-root (4 Goldilocks).
 pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
-    if root.len() != DIGEST {
-        return false;
-    }
-    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    verify(&make_config(), &JoinSplitBatchAir, &proof, root).is_ok()
+    crate::config::verify_proof_bytes(&JoinSplitBatchAir, DIGEST, proof_bytes, root)
 }
 
 #[cfg(test)]

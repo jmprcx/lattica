@@ -12,7 +12,8 @@ use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
 use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_uni_stark::{prove, verify, Proof};
+#[cfg(test)]
+use p3_uni_stark::prove;
 
 use crate::batch_common::padded_tiles;
 use crate::domains::DOM_TXROOT;
@@ -173,7 +174,8 @@ const fn chunk_src(ci: usize) -> ChunkSrc {
 }
 
 // FRI / ZK config — the production family from crate::config (single audited source).
-use crate::config::{make_config, MyConfig};
+#[cfg(test)]
+use crate::config::make_config;
 
 fn batch_periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic();
@@ -411,9 +413,7 @@ pub fn prove_batch_to_bytes(ws: &[Witness]) -> Vec<u8> {
         padded_tiles(ws.len()) <= crate::batch_common::MAX_BATCH_TILES,
         "batch exceeds MAX_BATCH_TILES; split the block into multiple batch proofs"
     );
-    let pis = batch_root(ws);
-    let proof = prove(&make_config(), &HtlcBatchAir, build_batch_trace(ws), &pis);
-    postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+    crate::config::proof_to_bytes(&HtlcBatchAir, build_batch_trace(ws), &batch_root(ws))
 }
 
 /// Proven (UDR) security bits at an HTLC batch of `n` transactions (same height as join-split, so the
@@ -424,14 +424,7 @@ pub fn proven_security_bits(n: usize) -> usize {
 
 /// Verify an HTLC batch proof against the block tx-root.
 pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
-    if root.len() != DIGEST {
-        return false;
-    }
-    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    verify(&make_config(), &HtlcBatchAir, &proof, root).is_ok()
+    crate::config::verify_proof_bytes(&HtlcBatchAir, DIGEST, proof_bytes, root)
 }
 
 #[cfg(test)]
