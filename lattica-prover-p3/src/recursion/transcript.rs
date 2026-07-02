@@ -13,28 +13,32 @@
 //! against the native sponge. Scope: the absorb-a-multiple-of-RATE-then-sample case (the core mechanic);
 //! variable-length buffering + `sample_bits` are follow-ons. Base-field only.
 
+#[cfg(test)]
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
-use p3_dft::Radix2DitParallel;
-use p3_field::extension::BinomialExtensionField;
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_fri::{FriParameters, HidingFriPcs};
-use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilocks};
+use p3_field::PrimeCharacteristicRing;
+use p3_goldilocks::Goldilocks;
+#[cfg(test)]
 use p3_matrix::dense::RowMajorMatrix;
-use p3_merkle_tree::MerkleTreeHidingMmcs;
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, Proof, StarkConfig};
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
+#[cfg(test)]
+use p3_uni_stark::{prove, verify, Proof};
+#[cfg(test)]
+use crate::config::{Challenge, Challenger};
+#[cfg(test)]
+use p3_goldilocks::default_goldilocks_poseidon2_8;
 
-use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W};
+use crate::poseidon2_air::{native_permute, W};
+#[cfg(test)]
+use crate::poseidon2_air::{periodic_table, BLOCK};
+#[cfg(test)]
+use crate::poseidon2_air::{ext_linear, int_linear, native_steps, pow7};
 
 type Val = Goldilocks;
 const RATE: usize = 4;
 const CAP_LANE: usize = RATE; // first capacity lane = state[4], holds the prefix-free count
 
+#[cfg(test)]
 const P_BLOCK_LAST: usize = 11; // appended after poseidon2's 11 round columns
+#[cfg(test)]
 const N_PERIODIC: usize = P_BLOCK_LAST + 1;
 
 /// Native duplex sponge over `native_permute`, modeling `DuplexChallenger` for the
@@ -115,6 +119,7 @@ impl Default for ModelChallenger {
     }
 }
 
+#[cfg(test)]
 fn periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic_table();
     let mut block_last = vec![Val::ZERO; BLOCK];
@@ -127,10 +132,12 @@ fn periodic() -> Vec<Vec<Val>> {
 /// absorbed transcript); the capacity is carried from the previous block with `state[CAP_LANE] += RATE`;
 /// the first block starts from the zero capacity (so `state[CAP_LANE] == RATE`). The final block's rate
 /// output is bound to the public squeeze.
+#[cfg(test)]
 pub struct SpongeAir {
     pub blocks: usize,
 }
 
+#[cfg(test)]
 impl BaseAir<Goldilocks> for SpongeAir {
     fn width(&self) -> usize {
         W
@@ -146,6 +153,7 @@ impl BaseAir<Goldilocks> for SpongeAir {
     }
 }
 
+#[cfg(test)]
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SpongeAir {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
@@ -207,6 +215,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SpongeAir {
     }
 }
 
+#[cfg(test)]
 fn build_trace(blocks: &[[Val; RATE]]) -> RowMajorMatrix<Val> {
     let m = blocks.len();
     let mut t = vec![Val::ZERO; m * BLOCK * W];
@@ -227,42 +236,18 @@ fn build_trace(blocks: &[[Val; RATE]]) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(t, W)
 }
 
-// --- FRI config (same as the spike's) ----------------------------------------------------------
-type Perm = Poseidon2Goldilocks<8>;
-type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
-type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
-type Challenge = BinomialExtensionField<Val, 2>;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
-type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
-type Dft = Radix2DitParallel<Val>;
-type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
-type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
-
-fn make_config() -> MyConfig {
-    let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
-    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: challenge_mmcs,
-    };
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
-    MyConfig::new(pcs, Challenger::new(perm))
-}
+// --- FRI config: the production family from crate::config (test-only consumers) ----------------
+#[cfg(test)]
+use crate::config::{make_config, MyConfig};
 
 /// Prove that absorbing `blocks` squeezes `out` (the final rate lanes).
+#[cfg(test)]
 pub fn prove_squeeze(blocks: &[[Val; RATE]], out: [Val; RATE]) -> Vec<u8> {
     let proof = prove(&make_config(), &SpongeAir { blocks: blocks.len() }, build_trace(blocks), &out.to_vec());
     postcard::to_allocvec(&proof).expect("serialize")
 }
 
+#[cfg(test)]
 pub fn verify_squeeze(proof_bytes: &[u8], out: [Val; RATE], blocks: usize) -> bool {
     let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
         Ok(p) => p,

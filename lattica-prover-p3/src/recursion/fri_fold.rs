@@ -12,38 +12,43 @@
 //! `inv2s = 1/(2s)` as a witness and constrains `inv2s·(2s) = 1`, then checks the fold relation, binding
 //! the result to a public output. Validated by a fast formula KAT + a real-prover differential.
 
+#[cfg(test)]
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
-use p3_dft::Radix2DitParallel;
 use p3_field::extension::BinomialExtensionField;
 use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing};
-use p3_fri::{FriParameters, HidingFriPcs};
-use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilocks};
+use p3_goldilocks::Goldilocks;
+#[cfg(test)]
 use p3_matrix::dense::RowMajorMatrix;
-use p3_merkle_tree::MerkleTreeHidingMmcs;
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, Proof, StarkConfig};
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
+#[cfg(test)]
+use p3_uni_stark::{prove, verify, Proof};
 
 type Val = Goldilocks;
 type Challenge = BinomialExtensionField<Val, 2>;
+#[cfg(test)]
 const W_EXT: u64 = 7; // X² = 7 for the Goldilocks quadratic extension
 
 // column layout (width 10): e0(2) ‖ e1(2) ‖ beta(2) ‖ s ‖ inv2s ‖ folded(2)
+#[cfg(test)]
 const E0: usize = 0;
+#[cfg(test)]
 const E1: usize = 2;
+#[cfg(test)]
 const BETA: usize = 4;
+#[cfg(test)]
 const S: usize = 6;
+#[cfg(test)]
 const INV2S: usize = 7;
+#[cfg(test)]
 const FOLDED: usize = 8;
+#[cfg(test)]
 const WIDTH: usize = 10;
+#[cfg(test)]
 const HEIGHT: usize = 16;
 
 fn ext(x: Val) -> Challenge {
     Challenge::from_basis_coefficients_fn(|i| if i == 0 { x } else { Val::ZERO })
 }
+#[cfg(test)]
 fn coeffs(c: Challenge) -> [Val; 2] {
     let s = c.as_basis_coefficients_slice();
     [s[0], s[1]]
@@ -56,8 +61,10 @@ pub fn native_fold(e0: Challenge, e1: Challenge, beta: Challenge, s: Val) -> Cha
     (e0 + e1) * half + (e0 - e1) * beta * inv2s
 }
 
+#[cfg(test)]
 pub struct FriFoldAir;
 
+#[cfg(test)]
 impl BaseAir<Goldilocks> for FriFoldAir {
     fn width(&self) -> usize {
         WIDTH
@@ -67,6 +74,7 @@ impl BaseAir<Goldilocks> for FriFoldAir {
     }
 }
 
+#[cfg(test)]
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriFoldAir {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
@@ -116,6 +124,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriFoldAir {
     }
 }
 
+#[cfg(test)]
 fn build_trace(e0: Challenge, e1: Challenge, beta: Challenge, s: Val) -> RowMajorMatrix<Val> {
     let folded = native_fold(e0, e1, beta, s);
     let inv2s = (Val::TWO * s).inverse();
@@ -146,15 +155,23 @@ fn build_trace(e0: Challenge, e1: Challenge, beta: Challenge, s: Val) -> RowMajo
 // =================================================================================================
 
 // row layout (width 8): running eval E(2) ‖ sibling S(2) ‖ beta B(2) ‖ point X ‖ inv2x
+#[cfg(test)]
 const C_E: usize = 0;
+#[cfg(test)]
 const C_S: usize = 2;
+#[cfg(test)]
 const C_B: usize = 4;
+#[cfg(test)]
 const C_X: usize = 6;
+#[cfg(test)]
 const C_I2X: usize = 7;
+#[cfg(test)]
 const CHAIN_WIDTH: usize = 8;
 
+#[cfg(test)]
 pub struct FoldChainAir;
 
+#[cfg(test)]
 impl BaseAir<Goldilocks> for FoldChainAir {
     fn width(&self) -> usize {
         CHAIN_WIDTH
@@ -164,6 +181,7 @@ impl BaseAir<Goldilocks> for FoldChainAir {
     }
 }
 
+#[cfg(test)]
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldChainAir {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
@@ -229,6 +247,7 @@ pub fn native_fold_chain(e0: Challenge, sibs: &[Challenge], betas: &[Challenge],
     evals
 }
 
+#[cfg(test)]
 fn build_chain_trace(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0: Val) -> RowMajorMatrix<Val> {
     let rounds = sibs.len();
     let height = (rounds + 1).next_power_of_two().max(2);
@@ -263,6 +282,7 @@ fn build_chain_trace(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0:
 }
 
 /// Prove the commit-phase fold chain takes `e0` to `final_eval` under the given siblings/betas/point.
+#[cfg(test)]
 pub fn prove_fold_chain(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0: Val, final_eval: Challenge) -> Vec<u8> {
     let mut pis = coeffs(e0).to_vec();
     pis.extend_from_slice(&coeffs(final_eval));
@@ -270,6 +290,7 @@ pub fn prove_fold_chain(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], 
     postcard::to_allocvec(&proof).expect("serialize")
 }
 
+#[cfg(test)]
 pub fn verify_fold_chain(proof_bytes: &[u8], e0: Challenge, final_eval: Challenge) -> bool {
     let mut pis = coeffs(e0).to_vec();
     pis.extend_from_slice(&coeffs(final_eval));
@@ -280,41 +301,18 @@ pub fn verify_fold_chain(proof_bytes: &[u8], e0: Challenge, final_eval: Challeng
     verify(&make_config(), &FoldChainAir, &proof, &pis).is_ok()
 }
 
-// --- FRI config (same family as the other spikes) ---------------------------------------------
-type Perm = Poseidon2Goldilocks<8>;
-type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
-type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
-type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
-type Dft = Radix2DitParallel<Val>;
-type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
-type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
-
-fn make_config() -> MyConfig {
-    let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
-    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: challenge_mmcs,
-    };
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
-    MyConfig::new(pcs, Challenger::new(perm))
-}
+// --- FRI config: the production family from crate::config (test-only consumers) ----------------
+#[cfg(test)]
+use crate::config::{make_config, MyConfig};
 
 /// Prove the in-circuit fold of (e0,e1,beta,s) equals `claimed`.
+#[cfg(test)]
 pub fn prove_fold(e0: Challenge, e1: Challenge, beta: Challenge, s: Val, claimed: Challenge) -> Vec<u8> {
     let proof = prove(&make_config(), &FriFoldAir, build_trace(e0, e1, beta, s), &coeffs(claimed).to_vec());
     postcard::to_allocvec(&proof).expect("serialize")
 }
 
+#[cfg(test)]
 pub fn verify_fold(proof_bytes: &[u8], claimed: Challenge) -> bool {
     let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
         Ok(p) => p,
