@@ -11,8 +11,9 @@
 //! Support layers: `native_fri`/`native_verify` are the NATIVE re-verifiers + witness oracles (the
 //! porting blueprint, differential-tested against `p3::verify`); `fri_fold`/`fri_merkle`/`transcript`
 //! hold the early standalone primitives (partly superseded by the monolith's fused regions, kept as
-//! the differential-test record — the live pieces are `fri_fold::native_fold{,_chain}`,
-//! `transcript::ModelChallenger`, and `fri_merkle`'s prove/verify used by monolith tests).
+//! the differential-test record — the only NON-test live piece is `fri_fold::native_fold` (the
+//! monolith trace builders); ModelChallenger / native_fold_chain / `fri_merkle`'s prove-verify
+//! wrappers serve the cfg(test) differential harnesses).
 //!
 //! This module is kept SEPARATE from the frozen audited circuits (`joinsplit_air`, `htlc_air`,
 //! `batch_*_air`); it only *reuses* their `pub`/`pub(crate)` primitives. See

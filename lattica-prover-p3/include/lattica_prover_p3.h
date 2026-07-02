@@ -8,7 +8,9 @@
  * CONVENTIONS
  *   - Return codes: verify → 0 = accept, nonzero = reject (fail-closed).
  *                   prove  → 0 = ok, 1 = malformed/invalid input or internal failure, 2 = an output
- *                   buffer was too small (*_len then holds the required size).
+ *                   buffer was too small. On rc=2 the *_len outputs are NOT written (the caps are
+ *                   checked before any store); size the buffers from MAX_PROOF_LEN / the fixed PI
+ *                   widths. *_len are written only on rc=0.
  *   - No call unwinds across the boundary (Rust catches panics); NULL pointers fail closed.
  *   - proof bytes: postcard-serialized p3-uni-stark Proof under the production config (see
  *     src/config.rs; pinned to p3 0.6.1 + the production FRI parameters). Verify rejects

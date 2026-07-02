@@ -22,29 +22,49 @@ use p3_uni_stark::{AirLayout, SymbolicAirBuilder};
 
 type Val = Goldilocks;
 
-/// (width, n_periodic, n_publics, n_constraints, max_degree, fnv64-of-constraints)
-type Fingerprint = (usize, usize, usize, usize, usize, u64);
+/// (width, n_periodic, n_publics, n_constraints, max_degree, fnv64-of-constraints, fnv64-of-periodic)
+///
+/// The LAST component closes a blind spot the symbolic constraints cannot see: periodic columns enter
+/// `get_symbolic_constraints` as content-free placeholder variables, yet their VALUES (one-hot selector
+/// row positions, `P_POS_COEFF` 2^d tables, the Poseidon2 round constants in `periodic_table()`) are
+/// verifier-semantic — the verifier evaluates these polynomials as part of the AIR. So the fingerprint
+/// also hashes `BaseAir::periodic_columns()` content, column by column, value by value.
+type Fingerprint = (usize, usize, usize, usize, usize, u64, u64);
 
 fn fingerprint<A>(air: &A) -> Fingerprint
 where
     A: Air<SymbolicAirBuilder<Val>> + p3_air::BaseAir<Val>,
 {
+    use p3_field::PrimeField64;
     let layout = AirLayout::from_air::<Val>(air);
     let cs = get_symbolic_constraints::<Val, A>(air, layout);
     let n = cs.len();
     let maxd = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     // FNV-1a over the Debug rendering of each constraint, in emission order.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for c in &cs {
         for b in format!("{c:?}").bytes() {
             h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            h = h.wrapping_mul(FNV_PRIME);
         }
         // constraint separator (so concatenation boundaries are unambiguous)
         h ^= 0x1e;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h = h.wrapping_mul(FNV_PRIME);
     }
-    (air.width(), air.num_periodic_columns(), air.num_public_values(), n, maxd, h)
+    // FNV-1a over the periodic-column CONTENT (canonical u64 LE bytes), column-separated.
+    let mut hp: u64 = 0xcbf2_9ce4_8422_2325;
+    for col in air.periodic_columns() {
+        for v in &col {
+            for b in v.as_canonical_u64().to_le_bytes() {
+                hp ^= b as u64;
+                hp = hp.wrapping_mul(FNV_PRIME);
+            }
+        }
+        hp ^= 0x1f;
+        hp = hp.wrapping_mul(FNV_PRIME);
+    }
+    (air.width(), air.num_periodic_columns(), air.num_public_values(), n, maxd, h, hp)
 }
 
 /// The recursion monolith at its two canonical shapes (synthetic geometry — `get_symbolic_constraints`
@@ -83,14 +103,17 @@ fn pinned_constraint_fingerprints() {
         println!("{name}: (width, periodic, publics, n, maxdeg, fnv) = {fp:?}");
     }
     let pinned: &[(&str, Fingerprint)] = &[
-        // Harvested at the pre-refactor baseline (v3 @ eda58ee); see module doc for the re-pin policy.
-        ("JoinSplitAir", (19, 33, 26, 81, 8, 10377435458428738100)),
-        ("HtlcAir", (36, 43, 31, 145, 8, 399889076546091351)),
-        ("JoinSplitBatchAir", (49, 45, 4, 167, 8, 9176787058577691560)),
-        ("HtlcBatchAir", (71, 57, 4, 244, 9, 14186304468083107211)),
-        ("Poseidon2RowsAir", (8, 11, 8, 16, 8, 4555829733017345773)),
-        ("MonolithAir[is_zk=0,db=6]", (193, 56, 53, 380, 13, 2831239969576965911)),
-        ("MonolithAir[is_zk=1,hiding]", (619, 81, 2271, 875, 9, 5788871046264575537)),
+        // Constraint components harvested at the pre-refactor baseline (v3 @ eda58ee) and UNCHANGED
+        // through the refactor; the periodic-content fnv (last) was added by the post-refactor review
+        // (the symbolic constraints cannot see periodic VALUES) and harvested at 324c45b — the periodic
+        // producers were byte-compared against eda58ee at that point. Re-pin policy: module doc.
+        ("JoinSplitAir", (19, 33, 26, 81, 8, 10377435458428738100, 2370469867362978521)),
+        ("HtlcAir", (36, 43, 31, 145, 8, 399889076546091351, 6527013588378775531)),
+        ("JoinSplitBatchAir", (49, 45, 4, 167, 8, 9176787058577691560, 6216047000859822608)),
+        ("HtlcBatchAir", (71, 57, 4, 244, 9, 14186304468083107211, 7128159627846454138)),
+        ("Poseidon2RowsAir", (8, 11, 8, 16, 8, 4555829733017345773, 3694726246285696047)),
+        ("MonolithAir[is_zk=0,db=6]", (193, 56, 53, 380, 13, 2831239969576965911, 4845014777825624174)),
+        ("MonolithAir[is_zk=1,hiding]", (619, 81, 2271, 875, 9, 5788871046264575537, 9300941697942390572)),
     ];
     for (name, fp) in pinned {
         let (_, actual) = got.iter().find(|(n, _)| n == name).expect("pinned AIR present");

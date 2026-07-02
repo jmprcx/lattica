@@ -21,8 +21,9 @@
 //! - two spend modes gated by one persistent `MODE` boolean: redeem (claim == redeem_tag,
 //!   `height < timeout`, bind `hashlock == redeem_hashlock` public = SHA256(preimage)) vs refund
 //!   (claim == refund_tag, `height >= timeout`); timeout compare reuses the range columns;
-//! - **CRITICAL soundness:** the nullifier is mode/party-independent — `nf = H(DOM_NF ‖ owner ‖ rho ‖
-//!   pos)` (NOT the claiming `nk`), else a note is spendable once per mode (double-spend);
+//! - **CRITICAL soundness:** the nullifier is mode/party-independent — `nf = H(DOM_NF_HTLC ‖ owner ‖
+//!   rho ‖ pos)` (owner-based, NOT the claiming `nk`), else a note is spendable once per mode
+//!   (double-spend);
 //! - public inputs gain `current_height` + `redeem_hashlock`.
 //!
 //! Every binding is differential-tested against the native oracle below and probed with adversarial

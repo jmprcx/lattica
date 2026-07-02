@@ -4,8 +4,9 @@
 //! absorbs two more chunks. The fold domain (`DOM_TXROOT`) is shared — an HTLC `s_k` (9 absorb blocks)
 //! cannot collide with a join-split `s_k` (7 blocks), and the two batch circuits have separate roots.
 //!
-//! PHASE 9a (this commit): the native oracle. The in-circuit fold + ABI + Zig seam mirror the
-//! join-split phases.
+//! The native oracle is the cross-checked contract; the file contains the complete in-circuit HTLC
+//! batch AIR (staging + fold, per-tile constraints = `htlc_air::eval_spend` reused verbatim), the
+//! byte ABI, and the Zig-seam root recompute — mirroring `batch_joinsplit_air`.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;

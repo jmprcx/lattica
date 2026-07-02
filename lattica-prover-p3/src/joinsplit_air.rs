@@ -406,8 +406,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
 /// staging columns for the batch (which makes the `cur == statement[..]` bindings double as the staging
 /// bindings). `tile_last` is 0 for the single circuit, or the tile-boundary one-hot for the batch (it
 /// frees the per-tile-persistent columns + ASSET across tiles). Single-circuit behaviour is unchanged
-/// (statement = pis, tile_last = 0) — proven by this file's full suite, incl. the corrupted-trace
-/// `--ignored` tests. (This mirrors `htlc_air::eval_spend`, the pattern's origin.)
+/// (statement = pis, tile_last = 0) — proven by this file's full suite, incl. the corrupted-trace-
+/// rejection tests. (This mirrors `htlc_air::eval_spend`, the pattern's origin.)
 pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(builder: &mut AB, statement: &[AB::Expr], tile_last: AB::Expr) {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();

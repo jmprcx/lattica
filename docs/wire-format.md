@@ -34,10 +34,12 @@ Note the wire order differs from the in-circuit `PI_*` order (`lib.rs` re-orders
 
 ## Witness records (wallet → prover)
 
-Fixed-length concatenated records; field order defined by `lib.rs` (`js_witness_len` /
-`htlc_witness_len`). `JS_WITNESS_LEN = 2464`, `HTLC_WITNESS_LEN = 2728`. Per input:
-`nk0,nk1 (u64) ‖ diversifier ‖ asset ‖ value ‖ rho0,rho1 ‖ rcm0,rcm1 ‖ 32×sibling(32) ‖ 32×path-bit
-(1 byte each, strictly 0/1)`. Batch proving: `witness_len == n_tx × record_len`, and
+Fixed-length concatenated records; the normative field order is `lib.rs` (`js_witness_len` /
+`htlc_witness_len`). `JS_WITNESS_LEN = 2464`, `HTLC_WITNESS_LEN = 2728`. The **join-split** record,
+per input: `nk0,nk1 (u64) ‖ diversifier ‖ asset ‖ value ‖ rho0,rho1 ‖ rcm0,rcm1 ‖ 32×sibling(32) ‖
+32×path-bit (1 byte each, strictly 0/1)`. The **HTLC** record extends it per `lib.rs`'s
+`parse_htlc_witness` (note_type, mode, redeem/refund tags, hashlock, timeout, current_height —
+do not infer the layout from this page). Batch proving: `witness_len == n_tx × record_len`, and
 `padded_tiles(n_tx) ≤ MAX_BATCH_TILES = 64` ★.
 
 ## Batch tx-root ★
@@ -59,5 +61,6 @@ asset id in commitment lane 6. Cross-language equality is KAT-pinned (`dump_p2` 
 ## Return codes
 
 - verify: `0` accept, nonzero reject (fail-closed; never unwinds across the ABI).
-- prove: `0` ok; `1` malformed/invalid input or internal failure; `2` output buffer too small
-  (`*_len` then holds the required size).
+- prove: `0` ok; `1` malformed/invalid input or internal failure; `2` output buffer too small —
+  on rc=2 the `*_len` outputs are **not** written (caps are checked before any store); size buffers
+  from `MAX_PROOF_LEN` / the fixed PI widths. `*_len` are written only on rc=0.
