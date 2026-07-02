@@ -18,13 +18,28 @@
 
 use ocl::ProQue;
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{PrimeField64, TwoAdicField};
+use p3_field::{Field, PrimeCharacteristicRing, PrimeField64, TwoAdicField};
 use p3_goldilocks::Goldilocks;
 use p3_matrix::bitrev::{BitReversalPerm, BitReversedMatrixView};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::util::reverse_matrix_index_bits;
 use p3_matrix::Matrix;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Lightweight profiling counters (GPU NTT wall-time + call count), for the benchmark to attribute
+/// how much of a proof is spent in the accelerated LDE. Reset/read via `prof_reset`/`prof_report`.
+pub static NTT_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static NTT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Reset the GPU profiling counters.
+pub fn prof_reset() {
+    NTT_NANOS.store(0, Ordering::Relaxed);
+    NTT_CALLS.store(0, Ordering::Relaxed);
+}
+/// `(total GPU-NTT milliseconds, number of dft_batch calls)` since the last reset.
+pub fn prof_report() -> (f64, u64) {
+    (NTT_NANOS.load(Ordering::Relaxed) as f64 / 1e6, NTT_CALLS.load(Ordering::Relaxed))
+}
 
 /// OpenCL C: Goldilocks field ops (matching p3's reduce128/add) + a radix-2 DIT NTT.
 const KERNEL_SRC: &str = r#"
@@ -54,6 +69,13 @@ __kernel void ntt_stage(__global ulong* a,const uint w,const uint h,const uint h
   a[iu]=gl_add(u,v); a[iv]=gl_sub(u,v);
 }
 __kernel void canon(__global ulong* a,const uint n){ size_t i=get_global_id(0); if(i<n) a[i]=gl_canon(a[i]); }
+// scale every element by the base-field scalar `s`.
+__kernel void scale_const(__global ulong* a,const uint n,const ulong s){ size_t i=get_global_id(0); if(i<n) a[i]=gl_mul(a[i],s); }
+// coset shift: row k (k<h) *= base^k; used to turn an inner-domain iDFT into a coset evaluation.
+__kernel void scale_pow(__global ulong* a,const uint w,const uint h,const ulong base){
+  size_t gid=get_global_id(0); uint k=(uint)(gid/w),c=(uint)(gid%w); if(k>=h) return;
+  a[(size_t)k*w+c]=gl_mul(a[(size_t)k*w+c], gl_pow(base,(ulong)k));
+}
 "#;
 
 thread_local! {
@@ -78,6 +100,7 @@ fn with_proque<R>(f: impl FnOnce(&ProQue) -> R) -> R {
 /// Run the radix-2 DIT NTT on the GPU: bit-reverse rows, then `log_h` butterfly stages, then
 /// canonicalize. Returns evaluations in **natural** row order (matching p3's `dft_batch` logical order).
 fn gpu_ntt(coeffs: &[u64], h: usize, w: usize, log_h: usize) -> Vec<u64> {
+    let _t0 = std::time::Instant::now();
     let n = h * w;
     let wlens: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
     with_proque(|pq| {
@@ -101,6 +124,54 @@ fn gpu_ntt(coeffs: &[u64], h: usize, w: usize, log_h: usize) -> Vec<u64> {
         }
         let mut out = vec![0u64; n];
         ab.read(&mut out).enq().unwrap();
+        NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        NTT_CALLS.fetch_add(1, Ordering::Relaxed);
+        out
+    })
+}
+
+/// Full coset-LDE on the GPU, **device-side** (one upload + one download): iDFT → coset-scale +
+/// zero-pad → forward NTT on `shift·K` (|K| = `h << added_bits`). Returns evaluations in NATURAL row
+/// order (matching p3's `coset_lde_batch` logical order). This is what `TwoAdicFriPcs` actually calls;
+/// keeping the two NTTs + the coset shift on-device eliminates the host round-trips (and the CPU
+/// reverse/scale/coset-shift) of the trait's default composition — the LDE's dominant overhead.
+fn gpu_coset_lde_natural(evals: &[u64], h: usize, w: usize, added_bits: usize, shift: u64) -> Vec<u64> {
+    let _t0 = std::time::Instant::now();
+    let log_h = h.trailing_zeros() as usize;
+    let big = h << added_bits;
+    let log_big = log_h + added_bits;
+    let (n_small, n_big) = (h * w, big * w);
+    // iDFT twiddles per stage = two_adic_generator(s).inverse(); forward (big) twiddles = generator(s).
+    let wl_inv: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).inverse().as_canonical_u64()).collect();
+    let wl_big: Vec<u64> = (1..=log_big).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
+    let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
+    with_proque(|pq| {
+        let mk = || ocl::Buffer::<u64>::builder().queue(pq.queue().clone()).flags(ocl::flags::MEM_READ_WRITE).len(n_big).build().unwrap();
+        let a = mk();
+        let b = mk();
+        unsafe {
+            a.cmd().fill(0u64, None).enq().unwrap();
+            b.cmd().fill(0u64, None).enq().unwrap();
+            a.write(evals).enq().unwrap(); // a[0..n_small] = input evals, rest 0
+            // --- iDFT on the first h rows: bitrev(a[0..hw]) -> b, inverse-twiddle stages, scale 1/h ---
+            pq.kernel_builder("bitrev_rows").arg(&a).arg(&b).arg(h as u32).arg(w as u32).arg(log_h as u32).global_work_size(n_small).build().unwrap().enq().unwrap();
+            for s in 1..=log_h {
+                pq.kernel_builder("ntt_stage").arg(&b).arg(w as u32).arg(h as u32).arg(1u32 << (s - 1)).arg(wl_inv[s - 1]).global_work_size((h / 2) * w).build().unwrap().enq().unwrap();
+            }
+            pq.kernel_builder("scale_const").arg(&b).arg(n_small as u32).arg(h_inv).global_work_size(n_small).build().unwrap().enq().unwrap();
+            // --- coset shift: b[k] *= shift^k (k<h); b[hw..] stays 0 (the zero-pad) ---
+            pq.kernel_builder("scale_pow").arg(&b).arg(w as u32).arg(h as u32).arg(shift).global_work_size(n_small).build().unwrap().enq().unwrap();
+            // --- forward NTT of size `big` on b: bitrev(b, log_big) -> a, forward stages, canon ---
+            pq.kernel_builder("bitrev_rows").arg(&b).arg(&a).arg(big as u32).arg(w as u32).arg(log_big as u32).global_work_size(n_big).build().unwrap().enq().unwrap();
+            for s in 1..=log_big {
+                pq.kernel_builder("ntt_stage").arg(&a).arg(w as u32).arg(big as u32).arg(1u32 << (s - 1)).arg(wl_big[s - 1]).global_work_size((big / 2) * w).build().unwrap().enq().unwrap();
+            }
+            pq.kernel_builder("canon").arg(&a).arg(n_big as u32).global_work_size(n_big).build().unwrap().enq().unwrap();
+        }
+        let mut out = vec![0u64; n_big];
+        a.read(&mut out).enq().unwrap();
+        NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        NTT_CALLS.fetch_add(1, Ordering::Relaxed);
         out
     })
 }
@@ -124,6 +195,24 @@ impl TwoAdicSubgroupDft<Goldilocks> for GpuDft {
         };
         let mut stored = RowMajorMatrix::new(evals.into_iter().map(Goldilocks::new).collect(), w);
         reverse_matrix_index_bits(&mut stored); // stored = bit-reverse(natural) ⇒ view = natural
+        BitReversalPerm::new_view(stored)
+    }
+
+    /// Override the trait default: do the whole coset-LDE device-side (see `gpu_coset_lde_natural`),
+    /// which is what the PCS calls to commit. Bit-identical to `Radix2DitParallel::coset_lde_batch`.
+    fn coset_lde_batch(&self, mat: RowMajorMatrix<Goldilocks>, added_bits: usize, shift: Goldilocks) -> Self::Evaluations {
+        let (h, w) = (mat.height(), mat.width());
+        let big = h << added_bits;
+        let natural: Vec<u64> = if h < 2 {
+            // degree-<1 (constant) poly ⇒ the same value at every coset point; replicate the single row.
+            let row: Vec<u64> = (0..w).map(|c| mat.values.get(c).map(|f| f.as_canonical_u64()).unwrap_or(0)).collect();
+            (0..big).flat_map(|_| row.clone()).collect()
+        } else {
+            let evals: Vec<u64> = mat.values.iter().map(|f| f.as_canonical_u64()).collect();
+            gpu_coset_lde_natural(&evals, h, w, added_bits, shift.as_canonical_u64())
+        };
+        let mut stored = RowMajorMatrix::new(natural.into_iter().map(Goldilocks::new).collect(), w);
+        reverse_matrix_index_bits(&mut stored);
         BitReversalPerm::new_view(stored)
     }
 }
@@ -192,11 +281,14 @@ mod tests {
             let b = joinsplit_air::prove_to_bytes(&w);
             cpu_ms = cpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
             assert!(joinsplit_air::verify_bytes(&b, &pis));
+            super::prof_reset();
             let t = Instant::now();
             let b = crate::config::gpu::proof_to_bytes(&JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
             gpu_ms = gpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
             assert!(joinsplit_air::verify_bytes(&b, &pis));
         }
+        let (ntt_ms, ntt_calls) = super::prof_report();
         println!("join-split prove (best of {runs}): CPU {cpu_ms:.1}ms | GPU-LDE {gpu_ms:.1}ms  (both verify)");
+        println!("  of the GPU run: {ntt_ms:.1}ms in {ntt_calls} GPU-NTT calls (the rest — Merkle/quotient/FRI/glue — is CPU)");
     }
 }
