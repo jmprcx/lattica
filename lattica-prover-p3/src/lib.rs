@@ -57,7 +57,7 @@ fn parse_joinsplit_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
     if b.len() != JS_PUBLIC_INPUTS_LEN {
         return None;
     }
-    let mut pis = Vec::with_capacity(joinsplit_air::NUM_PUBLIC_INPUTS);
+    let mut pis = Vec::with_capacity(joinsplit_air::N_PUBLIC);
     let mut off = 0;
     push_digest(&b[off..off + 32], &mut pis)?; // anchor
     off += 32;
@@ -207,7 +207,7 @@ pub unsafe extern "C" fn lattica_joinsplit_prove_demo(
 /// Encode the circuit's join-split public-input vector into the `JoinSplitPublicInputs` byte layout
 /// (inverse of `parse_joinsplit_public_inputs`). Used by tests and the node/wallet glue.
 pub fn encode_joinsplit_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
-    if pis.len() != joinsplit_air::NUM_PUBLIC_INPUTS {
+    if pis.len() != joinsplit_air::N_PUBLIC {
         return None;
     }
     let d = joinsplit_air::DIGEST;
@@ -252,7 +252,7 @@ fn parse_htlc_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
     if b.len() != HTLC_PUBLIC_INPUTS_LEN {
         return None;
     }
-    let mut pis = Vec::with_capacity(htlc_air::NUM_PUBLIC_INPUTS);
+    let mut pis = Vec::with_capacity(htlc_air::N_PUBLIC);
     let mut off = 0;
     push_digest(&b[off..off + 32], &mut pis)?; // anchor
     off += 32;
@@ -280,7 +280,7 @@ fn parse_htlc_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
 
 /// Encode the htlc_air public-input vector into the byte layout (inverse of `parse_htlc_public_inputs`).
 pub fn encode_htlc_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
-    if pis.len() != htlc_air::NUM_PUBLIC_INPUTS {
+    if pis.len() != htlc_air::N_PUBLIC {
         return None;
     }
     let d = htlc_air::DIGEST;

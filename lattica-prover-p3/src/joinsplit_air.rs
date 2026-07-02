@@ -196,41 +196,41 @@ const NUM_BLOCKS: usize = USED_BLOCKS.next_power_of_two();
 pub const HEIGHT: usize = NUM_BLOCKS * BLOCK;
 
 // columns (pub for reuse by batch_joinsplit_air; the constraint logic below is unchanged)
-pub const BIT: usize = 8; // membership position bit
-pub const NK: usize = 9; // local-persistent within an input span
-pub const RHO: usize = 10; // rho limb 0 (local-persistent)
-pub const VAL: usize = 11; // value within input / output / fee / mint region
-pub const POSACC: usize = 12; // Σ bit_d·2^d within an input's membership (A1)
-pub const VALACC: usize = 13; // global balance accumulator: +in +mint −out −fee ⇒ 0
-pub const REM: usize = 14; // range running remainder
-pub const RBIT: usize = 15;
-pub const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
-pub const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
-pub const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant across the whole tx)
+const BIT: usize = 8; // membership position bit
+const NK: usize = 9; // local-persistent within an input span
+const RHO: usize = 10; // rho limb 0 (local-persistent)
+const VAL: usize = 11; // value within input / output / fee / mint region
+const POSACC: usize = 12; // Σ bit_d·2^d within an input's membership (A1)
+const VALACC: usize = 13; // global balance accumulator: +in +mint −out −fee ⇒ 0
+const REM: usize = 14; // range running remainder
+const RBIT: usize = 15;
+const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
+const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
+pub(crate) const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant across the whole tx)
 pub const WIDTH: usize = 19;
 
 // periodic-column indices: 0..11 round schedule (period 32), then fixed (length HEIGHT) selectors.
 // The commitment is two permutations (commit_a -> chain -> commit_b -> cm); outputs likewise.
-pub const P_OWN_IN: usize = 11;
-pub const P_RECIP_LINK: usize = 12; // own.out -> commit_a.in recipient lanes
-pub const P_COMMIT_A_IN: usize = 13; // input commit_a: DOM_CM, value, rho0, rho1
-pub const P_CHAIN_LINK: usize = 14; // commit_a.out -> commit_b.in[0..4] (input & output commitments)
-pub const P_COMMIT_B: usize = 15; // commit_b.in pad lanes = 0 (input & output commitments)
-pub const P_MEM_LINK: usize = 16;
-pub const P_POS_COEFF: usize = 17; // 2^d at each membership link
-pub const P_ROOT: usize = 18;
-pub const P_NULL_IN: usize = 19;
-pub const P_OUT_A_IN: usize = 20; // output out_a: DOM_CM, out_value
-pub const P_FEE_IN: usize = 21;
-pub const P_MINT_IN: usize = 22; // issuance amount binding row
-pub const P_REGION_LAST: usize = 23; // last row of each region (gates local-persistent columns)
-pub const P_RANGE_SEED: usize = 24; // rem = VAL (each value's first range row)
-pub const P_RANGE_ACTIVE: usize = 25; // decomposition rows
-pub const P_RANGE_CLOSE: usize = 26; // rem = 0 (value < 2^BITS)
-pub const P_ROW0: usize = 27; // VALACC = 0
-pub const P_FINAL: usize = 28; // VALACC = 0 (balance)
-pub const P_NULLOUT: usize = 29; // N_IN one-hots: nf_i binding
-pub const P_OUTOUT: usize = 29 + N_IN; // M_OUT one-hots: out_cm_j binding
+const P_OWN_IN: usize = 11;
+const P_RECIP_LINK: usize = 12; // own.out -> commit_a.in recipient lanes
+const P_COMMIT_A_IN: usize = 13; // input commit_a: DOM_CM, value, rho0, rho1
+const P_CHAIN_LINK: usize = 14; // commit_a.out -> commit_b.in[0..4] (input & output commitments)
+const P_COMMIT_B: usize = 15; // commit_b.in pad lanes = 0 (input & output commitments)
+const P_MEM_LINK: usize = 16;
+const P_POS_COEFF: usize = 17; // 2^d at each membership link
+const P_ROOT: usize = 18;
+const P_NULL_IN: usize = 19;
+const P_OUT_A_IN: usize = 20; // output out_a: DOM_CM, out_value
+const P_FEE_IN: usize = 21;
+const P_MINT_IN: usize = 22; // issuance amount binding row
+const P_REGION_LAST: usize = 23; // last row of each region (gates local-persistent columns)
+const P_RANGE_SEED: usize = 24; // rem = VAL (each value's first range row)
+const P_RANGE_ACTIVE: usize = 25; // decomposition rows
+const P_RANGE_CLOSE: usize = 26; // rem = 0 (value < 2^BITS)
+const P_ROW0: usize = 27; // VALACC = 0
+const P_FINAL: usize = 28; // VALACC = 0 (balance)
+const P_NULLOUT: usize = 29; // N_IN one-hots: nf_i binding
+const P_OUTOUT: usize = 29 + N_IN; // M_OUT one-hots: out_cm_j binding
 pub const N_PERIODIC: usize = 29 + N_IN + M_OUT;
 
 // public inputs: anchor(4) ‖ nf_i(4·N) ‖ out_cm_j(4·M) ‖ fee(1) ‖ mint(1) ‖ tx_binding(4)
@@ -770,9 +770,6 @@ pub fn prove_verify_with(w: &Witness, pis: &[Val]) -> Result<(), String> {
 pub fn prove_verify(w: &Witness) -> Result<(), String> {
     prove_verify_with(w, &public_values(w))
 }
-
-/// Number of public-input field elements: `anchor ‖ N·nf ‖ M·out_cm ‖ fee ‖ tx_binding`.
-pub const NUM_PUBLIC_INPUTS: usize = N_PUBLIC;
 
 /// Prove a join-split and return canonical (postcard) proof bytes.
 pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {

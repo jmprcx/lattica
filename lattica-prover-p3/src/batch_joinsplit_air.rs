@@ -26,7 +26,7 @@ use p3_uni_stark::{prove, verify, Proof};
 use crate::poseidon2_air::{native_permute, BLOCK};
 use crate::joinsplit_air::{
     build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST,
-    HEIGHT, M_OUT, N_IN, N_PERIODIC, NUM_PUBLIC_INPUTS, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_MINT, PI_NF,
+    HEIGHT, M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_MINT, PI_NF,
     PI_OUTCM, PI_TXBIND, WIDTH,
 };
 
@@ -41,8 +41,8 @@ pub use crate::domains::DOM_TXROOT;
 /// `tx_binding` as 4-element chunks. The batch circuit reproduces this exact chain from the per-tile
 /// staging columns, so the layout here is the cross-checked contract.
 pub fn tx_statement_digest(pv: &[Val]) -> [Val; DIGEST] {
-    debug_assert_eq!(pv.len(), NUM_PUBLIC_INPUTS);
-    debug_assert_eq!(PI_TXBIND + DIGEST, NUM_PUBLIC_INPUTS);
+    debug_assert_eq!(pv.len(), N_PUBLIC);
+    debug_assert_eq!(PI_TXBIND + DIGEST, N_PUBLIC);
     let chunk = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
     let dom = [Val::from_u64(DOM_TXROOT), Val::ZERO, Val::ZERO, Val::ZERO];
     let mut c = merge(dom, chunk(PI_ANCHOR));
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn batch_kat_dump() {
         // KAT for the Zig node's txStatementDigest/batchRoot fold (poseidon2.zig). seq statement = 1..=26.
-        let seq: Vec<Val> = (1..=NUM_PUBLIC_INPUTS as u64).map(Val::from_u64).collect();
+        let seq: Vec<Val> = (1..=N_PUBLIC as u64).map(Val::from_u64).collect();
         let s = tx_statement_digest(&seq);
         let d = dummy_sk();
         let p = |label: &str, x: &[Val; DIGEST]| {

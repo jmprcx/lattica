@@ -1159,8 +1159,6 @@ pub fn prove_verify(w: &Witness) -> Result<(), String> {
     prove_verify_with(w, &public_values(w))
 }
 
-/// Number of public-input field elements: `anchor ‖ N·nf ‖ M·out_cm ‖ fee ‖ tx_binding`.
-pub const NUM_PUBLIC_INPUTS: usize = N_PUBLIC;
 
 /// Prove a join-split and return canonical (postcard) proof bytes.
 pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {
