@@ -4,6 +4,7 @@
 //! canonical proof serialization + the `lattica_joinsplit_*` / `lattica_htlc_*` **C ABI** the Zig node
 //! calls (matching `src/ffi.zig`).
 
+pub mod config; // crate-wide STARK config: the production (wire-pinned) + demo parameter families
 pub mod joinsplit_air;
 pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsplit_air, extended
 pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-split tiling + tx-root fold)

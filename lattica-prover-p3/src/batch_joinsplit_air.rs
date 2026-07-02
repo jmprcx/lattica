@@ -16,21 +16,11 @@
 //! in-circuit fold (a later phase) is differential-tested against this oracle, and the node's
 //! `poseidon2.zig` recompute is KAT-tested against it.
 
-use p3_air::symbolic::AirLayout;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
-use p3_dft::Radix2DitParallel;
-use p3_field::extension::BinomialExtensionField;
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_fri::{FriParameters, HidingFriPcs};
-use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilocks};
+use p3_field::PrimeCharacteristicRing;
+use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_merkle_tree::MerkleTreeHidingMmcs;
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, Proof, ProvenSecurity, StarkConfig, StarkSecurityParams};
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
+use p3_uni_stark::{prove, verify, Proof};
 
 use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, pow7, BLOCK};
 use crate::joinsplit_air::{
@@ -192,37 +182,9 @@ const fn chunk_stage(ci: usize) -> Option<usize> {
     }
 }
 
-// FRI / ZK config — identical to joinsplit_air's (same production parameters). Copied (not imported) to
-// avoid exposing joinsplit_air's private config types; the trace height is runtime, so one config + one
-// AIR proves/verifies every batch size.
-type Perm = Poseidon2Goldilocks<8>;
-type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
-type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
-type Challenge = BinomialExtensionField<Val, 2>;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
-type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
-type Dft = Radix2DitParallel<Val>;
-type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
-type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
-
-fn make_config() -> MyConfig {
-    let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
-    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: challenge_mmcs,
-    };
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
-    MyConfig::new(pcs, Challenger::new(perm))
-}
+// FRI / ZK config — the production family from crate::config (single audited source; the trace height
+// is runtime, so one config + one AIR proves/verifies every batch size).
+use crate::config::{make_config, MyConfig};
 
 /// The tile-periodic columns: joinsplit's `periodic()` (each length `HEIGHT` ⇒ repeated per tile by
 /// Plonky3) plus `P_TILE_LAST` = a one-hot at the tile's last row (also repeated per tile).
@@ -618,28 +580,7 @@ pub const MAX_BATCH_TILES: usize = 64;
 /// Mirrors `joinsplit_air::measure`'s computation; the batch grows the height ~log(n), slowly lowering the
 /// proven floor. The largest size holding ≥100 bits is `MAX_BATCH_TILES`.
 pub fn proven_security_bits(n: usize) -> usize {
-    let perm = default_goldilocks_poseidon2_8();
-    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, ChaCha20Rng::seed_from_u64(1));
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: ChallengeMmcs::new(vm),
-    };
-    let layout = AirLayout::from_air::<Goldilocks>(&JoinSplitBatchAir);
-    let params = StarkSecurityParams::from_air::<Val, Challenge, JoinSplitBatchAir, ChallengeMmcs>(
-        &fri,
-        &JoinSplitBatchAir,
-        layout,
-        127,
-        128,
-        2,
-    );
-    let height = padded_tiles(n) * TILE_HEIGHT;
-    ProvenSecurity::compute(&params, 1usize << (height.trailing_zeros() as usize + 1)).security_bits()
+    crate::config::proven_security_bits(&JoinSplitBatchAir, padded_tiles(n) * TILE_HEIGHT)
 }
 
 /// Verify a batch proof against the block tx-root (4 Goldilocks).

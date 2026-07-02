@@ -24,20 +24,10 @@
 //! "as if" at a different position (which would otherwise allow a second, undetected spend).
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
-use p3_dft::Radix2DitParallel;
-use p3_field::extension::BinomialExtensionField;
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_fri::{FriParameters, HidingFriPcs};
-use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilocks};
+use p3_field::PrimeCharacteristicRing;
+use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_merkle_tree::MerkleTreeHidingMmcs;
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_air::symbolic::AirLayout;
-use p3_uni_stark::{prove, verify, Proof, ProvenSecurity, StarkConfig, StarkSecurityParams};
-use rand_chacha::ChaCha20Rng;
-use rand::SeedableRng;
+use p3_uni_stark::{prove, verify, Proof};
 
 use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK};
 
@@ -567,40 +557,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
     }
 }
 
-// --- trace + ZK config (stage 1) --------------------------------------------------------------
+// --- trace + ZK config: the production family lives in crate::config (single audited source) ----
 
-type Perm = Poseidon2Goldilocks<8>;
-type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
-type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
-type Challenge = BinomialExtensionField<Val, 2>;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
-type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
-type Dft = Radix2DitParallel<Val>;
-type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
-type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
-
-fn make_config() -> MyConfig {
-    let perm = default_goldilocks_poseidon2_8();
-    // The hiding-PCS / Merkle-salt RNG must be a CSPRNG seeded from fresh OS entropy **per proof** —
-    // otherwise the zero-knowledge blinding is predictable/identical across proofs and the witness is
-    // not actually hidden. ChaCha20Rng is ChaCha-based; `from_os_rng` reseeds each call.
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
-    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
-    // production FRI parameters (C-04): ≈103-bit proven / ~127-bit conjectured, smallest-encoding.
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: challenge_mmcs,
-    };
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
-    MyConfig::new(pcs, Challenger::new(perm))
-}
+use crate::config::{make_config, MyConfig};
 
 fn set_block(t: &mut [Val], block: usize, input: [Val; 8]) {
     let rows = native_steps(input);
@@ -874,21 +833,8 @@ pub fn measure(w: &Witness) -> (usize, u128, u128, usize) {
     let t1 = std::time::Instant::now();
     assert!(verify(&config, &JoinSplitAir, &proof, &pis).is_ok());
     let verify_ms = t1.elapsed().as_millis();
-    // proven security at this trace height
-    let perm = default_goldilocks_poseidon2_8();
-    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, ChaCha20Rng::seed_from_u64(1));
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: ChallengeMmcs::new(vm),
-    };
-    let layout = AirLayout::from_air::<Goldilocks>(&JoinSplitAir);
-    let params = StarkSecurityParams::from_air::<Val, Challenge, JoinSplitAir, ChallengeMmcs>(&fri, &JoinSplitAir, layout, 127, 128, 2);
-    let proven = ProvenSecurity::compute(&params, 1usize << (HEIGHT.trailing_zeros() as usize + 1)).security_bits();
+    // proven security at this trace height (production params; single source in crate::config)
+    let proven = crate::config::proven_security_bits(&JoinSplitAir, HEIGHT);
     (bytes.len(), prove_ms, verify_ms, proven)
 }
 

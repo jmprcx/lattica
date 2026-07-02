@@ -7,21 +7,11 @@
 //! PHASE 9a (this commit): the native oracle. The in-circuit fold + ABI + Zig seam mirror the
 //! join-split phases.
 
-use p3_air::symbolic::AirLayout;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
-use p3_dft::Radix2DitParallel;
-use p3_field::extension::BinomialExtensionField;
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_fri::{FriParameters, HidingFriPcs};
-use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilocks};
+use p3_field::PrimeCharacteristicRing;
+use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_merkle_tree::MerkleTreeHidingMmcs;
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::{prove, verify, Proof, ProvenSecurity, StarkConfig, StarkSecurityParams};
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
+use p3_uni_stark::{prove, verify, Proof};
 
 use crate::batch_joinsplit_air::{padded_tiles, DOM_TXROOT};
 use crate::poseidon2_air::{native_permute, native_steps, BLOCK};
@@ -180,35 +170,8 @@ const fn chunk_src(ci: usize) -> ChunkSrc {
     }
 }
 
-// FRI config — identical to htlc_air's (copied to avoid exposing its private config types).
-type Perm = Poseidon2Goldilocks<8>;
-type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
-type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
-type Challenge = BinomialExtensionField<Val, 2>;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
-type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
-type Dft = Radix2DitParallel<Val>;
-type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
-type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
-
-fn make_config() -> MyConfig {
-    let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
-    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: challenge_mmcs,
-    };
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
-    MyConfig::new(pcs, Challenger::new(perm))
-}
+// FRI / ZK config — the production family from crate::config (single audited source).
+use crate::config::{make_config, MyConfig};
 
 fn batch_periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic();
@@ -462,21 +425,7 @@ pub fn prove_batch_to_bytes(ws: &[Witness]) -> Vec<u8> {
 /// Proven (UDR) security bits at an HTLC batch of `n` transactions (same height as join-split, so the
 /// floor matches — `MAX_BATCH_TILES = 64` holds; the extra HTLC columns/degree don't lower it).
 pub fn proven_security_bits(n: usize) -> usize {
-    let perm = default_goldilocks_poseidon2_8();
-    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, ChaCha20Rng::seed_from_u64(1));
-    let fri = FriParameters {
-        log_blowup: 4,
-        log_final_poly_len: 0,
-        max_log_arity: 4,
-        num_queries: 96,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 16,
-        mmcs: ChallengeMmcs::new(vm),
-    };
-    let layout = AirLayout::from_air::<Goldilocks>(&HtlcBatchAir);
-    let params = StarkSecurityParams::from_air::<Val, Challenge, HtlcBatchAir, ChallengeMmcs>(&fri, &HtlcBatchAir, layout, 127, 128, 2);
-    let height = padded_tiles(n) * TILE_HEIGHT;
-    ProvenSecurity::compute(&params, 1usize << (height.trailing_zeros() as usize + 1)).security_bits()
+    crate::config::proven_security_bits(&HtlcBatchAir, padded_tiles(n) * TILE_HEIGHT)
 }
 
 /// Verify an HTLC batch proof against the block tx-root.
