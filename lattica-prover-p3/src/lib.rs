@@ -14,6 +14,8 @@ pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-spl
 pub mod batch_htlc_air; // batch aggregation for the v3 shielded-HTLC spend (mirrors batch_joinsplit_air)
 pub mod poseidon2_air;
 pub mod recursion; // Phase B: recursive STARK verifier (B1 spike = in-circuit FRI Merkle-opening verifier)
+#[cfg(feature = "gpu")]
+pub mod gpu; // opt-in OpenCL LDE acceleration (additive, prove-only; --features gpu)
 #[cfg(test)]
 mod constraint_fingerprint; // refactor/audit oracle: pinned constraint-set fingerprints for every production AIR
 

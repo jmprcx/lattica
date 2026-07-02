@@ -136,6 +136,43 @@ where
     verify(&make_config(), air, &proof, pis).is_ok()
 }
 
+/// GPU-accelerated proving config (opt-in via `--features gpu`). IDENTICAL to the production config
+/// except the LDE runs on the GPU (`crate::gpu::GpuDft` in the PCS `Dft` slot). **Prove-only +
+/// wire-compatible**: the `Dft` appears neither in `verify` nor in the serialized `Proof`, so a
+/// GPU-produced proof deserializes and verifies under the standard `MyConfig` / `verify_bytes`
+/// unchanged. Same hiding PCS, same FRI params, same salts (still a fresh CSPRNG per proof).
+#[cfg(feature = "gpu")]
+pub mod gpu {
+    use super::*;
+    use crate::gpu::GpuDft;
+
+    pub type MyPcsGpu = HidingFriPcs<Val, GpuDft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
+    pub type MyConfigGpu = StarkConfig<MyPcsGpu, Challenge, Challenger>;
+
+    /// The production config with GPU LDE. See `super::make_config` — only the `Dft` differs.
+    pub fn make_config() -> MyConfigGpu {
+        let perm = default_goldilocks_poseidon2_8();
+        let val_mmcs =
+            ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+        let fri = production_fri(challenge_mmcs);
+        let pcs = MyPcsGpu::new(GpuDft, val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::from_rng(&mut rand::rng()));
+        MyConfigGpu::new(pcs, Challenger::new(perm))
+    }
+
+    /// Prove `air` over `trace` with `pis`, GPU-accelerated LDE. Returns wire-compatible postcard bytes
+    /// — verify with the standard `<circuit>::verify_bytes` / the C-ABI verifier, unchanged.
+    pub fn proof_to_bytes<A>(air: &A, trace: RowMajorMatrix<Val>, pis: &[Val]) -> Vec<u8>
+    where
+        A: Air<SymbolicAirBuilder<Val>>
+            + for<'a> Air<ProverConstraintFolder<'a, MyConfigGpu>>
+            + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+    {
+        let proof = prove(&make_config(), air, trace, pis);
+        postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+    }
+}
+
 /// Dev/demo config family — deterministic salts, reduced parameters. NOT for production proofs.
 pub mod demo {
     use super::{Challenge, Dft, MyCompress, MyHash, Val};
