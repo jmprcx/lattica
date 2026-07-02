@@ -395,11 +395,24 @@ impl BaseAir<Goldilocks> for JoinSplitAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
     fn eval(&self, builder: &mut AB) {
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        eval_spend(builder, &pis, AB::Expr::ZERO);
+    }
+}
+
+/// The join-split spend constraints, parameterized over the **statement source** and a `tile_last`
+/// selector, so `batch_joinsplit_air` reuses this exact (audited) constraint body instead of carrying a
+/// tile-edited fork. `statement[PI_*]` is the public inputs for the single circuit, or the per-tile
+/// staging columns for the batch (which makes the `cur == statement[..]` bindings double as the staging
+/// bindings). `tile_last` is 0 for the single circuit, or the tile-boundary one-hot for the batch (it
+/// frees the per-tile-persistent columns + ASSET across tiles). Single-circuit behaviour is unchanged
+/// (statement = pis, tile_last = 0) — proven by this file's full suite, incl. the corrupted-trace
+/// `--ignored` tests. (This mirrors `htlc_air::eval_spend`, the pattern's origin.)
+pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(builder: &mut AB, statement: &[AB::Expr], tile_last: AB::Expr) {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
-        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
         let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
@@ -430,13 +443,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         // RHO1 MUST be here: it is read at both commit_a (lane 7) and the nullifier (lane 4); without
         // persistence a prover could use one rho1 in the commitment and another in the nullifier,
         // minting a fresh nullifier for a real note ⇒ double-spend.
-        let not_last = one.clone() - p[P_REGION_LAST].clone();
+        // (batch) also free at the TILE boundary so tile k's keys/rho don't bleed into k+1.
+        let not_last = one.clone() - p[P_REGION_LAST].clone() - tile_last.clone();
         for &c in &[NK, NK1, RHO, RHO1, VAL] {
             builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
         }
-        // ASSET is GLOBAL-persistent: constant across the whole trace (one hidden asset per tx), so
-        // every note's committed asset (bound at commit_b below) equals this single value.
-        builder.when_transition().assert_zero(nxt[ASSET].clone() - cur[ASSET].clone());
+        // ASSET is per-tx-persistent: constant within a tx (one hidden asset), free at the tile boundary
+        // (batch) so distinct txs may carry distinct assets. every note's committed asset (bound at
+        // commit_b below) equals this tx's single value.
+        builder.when_transition().assert_zero((one.clone() - tile_last.clone()) * (nxt[ASSET].clone() - cur[ASSET].clone()));
         // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
         let bit = nxt[BIT].clone();
         builder.when_transition().assert_zero(
@@ -510,7 +525,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         // ---- root: every input folds to the shared public anchor ----
         let pr = p[P_ROOT].clone();
         for k in 0..DIGEST {
-            builder.assert_zero(pr.clone() * (cur[k].clone() - pis[PI_ANCHOR + k].clone()));
+            builder.assert_zero(pr.clone() * (cur[k].clone() - statement[PI_ANCHOR + k].clone()));
         }
 
         // ---- nullifier input: [DOM_NF, nk0, nk1, rho0, rho1, pos_acc, 0, 0] (A1: pos = pos_acc) ----
@@ -528,7 +543,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         for i in 0..N_IN {
             let sel = p[P_NULLOUT + i].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - pis[PI_NF + i * DIGEST + k].clone()));
+                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_NF + i * DIGEST + k].clone()));
             }
         }
 
@@ -541,18 +556,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
         for j in 0..M_OUT {
             let sel = p[P_OUTOUT + j].clone();
             for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - pis[PI_OUTCM + j * DIGEST + k].clone()));
+                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_OUTCM + j * DIGEST + k].clone()));
             }
         }
 
         // ---- fee region: VAL = public fee (range-checked like any value; A3) ----
-        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - pis[PI_FEE].clone()));
+        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - statement[PI_FEE].clone()));
 
         // ---- mint region: VAL = public mint (issuance; range-checked; added to the balance) ----
-        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - pis[PI_MINT].clone()));
+        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - statement[PI_MINT].clone()));
 
-        // tx_binding (pis[PI_TXBIND..]) is bound to the proof by Fiat–Shamir (observed public input).
-    }
+        // tx_binding (statement[PI_TXBIND..]) is bound to the proof by Fiat–Shamir for the single
+        // circuit (observed public input), and staged + folded into the tx-root by the batch.
 }
 
 // --- trace + ZK config: the production family lives in crate::config (single audited source) ----
