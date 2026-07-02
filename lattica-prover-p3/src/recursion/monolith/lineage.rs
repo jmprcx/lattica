@@ -1,0 +1,2764 @@
+//! The superseded standalone AIRs (Phases 1–4.B) + their build fns — the fused `MonolithAir`'s
+//! executable provenance, exercised only by the regression tests (see the lineage table in `mod.rs`).
+
+use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
+use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
+use p3_goldilocks::Goldilocks;
+use p3_matrix::dense::RowMajorMatrix;
+
+use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W};
+use crate::recursion::native_fri::{Challenge, Val};
+
+use super::*;
+
+const P_BLOCK_LAST: usize = 11; // periodic: one-hot at row BLOCK-1 of every block
+const P_ALPHA: usize = 12; // periodic: full-height one-hot at the α-squeeze row
+const P_ZETA: usize = 13; // periodic: full-height one-hot at the ζ-squeeze row
+const N_PERIODIC: usize = 14;
+
+/// The transcript preamble region: a Poseidon2 duplex sponge absorbing `i_blocks` instance blocks (→ α at
+/// that block's output) then `c_blocks` commitment blocks (→ ζ at the last row). Same sponge mechanics as
+/// the validated `TranscriptAir` (rate overwrite, capacity carry with the +RATE prefix-free count,
+/// challenge = (rate[3], rate[2])), generalized to arbitrary block counts. Composed into MonolithAir later.
+// standalone-validated in Phase 1; its eval is reused by MonolithAir in Phase 4
+pub(crate) struct PreambleAir {
+    pub i_blocks: usize,
+    pub c_blocks: usize,
+}
+
+impl PreambleAir {
+    fn n_blocks(&self) -> usize {
+        self.i_blocks + self.c_blocks
+    }
+    fn padded_blocks(&self) -> usize {
+        self.n_blocks().next_power_of_two() // p3 trace height must be a power of two
+    }
+    fn height(&self) -> usize {
+        self.padded_blocks() * BLOCK
+    }
+    fn alpha_row(&self) -> usize {
+        self.i_blocks * BLOCK - 1 // output row of the last instance block
+    }
+    fn zeta_row(&self) -> usize {
+        self.n_blocks() * BLOCK - 1 // output row of the last commitment block
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let mut cols = periodic_table(); // 11 round cols, period BLOCK
+        let mut block_last = vec![Val::ZERO; BLOCK];
+        block_last[BLOCK - 1] = Val::ONE;
+        cols.push(block_last);
+        let mut alpha = vec![Val::ZERO; self.height()]; // full-height ⇒ fires once, at alpha_row
+        alpha[self.alpha_row()] = Val::ONE;
+        cols.push(alpha);
+        let mut zeta = vec![Val::ZERO; self.height()];
+        zeta[self.zeta_row()] = Val::ONE;
+        cols.push(zeta);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for PreambleAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        4 // α(2) ‖ ζ(2)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PreambleAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let rate = AB::Expr::from(Goldilocks::from_u64(RATE as u64));
+
+        // Poseidon2 round constraints per block (reused).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(c);
+        }
+
+        // block 0 starts from the zero capacity with the prefix-free count folded in.
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[CAP_LANE].clone() - rate.clone());
+            for i in (CAP_LANE + 1)..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // capacity carries across blocks (+RATE); rate lanes free (the next absorbed felts).
+        {
+            let bl = p[P_BLOCK_LAST].clone();
+            builder.when_transition().assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())));
+            for i in (CAP_LANE + 1)..W {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+        }
+        // α squeeze at the last instance block's output: α = (rate[3], rate[2]).
+        {
+            let a = p[P_ALPHA].clone();
+            builder.assert_zero(a.clone() * (cur[3].clone() - pis[0].clone()));
+            builder.assert_zero(a.clone() * (cur[2].clone() - pis[1].clone()));
+        }
+        // ζ squeeze at the last commitment block's output (a one-hot, not when_last_row, since the trace
+        // is padded to a power-of-two block count beyond the ζ row): ζ = (rate[3], rate[2]).
+        {
+            let z = p[P_ZETA].clone();
+            builder.assert_zero(z.clone() * (cur[3].clone() - pis[2].clone()));
+            builder.assert_zero(z * (cur[2].clone() - pis[3].clone()));
+        }
+    }
+}
+
+/// Fill the preamble trace by absorbing (instance ‖ commitment) felts blockwise (rate overwrite, capacity
+/// carry with the +RATE prefix-free count), matching the duplex challenger.
+pub(crate) fn preamble_build_trace(i_blocks: usize, c_blocks: usize, instance: &[Val], commitment: &[Val]) -> RowMajorMatrix<Val> {
+    assert_eq!(instance.len(), i_blocks * RATE, "instance must be i_blocks·RATE felts");
+    assert_eq!(commitment.len(), c_blocks * RATE, "commitment must be c_blocks·RATE felts");
+    let n_blocks = i_blocks + c_blocks;
+    let padded = n_blocks.next_power_of_two();
+    let mut felts = instance.to_vec();
+    felts.extend_from_slice(commitment);
+    let mut t = vec![Val::ZERO; padded * BLOCK * W];
+    let mut cap = [Val::ZERO; W - RATE];
+    for blk in 0..padded {
+        let mut input = [Val::ZERO; W];
+        if blk < n_blocks {
+            input[..RATE].copy_from_slice(&felts[blk * RATE..blk * RATE + RATE]);
+        } // padding blocks (blk ≥ n_blocks) absorb zeros — a valid sponge continuation past the ζ row
+        input[RATE..].copy_from_slice(&cap);
+        input[CAP_LANE] += Val::from_u64(RATE as u64);
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        cap.copy_from_slice(&native_permute(input)[RATE..]);
+    }
+    RowMajorMatrix::new(t, W)
+}
+
+// =================================================================================================
+// Phase 2 — the full transcript: a GENERAL schedule-driven duplex sponge that derives α_stark, ζ,
+// α_fri, and every β_r (and, with the squeeze tail, the query indices). Each permutation block has a
+// per-block prefix-free count (`count_b` = num_absorbed: 4 for full absorbs, the remainder before a
+// sample, 0 for squeezes) folded into the capacity lane, and absorb blocks overwrite the rate while
+// squeeze blocks carry it. Driven by the recorded schedule; bindings read (rate[3], rate[2]) at each
+// challenge's block-output row (the duplex challenger pops from the back). Composed into MonolithAir later.
+// =================================================================================================
+
+/// The full-transcript duplex AIR. `counts[b]` = the prefix-free count for block b; `binds[j]` = the block
+/// whose output row carries the j-th ext challenge (→ public[2j], public[2j+1] = rate[3], rate[2]).
+/// `index_binds[k] = (block, lane)` locates the k-th query INDEX felt (a single rate lane popped from a
+/// squeeze block) → public[2·binds.len() + k]. The low-`bits` masking of each index felt is the
+/// separately-validated `SampleBitsAir`.
+// standalone-validated in Phase 2; composed into MonolithAir in Phase 4
+pub(crate) struct FullTranscriptAir {
+    pub counts: Vec<u8>,
+    pub binds: Vec<usize>,
+    pub index_binds: Vec<(usize, usize)>,
+}
+
+impl FullTranscriptAir {
+    fn n_blocks(&self) -> usize {
+        self.counts.len()
+    }
+    fn height(&self) -> usize {
+        self.n_blocks().next_power_of_two() * BLOCK
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let nb = self.counts.len();
+        let count_of = |b: usize| -> Val { if b < nb { Val::from_u64(self.counts[b] as u64) } else { Val::ZERO } };
+        let mut cols = periodic_table(); // 11 round cols
+        let mut block_last = vec![Val::ZERO; BLOCK];
+        block_last[BLOCK - 1] = Val::ONE;
+        cols.push(block_last);
+        let mut count = vec![Val::ZERO; h];
+        let mut count_next = vec![Val::ZERO; h];
+        let mut is_sq_next = vec![Val::ZERO; h];
+        for r in 0..h {
+            let b = r / BLOCK;
+            count[r] = count_of(b);
+            count_next[r] = count_of(b + 1);
+            is_sq_next[r] = if (b + 1 >= nb) || self.counts[b + 1] == 0 { Val::ONE } else { Val::ZERO };
+        }
+        cols.push(count);
+        cols.push(count_next);
+        cols.push(is_sq_next);
+        for &blk in &self.binds {
+            let mut col = vec![Val::ZERO; h];
+            col[blk * BLOCK + BLOCK - 1] = Val::ONE; // the block's output row
+            cols.push(col);
+        }
+        for &(blk, _lane) in &self.index_binds {
+            let mut col = vec![Val::ZERO; h];
+            col[blk * BLOCK + BLOCK - 1] = Val::ONE;
+            cols.push(col);
+        }
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for FullTranscriptAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        2 * self.binds.len() + self.index_binds.len()
+    }
+    fn num_periodic_columns(&self) -> usize {
+        FT_BIND_START + self.binds.len() + self.index_binds.len()
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullTranscriptAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+
+        // Poseidon2 round constraints (periodic_table zeroes the selectors at the block-boundary row).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(c);
+        }
+
+        // first block: capacity lane = count_0; other capacity lanes = 0.
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[CAP_LANE].clone() - p[FT_COUNT].clone());
+            for i in (CAP_LANE + 1)..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // block linkage at P_BLOCK_LAST: capacity carries (+count_next on the count lane); rate carries
+        // only on squeeze blocks (absorb blocks' rate is free = the next absorbed felts).
+        {
+            let bl = p[FT_P_BLOCK_LAST].clone();
+            builder.when_transition().assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()));
+            for i in (CAP_LANE + 1)..W {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+            for i in 0..RATE {
+                builder.when_transition().assert_zero(bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+        }
+        // ext challenge bindings: at each bind block's output row, (rate[3], rate[2]) = the public challenge.
+        for j in 0..self.binds.len() {
+            let b = p[FT_BIND_START + j].clone();
+            builder.assert_zero(b.clone() * (cur[3].clone() - pis[2 * j].clone()));
+            builder.assert_zero(b * (cur[2].clone() - pis[2 * j + 1].clone()));
+        }
+        // index-felt bindings: at each (block, lane), the popped rate lane = the public index felt.
+        let ext_pubs = 2 * self.binds.len();
+        let idx_start = FT_BIND_START + self.binds.len();
+        for (k, &(_blk, lane)) in self.index_binds.iter().enumerate() {
+            let b = p[idx_start + k].clone();
+            builder.assert_zero(b * (cur[lane].clone() - pis[ext_pubs + k].clone()));
+        }
+    }
+}
+
+// =================================================================================================
+// Phase 3 (part 1) — the DEEP query point: x = GENERATOR · g^reverse_bits(index, log_height), where
+// g = two_adic_generator(log_height). Computed in-circuit from the query index BITS as a product chain
+// over the bit-reversed powers (x = GENERATOR · Π_i (b_i ? g^(2^(N-1-i)) : 1)), since the bit at
+// position i of the index becomes bit (N-1-i) of the reversed exponent. Base-field arithmetic.
+// Validated vs native_fri's `x` (open_input). The index bits come from the validated SampleBitsAir.
+// =================================================================================================
+
+pub(crate) const DP_LOG_HEIGHT: usize = 10; // milestone log_global_max_height (= degree_bits 6 + log_blowup 4)
+const DP_BITS: usize = 0; // index bits b_0..b_{N-1}
+const DP_ACC: usize = DP_LOG_HEIGHT; // product-chain accumulators acc_1..acc_N
+const DP_WIDTH: usize = 2 * DP_LOG_HEIGHT;
+
+// standalone-validated in Phase 3; composed into MonolithAir's query region in Phase 4
+pub(crate) struct DeepPointAir;
+
+impl BaseAir<Goldilocks> for DeepPointAir {
+    fn width(&self) -> usize {
+        DP_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        1 // the DEEP point x
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for DeepPointAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let mut fr = builder.when_first_row();
+
+        // index bits are boolean
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[DP_BITS + i].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        // product chain: acc_{i+1} = acc_i · (1 + b_i·(c_i − 1)),  c_i = g^(2^(N-1-i)),  acc_0 = 1.
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[DP_BITS + i].clone() * (ci - one.clone());
+            fr.assert_zero(cur[DP_ACC + i].clone() - prev * factor);
+            prev = cur[DP_ACC + i].clone();
+        }
+        // x = GENERATOR · acc_N
+        let gen = AB::Expr::from(<Goldilocks as Field>::GENERATOR);
+        fr.assert_zero(gen * cur[DP_ACC + DP_LOG_HEIGHT - 1].clone() - pis[0].clone());
+    }
+}
+
+pub(crate) fn dp_build_trace(index: usize) -> RowMajorMatrix<Val> {
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let mut r = [Val::ZERO; DP_WIDTH];
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (index >> i) & 1;
+        r[DP_BITS + i] = Val::from_u64(bit as u64);
+        let ci = g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i);
+        acc *= if bit == 1 { ci } else { Val::ONE };
+        r[DP_ACC + i] = acc;
+    }
+    let mut vals = Vec::with_capacity(8 * DP_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, DP_WIDTH)
+}
+
+// =================================================================================================
+// Phase 3 (part 2) — the reduced opening (DEEP combination) for `open_input`'s real shape: a generic
+// N-term `ro = Σ_k α^k·(p_z_k − p_x_k)/(z_k − x)`, where p_z (claimed eval) is F_p², p_x (opened row
+// value) is base, x (the DEEP point) is base and shared across a height, and z_k are the opening points.
+// The milestone has 3 terms: trace at ζ, trace at ζ·g (the next row), quotient at ζ. Witnessed α-powers
+// and per-term inverse denominators (in-circuit inverse). Validated vs native_fri::query_terms's `ro`.
+// =================================================================================================
+
+// standalone-validated in Phase 3; composed into MonolithAir's query region in Phase 4
+pub(crate) struct MroAir {
+    pub n_terms: usize,
+}
+
+impl MroAir {
+    fn x(&self) -> usize {
+        0
+    }
+    fn alpha(&self) -> usize {
+        1
+    }
+    fn z(&self, k: usize) -> usize {
+        3 + 2 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        3 + 2 * self.n_terms + 2 * k
+    }
+    fn px(&self, k: usize) -> usize {
+        3 + 4 * self.n_terms + k
+    }
+    fn inv(&self, k: usize) -> usize {
+        3 + 5 * self.n_terms + 2 * k
+    }
+    fn apow(&self, k: usize) -> usize {
+        3 + 7 * self.n_terms + 2 * k
+    }
+    fn w(&self) -> usize {
+        3 + 9 * self.n_terms
+    }
+}
+
+impl BaseAir<Goldilocks> for MroAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the reduced opening
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MroAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let zero = AB::Expr::ZERO;
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let g = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let mut fr = builder.when_first_row();
+
+        let alpha = g(self.alpha());
+        let xb = cur[self.x()].clone(); // DEEP point (base)
+
+        // α-power chain: apow_0 = 1, apow_k = apow_{k-1} · α.
+        fr.assert_zero(cur[self.apow(0)].clone() - one.clone());
+        fr.assert_zero(cur[self.apow(0) + 1].clone());
+        for k in 1..self.n_terms {
+            let prod = emul(g(self.apow(k - 1)), alpha.clone());
+            fr.assert_zero(cur[self.apow(k)].clone() - prod.0);
+            fr.assert_zero(cur[self.apow(k) + 1].clone() - prod.1);
+        }
+
+        // ro = Σ_k apow_k · (p_z_k − p_x_k) · inv_k,  inv_k · (z_k − x) == 1.
+        let mut ro = (zero.clone(), zero.clone());
+        for k in 0..self.n_terms {
+            let z = g(self.z(k));
+            let inv = g(self.inv(k));
+            let z_m_x = (z.0 - xb.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            fr.assert_zero(chk.0 - one.clone());
+            fr.assert_zero(chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(g(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        fr.assert_zero(ro.0 - pis[0].clone());
+        fr.assert_zero(ro.1 - pis[1].clone());
+    }
+}
+
+pub(crate) fn mro_build_trace(terms: &[(Challenge, Challenge, Val)], x: Val, alpha: Challenge, ro: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = MroAir { n_terms: terms.len() };
+    let mut r = vec![Val::ZERO; air.w()];
+    r[air.x()] = x;
+    let ac = c(alpha);
+    r[air.alpha()] = ac[0];
+    r[air.alpha() + 1] = ac[1];
+    let mut apow = Challenge::ONE;
+    for (k, &(z, pz, px)) in terms.iter().enumerate() {
+        let (zc, pzc) = (c(z), c(pz));
+        r[air.z(k)] = zc[0];
+        r[air.z(k) + 1] = zc[1];
+        r[air.pz(k)] = pzc[0];
+        r[air.pz(k) + 1] = pzc[1];
+        r[air.px(k)] = px;
+        let inv = c((z - x).inverse());
+        r[air.inv(k)] = inv[0];
+        r[air.inv(k) + 1] = inv[1];
+        let ap = c(apow);
+        r[air.apow(k)] = ap[0];
+        r[air.apow(k) + 1] = ap[1];
+        apow *= alpha;
+    }
+    let _ = ro;
+    let mut vals = Vec::with_capacity(8 * air.w());
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, air.w())
+}
+
+// =================================================================================================
+// Phase 3 (parts 3+5) — the commit-phase fold chain + final check. Per round the running eval E folds
+// with that round's sibling at β_r and the fold point s_r, BIT-AWARE (the index bit decides the arity-2
+// group order): fold = (E+sib)/2 + (1−2·bit)·(E−sib)·β·inv(2s). The chain runs E0 = ro down to
+// folded_eval; the per-query accept (log_final_poly_len = 0) is folded_eval == final_poly[0]. The fold
+// points s_r are provided per round (their in-circuit derivation from the index is Phase-4 wiring).
+// Validated vs native_fri::query_fold_data.
+// =================================================================================================
+
+const QF_E: usize = 0; // running eval (F_p²)
+const QF_S: usize = 2; // sibling (F_p²)
+const QF_B: usize = 4; // β_r (F_p²)
+const QF_BIT: usize = 6; // arity-2 group slot of the running eval (boolean)
+const QF_SPT: usize = 7; // fold point s_r (base)
+const QF_I2S: usize = 8; // inv(2·s_r) (base)
+const QF_WIDTH: usize = 9;
+
+// standalone-validated in Phase 3; composed into MonolithAir's query region in Phase 4
+pub(crate) struct QueryFoldAir;
+
+impl BaseAir<Goldilocks> for QueryFoldAir {
+    fn width(&self) -> usize {
+        QF_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        4 // ro (initial E) ‖ folded_eval (final E)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryFoldAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+
+        // first row: running eval == public ro
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[QF_E].clone() - pis[0].clone());
+            fr.assert_zero(cur[QF_E + 1].clone() - pis[1].clone());
+        }
+
+        let bit = cur[QF_BIT].clone();
+        let i2s = cur[QF_I2S].clone();
+        let spt = cur[QF_SPT].clone();
+        builder.when_transition().assert_zero(bit.clone() * (one.clone() - bit.clone())); // boolean
+        builder.when_transition().assert_zero(i2s.clone() * (two.clone() * spt) - one.clone()); // inv(2s)
+        let sign = one - two * bit; // 1 − 2·bit ∈ {+1, −1}
+        let e = (cur[QF_E].clone(), cur[QF_E + 1].clone());
+        let s = (cur[QF_S].clone(), cur[QF_S + 1].clone());
+        let b = (cur[QF_B].clone(), cur[QF_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, b);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(nxt[QF_E].clone() - fold0);
+        builder.when_transition().assert_zero(nxt[QF_E + 1].clone() - fold1);
+
+        // last row: running eval == public folded_eval
+        {
+            let mut lr = builder.when_last_row();
+            lr.assert_zero(cur[QF_E].clone() - pis[2].clone());
+            lr.assert_zero(cur[QF_E + 1].clone() - pis[3].clone());
+        }
+    }
+}
+
+pub(crate) fn qf_build_trace(ro: Challenge, rounds: &[(Challenge, Challenge, bool, Val)], _folded_eval: Challenge) -> RowMajorMatrix<Val> {
+    use crate::recursion::fri_fold::native_fold;
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let n = rounds.len();
+    let height = (n + 1).next_power_of_two().max(2);
+    let mut t = vec![Val::ZERO; height * QF_WIDTH];
+    let mut e = ro;
+    for r in 0..height {
+        let base = r * QF_WIDTH;
+        let ec = c(e);
+        t[base + QF_E] = ec[0];
+        t[base + QF_E + 1] = ec[1];
+        if r < n {
+            let (sib, beta, bit, s) = rounds[r];
+            let (sc, bc) = (c(sib), c(beta));
+            t[base + QF_S] = sc[0];
+            t[base + QF_S + 1] = sc[1];
+            t[base + QF_B] = bc[0];
+            t[base + QF_B + 1] = bc[1];
+            t[base + QF_BIT] = if bit { Val::ONE } else { Val::ZERO };
+            t[base + QF_SPT] = s;
+            t[base + QF_I2S] = (Val::TWO * s).inverse();
+            let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+            e = native_fold(e0, e1, beta, s);
+        } else {
+            // padding: sibling = running eval, β = 0, bit = 0 ⇒ fold = E (identity); s = 1.
+            t[base + QF_S] = ec[0];
+            t[base + QF_S + 1] = ec[1];
+            t[base + QF_SPT] = Val::ONE;
+            t[base + QF_I2S] = Val::TWO.inverse();
+        }
+    }
+    RowMajorMatrix::new(t, QF_WIDTH)
+}
+
+// =================================================================================================
+// Phase 4 (part 1) — the per-query INPUT TILE: compose the DEEP point (3a) + reduced opening (3b) into
+// ONE AIR so x is no longer a separate input — the query index bits drive the DEEP product chain → x,
+// and that same x feeds the reduced-opening denominators → ro. This is the first cross-gadget composition
+// of the monolith's query region (column flow index → x → ro). Validated end-to-end vs native_fri's ro.
+// (The fold chain + Merkle bindings + ×K tiling + the transcript wire — accept-iff-p3::verify — follow.)
+// =================================================================================================
+
+// layout: DEEP bits b_0..b_{N-1} ‖ acc_1..acc_N ‖ α ‖ per-term {z, p_z, p_x, inv, apow}
+const QI_BITS: usize = 0;
+const QI_ACC: usize = DP_LOG_HEIGHT;
+const QI_ALPHA: usize = 2 * DP_LOG_HEIGHT;
+const QI_TERMS: usize = 2 * DP_LOG_HEIGHT + 2;
+
+pub(crate) struct QueryInputTileAir {
+    pub n_terms: usize,
+}
+
+impl QueryInputTileAir {
+    fn z(&self, k: usize) -> usize {
+        QI_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    fn w(&self) -> usize {
+        QI_TERMS + 9 * self.n_terms
+    }
+}
+
+impl BaseAir<Goldilocks> for QueryInputTileAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // ro
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryInputTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let mut fr = builder.when_first_row();
+
+        // --- DEEP point: index bits → x = GENERATOR · Π_i (b_i ? g^(2^(N-1-i)) : 1) ---
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[QI_BITS + i].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[QI_BITS + i].clone() * (ci - one.clone());
+            fr.assert_zero(cur[QI_ACC + i].clone() - prev * factor);
+            prev = cur[QI_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QI_ACC + DP_LOG_HEIGHT - 1].clone();
+
+        // --- reduced opening using THAT x: ro = Σ_k apow_k·(p_z_k − p_x_k)·inv_k, inv_k·(z_k − x) == 1 ---
+        let alpha = gg(QI_ALPHA);
+        fr.assert_zero(cur[self.apow(0)].clone() - one.clone());
+        fr.assert_zero(cur[self.apow(0) + 1].clone());
+        for k in 1..self.n_terms {
+            let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+            fr.assert_zero(cur[self.apow(k)].clone() - prod.0);
+            fr.assert_zero(cur[self.apow(k) + 1].clone() - prod.1);
+        }
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for k in 0..self.n_terms {
+            let z = gg(self.z(k));
+            let inv = gg(self.inv(k));
+            let z_m_x = (z.0 - x.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            fr.assert_zero(chk.0 - one.clone());
+            fr.assert_zero(chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(gg(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        fr.assert_zero(ro.0 - pis[0].clone());
+        fr.assert_zero(ro.1 - pis[1].clone());
+    }
+}
+
+pub(crate) fn qi_build_trace(index: usize, terms: &[(Challenge, Challenge, Val)], alpha: Challenge, ro: Challenge) -> RowMajorMatrix<Val> {
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = QueryInputTileAir { n_terms: terms.len() };
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let mut r = vec![Val::ZERO; air.w()];
+    // DEEP: bits + acc chain → x
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (index >> i) & 1;
+        r[QI_BITS + i] = Val::from_u64(bit as u64);
+        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        r[QI_ACC + i] = acc;
+    }
+    let x = <Goldilocks as Field>::GENERATOR * acc;
+    // reduced opening terms
+    let ac = c(alpha);
+    r[QI_ALPHA] = ac[0];
+    r[QI_ALPHA + 1] = ac[1];
+    let mut apow = Challenge::ONE;
+    for (k, &(z, pz, px)) in terms.iter().enumerate() {
+        let (zc, pzc) = (c(z), c(pz));
+        r[air.z(k)] = zc[0];
+        r[air.z(k) + 1] = zc[1];
+        r[air.pz(k)] = pzc[0];
+        r[air.pz(k) + 1] = pzc[1];
+        r[air.px(k)] = px;
+        let inv = c((z - Challenge::from(x)).inverse());
+        r[air.inv(k)] = inv[0];
+        r[air.inv(k) + 1] = inv[1];
+        let ap = c(apow);
+        r[air.apow(k)] = ap[0];
+        r[air.apow(k) + 1] = ap[1];
+        apow *= alpha;
+    }
+    let _ = ro;
+    let mut vals = Vec::with_capacity(8 * air.w());
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, air.w())
+}
+
+// =================================================================================================
+// Phase 4 (part 2) — the FULL per-query arithmetic tile: a multi-row AIR composing DEEP point + reduced
+// opening (row 0) → ro = E_0, then the bit-aware commit-phase fold chain (all rows) → folded_eval, then
+// the per-query accept folded_eval == final_poly[0] (last row). One AIR does the entire per-query
+// arithmetic: index → x → ro → fold → accept. Validated vs verify_query's per-query accept. (The Merkle
+// bindings authenticating the opened rows/siblings, and the ×K tiling + transcript wire, follow.)
+// =================================================================================================
+
+const QT_ACC: usize = QT_DBITS + DP_LOG_HEIGHT;
+const QT_ALPHA: usize = QT_ACC + DP_LOG_HEIGHT;
+const QT_TERMS: usize = QT_ALPHA + 2;
+
+pub(crate) struct QueryTileAir {
+    pub n_terms: usize,
+}
+
+impl QueryTileAir {
+    fn z(&self, k: usize) -> usize {
+        QT_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    fn w(&self) -> usize {
+        QT_TERMS + 9 * self.n_terms
+    }
+}
+
+impl BaseAir<Goldilocks> for QueryTileAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // final_poly[0] (the per-query accept target)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+
+        // --- row 0: DEEP point + reduced opening → ro, and E_0 == ro ---
+        {
+            let mut fr = builder.when_first_row();
+            for i in 0..DP_LOG_HEIGHT {
+                let b = cur[QT_DBITS + i].clone();
+                fr.assert_zero(b.clone() * (one.clone() - b));
+            }
+            let mut prev = one.clone();
+            for i in 0..DP_LOG_HEIGHT {
+                let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+                let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
+                fr.assert_zero(cur[QT_ACC + i].clone() - prev * factor);
+                prev = cur[QT_ACC + i].clone();
+            }
+            let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+            let alpha = gg(QT_ALPHA);
+            fr.assert_zero(cur[self.apow(0)].clone() - one.clone());
+            fr.assert_zero(cur[self.apow(0) + 1].clone());
+            for k in 1..self.n_terms {
+                let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+                fr.assert_zero(cur[self.apow(k)].clone() - prod.0);
+                fr.assert_zero(cur[self.apow(k) + 1].clone() - prod.1);
+            }
+            let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+            for k in 0..self.n_terms {
+                let z = gg(self.z(k));
+                let inv = gg(self.inv(k));
+                let z_m_x = (z.0 - x.clone(), z.1);
+                let chk = emul(inv.clone(), z_m_x);
+                fr.assert_zero(chk.0 - one.clone());
+                fr.assert_zero(chk.1);
+                let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+                let t = emul(emul(gg(self.apow(k)), d), inv);
+                ro = (ro.0 + t.0, ro.1 + t.1);
+            }
+            fr.assert_zero(cur[QT_E].clone() - ro.0); // E_0 == ro
+            fr.assert_zero(cur[QT_E + 1].clone() - ro.1);
+        }
+
+        // --- all rows: bit-aware fold chain E → folded_eval ---
+        let bit = cur[QT_BIT].clone();
+        let i2s = cur[QT_I2S].clone();
+        let spt = cur[QT_SPT].clone();
+        builder.when_transition().assert_zero(bit.clone() * (one.clone() - bit.clone()));
+        builder.when_transition().assert_zero(i2s.clone() * (two.clone() * spt) - one.clone());
+        let sign = one - two * bit;
+        let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
+        let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
+        let b = (cur[QT_B].clone(), cur[QT_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, b);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(nxt[QT_E].clone() - fold0);
+        builder.when_transition().assert_zero(nxt[QT_E + 1].clone() - fold1);
+
+        // --- last row: folded_eval == final_poly[0] (the per-query accept) ---
+        {
+            let mut lr = builder.when_last_row();
+            lr.assert_zero(cur[QT_E].clone() - pis[0].clone());
+            lr.assert_zero(cur[QT_E + 1].clone() - pis[1].clone());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qt_build_trace(
+    index: usize,
+    terms: &[(Challenge, Challenge, Val)],
+    alpha: Challenge,
+    ro: Challenge,
+    rounds: &[(Challenge, Challenge, bool, Val)],
+) -> RowMajorMatrix<Val> {
+    use crate::recursion::fri_fold::native_fold;
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = QueryTileAir { n_terms: terms.len() };
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let n = rounds.len();
+    let height = (n + 1).next_power_of_two().max(2);
+    let mut t = vec![Val::ZERO; height * air.w()];
+
+    // fold-chain columns (all rows) + the running eval.
+    let mut e = ro;
+    for r in 0..height {
+        let base = r * air.w();
+        let ec = c(e);
+        t[base + QT_E] = ec[0];
+        t[base + QT_E + 1] = ec[1];
+        if r < n {
+            let (sib, beta, bit, s) = rounds[r];
+            let (sc, bc) = (c(sib), c(beta));
+            t[base + QT_S] = sc[0];
+            t[base + QT_S + 1] = sc[1];
+            t[base + QT_B] = bc[0];
+            t[base + QT_B + 1] = bc[1];
+            t[base + QT_BIT] = if bit { Val::ONE } else { Val::ZERO };
+            t[base + QT_SPT] = s;
+            t[base + QT_I2S] = (Val::TWO * s).inverse();
+            let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+            e = native_fold(e0, e1, beta, s);
+        } else {
+            t[base + QT_S] = ec[0];
+            t[base + QT_S + 1] = ec[1];
+            t[base + QT_SPT] = Val::ONE;
+            t[base + QT_I2S] = Val::TWO.inverse();
+        }
+    }
+
+    // row 0: DEEP (bits + acc) + reduced (alpha + terms).
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (index >> i) & 1;
+        t[QT_DBITS + i] = Val::from_u64(bit as u64);
+        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        t[QT_ACC + i] = acc;
+    }
+    let x = <Goldilocks as Field>::GENERATOR * acc;
+    let ac = c(alpha);
+    t[QT_ALPHA] = ac[0];
+    t[QT_ALPHA + 1] = ac[1];
+    let mut apow = Challenge::ONE;
+    for (k, &(z, pz, px)) in terms.iter().enumerate() {
+        let (zc, pzc) = (c(z), c(pz));
+        t[air.z(k)] = zc[0];
+        t[air.z(k) + 1] = zc[1];
+        t[air.pz(k)] = pzc[0];
+        t[air.pz(k) + 1] = pzc[1];
+        t[air.px(k)] = px;
+        let inv = c((z - Challenge::from(x)).inverse());
+        t[air.inv(k)] = inv[0];
+        t[air.inv(k) + 1] = inv[1];
+        let ap = c(apow);
+        t[air.apow(k)] = ap[0];
+        t[air.apow(k) + 1] = ap[1];
+        apow *= alpha;
+    }
+    RowMajorMatrix::new(t, air.w())
+}
+
+// =================================================================================================
+// Phase 4 (part 4) — the TILED query region: the per-query tile composed ×K into ONE AIR (the batch_*_air
+// tiling pattern). Each tile occupies TILE_H rows; tile-periodic one-hots gate the per-tile work
+// (P_TF at each tile's first row drives DEEP+reduced → E_0=ro; the fold runs on within-tile transitions
+// gated by 1−P_TL; P_TL at each tile's last row checks E == final_poly[0]). One proof verifies every
+// query. Validated: accepts the real proof (all queries verify) and rejects a tampered query.
+// (The transcript wire feeding the shared challenges + the inline Merkle bindings are the final step.)
+// =================================================================================================
+
+const TILE_H: usize = 8; // fold chain height for the milestone's 6 rounds (rounds+1 padded to pow2)
+const TQ_P_TF: usize = 0; // one-hot at each tile's first row
+const TQ_P_TL: usize = 1; // one-hot at each tile's last row
+
+pub(crate) struct TiledQueryAir {
+    pub n_queries: usize,
+    pub n_terms: usize,
+}
+
+impl TiledQueryAir {
+    // per-tile column layout = the QueryTileAir layout (QT_* offsets reused).
+    fn z(&self, k: usize) -> usize {
+        QT_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    fn w(&self) -> usize {
+        QT_TERMS + 9 * self.n_terms
+    }
+    pub(crate) fn height(&self) -> usize {
+        (self.n_queries * TILE_H).next_power_of_two()
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut tf = vec![Val::ZERO; h];
+        let mut tl = vec![Val::ZERO; h];
+        for q in 0..self.n_queries {
+            tf[q * TILE_H] = Val::ONE;
+            tl[q * TILE_H + TILE_H - 1] = Val::ONE;
+        }
+        vec![tf, tl]
+    }
+}
+
+impl BaseAir<Goldilocks> for TiledQueryAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 // final_poly[0], shared across all tiles
+    }
+    fn num_periodic_columns(&self) -> usize {
+        2
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let tf = p[TQ_P_TF].clone();
+        let tl = p[TQ_P_TL].clone();
+
+        // --- per-tile first row (gated by TF): DEEP point + reduced opening → ro, E_0 == ro ---
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[QT_DBITS + i].clone();
+            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
+        }
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
+            builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
+            prev = cur[QT_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+        let alpha = gg(QT_ALPHA);
+        builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
+        builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
+        for k in 1..self.n_terms {
+            let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+            builder.assert_zero(tf.clone() * (cur[self.apow(k)].clone() - prod.0));
+            builder.assert_zero(tf.clone() * (cur[self.apow(k) + 1].clone() - prod.1));
+        }
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for k in 0..self.n_terms {
+            let z = gg(self.z(k));
+            let inv = gg(self.inv(k));
+            let z_m_x = (z.0 - x.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
+            builder.assert_zero(tf.clone() * chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(gg(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        builder.assert_zero(tf.clone() * (cur[QT_E].clone() - ro.0));
+        builder.assert_zero(tf * (cur[QT_E + 1].clone() - ro.1));
+
+        // --- within-tile fold (transition gated by 1−TL): bit-aware fold E → folded_eval ---
+        let not_last = one.clone() - tl.clone();
+        let bit = cur[QT_BIT].clone();
+        let i2s = cur[QT_I2S].clone();
+        let spt = cur[QT_SPT].clone();
+        builder.when_transition().assert_zero(not_last.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder.when_transition().assert_zero(not_last.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        let sign = one - two * bit;
+        let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
+        let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
+        let b = (cur[QT_B].clone(), cur[QT_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, b);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(not_last.clone() * (nxt[QT_E].clone() - fold0));
+        builder.when_transition().assert_zero(not_last * (nxt[QT_E + 1].clone() - fold1));
+
+        // --- per-tile last row (gated by TL): folded_eval == final_poly[0] (the per-query accept) ---
+        builder.assert_zero(tl.clone() * (cur[QT_E].clone() - pis[0].clone()));
+        builder.assert_zero(tl * (cur[QT_E + 1].clone() - pis[1].clone()));
+    }
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn tq_build_trace(
+    n_terms: usize,
+    per_query: &[(usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>)],
+) -> RowMajorMatrix<Val> {
+    use crate::recursion::fri_fold::native_fold;
+    use p3_field::BasedVectorSpace;
+    let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = TiledQueryAir { n_queries: per_query.len(), n_terms };
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let h = air.height();
+    let width = air.w();
+    let mut t = vec![Val::ZERO; h * width];
+    for (q, (index, terms, alpha, ro, rounds)) in per_query.iter().enumerate() {
+        let tile = q * TILE_H;
+        // fold-chain rows
+        let mut e = *ro;
+        for r in 0..TILE_H {
+            let base = (tile + r) * width;
+            let ec = c(e);
+            t[base + QT_E] = ec[0];
+            t[base + QT_E + 1] = ec[1];
+            if r < rounds.len() {
+                let (sib, beta, bit, s) = rounds[r];
+                let (sc, bc) = (c(sib), c(beta));
+                t[base + QT_S] = sc[0];
+                t[base + QT_S + 1] = sc[1];
+                t[base + QT_B] = bc[0];
+                t[base + QT_B + 1] = bc[1];
+                t[base + QT_BIT] = if bit { Val::ONE } else { Val::ZERO };
+                t[base + QT_SPT] = s;
+                t[base + QT_I2S] = (Val::TWO * s).inverse();
+                let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+                e = native_fold(e0, e1, beta, s);
+            } else {
+                t[base + QT_S] = ec[0];
+                t[base + QT_S + 1] = ec[1];
+                t[base + QT_SPT] = Val::ONE;
+                t[base + QT_I2S] = Val::TWO.inverse();
+            }
+        }
+        // tile row 0: DEEP + reduced
+        let base0 = tile * width;
+        let mut acc = Val::ONE;
+        for i in 0..DP_LOG_HEIGHT {
+            let bit = (index >> i) & 1;
+            t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
+            acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+            t[base0 + QT_ACC + i] = acc;
+        }
+        let x = <Goldilocks as Field>::GENERATOR * acc;
+        let ac = c(*alpha);
+        t[base0 + QT_ALPHA] = ac[0];
+        t[base0 + QT_ALPHA + 1] = ac[1];
+        let mut apow = Challenge::ONE;
+        for (k, &(z, pz, px)) in terms.iter().enumerate() {
+            let (zc, pzc) = (c(z), c(pz));
+            t[base0 + air.z(k)] = zc[0];
+            t[base0 + air.z(k) + 1] = zc[1];
+            t[base0 + air.pz(k)] = pzc[0];
+            t[base0 + air.pz(k) + 1] = pzc[1];
+            t[base0 + air.px(k)] = px;
+            let inv = c((z - Challenge::from(x)).inverse());
+            t[base0 + air.inv(k)] = inv[0];
+            t[base0 + air.inv(k) + 1] = inv[1];
+            let ap = c(apow);
+            t[base0 + air.apow(k)] = ap[0];
+            t[base0 + air.apow(k) + 1] = ap[1];
+            apow *= *alpha;
+        }
+    }
+    RowMajorMatrix::new(t, width)
+}
+
+// =================================================================================================
+// Phase 4.0 — the monolith SKELETON: de-risks the unified layout (the #1 assembly risk) BEFORE wiring
+// logic. One trace with the [transcript | query | epilogue] region structure, period-32 Poseidon round
+// columns, and full-height region masks (S_POSEIDON gates the round constraints to the transcript region;
+// the query/epilogue rows ignore them). Confirms: the periodic schedule + masks + 32-alignment compile and
+// prove, a Poseidon sponge runs correctly INSIDE a masked sub-region, and a transcript-output value binds
+// to public via a one-hot (the binding mechanism Phase 4.A generalizes) — all within the 8 GB / ≤2^16 budget.
+// =================================================================================================
+
+pub(crate) const SK_TB: usize = 4; // transcript Poseidon blocks (skeleton size)
+// periodic: 11 round cols + P_BLOCK_LAST (idx 11, present for alignment) + S_POSEIDON + P_OUT.
+const SK_S_POSEIDON: usize = 12; // 1 on the transcript region's rows
+const SK_P_OUT: usize = 13; // one-hot at the transcript's last block output row
+const SK_N_PERIODIC: usize = 14;
+
+pub(crate) struct MonolithSkeletonAir;
+
+impl MonolithSkeletonAir {
+    pub(crate) fn height(&self) -> usize {
+        (SK_TB * BLOCK + BLOCK).next_power_of_two() // transcript region + a query/epilogue region, padded
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round cols (period BLOCK)
+        let mut block_last = vec![Val::ZERO; BLOCK];
+        block_last[BLOCK - 1] = Val::ONE;
+        cols.push(block_last);
+        let mut s_pos = vec![Val::ZERO; h]; // transcript region = the first SK_TB blocks
+        for r in 0..SK_TB * BLOCK {
+            s_pos[r] = Val::ONE;
+        }
+        cols.push(s_pos);
+        let mut p_out = vec![Val::ZERO; h];
+        p_out[SK_TB * BLOCK - 1] = Val::ONE; // last transcript block's output row
+        cols.push(p_out);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for MonolithSkeletonAir {
+    fn width(&self) -> usize {
+        W
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the bound transcript output (rate[3], rate[2])
+    }
+    fn num_periodic_columns(&self) -> usize {
+        SK_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithSkeletonAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let s_pos = p[SK_S_POSEIDON].clone();
+
+        // Poseidon round constraints, GATED to the transcript region by S_POSEIDON (the query/epilogue rows
+        // ignore the period-32 schedule). periodic_table zeroes the round selectors at each block's last row,
+        // so the region-boundary transition is automatically vacuous.
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(s_pos.clone() * step);
+        }
+
+        // transcript seed: the first block absorbs a fixed sponge input [1, 0, …].
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[0].clone() - AB::Expr::ONE);
+            for i in 1..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // bind the transcript output (rate[3], rate[2]) at the last block's output row → public.
+        let out = p[SK_P_OUT].clone();
+        builder.assert_zero(out.clone() * (cur[3].clone() - pis[0].clone()));
+        builder.assert_zero(out * (cur[2].clone() - pis[1].clone()));
+    }
+}
+
+pub(crate) fn skeleton_build_trace() -> (RowMajorMatrix<Val>, [Val; 2]) {
+    let air = MonolithSkeletonAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * W];
+    // transcript region: a dummy duplex sponge (block 0 input [1,0,…], chained block-to-block).
+    let mut input = [Val::ZERO; W];
+    input[0] = Val::ONE;
+    let mut last_out = [Val::ZERO; W];
+    for blk in 0..SK_TB {
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        last_out = native_permute(input);
+        input = last_out; // chain (squeeze-style)
+    }
+    // the bound output = (rate[3], rate[2]) of the last transcript block's output row.
+    let out = [last_out[3], last_out[2]];
+    (RowMajorMatrix::new(t, W), out)
+}
+
+// =================================================================================================
+// Phase 4.A (binding mechanism) — the cross-region challenge carrier. A value squeezed in the transcript
+// region (rate[3],rate[2] at the output bind row) is written to a GLOBAL-PERSISTENT carrier column, held
+// constant across the whole trace, and READ in a later (query) region. This is the producer→carrier→
+// consumer pattern (the `batch_*_air::ROOT` mechanism) by which the tiles consume the transcript's DERIVED
+// challenges instead of free inputs — the soundness core of the full assembly. De-risked here on the
+// skeleton's real Poseidon sponge before fusing the actual FullTranscriptAir + TiledQueryAir.
+// =================================================================================================
+
+const CA_CARRY: usize = W; // 2 global-persistent carrier lanes (the squeezed value V)
+const CA_WIDTH: usize = W + 2;
+
+pub(crate) struct CarryBindAir;
+
+impl CarryBindAir {
+    fn height(&self) -> usize {
+        (SK_TB * BLOCK + BLOCK).next_power_of_two()
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        MonolithSkeletonAir.periodic() // reuse: round + block_last + S_POSEIDON + P_OUT
+    }
+}
+
+impl BaseAir<Goldilocks> for CarryBindAir {
+    fn width(&self) -> usize {
+        CA_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        2 // the carrier value read in the consumer region
+    }
+    fn num_periodic_columns(&self) -> usize {
+        SK_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CarryBindAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let s_pos = p[SK_S_POSEIDON].clone();
+
+        // Poseidon sponge in the transcript region (gated by S_POSEIDON) — the producer.
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(s_pos.clone() * step);
+        }
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[0].clone() - AB::Expr::ONE);
+            for i in 1..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+
+        // The carrier: GLOBAL-PERSISTENT (held every transition), pinned to the squeezed value
+        // (rate[3],rate[2]) at the transcript output row, read in the consumer (last) row → public.
+        builder.when_transition().assert_zero(nxt[CA_CARRY].clone() - cur[CA_CARRY].clone());
+        builder.when_transition().assert_zero(nxt[CA_CARRY + 1].clone() - cur[CA_CARRY + 1].clone());
+        let out = p[SK_P_OUT].clone();
+        builder.assert_zero(out.clone() * (cur[CA_CARRY].clone() - cur[3].clone()));
+        builder.assert_zero(out * (cur[CA_CARRY + 1].clone() - cur[2].clone()));
+        {
+            let mut lr = builder.when_last_row();
+            lr.assert_zero(cur[CA_CARRY].clone() - pis[0].clone());
+            lr.assert_zero(cur[CA_CARRY + 1].clone() - pis[1].clone());
+        }
+    }
+}
+
+pub(crate) fn carry_build_trace() -> (RowMajorMatrix<Val>, [Val; 2]) {
+    let air = CarryBindAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * CA_WIDTH];
+    let mut input = [Val::ZERO; W];
+    input[0] = Val::ONE;
+    let mut last_out = [Val::ZERO; W];
+    for blk in 0..SK_TB {
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * CA_WIDTH;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        last_out = native_permute(input);
+        input = last_out;
+    }
+    let v = [last_out[3], last_out[2]]; // the squeezed value V
+    for r in 0..h {
+        // carrier holds V across the WHOLE trace (constant; pinned at the output row, read at the last row)
+        t[r * CA_WIDTH + CA_CARRY] = v[0];
+        t[r * CA_WIDTH + CA_CARRY + 1] = v[1];
+    }
+    (RowMajorMatrix::new(t, CA_WIDTH), v)
+}
+
+// =================================================================================================
+// Phase 4.A (fusion checkpoint 1) — the REAL FullTranscriptAir + TiledQueryAir in ONE AIR. The transcript
+// region (rows [0,TR)) derives the challenges; the query region (rows [TR, TR+K·TILE_H)) runs the 32 tiles.
+// α_fri flows transcript→tiles through a GLOBAL-PERSISTENT carrier (seeded from the squeeze at α_fri's bind
+// row, held every transition, read by each tile as QT_ALPHA): the tiles consume the DERIVED α_fri, not a
+// free input. Region gating: transcript nxt-constraints by S_TRANS_TRANS (1 on [0,TR-1), so block-linkage
+// never leaks across the transcript→query boundary); tile fold by S_QUERY·(1-TL); tile DEEP/reduced by TF;
+// tile accept by TL. (β_r/index/Merkle bindings are the next checkpoints; here they remain tile witness.)
+// =================================================================================================
+
+pub(crate) struct Phase4AAir {
+    pub counts: Vec<u8>,
+    pub binds: Vec<usize>,
+    pub index_binds: Vec<(usize, usize)>,
+    pub n_queries: usize,
+    pub n_terms: usize,
+}
+
+impl Phase4AAir {
+    fn nb(&self) -> usize {
+        self.binds.len()
+    }
+    fn ni(&self) -> usize {
+        self.index_binds.len()
+    }
+    fn n_rounds(&self) -> usize {
+        self.nb() - 3 // binds = [α_stark, ζ, α_fri, β_0..β_{R-1}]
+    }
+    fn p_round(&self, r: usize) -> usize {
+        FT_BIND_START + self.nb() + self.ni() + r // per-round one-hot: 1 at tile-row r of every tile
+    }
+    fn p_query(&self, q: usize) -> usize {
+        FT_BIND_START + self.nb() + self.ni() + self.n_rounds() + q // per-query one-hot at tile q's first row
+    }
+    fn p_tf(&self) -> usize {
+        FT_BIND_START + self.nb() + self.ni() + self.n_rounds() + self.n_queries
+    }
+    fn p_tl(&self) -> usize {
+        self.p_tf() + 1
+    }
+    fn p_strans(&self) -> usize {
+        self.p_tf() + 2
+    }
+    fn p_squery(&self) -> usize {
+        self.p_tf() + 3
+    }
+    // index-binding columns (#3): per-tile canonical decomposition (SB) + the fold-bit shift register.
+    fn sb_x(&self) -> usize {
+        self.tile_w() // the index felt for this tile
+    }
+    fn sb_b(&self, i: usize) -> usize {
+        self.sb_x() + 1 + i // b_0..b_63
+    }
+    fn sb_q(&self, k: usize) -> usize {
+        self.sb_x() + 65 + k // q_1..q_31
+    }
+    fn idx_rem(&self) -> usize {
+        self.sb_x() + 96 // remaining index in the fold-bit shift register
+    }
+    fn tr(&self) -> usize {
+        self.counts.len().next_power_of_two() * BLOCK
+    }
+    fn tile_w(&self) -> usize {
+        QT_TERMS + 9 * self.n_terms
+    }
+    fn carry(&self) -> usize {
+        self.idx_rem() + 1 // α_fri carrier (after the index-binding columns)
+    }
+    // tile column accessors (= TiledQueryAir's QT_* layout)
+    fn z(&self, k: usize) -> usize {
+        QT_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    pub(crate) fn fused_w(&self) -> usize {
+        self.idx_rem() + 3 // tile + SB(96) + idx_rem(1) + α_fri carrier(2)
+    }
+    pub(crate) fn height(&self) -> usize {
+        (self.tr() + self.n_queries * TILE_H).next_power_of_two()
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let nb_used = self.counts.len();
+        let count_of = |b: usize| -> Val { if b < nb_used { Val::from_u64(self.counts[b] as u64) } else { Val::ZERO } };
+        let mut cols = periodic_table(); // 11 round (period BLOCK)
+        let mut block_last = vec![Val::ZERO; BLOCK];
+        block_last[BLOCK - 1] = Val::ONE;
+        cols.push(block_last);
+        let mut count = vec![Val::ZERO; h];
+        let mut count_next = vec![Val::ZERO; h];
+        let mut is_sq_next = vec![Val::ZERO; h];
+        for r in 0..h {
+            let b = r / BLOCK;
+            count[r] = count_of(b);
+            count_next[r] = count_of(b + 1);
+            is_sq_next[r] = if (b + 1 >= nb_used) || self.counts[b + 1] == 0 { Val::ONE } else { Val::ZERO };
+        }
+        cols.push(count);
+        cols.push(count_next);
+        cols.push(is_sq_next);
+        for &blk in &self.binds {
+            let mut col = vec![Val::ZERO; h];
+            col[blk * BLOCK + BLOCK - 1] = Val::ONE;
+            cols.push(col);
+        }
+        for &(blk, _lane) in &self.index_binds {
+            let mut col = vec![Val::ZERO; h];
+            col[blk * BLOCK + BLOCK - 1] = Val::ONE;
+            cols.push(col);
+        }
+        let tr = self.tr();
+        // per-round one-hots: P_ROUND_r = 1 at tile-row r of every tile (the fold row carrying β_r).
+        for r in 0..self.n_rounds() {
+            let mut col = vec![Val::ZERO; h];
+            for q in 0..self.n_queries {
+                col[tr + q * TILE_H + r] = Val::ONE;
+            }
+            cols.push(col);
+        }
+        // per-query one-hots: P_QUERY_q = 1 at tile q's first row (selects the q-th public index felt).
+        for q in 0..self.n_queries {
+            let mut col = vec![Val::ZERO; h];
+            col[tr + q * TILE_H] = Val::ONE;
+            cols.push(col);
+        }
+        let mut tf = vec![Val::ZERO; h];
+        let mut tl = vec![Val::ZERO; h];
+        for q in 0..self.n_queries {
+            tf[tr + q * TILE_H] = Val::ONE;
+            tl[tr + q * TILE_H + TILE_H - 1] = Val::ONE;
+        }
+        let mut s_trans_trans = vec![Val::ZERO; h]; // 1 where cur AND nxt are both in the transcript region
+        for r in 0..tr.saturating_sub(1) {
+            s_trans_trans[r] = Val::ONE;
+        }
+        let mut s_query = vec![Val::ZERO; h];
+        for r in tr..(tr + self.n_queries * TILE_H) {
+            s_query[r] = Val::ONE;
+        }
+        cols.push(tf);
+        cols.push(tl);
+        cols.push(s_trans_trans);
+        cols.push(s_query);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for Phase4AAir {
+    fn width(&self) -> usize {
+        self.fused_w()
+    }
+    fn num_public_values(&self) -> usize {
+        2 * self.nb() + self.ni() + 2 // transcript binds + index felts + final_poly[0]
+    }
+    fn num_periodic_columns(&self) -> usize {
+        self.p_squery() + 1
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let stt = p[self.p_strans()].clone();
+        let sq = p[self.p_squery()].clone();
+        let tf = p[self.p_tf()].clone();
+        let tl = p[self.p_tl()].clone();
+
+        // ---------- transcript region (FullTranscriptAir, nxt-constraints gated by S_TRANS_TRANS) ----------
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(stt.clone() * step);
+        }
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[CAP_LANE].clone() - p[FT_COUNT].clone());
+            for i in (CAP_LANE + 1)..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        {
+            let bl = p[FT_P_BLOCK_LAST].clone();
+            builder.when_transition().assert_zero(stt.clone() * bl.clone() * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()));
+            for i in (CAP_LANE + 1)..W {
+                builder.when_transition().assert_zero(stt.clone() * bl.clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+            for i in 0..RATE {
+                builder.when_transition().assert_zero(stt.clone() * bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()));
+            }
+        }
+        for j in 0..self.nb() {
+            let b = p[FT_BIND_START + j].clone();
+            builder.assert_zero(b.clone() * (cur[3].clone() - pis[2 * j].clone()));
+            builder.assert_zero(b * (cur[2].clone() - pis[2 * j + 1].clone()));
+        }
+        let ext_pubs = 2 * self.nb();
+        let idx_start = FT_BIND_START + self.nb();
+        for (k, &(_blk, lane)) in self.index_binds.iter().enumerate() {
+            let b = p[idx_start + k].clone();
+            builder.assert_zero(b * (cur[lane].clone() - pis[ext_pubs + k].clone()));
+        }
+
+        // ---------- α_fri carrier (global-persistent): held everywhere, pinned at α_fri's bind row ----------
+        let carry = self.carry();
+        builder.when_transition().assert_zero(nxt[carry].clone() - cur[carry].clone());
+        builder.when_transition().assert_zero(nxt[carry + 1].clone() - cur[carry + 1].clone());
+        let alpha_bind = p[FT_BIND_START + 2].clone(); // binds[2] = α_fri
+        builder.assert_zero(alpha_bind.clone() * (cur[carry].clone() - cur[3].clone()));
+        builder.assert_zero(alpha_bind * (cur[carry + 1].clone() - cur[2].clone()));
+
+        // ---------- query region (TiledQueryAir) ----------
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+
+        // tile first row (TF): DEEP + reduced → ro; QT_ALPHA bound to the carried α_fri.
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[QT_DBITS + i].clone();
+            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
+        }
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
+            builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
+            prev = cur[QT_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+        // bind the tile's α to the DERIVED, carried α_fri (the cross-region binding).
+        builder.assert_zero(tf.clone() * (cur[QT_ALPHA].clone() - cur[carry].clone()));
+        builder.assert_zero(tf.clone() * (cur[QT_ALPHA + 1].clone() - cur[carry + 1].clone()));
+        let alpha = gg(QT_ALPHA);
+        builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
+        builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
+        for k in 1..self.n_terms {
+            let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+            builder.assert_zero(tf.clone() * (cur[self.apow(k)].clone() - prod.0));
+            builder.assert_zero(tf.clone() * (cur[self.apow(k) + 1].clone() - prod.1));
+        }
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for k in 0..self.n_terms {
+            let z = gg(self.z(k));
+            let inv = gg(self.inv(k));
+            let z_m_x = (z.0 - x.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
+            builder.assert_zero(tf.clone() * chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(gg(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        builder.assert_zero(tf.clone() * (cur[QT_E].clone() - ro.0));
+        builder.assert_zero(tf.clone() * (cur[QT_E + 1].clone() - ro.1));
+
+        // bind each fold-row's β_r to the DERIVED (public) β_r (binding #1, the fold challenges).
+        // β_r = binds[3+r] → public[2(3+r)], public[2(3+r)+1]; P_ROUND_r selects the fold row.
+        for r in 0..self.n_rounds() {
+            let pr = p[self.p_round(r)].clone();
+            let bidx = 3 + r;
+            builder.assert_zero(pr.clone() * (cur[QT_B].clone() - pis[2 * bidx].clone()));
+            builder.assert_zero(pr * (cur[QT_B + 1].clone() - pis[2 * bidx + 1].clone()));
+        }
+
+        // ---------- index binding (#3): the per-query index is decomposed CANONICALLY; the DEEP bits and
+        // the per-round fold bits are pinned to the canonical low bits of the transcript-derived felt. ----------
+        let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
+        // at TF, SB_X == the q-th transcript index felt (selected by P_QUERY_q; pis[ext_pubs + q]).
+        let mut sel = AB::Expr::ZERO;
+        for q in 0..self.n_queries {
+            sel = sel + p[self.p_query(q)].clone() * pis[ext_pubs + q].clone();
+        }
+        builder.assert_zero(tf.clone() * cur[self.sb_x()].clone() - sel);
+        // canonical 64-bit decomposition (gated by TF; mirrors SampleBitsAir).
+        for i in 0..64 {
+            let b = cur[self.sb_b(i)].clone();
+            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
+        }
+        let mut recon = AB::Expr::ZERO;
+        for i in 0..64 {
+            recon = recon + cur[self.sb_b(i)].clone() * pow2(i);
+        }
+        builder.assert_zero(tf.clone() * (cur[self.sb_x()].clone() - recon));
+        builder.assert_zero(tf.clone() * (cur[self.sb_q(0)].clone() - cur[self.sb_b(32)].clone() * cur[self.sb_b(33)].clone()));
+        for k in 2..=31 {
+            builder.assert_zero(tf.clone() * (cur[self.sb_q(k - 1)].clone() - cur[self.sb_q(k - 2)].clone() * cur[self.sb_b(32 + k)].clone()));
+        }
+        let mut lo = AB::Expr::ZERO;
+        for i in 0..32 {
+            lo = lo + cur[self.sb_b(i)].clone() * pow2(i);
+        }
+        builder.assert_zero(tf.clone() * (cur[self.sb_q(30)].clone() * lo)); // canonical: value < p
+        // the DEEP bits are the canonical low bits.
+        for i in 0..DP_LOG_HEIGHT {
+            builder.assert_zero(tf.clone() * (cur[QT_DBITS + i].clone() - cur[self.sb_b(i)].clone()));
+        }
+        // idx_rem at TF = the query index (low DP_LOG_HEIGHT bits); the shift register feeds QT_BIT.
+        let mut qidx = AB::Expr::ZERO;
+        for i in 0..DP_LOG_HEIGHT {
+            qidx = qidx + cur[self.sb_b(i)].clone() * pow2(i);
+        }
+        builder.assert_zero(tf.clone() * (cur[self.idx_rem()].clone() - qidx));
+        // fold-bit shift register (gated by the round rows): idx_rem == 2·idx_rem_next + QT_BIT ⇒ QT_BIT = bit r.
+        let mut round_mask = AB::Expr::ZERO;
+        for r in 0..self.n_rounds() {
+            round_mask = round_mask + p[self.p_round(r)].clone();
+        }
+        builder
+            .when_transition()
+            .assert_zero(round_mask * (cur[self.idx_rem()].clone() - two.clone() * nxt[self.idx_rem()].clone() - cur[QT_BIT].clone()));
+
+        // tile fold (transition gated by S_QUERY·(1-TL)).
+        let fold_gate = sq.clone() * (one.clone() - tl.clone());
+        let bit = cur[QT_BIT].clone();
+        let i2s = cur[QT_I2S].clone();
+        let spt = cur[QT_SPT].clone();
+        builder.when_transition().assert_zero(fold_gate.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder.when_transition().assert_zero(fold_gate.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        let sign = one.clone() - two * bit;
+        let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
+        let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
+        let bb = (cur[QT_B].clone(), cur[QT_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, bb);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(fold_gate.clone() * (nxt[QT_E].clone() - fold0));
+        builder.when_transition().assert_zero(fold_gate * (nxt[QT_E + 1].clone() - fold1));
+
+        // tile accept (TL): folded_eval == final_poly[0] (shared public).
+        let fp0 = pis[2 * self.nb() + self.ni()].clone();
+        let fp1 = pis[2 * self.nb() + self.ni() + 1].clone();
+        builder.assert_zero(tl.clone() * (cur[QT_E].clone() - fp0));
+        builder.assert_zero(tl * (cur[QT_E + 1].clone() - fp1));
+    }
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn phase4a_build_trace(
+    air: &Phase4AAir,
+    block_inputs: &[[Val; W]],
+    per_query: &[(usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>)],
+    alpha_fri: [Val; 2],
+    index_felts: &[Val],
+) -> RowMajorMatrix<Val> {
+    use p3_field::PrimeField64;
+    let h = air.height();
+    let w = air.fused_w();
+    let tr = air.tr();
+    let tw = air.tile_w();
+    let mut t = vec![Val::ZERO; h * w];
+    // transcript region: the FullTranscript trace embedded in lanes [0,W) of rows [0,TR).
+    let ft = ft_build_trace(block_inputs);
+    for r in 0..tr {
+        for i in 0..W {
+            t[r * w + i] = ft.values[r * W + i];
+        }
+    }
+    // query region: the tiled-query trace embedded in lanes [0,tile_w) of rows [TR, TR+K·TILE_H).
+    let tq = tq_build_trace(air.n_terms, per_query);
+    let qrows = air.n_queries * TILE_H;
+    for r in 0..qrows {
+        for i in 0..tw {
+            t[(tr + r) * w + i] = tq.values[r * tw + i];
+        }
+    }
+    // index binding (#3): per tile, the canonical decomposition of the index felt (on the TF row) + the
+    // fold-bit shift register down the tile rows.
+    for q in 0..air.n_queries {
+        let tf_row = tr + q * TILE_H;
+        let felt = index_felts[q];
+        let v = felt.as_canonical_u64();
+        t[tf_row * w + air.sb_x()] = felt;
+        for i in 0..64 {
+            t[tf_row * w + air.sb_b(i)] = Val::from_u64((v >> i) & 1);
+        }
+        let mut qq = (v >> 32) & 1;
+        for k in 1..=31 {
+            qq &= (v >> (32 + k)) & 1;
+            t[tf_row * w + air.sb_q(k - 1)] = Val::from_u64(qq);
+        }
+        let mut rem = v & ((1u64 << DP_LOG_HEIGHT) - 1); // the masked query index
+        for r in 0..TILE_H {
+            t[(tf_row + r) * w + air.idx_rem()] = Val::from_u64(rem);
+            if r < air.n_rounds() {
+                rem >>= 1;
+            }
+        }
+    }
+    // α_fri carrier: held constant across the whole trace.
+    for r in 0..h {
+        t[r * w + air.carry()] = alpha_fri[0];
+        t[r * w + air.carry() + 1] = alpha_fri[1];
+    }
+    RowMajorMatrix::new(t, w)
+}
+
+// =================================================================================================
+// Phase 4.A (#3, sound core) — the INDEX binding's logical heart: a transcript index felt is decomposed
+// CANONICALLY (64 bits + the q_31·lo==0 check ⇒ value < p, mirroring SampleBitsAir), and the DEEP point x
+// is derived from the canonical LOW DP_LOG_HEIGHT bits. This proves the index bits that drive DEEP/fold are
+// the canonical low bits of the transcript-derived felt — NOT free witness — closing the soundness gap a
+// non-canonical decomposition would leave. Validated vs native (query_terms' x). (Wiring this per-tile into
+// the fusion — 32 instances + per-query selection + the fold-bit shift register — is the remaining #3 step.)
+// =================================================================================================
+
+const IB_X: usize = 0; // the index felt
+const IB_B: usize = 1; // b_0..b_63 (canonical bits)
+const IB_Q: usize = IB_B + 64; // q_1..q_31 (high-bit product chain)
+const IB_ACC: usize = IB_Q + 31; // DEEP product chain over the low DP_LOG_HEIGHT bits
+const IB_WIDTH: usize = IB_ACC + DP_LOG_HEIGHT;
+
+pub(crate) struct IndexBindAir;
+
+impl BaseAir<Goldilocks> for IndexBindAir {
+    fn width(&self) -> usize {
+        IB_WIDTH
+    }
+    fn num_public_values(&self) -> usize {
+        2 // index felt, DEEP point x
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for IndexBindAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let mut fr = builder.when_first_row();
+
+        // canonical 64-bit decomposition (mirrors SampleBitsAir).
+        for i in 0..64 {
+            let b = cur[IB_B + i].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        let mut recon = AB::Expr::ZERO;
+        for i in 0..64 {
+            recon = recon + cur[IB_B + i].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[IB_X].clone() - recon);
+        fr.assert_zero(cur[IB_Q].clone() - cur[IB_B + 32].clone() * cur[IB_B + 33].clone());
+        for k in 2..=31 {
+            fr.assert_zero(cur[IB_Q + k - 1].clone() - cur[IB_Q + k - 2].clone() * cur[IB_B + 32 + k].clone());
+        }
+        let mut lo = AB::Expr::ZERO;
+        for i in 0..32 {
+            lo = lo + cur[IB_B + i].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[IB_Q + 30].clone() * lo); // canonical: value < p
+
+        // DEEP point x = GENERATOR · Π_i (b_i ? g^(2^(N-1-i)) : 1) over the canonical LOW DP_LOG_HEIGHT bits.
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[IB_B + i].clone() * (ci - one.clone());
+            fr.assert_zero(cur[IB_ACC + i].clone() - prev * factor);
+            prev = cur[IB_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[IB_ACC + DP_LOG_HEIGHT - 1].clone();
+        fr.assert_zero(pis[0].clone() - cur[IB_X].clone());
+        fr.assert_zero(pis[1].clone() - x);
+    }
+}
+
+pub(crate) fn ib_build_trace(index_felt: Val) -> (RowMajorMatrix<Val>, Val) {
+    use p3_field::PrimeField64;
+    let v = index_felt.as_canonical_u64();
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let mut r = vec![Val::ZERO; IB_WIDTH];
+    r[IB_X] = index_felt;
+    for i in 0..64 {
+        r[IB_B + i] = Val::from_u64((v >> i) & 1);
+    }
+    let mut q = (v >> 32) & 1;
+    for k in 1..=31 {
+        q &= (v >> (32 + k)) & 1;
+        r[IB_Q + k - 1] = Val::from_u64(q);
+    }
+    let mut acc = Val::ONE;
+    for i in 0..DP_LOG_HEIGHT {
+        let bit = (v >> i) & 1;
+        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        r[IB_ACC + i] = acc;
+    }
+    let x = <Goldilocks as Field>::GENERATOR * acc;
+    let mut vals = Vec::with_capacity(8 * IB_WIDTH);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    (RowMajorMatrix::new(vals, IB_WIDTH), x)
+}
+
+// =================================================================================================
+// Phase 4.A (#4, sound core) — the FOLD POINTS s_r derived in-circuit from the index bits. Native:
+// s_r = two_adic_generator(N-r)^reverse_bits(index>>(r+1), N-r-1) = Π_{m=r+1}^{N-1} (b_m ? g_N^(2^(N-1-m+r)) : 1),
+// g_N = two_adic_generator(DP_LOG_HEIGHT). Each s_r is a product chain over the canonical index bits (the
+// same bits that feed DEEP + the fold group order) — replacing the free-witness QT_SPT. Validated vs native
+// (query_fold_data's s). (Wiring per-tile into the fusion mirrors #3: the chains on the TF row + carry/select.)
+// =================================================================================================
+
+pub(crate) struct FoldPointAir {
+    pub n_rounds: usize,
+}
+
+impl FoldPointAir {
+    fn b(&self, i: usize) -> usize {
+        1 + i // index bits b_0..b_{N-1}
+    }
+    fn s(&self, r: usize) -> usize {
+        1 + DP_LOG_HEIGHT + r // the derived fold point s_r
+    }
+    fn acc(&self, r: usize, m: usize) -> usize {
+        1 + DP_LOG_HEIGHT + self.n_rounds + r * DP_LOG_HEIGHT + m // chain[r][m]
+    }
+    fn w(&self) -> usize {
+        1 + DP_LOG_HEIGHT + self.n_rounds + self.n_rounds * DP_LOG_HEIGHT
+    }
+}
+
+impl BaseAir<Goldilocks> for FoldPointAir {
+    fn width(&self) -> usize {
+        self.w()
+    }
+    fn num_public_values(&self) -> usize {
+        1 + self.n_rounds // index, s_0..s_{R-1}
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldPointAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let n = DP_LOG_HEIGHT;
+        let mut fr = builder.when_first_row();
+
+        for i in 0..n {
+            let b = cur[self.b(i)].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        let mut recon = AB::Expr::ZERO;
+        for i in 0..n {
+            recon = recon + cur[self.b(i)].clone() * pow2(i);
+        }
+        fr.assert_zero(cur[0].clone() - recon);
+
+        for r in 0..self.n_rounds {
+            // chain[r][0] == 1 (m=0 < r+1 ⇒ identity factor)
+            fr.assert_zero(cur[self.acc(r, 0)].clone() - one.clone());
+            for m in 1..n {
+                let factor = if m >= r + 1 {
+                    let c = AB::Expr::from(g.exp_power_of_2(n - 1 - m + r)); // g_N^(2^(N-1-m+r))
+                    one.clone() + cur[self.b(m)].clone() * (c - one.clone())
+                } else {
+                    one.clone()
+                };
+                fr.assert_zero(cur[self.acc(r, m)].clone() - cur[self.acc(r, m - 1)].clone() * factor);
+            }
+            fr.assert_zero(cur[self.s(r)].clone() - cur[self.acc(r, n - 1)].clone());
+            fr.assert_zero(cur[self.s(r)].clone() - pis[1 + r].clone()); // == native s_r
+        }
+        fr.assert_zero(cur[0].clone() - pis[0].clone());
+    }
+}
+
+pub(crate) fn fp_build_trace(n_rounds: usize, index: usize) -> RowMajorMatrix<Val> {
+    let air = FoldPointAir { n_rounds };
+    let w = air.w();
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let n = DP_LOG_HEIGHT;
+    let mut r0 = vec![Val::ZERO; w];
+    r0[0] = Val::from_usize(index);
+    for i in 0..n {
+        r0[air.b(i)] = Val::from_u64(((index >> i) & 1) as u64);
+    }
+    for r in 0..n_rounds {
+        let mut acc = Val::ONE;
+        r0[air.acc(r, 0)] = acc;
+        for m in 1..n {
+            let factor = if m >= r + 1 && (index >> m) & 1 == 1 { g.exp_power_of_2(n - 1 - m + r) } else { Val::ONE };
+            acc *= factor;
+            r0[air.acc(r, m)] = acc;
+        }
+        r0[air.s(r)] = acc;
+    }
+    let mut vals = Vec::with_capacity(8 * w);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r0);
+    }
+    RowMajorMatrix::new(vals, w)
+}
+
+// =================================================================================================
+// Phase 4.B (#7, sound core) — the CAP MUX: a query's Merkle path stops `depth = log_height − cap_height`
+// below the cap and must equal commit.roots()[index >> depth]. The committed cap is public; the high
+// `cap_height` index bits select the entry via a degree-`cap_height` selector
+// cap_sel[l] = Σ_e (Π_j (e_j ? b_j : 1−b_j)) · cap[e][l]  (zero extra columns). Because the caps are
+// absorbed into the transcript (fixing the challenges) AND select the Merkle terminal here, a prover
+// cannot absorb one cap and authenticate to another. Validated vs native (commit.roots()[index>>depth]).
+// =================================================================================================
+
+pub(crate) struct CapMuxAir;
+
+impl BaseAir<Goldilocks> for CapMuxAir {
+    fn width(&self) -> usize {
+        CM_CAP_HEIGHT // the high index bits
+    }
+    fn num_public_values(&self) -> usize {
+        (1 << CM_CAP_HEIGHT) * 4 + 4 // the cap (64 entries × 4) + the claimed entry (4)
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CapMuxAir {
+    fn eval(&self, builder: &mut AB) {
+        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let n = 1 << CM_CAP_HEIGHT;
+        let mut fr = builder.when_first_row();
+        for j in 0..CM_CAP_HEIGHT {
+            let b = cur[j].clone();
+            fr.assert_zero(b.clone() * (one.clone() - b));
+        }
+        for l in 0..4 {
+            let mut mux = AB::Expr::ZERO;
+            for e in 0..n {
+                let mut sel = one.clone();
+                for j in 0..CM_CAP_HEIGHT {
+                    let b = cur[j].clone();
+                    sel = sel * if (e >> j) & 1 == 1 { b } else { one.clone() - b };
+                }
+                mux = mux + sel * pis[e * 4 + l].clone();
+            }
+            fr.assert_zero(mux - pis[n * 4 + l].clone());
+        }
+    }
+}
+
+pub(crate) fn cm_build_trace(index_high: usize) -> RowMajorMatrix<Val> {
+    let mut r = vec![Val::ZERO; CM_CAP_HEIGHT];
+    for j in 0..CM_CAP_HEIGHT {
+        r[j] = Val::from_u64(((index_high >> j) & 1) as u64);
+    }
+    let mut vals = Vec::with_capacity(8 * CM_CAP_HEIGHT);
+    for _ in 0..8 {
+        vals.extend_from_slice(&r);
+    }
+    RowMajorMatrix::new(vals, CM_CAP_HEIGHT)
+}
+
+// =================================================================================================
+// Phase 4.B (heavy restructure) — the INLINE input-Merkle super-tile: the opened value is hashed to a leaf
+// and authenticated up to the committed cap, all in ONE AIR. Block 0 is a leaf-hash (absorbs the width-1
+// opened row [v,0,0,0] → leaf = MyHash([v])); blocks 1..DEPTH are the binary merges (FriMerkleAir's
+// bit-ordered Poseidon compress, reused verbatim); the terminal == the committed cap entry. The crucial
+// structural step vs the standalone FriMerkleAir: the leaf is COMPUTED from the opened value, not a free
+// public — so the value used in the reduced opening is the one authenticated to the trace commitment.
+// Validated vs the real proof (query_input_merkle). DEPTH = log_global − cap_height = 4 for the milestone.
+// =================================================================================================
+
+const IMT_SIB: usize = W; // 8..12 sibling digest
+const IMT_BIT: usize = IMT_SIB + 4; // 12 merge direction
+const IMT_W: usize = IMT_BIT + 1; // 13 (= FriMerkleAir width)
+pub(crate) const IMT_DEPTH: usize = 4; // input-opening path depth (log_global − cap_height)
+const IMT_NBLOCKS: usize = 1 + IMT_DEPTH; // leaf block + DEPTH merge blocks (5 active)
+const IMT_NBLOCKS_PAD: usize = 8; // padded to a power-of-two block count (every block is valid Poseidon)
+const IMT_P_BLOCK_LAST: usize = 11;
+const IMT_P_TERMINAL: usize = 12; // one-hot at the last ACTIVE block's output row (block IMT_NBLOCKS-1)
+
+pub(crate) struct InputMerkleTileAir;
+
+impl InputMerkleTileAir {
+    fn height(&self) -> usize {
+        IMT_NBLOCKS_PAD * BLOCK // 256 (power of two)
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..IMT_NBLOCKS_PAD {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl);
+        let mut term = vec![Val::ZERO; h];
+        term[(IMT_NBLOCKS - 1) * BLOCK + BLOCK - 1] = Val::ONE; // block 4's output row (the cap terminal)
+        cols.push(term);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for InputMerkleTileAir {
+    fn width(&self) -> usize {
+        IMT_W
+    }
+    fn num_public_values(&self) -> usize {
+        1 + 4 // opened value v, cap entry (4)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        IMT_P_TERMINAL + 1
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for InputMerkleTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+
+        // Poseidon2 rounds (every block; reused verbatim from FriMerkleAir/poseidon2_air).
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(c);
+        }
+
+        let bit = cur[IMT_BIT].clone();
+        builder.assert_zero(bit.clone() * (one.clone() - bit));
+
+        // block 0 = the LEAF HASH: absorb the width-1 opened row → state = [v, 0, …]. leaf = block-0 output.
+        {
+            let mut fr = builder.when_first_row();
+            fr.assert_zero(cur[0].clone() - pis[0].clone()); // v
+            for i in 1..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+
+        // block-to-block link (bit-ordered merge into the next block) — reused from FriMerkleAir. Block 0's
+        // output (the leaf) folds into block 1 with sibling_0; block i output → block i+1, etc.
+        {
+            let bl = p[IMT_P_BLOCK_LAST].clone();
+            let nb = nxt[IMT_BIT].clone();
+            for k in 0..4 {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[IMT_SIB + k].clone())));
+                builder.when_transition().assert_zero(bl.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[IMT_SIB + k].clone() + nb.clone() * cur[k].clone())));
+            }
+        }
+
+        // terminal: the last ACTIVE block's output (block IMT_NBLOCKS-1, via the one-hot) == the cap entry.
+        // (Trailing padding blocks continue valid Poseidon so the round constraints hold to the pow2 height.)
+        let term = p[IMT_P_TERMINAL].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[1 + k].clone()));
+        }
+    }
+}
+
+pub(crate) fn im_build_trace(v: Val, path: &[([Val; 4], bool)]) -> (RowMajorMatrix<Val>, [Val; 4]) {
+    let air = InputMerkleTileAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * IMT_W];
+    // block 0: leaf hash. input = [v, 0, …]; output[0..4] = leaf.
+    let mut input = [Val::ZERO; W];
+    input[0] = v;
+    let rows = native_steps(input);
+    for r in 0..BLOCK {
+        t[r * IMT_W..r * IMT_W + W].copy_from_slice(&rows[r]);
+    }
+    let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+    // blocks 1..=DEPTH: the binary merges.
+    for (l, &(sib, b)) in path.iter().enumerate() {
+        let blk = 1 + l;
+        let mut inp = [Val::ZERO; W];
+        if b {
+            inp[..4].copy_from_slice(&sib);
+            inp[4..].copy_from_slice(&node);
+        } else {
+            inp[..4].copy_from_slice(&node);
+            inp[4..].copy_from_slice(&sib);
+        }
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * IMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+            t[base + IMT_SIB..base + IMT_SIB + 4].copy_from_slice(&sib);
+            t[base + IMT_BIT] = if b { Val::ONE } else { Val::ZERO };
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    let terminal = node;
+    // padding blocks (IMT_NBLOCKS..IMT_NBLOCKS_PAD): continue valid Poseidon (merge node with 0, bit 0) so
+    // every block satisfies the round + link constraints up to the power-of-two height. The terminal binding
+    // is at block IMT_NBLOCKS-1's output (a one-hot), so these blocks don't affect the result.
+    for blk in IMT_NBLOCKS..IMT_NBLOCKS_PAD {
+        let mut inp = [Val::ZERO; W];
+        inp[..4].copy_from_slice(&node); // bit 0, sibling 0 ⇒ input = [node, 0]
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * IMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    (RowMajorMatrix::new(t, IMT_W), terminal)
+}
+
+// =================================================================================================
+// Phase 4.B (structural scaling) — the SUPER-TILE: one query's arithmetic AND its inline input-Merkle in
+// ONE AIR. Block 0 is the arith (QueryTileAir: DEEP→reduced→fold→accept, rows 0..7); blocks 1..5 are the
+// input-Merkle (leaf-hash + 4 binary merges); blocks 6..7 pad to a pow2 block count. The opened value used
+// in the reduced opening (QT_px, term 0 = the trace value) is carried to the leaf-hash via a global-
+// persistent column and absorbed as the leaf preimage — so the value the arith opens is THE value
+// authenticated to the trace commitment (no second witness). S_POSEIDON gates the round constraints to the
+// Merkle blocks; the arith block runs no Poseidon. This is the building block the ×K fusion tiles.
+// Validated vs the real proof: the query verifies AND its opened value authenticates to the committed cap.
+// =================================================================================================
+
+const ST_SIB: usize = 8; // sibling digest (overlays arith cols on Merkle rows — disjoint rows)
+const ST_BIT: usize = 12; // merge direction
+const ST_CARRY: usize = QT_TERMS + 9 * 4; // opened-value carrier (after the n_terms=4 arith layout)
+pub(crate) const ST_W: usize = ST_CARRY + 1;
+const ST_NBLOCKS_PAD: usize = 8;
+const ST_LEAF_BLOCK: usize = 1;
+const ST_TERMINAL_BLOCK: usize = 5; // leaf (1) + 4 merges (2..5)
+// periodic indices
+const ST_P_BLOCK_LAST: usize = 11;
+const ST_P_SPOS: usize = 12; // 1 on the Merkle blocks (1..7)
+const ST_P_TF: usize = 13; // arith head (block 0 row 0)
+const ST_P_ROUND0: usize = 14; // P_ROUND_0..5 at block 0 rows 0..5 (fold)
+const ST_P_TL: usize = 20; // arith accept (block 0 row 7)
+const ST_P_LEAF: usize = 21; // leaf-hash head (block 1 row 0)
+const ST_P_TERM: usize = 22; // Merkle terminal (block 5 row 31)
+const ST_P_ST_LAST: usize = 23; // super-tile last row (carrier boundary, for the ×K tiling)
+const ST_N_PERIODIC: usize = 24;
+const ST_PERIOD: usize = ST_NBLOCKS_PAD * BLOCK; // rows per super-tile (256)
+
+pub(crate) struct SuperTileAir {
+    pub n_queries: usize,
+}
+
+impl SuperTileAir {
+    fn z(&self, k: usize) -> usize {
+        QT_TERMS + 9 * k
+    }
+    fn pz(&self, k: usize) -> usize {
+        self.z(k) + 2
+    }
+    fn px(&self, k: usize) -> usize {
+        self.z(k) + 4
+    }
+    fn inv(&self, k: usize) -> usize {
+        self.z(k) + 5
+    }
+    fn apow(&self, k: usize) -> usize {
+        self.z(k) + 7
+    }
+    pub(crate) fn height(&self) -> usize {
+        self.n_queries * ST_PERIOD
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table(); // 11 round (period BLOCK, repeats across the whole trace)
+        // each of these is full-height with a 1 at the given within-super-tile offset of EVERY super-tile.
+        let tiled = |offset: usize| -> Vec<Val> {
+            let mut c = vec![Val::ZERO; h];
+            for q in 0..self.n_queries {
+                c[q * ST_PERIOD + offset] = Val::ONE;
+            }
+            c
+        };
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..ST_NBLOCKS_PAD * self.n_queries {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl); // P_BLOCK_LAST (every block of every super-tile)
+        let mut spos = vec![Val::ZERO; h];
+        for q in 0..self.n_queries {
+            for r in BLOCK..ST_PERIOD {
+                spos[q * ST_PERIOD + r] = Val::ONE; // blocks 1..7 (the Merkle region) of each super-tile
+            }
+        }
+        cols.push(spos); // S_POSEIDON
+        cols.push(tiled(0)); // P_TF (block 0 row 0)
+        for r in 0..6 {
+            cols.push(tiled(r)); // P_ROUND_0..5 (block 0 rows 0..5)
+        }
+        cols.push(tiled(6)); // P_TL — accept at the folded_eval row
+        cols.push(tiled(ST_LEAF_BLOCK * BLOCK)); // P_LEAF (block 1 row 0)
+        cols.push(tiled(ST_TERMINAL_BLOCK * BLOCK + BLOCK - 1)); // P_TERMINAL (block 5 row 31)
+        cols.push(tiled(ST_PERIOD - 1)); // P_ST_LAST (super-tile last row — carrier boundary)
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for SuperTileAir {
+    fn width(&self) -> usize {
+        ST_W
+    }
+    fn num_public_values(&self) -> usize {
+        2 + 4 // final_poly[0] (2) + the committed cap entry (4)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        ST_N_PERIODIC
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let two = AB::Expr::TWO;
+        let half = AB::Expr::from(Goldilocks::ONE.halve());
+        let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+        let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let tf = p[ST_P_TF].clone();
+        let tl = p[ST_P_TL].clone();
+        let spos = p[ST_P_SPOS].clone();
+
+        // ---------------- arith (block 0): DEEP + reduced → ro = E_0; fold; accept ----------------
+        for i in 0..DP_LOG_HEIGHT {
+            let b = cur[QT_DBITS + i].clone();
+            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
+        }
+        let mut prev = one.clone();
+        for i in 0..DP_LOG_HEIGHT {
+            let ci = AB::Expr::from(g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i));
+            let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
+            builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
+            prev = cur[QT_ACC + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+        let alpha = gg(QT_ALPHA);
+        builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
+        builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
+        for k in 1..4 {
+            let prod = emul(gg(self.apow(k - 1)), alpha.clone());
+            builder.assert_zero(tf.clone() * (cur[self.apow(k)].clone() - prod.0));
+            builder.assert_zero(tf.clone() * (cur[self.apow(k) + 1].clone() - prod.1));
+        }
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for k in 0..4 {
+            let z = gg(self.z(k));
+            let inv = gg(self.inv(k));
+            let z_m_x = (z.0 - x.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
+            builder.assert_zero(tf.clone() * chk.1);
+            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let t = emul(emul(gg(self.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        builder.assert_zero(tf.clone() * (cur[QT_E].clone() - ro.0));
+        builder.assert_zero(tf.clone() * (cur[QT_E + 1].clone() - ro.1));
+        // fold (transitions on the round rows 0..5)
+        let mut round_mask = AB::Expr::ZERO;
+        for r in 0..6 {
+            round_mask = round_mask + p[ST_P_ROUND0 + r].clone();
+        }
+        let bit = cur[QT_BIT].clone();
+        let i2s = cur[QT_I2S].clone();
+        let spt = cur[QT_SPT].clone();
+        builder.when_transition().assert_zero(round_mask.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder.when_transition().assert_zero(round_mask.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        let sign = one.clone() - two.clone() * bit;
+        let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
+        let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
+        let bb = (cur[QT_B].clone(), cur[QT_B + 1].clone());
+        let sum = (e.0.clone() + s.0.clone(), e.1.clone() + s.1.clone());
+        let diff = (e.0 - s.0, e.1 - s.1);
+        let prod = emul(diff, bb);
+        let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
+        let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
+        builder.when_transition().assert_zero(round_mask.clone() * (nxt[QT_E].clone() - fold0));
+        builder.when_transition().assert_zero(round_mask * (nxt[QT_E + 1].clone() - fold1));
+        // accept (block 0 row 7): folded_eval == final_poly[0]
+        builder.assert_zero(tl.clone() * (cur[QT_E].clone() - pis[0].clone()));
+        builder.assert_zero(tl * (cur[QT_E + 1].clone() - pis[1].clone()));
+
+        // ---------------- opened-value carrier: tile-persistent (held within a super-tile, free at its
+        // boundary so each query carries its own value); == QT_px(term 0) at the arith head; leaf preimage.
+        let not_st_last = one.clone() - p[ST_P_ST_LAST].clone();
+        builder.when_transition().assert_zero(not_st_last * (nxt[ST_CARRY].clone() - cur[ST_CARRY].clone()));
+        builder.assert_zero(tf.clone() * (cur[ST_CARRY].clone() - cur[self.px(0)].clone()));
+
+        // ---------------- input-Merkle (blocks 1..5): leaf-hash + binary merges → terminal == cap entry ----
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(spos.clone() * step); // Poseidon only on the Merkle blocks
+        }
+        // leaf-hash head (block 1 row 0): state = [v, 0, …], v = the carried opened value.
+        let leaf = p[ST_P_LEAF].clone();
+        builder.assert_zero(leaf.clone() * (cur[0].clone() - cur[ST_CARRY].clone()));
+        for i in 1..W {
+            builder.assert_zero(leaf.clone() * cur[i].clone());
+        }
+        // merge bit boolean (on Merkle blocks), and the bit-ordered block link (block i output → block i+1).
+        builder.assert_zero(spos.clone() * (cur[ST_BIT].clone() * (one.clone() - cur[ST_BIT].clone())));
+        {
+            // Merkle block-last only (not block 0→1, since S_POSEIDON=0 on block 0), AND not the super-tile
+            // boundary (1 - P_ST_LAST), so super-tile q's last block doesn't merge into q+1's arith block.
+            let link = spos.clone() * p[ST_P_BLOCK_LAST].clone() * (one.clone() - p[ST_P_ST_LAST].clone());
+            let nb = nxt[ST_BIT].clone();
+            for k in 0..4 {
+                builder.when_transition().assert_zero(link.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[ST_SIB + k].clone())));
+                builder.when_transition().assert_zero(link.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[ST_SIB + k].clone() + nb.clone() * cur[k].clone())));
+            }
+        }
+        // terminal (block 5 row 31): output digest == the committed cap entry.
+        let term = p[ST_P_TERM].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[2 + k].clone()));
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn st_build_trace(
+    per_query: &[(
+        (usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>),
+        Val,
+        Vec<([Val; 4], bool)>,
+    )],
+) -> RowMajorMatrix<Val> {
+    use crate::recursion::fri_fold::native_fold;
+    use p3_field::BasedVectorSpace;
+    let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let air = SuperTileAir { n_queries: per_query.len() };
+    let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * ST_W];
+    for (q, ((index, terms, alpha, ro, rounds), v, path)) in per_query.iter().enumerate() {
+        let off = q * ST_PERIOD; // this super-tile's first row
+        let v = *v;
+        // block 0: the arith. fold chain E_0..E_6 (rows 0..6); DEEP+reduced on row 0.
+        let mut e = *ro;
+        for r in 0..=6 {
+            let base = (off + r) * ST_W;
+            let ec = c(e);
+            t[base + QT_E] = ec[0];
+            t[base + QT_E + 1] = ec[1];
+            if r < rounds.len() {
+                let (sib, beta, bit, s) = rounds[r];
+                let (sc, bc) = (c(sib), c(beta));
+                t[base + QT_S] = sc[0];
+                t[base + QT_S + 1] = sc[1];
+                t[base + QT_B] = bc[0];
+                t[base + QT_B + 1] = bc[1];
+                t[base + QT_BIT] = if bit { Val::ONE } else { Val::ZERO };
+                t[base + QT_SPT] = s;
+                t[base + QT_I2S] = (Val::TWO * s).inverse();
+                let (e0, e1) = if bit { (sib, e) } else { (e, sib) };
+                e = native_fold(e0, e1, beta, s);
+            }
+        }
+        let base0 = off * ST_W;
+        let mut acc = Val::ONE;
+        for i in 0..DP_LOG_HEIGHT {
+            let bit = (index >> i) & 1;
+            t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
+            acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+            t[base0 + QT_ACC + i] = acc;
+        }
+        let x = <Goldilocks as Field>::GENERATOR * acc;
+        let ac = c(*alpha);
+        t[base0 + QT_ALPHA] = ac[0];
+        t[base0 + QT_ALPHA + 1] = ac[1];
+        let mut apow = Challenge::ONE;
+        for (k, &(z, pz, px)) in terms.iter().enumerate() {
+            let (zc, pzc) = (c(z), c(pz));
+            t[base0 + air.z(k)] = zc[0];
+            t[base0 + air.z(k) + 1] = zc[1];
+            t[base0 + air.pz(k)] = pzc[0];
+            t[base0 + air.pz(k) + 1] = pzc[1];
+            t[base0 + air.px(k)] = px;
+            let inv = c((z - Challenge::from(x)).inverse());
+            t[base0 + air.inv(k)] = inv[0];
+            t[base0 + air.inv(k) + 1] = inv[1];
+            let ap = c(apow);
+            t[base0 + air.apow(k)] = ap[0];
+            t[base0 + air.apow(k) + 1] = ap[1];
+            apow *= *alpha;
+        }
+        // blocks 1..5: the input-Merkle. leaf-hash (block 1) absorbs v; 4 merges (blocks 2..5).
+        let mut input = [Val::ZERO; W];
+        input[0] = v;
+        let rows = native_steps(input);
+        for r in 0..BLOCK {
+            let base = (off + ST_LEAF_BLOCK * BLOCK + r) * ST_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+        for (l, &(sib, b)) in path.iter().enumerate() {
+            let blk = ST_LEAF_BLOCK + 1 + l;
+            let mut inp = [Val::ZERO; W];
+            if b {
+                inp[..4].copy_from_slice(&sib);
+                inp[4..].copy_from_slice(&node);
+            } else {
+                inp[..4].copy_from_slice(&node);
+                inp[4..].copy_from_slice(&sib);
+            }
+            let rows = native_steps(inp);
+            for r in 0..BLOCK {
+                let base = (off + blk * BLOCK + r) * ST_W;
+                t[base..base + W].copy_from_slice(&rows[r]);
+                t[base + ST_SIB..base + ST_SIB + 4].copy_from_slice(&sib);
+                t[base + ST_BIT] = if b { Val::ONE } else { Val::ZERO };
+            }
+            node = native_permute(inp)[..4].try_into().unwrap();
+        }
+        // padding blocks (6..8): continue valid Poseidon so the round constraints hold to the pow2 height.
+        for blk in (ST_TERMINAL_BLOCK + 1)..ST_NBLOCKS_PAD {
+            let mut inp = [Val::ZERO; W];
+            inp[..4].copy_from_slice(&node);
+            let rows = native_steps(inp);
+            for r in 0..BLOCK {
+                let base = (off + blk * BLOCK + r) * ST_W;
+                t[base..base + W].copy_from_slice(&rows[r]);
+            }
+            node = native_permute(inp)[..4].try_into().unwrap();
+        }
+        // opened-value carrier: held = v within this super-tile.
+        for r in 0..ST_PERIOD {
+            t[(off + r) * ST_W + ST_CARRY] = v;
+        }
+    }
+    RowMajorMatrix::new(t, ST_W)
+}
+
+// =================================================================================================
+// Phase 4.B — the COMMIT-PHASE Merkle opening inline (the other opening type): the reconstructed arity-2
+// fold group {e_r, sib_r} is hashed to a leaf (4-felt preimage = the group flattened) and authenticated up
+// to the round's commitment cap. Same structure as the input-Merkle but the leaf absorbs the 4-felt group
+// and the path is shorter (round 1: depth 2). This binds the fold's SIBLINGS to the committed FRI codeword.
+// Validated vs the real proof (query_commit_merkle, round 1).
+// =================================================================================================
+
+const CMT_SIB: usize = 8;
+const CMT_BIT: usize = 12;
+const CMT_W: usize = 13;
+const CMT_DEPTH: usize = 2; // round-1 commit-phase path depth (log_folded − cap_height = 8 − 6)
+const CMT_NBLOCKS: usize = 1 + CMT_DEPTH; // leaf + 2 merges
+const CMT_NBLOCKS_PAD: usize = 4; // pow2 (already 2^7 = 128 rows)
+const CMT_P_BLOCK_LAST: usize = 11;
+const CMT_P_TERM: usize = 12;
+
+pub(crate) struct CommitMerkleTileAir;
+
+impl CommitMerkleTileAir {
+    fn height(&self) -> usize {
+        CMT_NBLOCKS_PAD * BLOCK
+    }
+    fn periodic(&self) -> Vec<Vec<Val>> {
+        let h = self.height();
+        let mut cols = periodic_table();
+        let mut bl = vec![Val::ZERO; h];
+        for blk in 0..CMT_NBLOCKS_PAD {
+            bl[blk * BLOCK + BLOCK - 1] = Val::ONE;
+        }
+        cols.push(bl);
+        let mut term = vec![Val::ZERO; h];
+        term[(CMT_NBLOCKS - 1) * BLOCK + BLOCK - 1] = Val::ONE;
+        cols.push(term);
+        cols
+    }
+}
+
+impl BaseAir<Goldilocks> for CommitMerkleTileAir {
+    fn width(&self) -> usize {
+        CMT_W
+    }
+    fn num_public_values(&self) -> usize {
+        4 + 4 // the group (leaf preimage, 4 felts) + the cap entry (4)
+    }
+    fn num_periodic_columns(&self) -> usize {
+        CMT_P_TERM + 1
+    }
+    fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+        self.periodic()
+    }
+}
+
+impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CommitMerkleTileAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+
+        let is_init = p[0].clone();
+        let is_full = p[1].clone();
+        let is_partial = p[2].clone();
+        let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
+        let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
+        ext_linear(&mut init_s);
+        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        ext_linear(&mut full_s);
+        let mut part_s: [AB::Expr; W] =
+            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        int_linear(&mut part_s);
+        for i in 0..W {
+            let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+            builder.when_transition().assert_zero(step);
+        }
+        let bit = cur[CMT_BIT].clone();
+        builder.assert_zero(bit.clone() * (one.clone() - bit));
+
+        // block 0 = the leaf hash: absorb the 4-felt group → state = [group, 0,0,0,0].
+        {
+            let mut fr = builder.when_first_row();
+            for k in 0..4 {
+                fr.assert_zero(cur[k].clone() - pis[k].clone());
+            }
+            for i in 4..W {
+                fr.assert_zero(cur[i].clone());
+            }
+        }
+        // bit-ordered block link (block i output → block i+1).
+        {
+            let bl = p[CMT_P_BLOCK_LAST].clone();
+            let nb = nxt[CMT_BIT].clone();
+            for k in 0..4 {
+                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[CMT_SIB + k].clone())));
+                builder.when_transition().assert_zero(bl.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[CMT_SIB + k].clone() + nb.clone() * cur[k].clone())));
+            }
+        }
+        // terminal: the last active block's output == the committed cap entry.
+        let term = p[CMT_P_TERM].clone();
+        for k in 0..4 {
+            builder.assert_zero(term.clone() * (cur[k].clone() - pis[4 + k].clone()));
+        }
+    }
+}
+
+pub(crate) fn cm2_build_trace(group: [Val; 4], path: &[([Val; 4], bool)]) -> (RowMajorMatrix<Val>, [Val; 4]) {
+    let air = CommitMerkleTileAir;
+    let h = air.height();
+    let mut t = vec![Val::ZERO; h * CMT_W];
+    let mut input = [Val::ZERO; W];
+    input[..4].copy_from_slice(&group); // the leaf preimage in the rate lanes
+    let rows = native_steps(input);
+    for r in 0..BLOCK {
+        t[r * CMT_W..r * CMT_W + W].copy_from_slice(&rows[r]);
+    }
+    let mut node: [Val; 4] = native_permute(input)[..4].try_into().unwrap();
+    for (l, &(sib, b)) in path.iter().enumerate() {
+        let blk = 1 + l;
+        let mut inp = [Val::ZERO; W];
+        if b {
+            inp[..4].copy_from_slice(&sib);
+            inp[4..].copy_from_slice(&node);
+        } else {
+            inp[..4].copy_from_slice(&node);
+            inp[4..].copy_from_slice(&sib);
+        }
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * CMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+            t[base + CMT_SIB..base + CMT_SIB + 4].copy_from_slice(&sib);
+            t[base + CMT_BIT] = if b { Val::ONE } else { Val::ZERO };
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    let terminal = node;
+    for blk in CMT_NBLOCKS..CMT_NBLOCKS_PAD {
+        let mut inp = [Val::ZERO; W];
+        inp[..4].copy_from_slice(&node);
+        let rows = native_steps(inp);
+        for r in 0..BLOCK {
+            let base = (blk * BLOCK + r) * CMT_W;
+            t[base..base + W].copy_from_slice(&rows[r]);
+        }
+        node = native_permute(inp)[..4].try_into().unwrap();
+    }
+    (RowMajorMatrix::new(t, CMT_W), terminal)
+}
