@@ -3097,9 +3097,12 @@ impl MonolithAir {
     fn cm_depth_r(&self, r: usize) -> usize {
         cm_depth_at(r, self.lg(), CM_CAP_HEIGHT)
     }
-    // HIDING random-round leaf blocks (is_zk=1): committed random row (RAND_PUB ‖ codewords) ‖ salt.
+    // HIDING random-round leaf felts (is_zk=1): committed random row (RAND_PUB ‖ codewords) ‖ salt.
+    fn random_leaf_felts(&self) -> usize {
+        HIDING_RAND_PUB + HIDING_NUM_CW + HIDING_SALT
+    }
     fn random_leaf_blocks(&self) -> usize {
-        (HIDING_RAND_PUB + HIDING_NUM_CW + HIDING_SALT).div_ceil(RATE)
+        self.random_leaf_felts().div_ceil(RATE)
     }
     // HIDING random-round terminal block (is_zk=1): leaf + input_depth path, prepended at M_INPUT_LEAF.
     fn m_random_term(&self) -> usize {
@@ -3157,13 +3160,29 @@ impl MonolithAir {
     fn n_quot(&self) -> usize {
         self.n_terms - 2 * self.w_inner()
     }
-    // opened-row carrier felt c (0..W): the authenticated trace row value, shared across that column's ζ/ζ_next terms.
+    // opened-row carrier felt c: the authenticated trace-leaf preimage, shared across ζ/ζ_next terms. Width
+    // input_leaf_felts() (= w_inner is_zk=0; = W‖codewords‖salt is_zk=1).
     fn ov_c(&self, c: usize) -> usize {
         self.ov() + c
     }
-    // start of the commit-phase fold-group carriers (after the W-wide opened row + the 2·nqc quotient carriers).
+    // HIDING (is_zk=1) random-round leaf-preimage carrier felt c, after the trace-leaf carriers.
+    fn ov_random(&self, c: usize) -> usize {
+        self.ov() + self.input_leaf_felts() + c
+    }
+    // width of the random-round carrier region (0 for is_zk=0).
+    fn random_carriers(&self) -> usize {
+        if self.is_zk == 1 {
+            self.random_leaf_felts()
+        } else {
+            0
+        }
+    }
+    // start of the commit-phase fold-group carriers, after the leaf-preimage carriers. is_zk=0: opened row
+    // (w_inner) + quotient (2·nqc = n_quot). is_zk=1: trace-leaf (W‖cw‖salt) + random-leaf + quotient-leaf
+    // (nqc multi-matrix ‖ salt) preimages. (input_leaf_felts/quot_leaf_felts equal w_inner/2·nqc at is_zk=0,
+    // so this is byte-for-byte there.)
     fn carriers_base(&self) -> usize {
-        self.ov() + self.w_inner() + self.n_quot()
+        self.ov() + self.input_leaf_felts() + self.random_carriers() + self.quot_leaf_felts()
     }
     fn nb(&self) -> usize {
         self.binds.len()
@@ -3231,7 +3250,9 @@ impl MonolithAir {
         self.carry() + 2 // opened-value carrier (the input-Merkle leaf preimage)
     }
     fn qc(&self, i: usize) -> usize {
-        self.ov() + self.w_inner() + i // quotient opened-value carriers (after the W-wide opened row), 2 felts
+        // quotient-leaf-preimage carriers, after the trace-leaf (+ random-leaf when is_zk=1) carriers. is_zk=0:
+        // ov + w_inner + i (2·nqc felts, unchanged); is_zk=1: after the trace + random leaf preimages.
+        self.ov() + self.input_leaf_felts() + self.random_carriers() + i
     }
     fn cg(&self, r: usize, k: usize) -> usize {
         self.carriers_base() + 4 * r + k // commit-phase group carriers: 6 rounds × 4 felts (the fold group {e_r, sib_r})
@@ -3242,7 +3263,8 @@ impl MonolithAir {
         self.carriers_base() + 4 * self.cm_rounds() + g // g: input 0..4, quotient 4..8, commit r 8+4r..8+4r+4
     }
     fn n_cap_c(&self) -> usize {
-        (2 + self.cm_rounds()) * 4 // input + quotient + cm_rounds commit = (2+R) entries × 4
+        // cap-entry carriers: input + quotient + cm_rounds commit (2+R), plus the RANDOM round when is_zk=1.
+        (2 + self.is_zk + self.cm_rounds()) * 4
     }
     // column-window: the inner-proof "pis" as a witness column window (held constant across the instance) so
     // the monolith can be tiled. Placed after all other columns.
@@ -7332,7 +7354,14 @@ mod tests {
         assert_eq!(air.m_nblocks(), nb, "m_nblocks");
         assert_eq!(air.n_terms, n_terms, "n_terms");
         assert_eq!(air.lg(), 11, "log_global from binds");
-        println!("MonolithAir is_zk=1 geometry threaded: nqc={}, leaf blocks {rlb}/{ilb}/{qlb}, terminals {rt}/{it}/{qt}, m_nblocks={nb} == hiding_commit_layout", air.nqc());
+        // carrier/arith-tile layout: the tile width auto-scales with n_terms; the carrier region holds the
+        // THREE salted leaf preimages (9 trace + 10 random + 40 quotient = 59), disjoint + monotone.
+        assert_eq!(air.tile_w(), air.qt_terms() + 9 * 40, "arith tile width = qt_terms + 9·n_terms");
+        assert_eq!((air.input_leaf_felts(), air.random_leaf_felts(), air.quot_leaf_felts()), (9, 10, 40), "leaf-preimage felt widths");
+        assert_eq!(air.carriers_base() - air.ov(), 9 + 10 + 40, "carrier region = 3 salted leaf preimages (59 felts)");
+        assert_eq!((air.ov_c(0), air.ov_random(0), air.qc(0)), (air.ov(), air.ov() + 9, air.ov() + 19), "leaf-preimage carrier offsets: trace|random|quotient");
+        assert_eq!(air.n_cap_c(), (2 + 1 + 7) * 4, "cap carriers incl. the random round = (3+cm_rounds)·4");
+        println!("MonolithAir is_zk=1 geometry threaded: nqc={}, leaf blocks {rlb}/{ilb}/{qlb}, terminals {rt}/{it}/{qt}, m_nblocks={nb}; carriers = 3 salted leaves (59 felts), tile_w={} == hiding_commit_layout + witness widths", air.nqc(), air.tile_w());
     }
 
     #[test]
