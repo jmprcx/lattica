@@ -156,28 +156,24 @@ const P_ROOT_IN: usize = P_SK_TO_ROOT + 1;
 const P_ROOT_UPDATE: usize = P_ROOT_IN + 1;
 const BATCH_N_PERIODIC: usize = P_ROOT_UPDATE + 1;
 
-/// The statement chunk absorbed by s_k fold block `ci` (parallels the oracle's `tx_statement_digest`).
-enum ChunkSrc {
-    Full(usize), // a 4-element staging chunk at this column
-    FeeMint,     // [S_FEE, S_MINT, 0, 0]
-    Height,      // [S_HEIGHT, 0, 0, 0]
-}
-const fn chunk_src(ci: usize) -> ChunkSrc {
-    if ci == 0 {
-        ChunkSrc::Full(S_ANCHOR)
-    } else if ci < 1 + N_IN {
-        ChunkSrc::Full(S_NF + (ci - 1) * DIGEST)
-    } else if ci < 1 + N_IN + M_OUT {
-        ChunkSrc::Full(S_OUTCM + (ci - 1 - N_IN) * DIGEST)
-    } else if ci == 1 + N_IN + M_OUT {
-        ChunkSrc::FeeMint
-    } else if ci == 2 + N_IN + M_OUT {
-        ChunkSrc::Full(S_TXBIND)
-    } else if ci == 3 + N_IN + M_OUT {
-        ChunkSrc::Height
-    } else {
-        ChunkSrc::Full(S_HASHLOCK)
+/// The AIR-side chunk table the tx-root fold injects, in fold order — the in-circuit twin of the native
+/// `statement_chunks`. The HTLC statement extends the join-split one with `[S_HEIGHT,0,0,0]` and the
+/// hashlock (an auditor checks this table against `statement_chunks` side by side).
+fn fold_chunks() -> Vec<crate::batch_common::FoldChunk> {
+    let full = |base: usize| [Some(base), Some(base + 1), Some(base + 2), Some(base + 3)];
+    let mut v = Vec::with_capacity(FOLD_SK_BLOCKS);
+    v.push(full(S_ANCHOR));
+    for i in 0..N_IN {
+        v.push(full(S_NF + i * DIGEST));
     }
+    for j in 0..M_OUT {
+        v.push(full(S_OUTCM + j * DIGEST));
+    }
+    v.push([Some(S_FEE), Some(S_MINT), None, None]);
+    v.push(full(S_TXBIND));
+    v.push([Some(S_HEIGHT), None, None, None]);
+    v.push(full(S_HASHLOCK));
+    v
 }
 
 // FRI / ZK config — the production family from crate::config (single audited source).
@@ -261,68 +257,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcBatchAir {
                 staged.push(S_OUTCM + j * DIGEST + k);
             }
         }
-        for &c in &staged {
-            builder.when_transition().assert_zero(tile_persist.clone() * (nxt[c].clone() - cur[c].clone()));
-        }
+        crate::batch_common::eval_tile_persistence(builder, &cur, &nxt, tile_persist, &staged);
 
         // 3. the per-tile HTLC spend constraints — reused verbatim, fed the staging statement + tile_last.
         //    (the cur == statement[..] bindings inside eval_spend double as the staging bindings.)
         eval_spend(builder, &statement, tile_last.clone());
 
-        // 4. the in-circuit tx-root fold (identical structure to batch_joinsplit_air; 9 s_k chunks).
-        let dom_txroot = AB::Expr::from(Goldilocks::from_u64(DOM_TXROOT));
-        for bi in 0..FOLD_SK_BLOCKS {
-            let sel = p[P_FOLD_IN + bi].clone();
-            match chunk_src(bi) {
-                ChunkSrc::Full(base) => {
-                    for k in 0..DIGEST {
-                        builder.assert_zero(sel.clone() * (cur[DIGEST + k].clone() - cur[base + k].clone()));
-                    }
-                }
-                ChunkSrc::FeeMint => {
-                    builder.assert_zero(sel.clone() * (cur[DIGEST].clone() - cur[S_FEE].clone()));
-                    builder.assert_zero(sel.clone() * (cur[DIGEST + 1].clone() - cur[S_MINT].clone()));
-                    builder.assert_zero(sel.clone() * cur[DIGEST + 2].clone());
-                    builder.assert_zero(sel.clone() * cur[DIGEST + 3].clone());
-                }
-                ChunkSrc::Height => {
-                    builder.assert_zero(sel.clone() * (cur[DIGEST].clone() - cur[S_HEIGHT].clone()));
-                    for k in 1..DIGEST {
-                        builder.assert_zero(sel.clone() * cur[DIGEST + k].clone());
-                    }
-                }
-            }
-        }
-        let sk0 = p[P_FOLD_IN].clone(); // block 0 low lanes = [DOM_TXROOT, 0, 0, 0]
-        builder.assert_zero(sk0.clone() * (cur[0].clone() - dom_txroot.clone()));
-        for k in 1..DIGEST {
-            builder.assert_zero(sk0.clone() * cur[k].clone());
-        }
-        let sl = p[P_SK_LINK].clone(); // s_k block output[0..4] → next block input[0..4]
-        for k in 0..DIGEST {
-            builder.when_transition().assert_zero(sl.clone() * (nxt[k].clone() - cur[k].clone()));
-        }
-        let s2r = p[P_SK_TO_ROOT].clone(); // last s_k block output → root block input lanes 4..8 (= s_k)
-        for k in 0..DIGEST {
-            builder.when_transition().assert_zero(s2r.clone() * (nxt[DIGEST + k].clone() - cur[k].clone()));
-        }
-        let ri = p[P_ROOT_IN].clone(); // root block input lanes 0..4 == the running ROOT
-        for k in 0..DIGEST {
-            builder.assert_zero(ri.clone() * (cur[k].clone() - cur[ROOT + k].clone()));
-        }
-        for k in 0..DIGEST {
-            builder.when_first_row().assert_zero(cur[ROOT + k].clone()); // IV = 0
-        }
-        let ru = p[P_ROOT_UPDATE].clone();
-        for k in 0..DIGEST {
-            builder
-                .when_transition()
-                .assert_zero((one.clone() - ru.clone()) * (nxt[ROOT + k].clone() - cur[ROOT + k].clone()));
-            builder.when_transition().assert_zero(ru.clone() * (nxt[ROOT + k].clone() - cur[k].clone()));
-        }
-        for k in 0..DIGEST {
-            builder.when_last_row().assert_zero(cur[k].clone() - pis[k].clone()); // root block is the last block
-        }
+        // 4. the in-circuit tx-root fold — the SAME shared emitter as batch_joinsplit_air; the HTLC delta
+        //    is only the two extra chunks (Height, hashlock) in fold_chunks() and the larger FOLD_SK_BLOCKS.
+        crate::batch_common::eval_txroot_fold(builder, &cur, &nxt, &pis, &p[P_FOLD_IN..], &fold_chunks(), ROOT);
     }
 }
 
