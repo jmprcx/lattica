@@ -2954,13 +2954,16 @@ fn hiding_commit_layout(
     let m_random_term = M_INPUT_LEAF + (rlb - 1) + input_depth;
     let m_input_term = (m_random_term + 1) + (ilb - 1) + input_depth;
     let m_quot_term = (m_input_term + 1) + (qlb - 1) + input_depth;
+    // the commit phase is ALSO salted (hiding ChallengeMmcs): each round's leaf = MyHash(group ‖ salt) = 8
+    // felts ⇒ a 2-block sponge per round (confirmed by hiding_query_commit_merkle_all's (salts, siblings)).
+    let cm_leaf_blocks = (4 + HIDING_SALT).div_ceil(RATE);
     let (mut leaf, mut term) = (Vec::with_capacity(cm_rounds), Vec::with_capacity(cm_rounds));
     let mut blk = m_quot_term + 1;
     for r in 0..cm_rounds {
         let d = cm_depth_at(r, log_global, cap);
         leaf.push(blk);
-        term.push(blk + d);
-        blk += d + 1;
+        term.push(blk + (cm_leaf_blocks - 1) + d);
+        blk += (cm_leaf_blocks - 1) + d + 1;
     }
     let m_nblocks = term[cm_rounds - 1] + 1;
     // reduced-opening terms: random (×1 point) + trace (×2 points ζ,ζ_next) + quotient (nqc chunks ×1 point).
@@ -3125,16 +3128,25 @@ impl MonolithAir {
     fn m_quot_term(&self) -> usize {
         self.m_quot_leaf() + (self.quot_leaf_blocks() - 1) + self.input_depth()
     }
-    // commit round r: leaf-hash block then cm_depth_r(r) merges, laid out cumulatively after the quotient terminal.
+    // commit-phase leaf felts: the arity-2 fold group (4 base felts); HIDING (is_zk=1) salts it (+SALT), so the
+    // salted commit leaf is a 2-block sponge (like the input leaves). is_zk=0 ⇒ 4 felts / 1 block (byte-for-byte).
+    fn cm_leaf_felts(&self) -> usize {
+        4 + if self.is_zk == 1 { HIDING_SALT } else { 0 }
+    }
+    fn cm_leaf_blocks(&self) -> usize {
+        self.cm_leaf_felts().div_ceil(RATE)
+    }
+    // commit round r: cm_leaf_blocks leaf-hash blocks then cm_depth_r(r) merges, laid out cumulatively after the
+    // quotient terminal.
     fn cm_leaf(&self, r: usize) -> usize {
         let mut blk = self.m_quot_term() + 1;
         for r2 in 0..r {
-            blk += self.cm_depth_r(r2) + 1;
+            blk += (self.cm_leaf_blocks() - 1) + self.cm_depth_r(r2) + 1;
         }
         blk
     }
     fn cm_term(&self, r: usize) -> usize {
-        self.cm_leaf(r) + self.cm_depth_r(r)
+        self.cm_leaf(r) + (self.cm_leaf_blocks() - 1) + self.cm_depth_r(r)
     }
     fn m_nblocks(&self) -> usize {
         self.cm_term(self.cm_rounds() - 1) + 1
@@ -3145,7 +3157,7 @@ impl MonolithAir {
     // a NON-CONSTANT inner (counter or any symbolic multi-column) needs the full committed cap + the
     // index-selecting cap-mux (per-query cap entries differ), rather than ConstAir's single shared entry.
     fn full_cap(&self) -> bool {
-        self.inner_counter || self.symbolic()
+        self.inner_counter || self.symbolic() || self.is_zk == 1
     }
     // symbolic mode witnesses the three Lagrange selectors at ζ (is_first, is_last, inv_van = 3 ext = 6 felts),
     // bound to their ζ-definitions, so the constraint tree is evaluated with selector VALUES (no per-constraint
@@ -3159,6 +3171,54 @@ impl MonolithAir {
     // quotient DEEP terms = n_terms − the 2·W trace terms.
     fn n_quot(&self) -> usize {
         self.n_terms - 2 * self.w_inner()
+    }
+
+    // ---- HIDING (is_zk=1) reduced-opening TERM offsets. is_zk=1 prepends a random round (RAND_PUB+CW terms) and
+    // widens every committed matrix by HIDING_NUM_CW codewords; the trace opens at zeta and zeta_next, the
+    // quotient at zeta over nqc chunks. is_zk=0 reduces to the legacy [trace(W) | next(W) | quot(2*nqc)] layout,
+    // so every offset below is byte-for-byte at is_zk=0. ----
+    fn cw(&self) -> usize {
+        if self.is_zk == 1 { HIDING_NUM_CW } else { 0 }
+    }
+    // committed trace-row width (px-bound reduced-opening terms per opening point): W, or W+CW hiding.
+    fn trm_committed_w(&self) -> usize {
+        self.w_inner() + self.cw()
+    }
+    // first trace-zeta term index (past the prepended random round when is_zk=1).
+    fn trm_trace_base(&self) -> usize {
+        if self.is_zk == 1 { HIDING_RAND_PUB + HIDING_NUM_CW } else { 0 }
+    }
+    fn trm_next_base(&self) -> usize {
+        self.trm_trace_base() + self.trm_committed_w()
+    }
+    fn trm_quot_base(&self) -> usize {
+        self.trm_next_base() + self.trm_committed_w()
+    }
+    // committed quotient-chunk width (2 F_p^2 components + CW codewords hiding).
+    fn trm_chunk_w(&self) -> usize {
+        2 + self.cw()
+    }
+    fn trm_trace(&self, c: usize) -> usize {
+        self.trm_trace_base() + c
+    }
+    fn trm_next(&self, c: usize) -> usize {
+        self.trm_next_base() + c
+    }
+    fn trm_quot(&self, i: usize, j: usize) -> usize {
+        self.trm_quot_base() + i * self.trm_chunk_w() + j
+    }
+    // committed random-row width (px-bound prefix of the random leaf preimage): RAND_PUB + CW (is_zk=1).
+    fn random_committed_w(&self) -> usize {
+        HIDING_RAND_PUB + self.cw()
+    }
+    // per-chunk stride in the quotient-leaf preimage: committed chunk row (+ salt hiding).
+    fn quot_chunk_stride(&self) -> usize {
+        self.trm_chunk_w() + if self.is_zk == 1 { HIDING_SALT } else { 0 }
+    }
+    // HIDING random-round cap pis region (a full cap; the random commitment varies per query so the cap-mux
+    // selects cap[index>>input_depth]); placed AFTER the qwt region. is_zk=0 => absent (byte-for-byte).
+    pub(crate) fn random_cap_base(&self) -> usize {
+        self.qwt_base() + self.qwt_len()
     }
     // opened-row carrier felt c: the authenticated trace-leaf preimage, shared across ζ/ζ_next terms. Width
     // input_leaf_felts() (= w_inner is_zk=0; = W‖codewords‖salt is_zk=1).
@@ -3308,14 +3368,14 @@ impl MonolithAir {
         self.periodic_base() + self.n_periodic() * 2
     }
     fn qwt_len(&self) -> usize {
-        if self.symbolic() && self.nqc() > 1 {
+        if (self.symbolic() || self.is_zk == 1) && self.nqc() > 1 {
             2 * self.nqc()
         } else {
             0
         }
     }
-    fn pis_count(&self) -> usize {
-        self.qwt_base() + self.qwt_len()
+    pub(crate) fn pis_count(&self) -> usize {
+        self.random_cap_base() + if self.is_zk == 1 { self.cap_stride() } else { 0 }
     }
     // pis cap layout — the FULL cap (2^cap_height entries) for a non-constant inner (so the cap-mux can select
     // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
@@ -3327,13 +3387,13 @@ impl MonolithAir {
             4
         }
     }
-    fn cap_base(&self) -> usize {
+    pub(crate) fn cap_base(&self) -> usize {
         2 * self.nb() + self.ni() + 2 // after challenges + index felts + final_poly[0]
     }
     fn qcap_base(&self) -> usize {
         self.cap_base() + self.cap_stride()
     }
-    fn pub_pi(&self) -> usize {
+    pub(crate) fn pub_pi(&self) -> usize {
         self.qcap_base() + self.cap_stride()
     }
     fn ccap_base(&self) -> usize {
@@ -3353,7 +3413,7 @@ impl MonolithAir {
     fn commit_cap_base(&self, r: usize) -> usize {
         self.ccap_base() + (0..r).map(|r2| self.commit_cap_size(r2) * 4).sum::<usize>()
     }
-    fn fused_w(&self) -> usize {
+    pub(crate) fn fused_w(&self) -> usize {
         self.sel_base() + if self.symbolic() { 6 } else { 0 } // sel_base = pw_base (+ column-window window); + 3 witnessed selectors (symbolic)
     }
     // aggregator fold columns (only when `fold`): 8 Poseidon lanes (the two merge permutations) + 4 lanes for
@@ -3434,7 +3494,7 @@ impl MonolithAir {
     fn inst_h(&self) -> usize {
         (self.tr() + self.n_queries * self.m_period()).next_power_of_two() // one inner-proof instance
     }
-    fn height(&self) -> usize {
+    pub(crate) fn height(&self) -> usize {
         self.k_instances * self.inst_h() // K instances tiled row-disjoint
     }
     // per-instance first/last row one-hots (appended after the single-instance periodic columns): the
@@ -3453,7 +3513,7 @@ impl MonolithAir {
         if self.leaf_blocks() > 1 {
             (self.leaf_blocks() - 1) // ia_in(1..leaf_blocks): absorb heads
                 + 1 // in_boundary: leaf-internal capacity carry (union)
-                + usize::from(self.w_inner() % RATE != 0) // in_last_carry: short-final rate carry
+                + usize::from(self.input_leaf_felts() % RATE != 0) // in_last_carry: short-final rate carry
         } else {
             0
         }
@@ -3480,7 +3540,7 @@ impl MonolithAir {
         if self.quot_leaf_blocks() > 1 {
             (self.quot_leaf_blocks() - 1) // iq_(1..quot_leaf_blocks): absorb heads
                 + 1 // q_boundary: capacity carry (union)
-                + usize::from((2 * self.nqc()) % RATE != 0) // q_last_carry: short-final
+                + usize::from(self.quot_leaf_felts() % RATE != 0) // q_last_carry: short-final
         } else {
             0
         }
@@ -3517,8 +3577,54 @@ impl MonolithAir {
     fn p_fold_rootupd(&self) -> usize {
         self.fold_base() + 4
     }
-    fn p_inst_first(&self) -> usize {
+    // ---- HIDING random-round leaf periodic selectors (is_zk=1): the random-polynomial commitment opens as a
+    // THIRD input round, laid out as a salted leaf (blocks M_INPUT_LEAF..) + input_depth path, mirroring the
+    // trace leaf. Appended AFTER the fold selectors so is_zk=0 keeps p_inst_first/p_inst_last byte-for-byte. ----
+    fn random_absorb_base(&self) -> usize {
         self.fold_base() + self.n_fold_p()
+    }
+    fn n_random_periodic(&self) -> usize {
+        if self.is_zk == 1 {
+            2 // p_random_leaf (head) + p_random_term (terminal)
+                + (self.random_leaf_blocks() - 1) // subsequent-block absorb heads
+                + usize::from(self.random_leaf_blocks() > 1) // capacity-carry boundary
+                + usize::from(self.random_leaf_blocks() > 1 && self.random_leaf_felts() % RATE != 0) // short-final
+        } else {
+            0
+        }
+    }
+    fn p_random_leaf(&self) -> usize {
+        self.random_absorb_base()
+    }
+    fn p_random_term(&self) -> usize {
+        self.random_absorb_base() + 1
+    }
+    fn p_random_absorb(&self, b: usize) -> usize {
+        self.random_absorb_base() + 2 + (b - 1)
+    }
+    fn p_random_boundary(&self) -> usize {
+        self.random_absorb_base() + 2 + (self.random_leaf_blocks() - 1)
+    }
+    fn p_random_last_carry(&self) -> usize {
+        self.p_random_boundary() + 1
+    }
+    // HIDING commit-leaf internal boundary (is_zk=1, 2-block salted commit leaf): a capacity-carry one-hot at
+    // each round's block-0→block-1 boundary. Appended after the random region. Absent at is_zk=0 (byte-for-byte).
+    fn commit_absorb_base(&self) -> usize {
+        self.random_absorb_base() + self.n_random_periodic()
+    }
+    fn n_commit_absorb(&self) -> usize {
+        if self.is_zk == 1 && self.cm_leaf_blocks() > 1 {
+            1 // a single UNION capacity-carry one-hot over every round's commit-leaf block-0→block-1 boundary
+        } else {
+            0
+        }
+    }
+    fn c_bnd(&self) -> usize {
+        self.commit_absorb_base()
+    }
+    fn p_inst_first(&self) -> usize {
+        self.commit_absorb_base() + self.n_commit_absorb()
     }
     fn p_inst_last(&self) -> usize {
         self.p_inst_first() + 1
@@ -3607,7 +3713,7 @@ impl MonolithAir {
         };
         cols.push(tiled(0)); // M_TF (arith head)
         cols.push(tiled(self.cm_rounds())); // M_TL (folded_eval / accept row: E_{cm_rounds})
-        cols.push(tiled(M_INPUT_LEAF * BLOCK)); // M_LEAF
+        cols.push(tiled(self.m_input_leaf() * BLOCK)); // M_LEAF (trace leaf-hash head; past the random round when is_zk=1)
         cols.push(tiled(self.m_input_term() * BLOCK + BLOCK - 1)); // M_TERM
         let mut s_trans = vec![Val::ZERO; h];
         for r in 0..tr {
@@ -3644,18 +3750,19 @@ impl MonolithAir {
         // leaf-internal capacity-carry boundary (union), and — if the final block is short — its rate-carry
         // boundary. Absent at leaf_blocks=1, so the milestone layout is unchanged.
         if self.leaf_blocks() > 1 {
+            let ml = self.m_input_leaf(); // trace leaf-hash head block (past the random round when is_zk=1)
             for b in 1..self.leaf_blocks() {
-                cols.push(tiled((M_INPUT_LEAF + b) * BLOCK)); // ia_in(b): block (M_INPUT_LEAF+b) head
+                cols.push(tiled((ml + b) * BLOCK)); // ia_in(b): block (m_input_leaf+b) head
             }
             let mut boundary = vec![Val::ZERO; h];
             for q in 0..self.n_queries {
                 for b in 1..self.leaf_blocks() {
-                    boundary[st_off(q, (M_INPUT_LEAF + b) * BLOCK - 1)] = Val::ONE; // block (M_INPUT_LEAF+b−1) last row
+                    boundary[st_off(q, (ml + b) * BLOCK - 1)] = Val::ONE; // block (m_input_leaf+b−1) last row
                 }
             }
             cols.push(boundary); // in_boundary
-            if self.w_inner() % RATE != 0 {
-                cols.push(tiled((M_INPUT_LEAF + self.leaf_blocks() - 1) * BLOCK - 1)); // in_last_carry (into the short final block)
+            if self.input_leaf_felts() % RATE != 0 {
+                cols.push(tiled((ml + self.leaf_blocks() - 1) * BLOCK - 1)); // in_last_carry (into the short final block)
             }
         }
         // MULTI-BLOCK quotient-leaf one-hots (only quot_leaf_blocks>1), mirroring the input-leaf ones.
@@ -3670,7 +3777,7 @@ impl MonolithAir {
                 }
             }
             cols.push(qboundary); // q_boundary
-            if (2 * self.nqc()) % RATE != 0 {
+            if self.quot_leaf_felts() % RATE != 0 {
                 cols.push(tiled((self.m_quot_leaf() + self.quot_leaf_blocks() - 1) * BLOCK - 1)); // q_last_carry
             }
         }
@@ -3694,6 +3801,39 @@ impl MonolithAir {
             cols.push(sklast);
             cols.push(rootin);
             cols.push(rootupd);
+        }
+        // HIDING random-round leaf one-hots (is_zk=1): the random-polynomial commitment's salted leaf (blocks
+        // M_INPUT_LEAF..+random_leaf_blocks) + input_depth path + terminal, mirroring the trace leaf. Appended
+        // AFTER the fold selectors (random_absorb_base = fold_base + n_fold_p); absent at is_zk=0 (byte-for-byte).
+        if self.is_zk == 1 {
+            cols.push(tiled(M_INPUT_LEAF * BLOCK)); // p_random_leaf (random leaf-hash head)
+            cols.push(tiled(self.m_random_term() * BLOCK + BLOCK - 1)); // p_random_term (random terminal)
+            if self.random_leaf_blocks() > 1 {
+                for b in 1..self.random_leaf_blocks() {
+                    cols.push(tiled((M_INPUT_LEAF + b) * BLOCK)); // p_random_absorb(b)
+                }
+                let mut rboundary = vec![Val::ZERO; h];
+                for q in 0..self.n_queries {
+                    for b in 1..self.random_leaf_blocks() {
+                        rboundary[st_off(q, (M_INPUT_LEAF + b) * BLOCK - 1)] = Val::ONE;
+                    }
+                }
+                cols.push(rboundary); // p_random_boundary
+                if self.random_leaf_felts() % RATE != 0 {
+                    cols.push(tiled((M_INPUT_LEAF + self.random_leaf_blocks() - 1) * BLOCK - 1)); // p_random_last_carry
+                }
+            }
+        }
+        // HIDING commit-leaf internal boundary (is_zk=1, 2-block salted commit leaf): a single UNION one-hot over
+        // every round's block-0→block-1 boundary (block cm_leaf(r)'s last row) — the capacity carry.
+        if self.is_zk == 1 && self.cm_leaf_blocks() > 1 {
+            let mut cbnd = vec![Val::ZERO; h];
+            for q in 0..self.n_queries {
+                for r in 0..self.cm_rounds() {
+                    cbnd[st_off(q, (self.cm_leaf(r) + 1) * BLOCK - 1)] = Val::ONE;
+                }
+            }
+            cols.push(cbnd); // c_bnd (union)
         }
         cols
     }
@@ -3943,9 +4083,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             // S_6 = ζ^(2^degree_bits). In pis mode ζ is a degree-0 public constant ⇒ inline squaring (degree 0).
             // In column-window ζ is a degree-1 witness ⇒ use the witnessed squaring chain (S_{i+1}=S_i², bound
             // degree 2) so z_h stays degree 1 and the OOD constraint doesn't blow up.
+            // constraint-domain degree bits: HALVED under is_zk (init_trace_domain = degree >> is_zk), so
+            // z_h = ζ^(2^(cm_rounds−is_zk))−1 and the domain generator uses cm_rounds−is_zk. is_zk=0 ⇒ cm_rounds
+            // (byte-for-byte).
+            let cdb = self.cm_rounds() - self.is_zk;
             let z_h = if self.column_window {
                 let mut prev = zeta.clone();
-                for i in 0..self.cm_rounds() {
+                for i in 0..cdb {
                     let si = (cur[self.sch(2 * i)].clone(), cur[self.sch(2 * i) + 1].clone());
                     let sq = emul(prev.clone(), prev.clone());
                     builder.assert_zero(tf.clone() * (si.0.clone() - sq.0));
@@ -3955,12 +4099,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 (prev.0 - one.clone(), prev.1)
             } else {
                 let mut s = zeta.clone();
-                for _ in 0..self.cm_rounds() {
+                for _ in 0..cdb {
                     s = emul(s.clone(), s.clone());
                 }
                 (s.0 - one.clone(), s.1)
             };
-            let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(self.cm_rounds()).inverse());
+            let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(cdb).inverse());
             let is_trans = (zeta.0.clone() - g_inv, zeta.1.clone());
             let zm1 = (zeta.0.clone() - one.clone(), zeta.1.clone());
             let w_in = self.w_inner();
@@ -3982,16 +4126,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 let biv = emul(inv_van.clone(), z_h.clone());
                 builder.assert_zero(tf.clone() * (biv.0 - one.clone()));
                 builder.assert_zero(tf.clone() * biv.1);
-                let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(c))).collect();
-                let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(w_in + c))).collect();
+                let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_trace(c)))).collect();
+                let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_next(c)))).collect();
                 // recompose quotient(ζ) from the nqc chunk-openings: Σ_i zps_i·(pz(2W+2i)+pz(2W+2i+1)·X). nqc=1 ⇒
                 // the single chunk c0+c1·X (implicit weight 1, byte-for-byte); nqc>1 ⇒ verifier-computed weights
                 // zps_i (the qwt pis region) — exactly p3's recompose_quotient_from_chunks (validated by the oracle).
                 let quot = {
                     let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
                     for i in 0..self.nqc() {
-                        let d0 = gg(self.pz(2 * w_in + 2 * i));
-                        let d1 = gg(self.pz(2 * w_in + 2 * i + 1));
+                        let d0 = gg(self.pz(self.trm_quot(i, 0)));
+                        let d1 = gg(self.pz(self.trm_quot(i, 1)));
                         let chunk = (d0.0.clone() + w.clone() * d1.1.clone(), d0.1.clone() + d1.0.clone());
                         let weighted = if self.nqc() == 1 {
                             chunk
@@ -4022,11 +4166,27 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 let p2 = emul(is_trans.clone(), zm1.clone()); // is_trans·(ζ−1)
                 let p3v = emul(z_h.clone(), zm1.clone()); // z_h·(ζ−1)
                 let pub_val = pis[self.pub_pi()].clone();
-                let local = gg(self.pz(0));
-                let next = gg(self.pz(1));
-                let c0 = gg(self.pz(2));
-                let c1 = gg(self.pz(3));
-                let quot = (c0.0.clone() + w.clone() * c1.1.clone(), c0.1.clone() + c1.0.clone());
+                let local = gg(self.pz(self.trm_trace(0)));
+                let next = gg(self.pz(self.trm_next(0)));
+                // recompose quotient(ζ) from the nqc chunk-openings: weight-1 single chunk when nqc=1 (byte-for-byte
+                // c0+c1·X); verifier-computed weights zps_i (qwt pis region) when nqc>1 — the hiding ConstAir has
+                // nqc=4. Exactly p3's recompose_quotient_from_chunks, matching the symbolic path above.
+                let quot = {
+                    let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
+                    for i in 0..self.nqc() {
+                        let d0 = gg(self.pz(self.trm_quot(i, 0)));
+                        let d1 = gg(self.pz(self.trm_quot(i, 1)));
+                        let chunk = (d0.0.clone() + w.clone() * d1.1.clone(), d0.1.clone() + d1.0.clone());
+                        let weighted = if self.nqc() == 1 {
+                            chunk
+                        } else {
+                            let zps = (pis[self.qwt_base() + 2 * i].clone(), pis[self.qwt_base() + 2 * i + 1].clone());
+                            emul(zps, chunk)
+                        };
+                        acc = (acc.0 + weighted.0, acc.1 + weighted.1);
+                    }
+                    acc
+                };
                 let lm = (local.0.clone() - pub_val, local.1.clone());
                 let trans_const = if self.inner_counter { one.clone() } else { AB::Expr::ZERO };
                 let nl = (next.0 - local.0 - trans_const, next.1 - local.1);
@@ -4036,39 +4196,62 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 builder.assert_zero(tf.clone() * (t1.0 + t2.0 - rhs.0));
                 builder.assert_zero(tf.clone() * (t1.1 + t2.1 - rhs.1));
             }
-            // z-term binding: the trace opening z's are ζ (columns 0..W) and ζ·g_trace (columns W..2W); the
-            // quotient z's are ζ (terms 2W..). So each QT_pz(k) is genuinely the opening AT its point.
-            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(self.cm_rounds()));
-            for c in 0..w_in {
-                builder.assert_zero(tf.clone() * (cur[self.z(c)].clone() - zeta.0.clone()));
-                builder.assert_zero(tf.clone() * (cur[self.z(c) + 1].clone() - zeta.1.clone()));
-                builder.assert_zero(tf.clone() * (cur[self.z(w_in + c)].clone() - zeta.0.clone() * g_trace.clone()));
-                builder.assert_zero(tf.clone() * (cur[self.z(w_in + c) + 1].clone() - zeta.1.clone() * g_trace.clone()));
-            }
-            for j in 0..self.n_quot() {
-                builder.assert_zero(tf.clone() * (cur[self.z(2 * w_in + j)].clone() - zeta.0.clone()));
-                builder.assert_zero(tf.clone() * (cur[self.z(2 * w_in + j) + 1].clone() - zeta.1.clone()));
+            // z-term binding: bind each opened point z to its transcript-derived value — ζ for the random,
+            // trace-ζ, and quotient terms; ζ·g_trace (the HALVED constraint-domain generator) for the trace-ζ_next
+            // block [trm_next_base, trm_quot_base). is_zk=0 ⇒ [0,W)→ζ, [W,2W)→ζ·g, [2W,·)→ζ (byte-for-byte). So
+            // each QT_pz(k) is genuinely the opening AT its point.
+            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(cdb));
+            for k in 0..self.n_terms {
+                let at_next = k >= self.trm_next_base() && k < self.trm_quot_base();
+                let (zx, zy) = if at_next {
+                    (zeta.0.clone() * g_trace.clone(), zeta.1.clone() * g_trace.clone())
+                } else {
+                    (zeta.0.clone(), zeta.1.clone())
+                };
+                builder.assert_zero(tf.clone() * (cur[self.z(k)].clone() - zx));
+                builder.assert_zero(tf.clone() * (cur[self.z(k) + 1].clone() - zy));
             }
         }
 
         // ---------- opened-value carrier: held WITHIN each super-tile (S_QUERY · not-boundary) so it doesn't
         // leak across the transcript→query boundary; == QT_px(0) at the arith head; the leaf preimage. ----
-        let w_in = self.w_inner();
         let hold = p[self.s_query()].clone() * (one.clone() - p[self.p_st_last()].clone());
-        // opened-row carrier (W felts): held within the super-tile; column c's value feeds BOTH its ζ term
-        // px(c) AND its ζ_next term px(W+c) (px-sharing — one authenticated value → two DEEP terms) and the leaf.
-        for c in 0..w_in {
+        // opened-row carrier (input_leaf_felts felts): held within the super-tile. Its committed-row prefix
+        // (trm_committed_w felts) feeds BOTH its ζ term px(trm_trace(c)) AND its ζ_next term px(trm_next(c))
+        // (px-sharing — one authenticated value → two DEEP terms) and the leaf. The trailing HIDING_SALT felts
+        // (is_zk=1) are the free leaf salt: held but not px-bound (authenticated by folding to the committed cap).
+        for c in 0..self.input_leaf_felts() {
             let ovc = self.ov_c(c);
             builder.when_transition().assert_zero(hold.clone() * (nxt[ovc].clone() - cur[ovc].clone()));
-            builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(c)].clone())); // px(c) @ ζ
-            builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(w_in + c)].clone())); // px(W+c) @ ζ_next
+            if c < self.trm_committed_w() {
+                builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_trace(c))].clone())); // @ ζ
+                builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_next(c))].clone())); // @ ζ_next
+            }
         }
-        // quotient opened-value carriers (2·nqc felts): held within the super-tile; == the quotient reduced-
-        // opening terms px(2W+j) (the nqc chunk-openings at the query row — the quotient-leaf preimage).
-        for j in 0..self.n_quot() {
-            let qcj = self.qc(j);
-            builder.when_transition().assert_zero(hold.clone() * (nxt[qcj].clone() - cur[qcj].clone()));
-            builder.assert_zero(tf.clone() * (cur[qcj].clone() - cur[self.px(2 * w_in + j)].clone()));
+        // HIDING random-round carrier (random_leaf_felts felts, is_zk=1): the random-polynomial committed row
+        // (px-bound to the random reduced-opening terms px(0..random_committed_w)) ‖ free salt; held.
+        if self.is_zk == 1 {
+            for c in 0..self.random_leaf_felts() {
+                let ovr = self.ov_random(c);
+                builder.when_transition().assert_zero(hold.clone() * (nxt[ovr].clone() - cur[ovr].clone()));
+                if c < self.random_committed_w() {
+                    builder.assert_zero(tf.clone() * (cur[ovr].clone() - cur[self.px(c)].clone()));
+                }
+            }
+        }
+        // quotient opened-value carriers (quot_leaf_felts felts): the multi-matrix concat over nqc chunks. Each
+        // chunk's committed-row prefix (trm_chunk_w felts) is px-bound to its reduced-opening terms px(trm_quot(i,j))
+        // (the nqc chunk-openings at the query row); the trailing HIDING_SALT per chunk (is_zk=1) is free salt. Held.
+        {
+            let stride = self.quot_chunk_stride();
+            for c in 0..self.quot_leaf_felts() {
+                let qcj = self.qc(c);
+                builder.when_transition().assert_zero(hold.clone() * (nxt[qcj].clone() - cur[qcj].clone()));
+                let (i, j) = (c / stride, c % stride);
+                if j < self.trm_chunk_w() {
+                    builder.assert_zero(tf.clone() * (cur[qcj].clone() - cur[self.px(self.trm_quot(i, j))].clone()));
+                }
+            }
         }
         // commit-phase group carriers: seed the bit-ordered fold group {e_r, sib_r} at fold row r (p_round(r));
         // held within the super-tile so round r's leaf-hash block can absorb it (group[0..2]=lo, [2..4]=hi).
@@ -4092,7 +4275,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // trace row, RATE felts absorbed per block. First block: rate lanes 0..min(W,RATE) = opened_row, the
         // rest = 0 (fresh state). At W≤RATE this is the single-block milestone leaf (byte-for-byte).
         let leaf = p[self.m_leaf()].clone();
-        let lc0 = core::cmp::min(w_in, RATE);
+        let lc0 = core::cmp::min(self.input_leaf_felts(), RATE);
         for c in 0..lc0 {
             builder.assert_zero(leaf.clone() * (cur[c].clone() - cur[self.ov_c(c)].clone()));
         }
@@ -4104,7 +4287,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // rate lanes that chunk doesn't overwrite) — exactly PaddingFreeSponge's overwrite-mode duplex.
         for b in 1..self.leaf_blocks() {
             let ia = p[self.ia_in(b)].clone();
-            let clen = core::cmp::min(RATE, w_in - b * RATE);
+            let clen = core::cmp::min(RATE, self.input_leaf_felts() - b * RATE);
             for k in 0..clen {
                 builder.assert_zero(ia.clone() * (cur[k].clone() - cur[self.ov_c(b * RATE + k)].clone()));
             }
@@ -4114,9 +4297,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for k in RATE..W {
                 builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
             }
-            if w_in % RATE != 0 {
+            if self.input_leaf_felts() % RATE != 0 {
                 let lc = p[self.in_last_carry()].clone();
-                let rem = w_in - (self.leaf_blocks() - 1) * RATE;
+                let rem = self.input_leaf_felts() - (self.leaf_blocks() - 1) * RATE;
                 for k in rem..RATE {
                     builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
                 }
@@ -4126,7 +4309,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // quotient row (the nqc chunk-openings), RATE felts/block — the SAME multi-block machinery as the input
         // leaf. First block: rate 0..min(2·nqc,RATE) = qc, rest 0. Single block for nqc≤2 (2·nqc≤RATE).
         let qleaf = p[self.q_leaf()].clone();
-        let qlc0 = core::cmp::min(self.n_quot(), RATE);
+        let qlc0 = core::cmp::min(self.quot_leaf_felts(), RATE);
         for k in 0..qlc0 {
             builder.assert_zero(qleaf.clone() * (cur[k].clone() - cur[self.qc(k)].clone()));
         }
@@ -4136,7 +4319,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // subsequent quotient-leaf blocks (2·nqc>RATE): absorb the next chunk + carry capacity / short-final rate.
         for b in 1..self.quot_leaf_blocks() {
             let iq = p[self.iq_(b)].clone();
-            let clen = core::cmp::min(RATE, self.n_quot() - b * RATE);
+            let clen = core::cmp::min(RATE, self.quot_leaf_felts() - b * RATE);
             for k in 0..clen {
                 builder.assert_zero(iq.clone() * (cur[k].clone() - cur[self.qc(b * RATE + k)].clone()));
             }
@@ -4146,12 +4329,52 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for k in RATE..W {
                 builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
             }
-            if (2 * self.nqc()) % RATE != 0 {
+            if self.quot_leaf_felts() % RATE != 0 {
                 let lc = p[self.q_last_carry()].clone();
-                let rem = self.n_quot() - (self.quot_leaf_blocks() - 1) * RATE;
+                let rem = self.quot_leaf_felts() - (self.quot_leaf_blocks() - 1) * RATE;
                 for k in rem..RATE {
                     builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
                 }
+            }
+        }
+        // HIDING random-round leaf (is_zk=1, blocks M_INPUT_LEAF..+random_leaf_blocks): a salted PaddingFreeSponge
+        // over the random-polynomial committed row ‖ salt (random_leaf_felts felts), RATE/block — the SAME
+        // multi-block machinery as the trace leaf, then input_depth merges (via the generic merge link) to the
+        // random cap. The random terminal binds to the random cap carrier (a full cap; random varies per query).
+        if self.is_zk == 1 {
+            let rleaf = p[self.p_random_leaf()].clone();
+            let rlc0 = core::cmp::min(self.random_leaf_felts(), RATE);
+            for c in 0..rlc0 {
+                builder.assert_zero(rleaf.clone() * (cur[c].clone() - cur[self.ov_random(c)].clone()));
+            }
+            for i in rlc0..W {
+                builder.assert_zero(rleaf.clone() * cur[i].clone());
+            }
+            for b in 1..self.random_leaf_blocks() {
+                let ia = p[self.p_random_absorb(b)].clone();
+                let clen = core::cmp::min(RATE, self.random_leaf_felts() - b * RATE);
+                for k in 0..clen {
+                    builder.assert_zero(ia.clone() * (cur[k].clone() - cur[self.ov_random(b * RATE + k)].clone()));
+                }
+            }
+            if self.random_leaf_blocks() > 1 {
+                let bnd = p[self.p_random_boundary()].clone();
+                for k in RATE..W {
+                    builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+                }
+                if self.random_leaf_felts() % RATE != 0 {
+                    let lc = p[self.p_random_last_carry()].clone();
+                    let rem = self.random_leaf_felts() - (self.random_leaf_blocks() - 1) * RATE;
+                    for k in rem..RATE {
+                        builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
+                    }
+                }
+            }
+            // random terminal (block m_random_term) == the query's index-selected random cap entry, carried per
+            // super-tile in cap_c group (8 + 4·cm_rounds) and seeded at the arith head by the cap-mux below.
+            let rterm = p[self.p_random_term()].clone();
+            for k in 0..4 {
+                builder.assert_zero(rterm.clone() * (cur[k].clone() - cur[self.cap_c(8 + 4 * self.cm_rounds() + k)].clone()));
             }
         }
         // commit-phase leaves (blocks CM_LEAF[r]): absorb the bit-ordered fold group carried in cg(r,·).
@@ -4164,22 +4387,57 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 builder.assert_zero(cl.clone() * cur[i].clone());
             }
         }
+        // HIDING commit-leaf 2nd block (is_zk=1, blocks cm_leaf(r)+1): the salt is absorbed into the rate lanes
+        // (free — authenticated by folding to the committed cap), and the capacity carries from block 0. Only the
+        // capacity-carry boundary is constrained; the generic Poseidon step then produces the leaf output.
+        if self.is_zk == 1 && self.cm_leaf_blocks() > 1 {
+            let cb = p[self.c_bnd()].clone();
+            for k in RATE..W {
+                builder.when_transition().assert_zero(cb.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+            }
+        }
         builder.assert_zero(s_merkle.clone() * (cur[self.m_bit()].clone() * (one.clone() - cur[self.m_bit()].clone())));
         {
             // bit-ordered merge link across Merkle block boundaries, EXCEPT after any terminal (input/quotient/
-            // commit) — the block after a terminal is a fresh leaf-hash seeded from its carrier, not a merge.
-            let mut not_term = (one.clone() - p[self.m_term()].clone()) * (one.clone() - p[self.q_term()].clone());
-            for r in 0..self.cm_rounds() {
-                not_term = not_term * (one.clone() - p[self.c_term(r)].clone());
-            }
-            // a multi-block leaf's INTERNAL boundary is a sponge absorb-continuation, not a merge — exclude it
-            // (both the input leaf and the quotient leaf).
-            if self.leaf_blocks() > 1 {
-                not_term = not_term * (one.clone() - p[self.in_boundary()].clone());
-            }
-            if self.quot_leaf_blocks() > 1 {
-                not_term = not_term * (one.clone() - p[self.q_boundary()].clone());
-            }
+            // random/commit) — the block after a terminal is a fresh leaf-hash seeded from its carrier, not a
+            // merge — and EXCEPT a multi-block leaf's INTERNAL boundary (a sponge absorb-continuation).
+            // All excluded one-hots fire on last rows of DISTINCT blocks (the super-tile layout is strictly
+            // sequential), so Π(1−t_i) == 1−Σ t_i on every trace row. is_zk=1 MUST use the SUM form: the
+            // product's degree grows by one per commit round and crosses the outer quotient/LDE capacity
+            // (log_nqc 4→5 ⇒ quotient domain 2^21 > the 2^20 blowup-4 LDE) at db≥4 — row-wise-satisfied
+            // trace, garbage quotient, OodEvaluationMismatch. The sum form is degree-1 at any db. is_zk=0
+            // keeps the validated product byte-for-byte.
+            let not_term = if self.is_zk == 1 {
+                let mut term_sum = p[self.m_term()].clone() + p[self.q_term()].clone() + p[self.p_random_term()].clone();
+                for r in 0..self.cm_rounds() {
+                    term_sum = term_sum + p[self.c_term(r)].clone();
+                }
+                if self.leaf_blocks() > 1 {
+                    term_sum = term_sum + p[self.in_boundary()].clone();
+                }
+                if self.quot_leaf_blocks() > 1 {
+                    term_sum = term_sum + p[self.q_boundary()].clone();
+                }
+                if self.random_leaf_blocks() > 1 {
+                    term_sum = term_sum + p[self.p_random_boundary()].clone();
+                }
+                if self.cm_leaf_blocks() > 1 {
+                    term_sum = term_sum + p[self.c_bnd()].clone(); // commit-leaf block-0→block-1 boundary
+                }
+                one.clone() - term_sum
+            } else {
+                let mut nt = (one.clone() - p[self.m_term()].clone()) * (one.clone() - p[self.q_term()].clone());
+                for r in 0..self.cm_rounds() {
+                    nt = nt * (one.clone() - p[self.c_term(r)].clone());
+                }
+                if self.leaf_blocks() > 1 {
+                    nt = nt * (one.clone() - p[self.in_boundary()].clone());
+                }
+                if self.quot_leaf_blocks() > 1 {
+                    nt = nt * (one.clone() - p[self.q_boundary()].clone());
+                }
+                nt
+            };
             let link = s_merkle.clone() * p[FT_P_BLOCK_LAST].clone() * (one.clone() - p[self.p_st_last()].clone()) * not_term;
             let nb_ = nxt[self.m_bit()].clone();
             let sib = self.m_sib();
@@ -4218,6 +4476,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let mut openings = vec![(0usize, self.input_depth(), CM_CAP_HEIGHT, self.cap_base()), (4, self.input_depth(), CM_CAP_HEIGHT, self.qcap_base())];
             for r in 0..self.cm_rounds() {
                 openings.push((8 + 4 * r, self.commit_shift(r), self.commit_bits(r), self.commit_cap_base(r)));
+            }
+            // HIDING random round (is_zk=1): a full cap at max height (shift = input_depth), cap_c group
+            // (8 + 4·cm_rounds), selecting cap[index>>input_depth] from the random commitment's cap pis region.
+            if self.is_zk == 1 {
+                openings.push((8 + 4 * self.cm_rounds(), self.input_depth(), CM_CAP_HEIGHT, self.random_cap_base()));
             }
             for (cg_off, shift, bits, cbase) in openings {
                 for k in 0..4 {
@@ -4304,6 +4567,19 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
     }
 }
 
+// HIDING (is_zk=1) per-query witness the build consumes on top of `per_query`/`quot_paths`/`commit_data`: the
+// leaf SALTS (fresh witness felts appended to each committed-row leaf preimage) and the random-round leaf's path
+// (the random commitment is a THIRD input round with no analog in the non-hiding args). The committed rows
+// themselves are derived from the reduced-opening terms (px-shared), so only the salts + random path are new.
+#[allow(dead_code)]
+pub(crate) struct HidingWitness {
+    pub trace_salt: [Val; 4],
+    pub random_salt: [Val; 4],
+    pub random_path: Vec<([Val; 4], bool)>, // input_depth merges (random leaf → random cap)
+    pub quot_salts: Vec<[Val; 4]>,          // nqc (one per quotient chunk in the multi-matrix leaf)
+    pub commit_salts: Vec<[Val; 4]>,        // cm_rounds (one per commit-phase round)
+}
+
 #[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn monolith_build_trace(
@@ -4318,7 +4594,8 @@ pub(crate) fn monolith_build_trace(
     index_felts: &[Val],
     quot_paths: &[Vec<([Val; 4], bool)>],
     commit_data: &[Vec<([Val; 4], [Val; 4], Vec<([Val; 4], bool)>, [Val; 4])>],
-    pub_window: &[Val], // column-window mode: the inner-proof pis values (empty otherwise)
+    pub_window: &[Val],                  // column-window mode: the inner-proof pis values (empty otherwise)
+    hiding: Option<&[HidingWitness]>,    // is_zk=1 only: per-query salts + random-round path (None for is_zk=0)
 ) -> RowMajorMatrix<Val> {
     use crate::recursion::fri_fold::native_fold;
     use p3_field::{BasedVectorSpace, PrimeField64};
@@ -4428,76 +4705,103 @@ pub(crate) fn monolith_build_trace(
             }
             native_permute(inp)[..4].try_into().unwrap()
         };
-        // the W-value opened trace row (px shared per column) = the first W terms' p_x.
-        let w_in = air.w_inner();
-        let opened_row: Vec<Val> = (0..w_in).map(|c| terms[c].2).collect();
-        // inline input-Merkle: MULTI-BLOCK leaf-hash (blocks M_INPUT_LEAF .. +leaf_blocks) absorbs the W-value
-        // opened row RATE felts/block (PaddingFreeSponge: overwrite the rate, carry the capacity; a short final
-        // block absorbs the remainder and carries the un-overwritten rate lanes), then INPUT_DEPTH merges. At
-        // W≤RATE this is one block (== the milestone leaf, byte-for-byte).
-        let n_leaf = air.leaf_blocks();
-        let mut state = [Val::ZERO; W];
-        for b in 0..n_leaf {
-            let clen = core::cmp::min(RATE, w_in - b * RATE); // chunk length: RATE, or the short final remainder
-            state[..clen].copy_from_slice(&opened_row[b * RATE..b * RATE + clen]); // overwrite rate lanes 0..clen
-            let rows = native_steps(state);
-            for r in 0..BLOCK {
-                let base = (off + (M_INPUT_LEAF + b) * BLOCK + r) * w;
-                t[base..base + W].copy_from_slice(&rows[r]);
+        // generic salted leaf-hash: absorb `preimage` RATE felts/block over ceil(len/RATE) blocks (PaddingFree-
+        // Sponge overwrite-mode — a short final block leaves the un-overwritten rate lanes carrying), filling
+        // blocks start_block.. and returning the sponge output. Used for every leaf (random/trace/quot/commit);
+        // at is_zk=0 the preimage is the raw committed row (no salt), so this is the exact milestone leaf-hash.
+        let leaf_hash = |t: &mut [Val], off: usize, start_block: usize, preimage: &[Val]| -> [Val; 4] {
+            let mut state = [Val::ZERO; W];
+            let nblk = preimage.len().div_ceil(RATE);
+            for b in 0..nblk {
+                let clen = core::cmp::min(RATE, preimage.len() - b * RATE);
+                state[..clen].copy_from_slice(&preimage[b * RATE..b * RATE + clen]); // overwrite rate lanes 0..clen
+                let rows = native_steps(state);
+                for r in 0..BLOCK {
+                    let base = (off + (start_block + b) * BLOCK + r) * w;
+                    t[base..base + W].copy_from_slice(&rows[r]);
+                }
+                state = native_permute(state);
             }
-            state = native_permute(state);
-        }
-        let mut node: [Val; 4] = state[..4].try_into().unwrap();
-        for (l, &(sib, b)) in path.iter().enumerate() {
-            node = merge_block(&mut t, off, M_INPUT_LEAF + n_leaf + l, node, sib, b);
-        }
-        let trace_cap_entry = node; // the input-Merkle terminal == the query's selected trace cap entry
-        // inline quotient-Merkle: MULTI-BLOCK leaf-hash (blocks m_quot_leaf .. +quot_leaf_blocks) absorbs the
-        // 2·nqc-felt quotient row (the nqc chunk-openings) RATE felts/block (same PaddingFreeSponge overwrite-mode
-        // as the input leaf), then INPUT_DEPTH merges. Single block for nqc≤2 (== the milestone [qc0,qc1] leaf).
-        let qc_vals: Vec<Val> = (0..air.n_quot()).map(|j| terms[2 * w_in + j].2).collect();
-        let n_qleaf = air.quot_leaf_blocks();
-        let mut qstate = [Val::ZERO; W];
-        for b in 0..n_qleaf {
-            let clen = core::cmp::min(RATE, air.n_quot() - b * RATE);
-            qstate[..clen].copy_from_slice(&qc_vals[b * RATE..b * RATE + clen]);
-            let rows = native_steps(qstate);
-            for r in 0..BLOCK {
-                let base = (off + (air.m_quot_leaf() + b) * BLOCK + r) * w;
-                t[base..base + W].copy_from_slice(&rows[r]);
+            state[..4].try_into().unwrap()
+        };
+        let hq = hiding.map(|hh| &hh[q]);
+        // leaf preimages = the committed row (from the reduced-opening px terms, px-shared) ‖ salt (is_zk=1, fresh
+        // witness — authenticated by folding to the committed cap). is_zk=0 ⇒ the raw opened row / 2·nqc quotient
+        // row (byte-for-byte).
+        let mut input_preimage: Vec<Val> = (0..air.trm_committed_w()).map(|cc| terms[air.trm_trace(cc)].2).collect();
+        let mut quot_preimage: Vec<Val> = Vec::new();
+        for i in 0..air.nqc() {
+            for j in 0..air.trm_chunk_w() {
+                quot_preimage.push(terms[air.trm_quot(i, j)].2);
             }
-            qstate = native_permute(qstate);
+            if air.is_zk == 1 {
+                quot_preimage.extend_from_slice(&hq.unwrap().quot_salts[i]);
+            }
         }
-        let mut qnode: [Val; 4] = qstate[..4].try_into().unwrap();
-        for (l, &(sib, b)) in quot_paths[q].iter().enumerate() {
-            qnode = merge_block(&mut t, off, air.m_quot_leaf() + n_qleaf + l, qnode, sib, b);
+        let mut random_preimage: Vec<Val> = Vec::new();
+        if air.is_zk == 1 {
+            let hqv = hq.unwrap();
+            input_preimage.extend_from_slice(&hqv.trace_salt);
+            random_preimage = (0..air.random_committed_w()).map(|cc| terms[cc].2).collect();
+            random_preimage.extend_from_slice(&hqv.random_salt);
         }
-        let quot_cap_entry = qnode; // the quotient-Merkle terminal == the selected quotient cap entry
-        // inline commit-phase Merkle: 6 rounds, each a leaf-hash (absorb the bit-ordered fold group) + `depth`
+        // HIDING random-round leaf (is_zk=1): blocks M_INPUT_LEAF.., then input_depth merges → the random cap entry.
+        let random_cap_entry: [Val; 4] = if air.is_zk == 1 {
+            let mut node = leaf_hash(&mut t, off, M_INPUT_LEAF, &random_preimage);
+            let start = M_INPUT_LEAF + air.random_leaf_blocks();
+            for (l, &(sib, b)) in hq.unwrap().random_path.iter().enumerate() {
+                node = merge_block(&mut t, off, start + l, node, sib, b);
+            }
+            node
+        } else {
+            [Val::ZERO; 4]
+        };
+        // inline (trace) input-Merkle: multi-block salted leaf (blocks m_input_leaf..) + input_depth merges.
+        let trace_cap_entry = {
+            let mut node = leaf_hash(&mut t, off, air.m_input_leaf(), &input_preimage);
+            let start = air.m_input_leaf() + air.leaf_blocks();
+            for (l, &(sib, b)) in path.iter().enumerate() {
+                node = merge_block(&mut t, off, start + l, node, sib, b);
+            }
+            node
+        };
+        // inline quotient-Merkle: multi-block (multi-matrix salted, is_zk=1) leaf (blocks m_quot_leaf..) + merges.
+        let quot_cap_entry = {
+            let mut node = leaf_hash(&mut t, off, air.m_quot_leaf(), &quot_preimage);
+            let start = air.m_quot_leaf() + air.quot_leaf_blocks();
+            for (l, &(sib, b)) in quot_paths[q].iter().enumerate() {
+                node = merge_block(&mut t, off, start + l, node, sib, b);
+            }
+            node
+        };
+        // inline commit-phase Merkle: cm_rounds rounds, each a (salted, is_zk=1 ⇒ 2-block) leaf-hash + `depth`
         // merges, authenticating every fold sibling to commit_phase_commits[r].
         let mut commit_cap_entries = vec![[Val::ZERO; 4]; air.cm_rounds()];
         for (r, (group, _leaf, cpath, _cap)) in commit_data[q].iter().enumerate() {
-            let mut cinput = [Val::ZERO; W];
-            cinput[..4].copy_from_slice(group);
-            let rows = native_steps(cinput);
-            for row in 0..BLOCK {
-                let base = (off + air.cm_leaf(r) * BLOCK + row) * w;
-                t[base..base + W].copy_from_slice(&rows[row]);
+            let mut cpreimage: Vec<Val> = group.to_vec();
+            if air.is_zk == 1 {
+                cpreimage.extend_from_slice(&hq.unwrap().commit_salts[r]);
             }
-            let mut cnode: [Val; 4] = native_permute(cinput)[..4].try_into().unwrap();
+            let mut cnode = leaf_hash(&mut t, off, air.cm_leaf(r), &cpreimage);
+            let start = air.cm_leaf(r) + air.cm_leaf_blocks();
             for (l, &(sib, b)) in cpath.iter().enumerate() {
-                cnode = merge_block(&mut t, off, air.cm_leaf(r) + 1 + l, cnode, sib, b);
+                cnode = merge_block(&mut t, off, start + l, cnode, sib, b);
             }
             commit_cap_entries[r] = cnode; // this round's commit-Merkle terminal == the selected commit cap
         }
-        // carriers held within this super-tile: the W-value opened row + the 2·nqc-value quotient row + the 6
-        // fold groups (+ the 8 per-query cap-entry carriers when verifying a non-constant inner).
+        // carriers held within this super-tile: the input/random/quot leaf preimages + the fold groups (+ the
+        // per-query cap-entry carriers, including the random cap, when verifying a non-constant/hiding inner).
         for r in 0..air.m_period() {
-            for c in 0..w_in {
-                t[(off + r) * w + air.ov_c(c)] = opened_row[c];
+            for (cc, &v) in input_preimage.iter().enumerate() {
+                t[(off + r) * w + air.ov_c(cc)] = v;
             }
-            for (j, &qv) in qc_vals.iter().enumerate() {
-                t[(off + r) * w + air.qc(j)] = qv;
+            if air.is_zk == 1 {
+                for (cc, &v) in random_preimage.iter().enumerate() {
+                    t[(off + r) * w + air.ov_random(cc)] = v;
+                }
+            }
+            for (cc, &qv) in quot_preimage.iter().enumerate() {
+                t[(off + r) * w + air.qc(cc)] = qv;
             }
             for (cr, (group, _l, _p, _c)) in commit_data[q].iter().enumerate() {
                 for k in 0..4 {
@@ -4510,6 +4814,9 @@ pub(crate) fn monolith_build_trace(
                     t[(off + r) * w + air.cap_c(4 + k)] = quot_cap_entry[k];
                     for cr in 0..air.cm_rounds() {
                         t[(off + r) * w + air.cap_c(8 + 4 * cr + k)] = commit_cap_entries[cr][k];
+                    }
+                    if air.is_zk == 1 {
+                        t[(off + r) * w + air.cap_c(8 + 4 * air.cm_rounds() + k)] = random_cap_entry[k];
                     }
                 }
             }
@@ -6622,21 +6929,21 @@ mod tests {
             // COLUMN-WINDOW: the inner-proof pis live in a held witness column window; NOTHING is public. The
             // internal binds (squeeze↦challenge, terminal↦cap, SB↦index, OOD↦pub) pin the window. This is the
             // tileable form the aggregator uses (per-instance witness data, only the tx-root public).
-            let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis);
+            let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis, None);
             println!("column-window monolith @ {n_queries} queries: 2^{} rows (width {})", hh.trailing_zeros(), air.fused_w());
             let prf = prove(&config, &air, trace, &[]);
             assert!(verify(&config, &air, &prf, &[]).is_ok(), "column-window monolith proves (inner pis in witness columns)");
             // tamper a challenge felt in the window ⇒ the squeeze↦window bind fails ⇒ reject.
             let mut bw = pis.clone();
             bw[0] += Val::ONE;
-            let bt = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &bw);
+            let bt = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &bw, None);
             let bp = prove(&config, &air, bt, &[]);
             assert!(verify(&config, &air, &bp, &[]).is_err(), "tampered pis window ⇒ internal bind fails ⇒ reject");
             let rss = peak_rss_bytes();
             println!("  -> peak RSS {} MiB", rss / (1 << 20));
             return (hh.trailing_zeros(), rss);
         }
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], None);
         println!("monolith @ {n_queries} queries: 2^{} rows (width {}, {} transcript blocks)", hh.trailing_zeros(), air.fused_w(), counts.len());
         let prf = prove(&config, &air, trace, &pis);
         assert!(verify(&config, &air, &prf, &pis).is_ok(), "monolith proves @ {n_queries}: transcript + super-tiles + all openings authenticate + OOD");
@@ -6733,7 +7040,7 @@ mod tests {
         for ce in &ccap0 {
             pis.extend_from_slice(ce);
         }
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis);
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis, None);
         (trace.values, counts, binds, index_binds, n_terms, pvs[0])
     }
 
@@ -6931,7 +7238,7 @@ mod tests {
                 pis.extend_from_slice(e);
             }
         }
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], None);
         let hh = air.height();
         println!("counter monolith @ {n_queries} queries: 2^{} rows (width {}, full caps + cap-mux)", hh.trailing_zeros(), air.fused_w());
         let prf = prove(&config, &air, trace, &pis);
@@ -7056,7 +7363,7 @@ mod tests {
             }
             assert_eq!(folded * inv_van, eo_quot, "{label} PRE-CHECK: native symbolic fold == quot(ζ)");
         }
-        let mut trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[]);
+        let mut trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], None);
         // fill the witnessed Lagrange selectors at ζ (is_first/is_last/inv_van), bound in-circuit to their ζ-defs.
         let (isf, isl, iv) = (cc(is_first), cc(is_last), cc(inv_van));
         let fw = air.fused_w();
@@ -7317,7 +7624,7 @@ mod tests {
         // three disjoint leaf regions (each leaf + input_depth=5 path), then commit rounds.
         assert_eq!((rt, it, qt), (8, 16, 31), "random/trace/quotient terminal blocks");
         assert_eq!(leaf.len(), 7, "arity-2 cm_rounds = log_global − blowup = 7");
-        assert_eq!((leaf[0], nb), (32, 49), "commit rounds start after the quotient terminal; m_nblocks");
+        assert_eq!((leaf[0], nb), (32, 56), "commit rounds start after the quotient terminal; m_nblocks (2-block salted commit leaves)");
         assert_eq!(*term.last().unwrap() + 1, nb, "m_nblocks == last commit term + 1");
         assert!(rt < it && it < qt && qt < leaf[0], "regions are monotone and disjoint");
         println!("hiding super-tile layout: 3 salted leaf regions (terms at blocks {rt}/{it}/{qt}, blocks {rlb}/{ilb}/{qlb}) + 7 commit rounds → m_nblocks={nb}, n_terms={n_terms} (matches the native witness)");

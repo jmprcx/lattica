@@ -1223,6 +1223,20 @@ mod tests {
             let c1 = self.sample_base();
             [c0, c1]
         }
+        // block/lane-recording variants (for deriving the monolith's challenge/index binds from the schedule).
+        fn sample_base_bl(&mut self) -> (Val, usize, usize) {
+            if !self.input.is_empty() || self.output.is_empty() {
+                self.duplex();
+            }
+            let blk = self.block_inputs.len() - 1;
+            let lane = self.output.len() - 1; // pop from the back
+            (self.output.pop().unwrap(), blk, lane)
+        }
+        fn sample_ext_bl(&mut self) -> ([Val; 2], usize) {
+            let (c0, blk, _) = self.sample_base_bl();
+            let (c1, _, _) = self.sample_base_bl();
+            ([c0, c1], blk)
+        }
     }
 
     fn cap_felts_h(commit: &<ValMmcs as p3_commit::Mmcs<Val>>::Commitment) -> Vec<Val> {
@@ -1503,5 +1517,385 @@ mod tests {
             "a tampered quotient(ζ) must fail the OOD relation"
         );
         println!("hiding epilogue: OOD openings (halved domain, is_zk-recomposed quotient) satisfy verify_constraints");
+    }
+
+    // ================================ #86 AIR mode — END-TO-END hiding monolith ================================
+
+    fn peak_rss_bytes() -> u64 {
+        // VmHWM = peak resident set size of this process (Linux).
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| l.strip_prefix("VmHWM:").and_then(|r| r.split_whitespace().next()?.parse::<u64>().ok()))
+            })
+            .map(|kb| kb * 1024)
+            .unwrap_or(0)
+    }
+
+    /// The is_zk-aware analog of quotient_recompose_weights: the in-circuit epilogue's quotient(ζ) = Σ_i zps_i·
+    /// chunk_i(ζ), with zps_i the verifier-computed weights over the HIDING split domains (nqc = 1<<(log+is_zk)).
+    /// Matches p3's recompose_quotient_from_chunks (asserted against it in the harness before feeding the pis).
+    fn hiding_quotient_recompose_weights(config: &MyConfig, proof: &Proof<MyConfig>, pvs: &[Val]) -> Vec<Challenge> {
+        use p3_commit::PolynomialSpace;
+        let (_, zeta, _, _, _) = hiding_transcript_challenges(config, proof, pvs);
+        let pcs = config.pcs();
+        let is_zk = config.is_zk();
+        let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
+        let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+        let layout = AirLayout::from_air::<Val>(&ConstAir);
+        let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&ConstAir, layout, is_zk);
+        let nqc = 1usize << (log_nqc + is_zk);
+        let qd = trace_domain.create_disjoint_domain(1 << (proof.degree_bits + log_nqc));
+        let qcd = qd.split_domains(nqc);
+        (0..nqc)
+            .map(|i| {
+                let mut zp = Challenge::ONE;
+                for j in 0..nqc {
+                    if j != i {
+                        zp *= qcd[j].vanishing_poly_at_point(zeta) * qcd[j].vanishing_poly_at_point(qcd[i].first_point()).inverse();
+                    }
+                }
+                zp
+            })
+            .collect()
+    }
+
+    /// The HIDING analog of monolith::tests::sim_full: sim_full_hiding + recording the challenge binds (block per
+    /// challenge) and the index binds/felts (block, lane per query) — the full transcript schedule the monolith needs.
+    #[allow(clippy::type_complexity)]
+    fn sim_full_hiding_all(
+        config: &MyConfig,
+        proof: &Proof<MyConfig>,
+        pvs: &[Val],
+    ) -> (Vec<[Val; SPONGE_W]>, Vec<u8>, Vec<usize>, Vec<[Val; 2]>, Vec<(usize, usize)>, Vec<Val>) {
+        let pcs = config.pcs();
+        let is_zk = config.is_zk();
+        let degree_bits = proof.degree_bits;
+        let (base_degree_bits, _) =
+            validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).expect("degree bits");
+        let mut s = Sim::new();
+        s.observe(Val::from_usize(degree_bits));
+        s.observe(Val::from_usize(base_degree_bits));
+        s.observe(Val::from_usize(0));
+        for f in cap_felts_h(&proof.commitments.trace) {
+            s.observe(f);
+        }
+        for &p in pvs {
+            s.observe(p);
+        }
+        let (a_stark, b0) = s.sample_ext_bl();
+        for f in cap_felts_h(&proof.commitments.quotient_chunks) {
+            s.observe(f);
+        }
+        if let Some(r) = &proof.commitments.random {
+            for f in cap_felts_h(r) {
+                s.observe(f);
+            }
+        }
+        let (zeta, b1) = s.sample_ext_bl();
+        let rand_cws = &proof.opening_proof.0;
+        let mut round = 0usize;
+        let observe_merged = |s: &mut Sim, public: &[Challenge], cw: &[Challenge]| {
+            for &x in public {
+                s.observe_ext(x);
+            }
+            for &x in cw {
+                s.observe_ext(x);
+            }
+        };
+        if let Some(rv) = &proof.opened_values.random {
+            observe_merged(&mut s, rv, &rand_cws[round][0][0]);
+            round += 1;
+        }
+        observe_merged(&mut s, &proof.opened_values.trace_local, &rand_cws[round][0][0]);
+        if let Some(tn) = &proof.opened_values.trace_next {
+            observe_merged(&mut s, tn, &rand_cws[round][0][1]);
+        }
+        round += 1;
+        for (i, c) in proof.opened_values.quotient_chunks.iter().enumerate() {
+            observe_merged(&mut s, c, &rand_cws[round][i][0]);
+        }
+        let (a_fri, b2) = s.sample_ext_bl();
+        let mut binds = vec![b0, b1, b2];
+        let mut chs = vec![a_stark, zeta, a_fri];
+        let fri = &proof.opening_proof.1;
+        for comm in &fri.commit_phase_commits {
+            for f in cap_felts_h(comm) {
+                s.observe(f);
+            }
+            let (beta, bb) = s.sample_ext_bl();
+            binds.push(bb);
+            chs.push(beta);
+        }
+        for &x in &fri.final_poly {
+            s.observe_ext(x);
+        }
+        let log_arities: Vec<usize> = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+        for &la in &log_arities {
+            s.observe(Val::from_usize(la));
+        }
+        s.observe(fri.query_pow_witness);
+        let _ = s.sample_base_bl();
+        let mut index_binds = Vec::new();
+        let mut index_felts = Vec::new();
+        for _ in 0..fri.query_proofs.len() {
+            let (f, blk, lane) = s.sample_base_bl();
+            index_binds.push((blk, lane));
+            index_felts.push(f);
+        }
+        (s.block_inputs, s.counts, binds, chs, index_binds, index_felts)
+    }
+
+    /// #86 AIR mode — the END-TO-END hiding monolith: builds MonolithAir{is_zk:1} over a real arity-2 HIDING
+    /// ConstAir proof (HidingFriPcs), proves it with p3_uni_stark::prove, and asserts p3_uni_stark::verify
+    /// accepts — the single in-circuit AIR accepts iff p3::verify(hiding_inner) accepts. Returns (log2 height,
+    /// peak RSS bytes). Reduced queries keep it inside the 8 GB budget (arity-2, is_zk=1).
+    fn run_hiding_monolith(n_queries: usize, check_only: bool) -> (u32, u64) {
+        run_hiding_monolith_lh(n_queries, 6, check_only)
+    }
+
+    fn run_hiding_monolith_lh(n_queries: usize, log_height: usize, check_only: bool) -> (u32, u64) {
+        use crate::recursion::monolith::{monolith_build_trace, HidingWitness, MonolithAir};
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let config = make_config_ar(1, n_queries); // arity-2 hiding
+        let (proof, pvs) = gen_proof(&config, 42, log_height);
+        assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "sanity: p3::verify accepts the hiding ConstAir proof");
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full_hiding_all(&config, &proof, &pvs);
+        let fri = &proof.opening_proof.1;
+        let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+        let random_present = proof.commitments.random.is_some();
+        let trace_batch = if random_present { 1 } else { 0 };
+        let quot_batch = trace_batch + 1;
+        let nqc = proof.opened_values.quotient_chunks.len();
+
+        let mut per_query = Vec::new();
+        let mut quot_paths = Vec::new();
+        let mut commit_data = Vec::new();
+        let mut hiding = Vec::new();
+        let mut n_terms = 0;
+        let mut final0 = Challenge::ZERO;
+        for q in 0..n_queries {
+            let (terms, _x, alpha, ro) = hiding_multicol_query_terms(&config, &proof, &pvs, q);
+            let (_ro2, rounds, _e, f0) = hiding_query_fold_data(&config, &proof, &pvs, q);
+            let (_leaf, path, _cap) = hiding_query_input_merkle(&config, &proof, &pvs, q);
+            let (_ql, qpath, _qce, _qw) = hiding_query_quotient_merkle(&config, &proof, &pvs, q);
+            let cm = hiding_query_commit_merkle_all(&config, &proof, &pvs, q);
+            if q == 0 {
+                final0 = f0;
+            }
+            n_terms = terms.len();
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            // salts extracted directly from the proof (mirroring the salted-leaf witness fns).
+            let qp = &fri.query_proofs[q];
+            let trace_salt: [Val; 4] = qp.input_proof[trace_batch].opening_proof.0[0].clone().try_into().unwrap();
+            let rbatch = &qp.input_proof[0]; // random-round batch
+            let random_salt: [Val; 4] = rbatch.opening_proof.0[0].clone().try_into().unwrap();
+            let random_path: Vec<([Val; 4], bool)> =
+                rbatch.opening_proof.1.iter().enumerate().map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1)).collect();
+            let quot_salts: Vec<[Val; 4]> =
+                (0..nqc).map(|m| qp.input_proof[quot_batch].opening_proof.0[m].clone().try_into().unwrap()).collect();
+            let commit_salts: Vec<[Val; 4]> =
+                qp.commit_phase_openings.iter().map(|o| o.opening_proof.0[0].clone().try_into().unwrap()).collect();
+            per_query.push(((index, terms, alpha, ro, rounds), pvs[0], path));
+            quot_paths.push(qpath);
+            commit_data.push(cm);
+            hiding.push(HidingWitness { trace_salt, random_salt, random_path, quot_salts, commit_salts });
+        }
+
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries,
+            n_terms,
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            constraints: vec![],
+            w_inner_f: 1,
+            n_pub_f: 1,
+            n_periodic_f: 0,
+            is_zk: 1,
+        };
+
+        // pis in the geometry's order: challenges, index felts, final_poly[0], full trace cap, full quotient cap,
+        // inner pub, per-round commit caps, (periodic — none for ConstAir), qwt weights (nqc>1), full random cap.
+        let mut pis = Vec::new();
+        for ch in &chs {
+            pis.push(ch[0]);
+            pis.push(ch[1]);
+        }
+        for f in &index_felts {
+            pis.push(*f);
+        }
+        let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+        pis.push(fp[0]);
+        pis.push(fp[1]);
+        for e in proof.commitments.trace.roots().iter() {
+            pis.extend_from_slice(e);
+        }
+        for e in proof.commitments.quotient_chunks.roots().iter() {
+            pis.extend_from_slice(e);
+        }
+        pis.push(pvs[0]);
+        for comm in fri.commit_phase_commits.iter() {
+            for e in comm.roots().iter() {
+                pis.extend_from_slice(e);
+            }
+        }
+        if nqc > 1 {
+            // qwt weights; pre-check Σ zps_i·chunk_i == p3's recompose (guards the in-circuit recompose).
+            let zps = hiding_quotient_recompose_weights(&config, &proof, &pvs);
+            let (_, _, _, _, _, _, eo_quot, _, _, _) = hiding_epilogue_openings(&config, &proof, &pvs);
+            let x = Challenge::from_basis_coefficients_fn(|k| if k == 1 { Val::ONE } else { Val::ZERO });
+            let mut rq = Challenge::ZERO;
+            for (i, ch) in proof.opened_values.quotient_chunks.iter().enumerate() {
+                rq += zps[i] * (ch[0] + ch[1] * x);
+            }
+            assert_eq!(rq, eo_quot, "hiding qwt: Σ zps_i·chunk_i must equal p3 recompose_quotient_from_chunks");
+            for z in &zps {
+                let c = cc(*z);
+                pis.push(c[0]);
+                pis.push(c[1]);
+            }
+        }
+        for e in proof.commitments.random.as_ref().unwrap().roots().iter() {
+            pis.extend_from_slice(e);
+        }
+        assert_eq!(pis.len(), air.pis_count(), "assembled pis length must match the geometry's pis_count");
+
+        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], Some(&hiding));
+        let hh = air.height();
+        println!("hiding monolith @ {n_queries} queries: 2^{} rows (width {}, is_zk=1, arity-2)", hh.trailing_zeros(), air.fused_w());
+        // per-query masked indices — for correlating an index-dependent failure with the triggering query.
+        let idxs: Vec<usize> = index_felts.iter().map(|f| (f.as_canonical_u64() as usize) & ((1 << log_global) - 1)).collect();
+        println!("  query indices (lg={log_global}): {idxs:?}");
+        if check_only {
+            // localize a constraint/build mismatch fast (row + constraint index) without the slow FRI, then
+            // prove+verify the SAME instance — one run settles whether a failure is a constraint violation
+            // (check panics with row+constraint) or something else (check passes, verify rejects).
+            p3_air::check_constraints(&air, &trace, &pis);
+            println!("check_constraints PASSED @ {n_queries} queries (2^{} rows) — proving the SAME instance...", hh.trailing_zeros());
+            let prf = prove(&config, &air, trace, &pis);
+            if let Err(e) = verify(&config, &air, &prf, &pis) {
+                panic!("IMPOSSIBLE-CLASS bug: check_constraints passed but verify rejected the SAME instance: {e:?}");
+            }
+            println!("prove+verify ALSO PASSED on the same instance @ {n_queries} queries");
+            return (hh.trailing_zeros(), peak_rss_bytes());
+        }
+        let prf = prove(&config, &air, trace, &pis);
+        if let Err(e) = verify(&config, &air, &prf, &pis) {
+            panic!("hiding monolith rejected a valid proof: {e:?}");
+        }
+        // tamper: wrong inner public value ⇒ OOD epilogue fails ⇒ reject.
+        let mut bad = pis.clone();
+        bad[air.pub_pi()] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered inner pub ⇒ epilogue rejects");
+        // tamper: the FULL trace cap entry query 0 selects (index0 >> input_depth) ⇒ cap-mux ≠ terminal ⇒ reject.
+        let idx0 = (index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+        let input_depth = log_global - 6;
+        let mut bad_cap = pis.clone();
+        bad_cap[air.cap_base() + (idx0 >> input_depth) * 4] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad_cap).is_err(), "tampered selected trace cap ⇒ cap-mux rejects");
+        // tamper: the selected RANDOM cap entry ⇒ the random round's cap-mux ⇒ reject (validates the hiding auth).
+        let mut bad_rcap = pis.clone();
+        bad_rcap[air.random_cap_base() + (idx0 >> input_depth) * 4] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad_rcap).is_err(), "tampered selected random cap ⇒ cap-mux rejects");
+        let rss = peak_rss_bytes();
+        println!(" -> peak RSS {} MiB", rss / (1 << 20));
+        (hh.trailing_zeros(), rss)
+    }
+
+    #[test]
+    #[ignore = "slow: end-to-end hiding (is_zk=1) monolith proves + p3::verify accepts (#86)"]
+    fn hiding_monolith_end_to_end() {
+        // The LARGEST hiding config inside the 8 GB budget: log_height=4 (degree_bits=5, log_global=9,
+        // cm_rounds=5) at 8 queries ⇒ 2^15 rows. Exercises the FULL hiding path: random round, salted
+        // 3-block trace / 10-block multi-matrix quotient / 2-block commit leaves (depth-2 AND depth-0
+        // rounds), halved z_h, nqc=4 recompose, random cap-mux. The plan's log_height=6 config is
+        // functionally green too (see hiding_monolith_plan_config) but its transcript forces 2^16 rows
+        // (>512 sponge blocks of cap absorbs) ⇒ ~16 GB — outside the budget at any query count.
+        let (log_h, rss) = run_hiding_monolith_lh(8, 4, false);
+        assert!(rss < 8u64 << 30, "hiding monolith must fit in 8 GB (got {} MiB)", rss / (1 << 20));
+        println!("HIDING monolith end-to-end: 2^{log_h} rows, {} MiB — accept-iff-p3::verify(hiding ConstAir)", rss / (1 << 20));
+    }
+
+    /// The PLAN's full config (log_height=6 ⇒ degree_bits=7/log_global=11/cm_rounds=7): accept-iff-p3::verify
+    /// + tamper rejects VALIDATED (2^16 rows / width 619 / ~16.2 GB peak) — functionally green, but the
+    /// transcript's cap absorbs exceed 512 sponge blocks ⇒ tr=2^15 ⇒ 2^16 total rows, so it can never fit the
+    /// 8 GB budget (production verifies hiding proofs via the aggregation tree, not one giant monolith).
+    #[test]
+    #[ignore = "slow + ~16 GB RSS: the plan's log_height=6 hiding config end-to-end (no 8 GB assert)"]
+    fn hiding_monolith_plan_config() {
+        let (log_h, rss) = run_hiding_monolith_lh(8, 6, false);
+        println!("HIDING monolith (plan config, db=7): 2^{log_h} rows, {} MiB — accept-iff-p3::verify + tampers", rss / (1 << 20));
+    }
+
+    #[test]
+    #[ignore = "debug: localize a failing hiding constraint via check_constraints (run in DEBUG, 1 query)"]
+    fn hiding_monolith_check() {
+        run_hiding_monolith(1, true);
+    }
+
+    #[test]
+    #[ignore = "debug: fast constraint localization — small inner (log_height=4, first failing db)"]
+    fn hiding_monolith_check_small() {
+        // 1-query PASSED check_constraints at db=4 but the 4-query e2e FAILED ⇒ query-index-specific. 8 queries
+        // (same 2^15 height) maximizes trigger odds; check_only now ALSO proves the same instance, so one run
+        // either panics at the exact (row, constraint) or settles that the instance is genuinely fine.
+        run_hiding_monolith_lh(8, 4, true);
+    }
+
+    /// Degree-overflow discriminator: the OUTER MonolithAir's symbolic max constraint degree + log_nqc at
+    /// db=3 (passes) vs db=4 (fails). The merge-link `not_term` = Π(1−one_hot) gains a factor per commit
+    /// round (+3 hiding factors), so its degree GROWS with db — if log_nqc crosses between db=3 and db=4,
+    /// the quotient/LDE capacity is the failure mechanism (invisible to row-wise check_constraints).
+    #[test]
+    #[ignore = "debug: outer-AIR symbolic max degree + log_nqc at db=3 vs db=4"]
+    fn hiding_monolith_degree_probe() {
+        use crate::recursion::monolith::MonolithAir;
+        use p3_air::symbolic::get_symbolic_constraints;
+        for lh in [3usize, 4] {
+            let config = make_config_ar(1, 8);
+            let (proof, pvs) = gen_proof(&config, 42, lh);
+            let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full_hiding_all(&config, &proof, &pvs);
+            let (terms, _x, _a, _ro) = hiding_multicol_query_terms(&config, &proof, &pvs, 0);
+            let air = MonolithAir {
+                counts,
+                binds,
+                index_binds,
+                n_queries: index_felts.len(),
+                n_terms: terms.len(),
+                inner_counter: false,
+                column_window: false,
+                k_instances: 1,
+                fold: false,
+                constraints: vec![],
+                w_inner_f: 1,
+                n_pub_f: 1,
+                n_periodic_f: 0,
+                is_zk: 1,
+            };
+            let layout = AirLayout::from_air::<Val>(&air);
+            let cs = get_symbolic_constraints::<Val, MonolithAir>(&air, layout);
+            let maxd = cs.iter().map(|c| c.degree_multiple()).max().unwrap();
+            let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 1);
+            println!(
+                "inner log_height={lh} (degree_bits={}): outer max_constraint_degree={maxd}, outer log_nqc={log_nqc} ({} constraints)",
+                lh + 1,
+                cs.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "debug: hypothesis-B probe — db=3 with 8 queries (is the failure index-dependent at ALL db?)"]
+    fn hiding_monolith_e2e_small() {
+        // db=3/4q e2e PASSED, db=4/4q FAILED. If db=3 with MORE index samples also fails, the bug is
+        // index-dependent at all db (not tied to db=4's extra index bit).
+        run_hiding_monolith_lh(8, 3, false);
+        println!("=== db=3 @ 8 queries PASSED ===");
     }
 }
