@@ -174,20 +174,22 @@ const P_ROOT_IN: usize = P_SK_TO_ROOT + 1; // root block input lanes 0..4 == ROO
 const P_ROOT_UPDATE: usize = P_ROOT_IN + 1; // root block output → ROOT column (the per-tile update)
 const BATCH_N_PERIODIC: usize = P_ROOT_UPDATE + 1;
 
-/// The 4-element staging column base for fold chunk `ci` (anchor, nf_i, out_cm_j, [fee,mint], tx_binding).
-/// Returns None for the fee/mint chunk (handled specially: [S_FEE, S_MINT, 0, 0]).
-const fn chunk_stage(ci: usize) -> Option<usize> {
-    if ci == 0 {
-        Some(S_ANCHOR)
-    } else if ci < 1 + N_IN {
-        Some(S_NF + (ci - 1) * DIGEST)
-    } else if ci < 1 + N_IN + M_OUT {
-        Some(S_OUTCM + (ci - 1 - N_IN) * DIGEST)
-    } else if ci == 1 + N_IN + M_OUT {
-        None // [fee, mint, 0, 0]
-    } else {
-        Some(S_TXBIND)
+/// The AIR-side chunk table the tx-root fold injects, in fold order — the in-circuit twin of the native
+/// `statement_chunks` (an auditor checks the two side by side). Each entry is 4 lanes: a staged column
+/// `Some(col)` or a 0-pin `None`; the fee/mint block is `[S_FEE, S_MINT, 0, 0]`.
+fn fold_chunks() -> Vec<crate::batch_common::FoldChunk> {
+    let full = |base: usize| [Some(base), Some(base + 1), Some(base + 2), Some(base + 3)];
+    let mut v = Vec::with_capacity(FOLD_SK_BLOCKS);
+    v.push(full(S_ANCHOR));
+    for i in 0..N_IN {
+        v.push(full(S_NF + i * DIGEST));
     }
+    for j in 0..M_OUT {
+        v.push(full(S_OUTCM + j * DIGEST));
+    }
+    v.push([Some(S_FEE), Some(S_MINT), None, None]);
+    v.push(full(S_TXBIND));
+    v
 }
 
 // FRI / ZK config — the production family from crate::config (single audited source; the trace height
@@ -282,72 +284,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
             }
             v
         };
-        for &c in &staged {
-            builder.when_transition().assert_zero(tile_persist.clone() * (nxt[c].clone() - cur[c].clone()));
-        }
+        crate::batch_common::eval_tile_persistence(builder, &cur, &nxt, tile_persist, &staged);
 
-        // ---- s_k MD-chain: block 0 = perm([DOM_TXROOT,0,0,0 ‖ anchor]); blocks 1.. absorb each chunk ----
-        let dom_txroot = AB::Expr::from(Goldilocks::from_u64(DOM_TXROOT));
-        // chunk injection: at fold block bi's input row, lanes 4..8 == the bi-th statement chunk.
-        for bi in 0..FOLD_SK_BLOCKS {
-            let sel = p[P_FOLD_IN + bi].clone();
-            match chunk_stage(bi) {
-                Some(base) => {
-                    for k in 0..DIGEST {
-                        builder.assert_zero(sel.clone() * (cur[DIGEST + k].clone() - cur[base + k].clone()));
-                    }
-                }
-                None => {
-                    // the [fee, mint, 0, 0] chunk
-                    builder.assert_zero(sel.clone() * (cur[DIGEST].clone() - cur[S_FEE].clone()));
-                    builder.assert_zero(sel.clone() * (cur[DIGEST + 1].clone() - cur[S_MINT].clone()));
-                    builder.assert_zero(sel.clone() * cur[DIGEST + 2].clone());
-                    builder.assert_zero(sel.clone() * cur[DIGEST + 3].clone());
-                }
-            }
-        }
-        // block 0 also pins the low lanes to [DOM_TXROOT, 0, 0, 0] (the chain start).
-        let sk0 = p[P_FOLD_IN].clone();
-        builder.assert_zero(sk0.clone() * (cur[0].clone() - dom_txroot.clone()));
-        for k in 1..DIGEST {
-            builder.assert_zero(sk0.clone() * cur[k].clone());
-        }
-        // s_k chain link: block bi output lanes 0..4 → block bi+1 input lanes 0..4.
-        let sl = p[P_SK_LINK].clone();
-        for k in 0..DIGEST {
-            builder.when_transition().assert_zero(sl.clone() * (nxt[k].clone() - cur[k].clone()));
-        }
-        // last s_k block output (= s_k) → root block input lanes 4..8.
-        let s2r = p[P_SK_TO_ROOT].clone();
-        for k in 0..DIGEST {
-            builder.when_transition().assert_zero(s2r.clone() * (nxt[DIGEST + k].clone() - cur[k].clone()));
-        }
-
-        // ---- root chain: root_k = perm([root_{k-1} ‖ s_k]); ROOT carries root across tiles ----
-        // root block input lanes 0..4 == the running ROOT column (root_{k-1}).
-        let ri = p[P_ROOT_IN].clone();
-        for k in 0..DIGEST {
-            builder.assert_zero(ri.clone() * (cur[k].clone() - cur[ROOT + k].clone()));
-        }
-        // IV: ROOT = 0 at the global first row.
-        for k in 0..DIGEST {
-            builder.when_first_row().assert_zero(cur[ROOT + k].clone());
-        }
-        // ROOT is constant except across the per-tile update transition (root block output row).
-        let ru = p[P_ROOT_UPDATE].clone();
-        for k in 0..DIGEST {
-            builder
-                .when_transition()
-                .assert_zero((one.clone() - ru.clone()) * (nxt[ROOT + k].clone() - cur[ROOT + k].clone()));
-            // at the update, ROOT becomes the root block's output (lanes 0..4 of root_out_row).
-            builder.when_transition().assert_zero(ru.clone() * (nxt[ROOT + k].clone() - cur[k].clone()));
-        }
-        // The root block is the LAST block, so on the global last row cur[0..4] IS the final tile's root
-        // block output (root_{n-1}) — the block tx-root. (The ROOT column's update lands on the *next*
-        // row, which doesn't exist for the last tile, so bind the fold output directly.)
-        for k in 0..DIGEST {
-            builder.when_last_row().assert_zero(cur[k].clone() - pis[k].clone());
-        }
+        // ---- the in-circuit tx-root fold: s_k MD-chain (block 0 = perm([DOM_TXROOT,0,0,0 ‖ anchor]),
+        //      blocks 1.. absorb each chunk) then root_k = perm([root_{k-1} ‖ s_k]), ROOT carried across
+        //      tiles. Shared emitter; `fold_chunks()` is this circuit's chunk table (checked by eye
+        //      against `statement_chunks`) and `ROOT` is the running-root column. ----
+        crate::batch_common::eval_txroot_fold(builder, &cur, &nxt, &pis, &p[P_FOLD_IN..], &fold_chunks(), ROOT);
     }
 }
 
