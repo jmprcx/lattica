@@ -56,7 +56,7 @@ pub fn tx_statement_digest(pv: &[Val]) -> [Val; DIGEST] {
 /// The ordered 4-element statement chunks the s_k fold absorbs, in fold order (anchor, each nullifier,
 /// each out_cm, `[fee, mint, 0, 0]`, tx_binding). The SINGLE native source of the consensus chunk
 /// order: `tx_statement_digest` folds these, and the trace builder feeds them to the in-circuit fold
-/// (`write_fold_blocks`). Must stay in lockstep with the AIR's chunk selectors (`chunk_stage`).
+/// (`write_fold_blocks`). Must stay in lockstep with the AIR-side chunk table (`fold_chunks`).
 fn statement_chunks(pv: &[Val]) -> Vec<[Val; DIGEST]> {
     let chunk = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
     let mut v = Vec::with_capacity(FOLD_SK_BLOCKS);
@@ -294,12 +294,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
     }
 }
 
-/// Write the Poseidon2 permutation of `input` into fold `block`'s state columns (cols 0..8), tile `toff`.
-/// The 4-element statement chunk absorbed by s_k fold block `bi` (mirrors `chunk_stage` / the oracle's
-/// `tx_statement_digest` order: anchor, nf_i, out_cm_j, [fee,mint,0,0], tx_binding).
-/// Tile `ws.len()` single-tile traces into one batch trace, fill each tile's staging columns, run the
-/// in-circuit tx-root fold, and thread the running ROOT across tiles. Power-of-two count for now (dummy
-/// tiles arrive in Phase 4). Each tile reuses the audited `joinsplit_air::build_trace`.
+/// Tile `padded_tiles(ws.len())` single-tile traces into one batch trace, fill each tile's staging
+/// columns, run the in-circuit tx-root fold (`batch_common::write_fold_blocks`), and thread the running
+/// ROOT across tiles (padded to a power of two with `dummy_witness`). Each tile reuses the audited
+/// `joinsplit_air::build_trace`.
 pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
     let n = padded_tiles(ws.len());
     let dummy = dummy_witness();

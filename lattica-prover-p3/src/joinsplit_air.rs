@@ -11,7 +11,7 @@
 //! Every data hash carries a distinct **domain tag in lane 0** of the Poseidon2 input, so a digest
 //! produced in one context can't be reinterpreted in another:
 //!   * ownership  `recipient = H(DOM_OWN ‖ nk)`
-//!   * commitment `cm        = H(DOM_CM  ‖ recipient(4) ‖ value ‖ rho ‖ rcm)`   (input & output notes)
+//!   * commitment `cm        = H(DOM_CM ‖ recipient(4) ‖ value ‖ rho ‖ rcm ‖ asset)`  (asset in lane 6; input & output notes)
 //!   * nullifier  `nf        = H(DOM_NF  ‖ nk ‖ rho ‖ pos)`
 //! The Merkle **merge** `H(l(4) ‖ r(4))` fills all 8 lanes (no tag); it is structurally separated —
 //! it only ever appears as an internal node over two 4-element digests, and the leaf entering the

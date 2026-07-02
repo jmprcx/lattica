@@ -43,7 +43,7 @@ pub fn tx_statement_digest(pv: &[Val]) -> [Val; DIGEST] {
 /// The ordered 4-element statement chunks the HTLC s_k fold absorbs (the join-split chunks — anchor,
 /// each nullifier, each out_cm, `[fee,mint,0,0]`, tx_binding — plus `[current_height,0,0,0]` and
 /// redeem_hashlock). The SINGLE native source of the consensus chunk order: `tx_statement_digest`
-/// folds these and the trace builder feeds them to the in-circuit fold. Lockstep with `chunk_src`.
+/// folds these and the trace builder feeds them to the in-circuit fold. Lockstep with `fold_chunks`.
 fn statement_chunks(pv: &[Val]) -> Vec<[Val; DIGEST]> {
     let chunk = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
     let mut v = Vec::with_capacity(FOLD_SK_BLOCKS);

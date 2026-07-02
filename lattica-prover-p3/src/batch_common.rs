@@ -2,8 +2,10 @@
 //! writer used by BOTH batch circuits (`batch_joinsplit_air`, `batch_htlc_air`).
 //!
 //! The per-circuit fold GEOMETRY (`FOLD_SK_BLOCKS`, chunk schedules, staging column offsets) stays
-//! in each circuit file by design: the two statements fold different chunk counts (join-split 5,
-//! HTLC 7 + height/hashlock), so those constants are circuit shape, not shared machinery.
+//! in each circuit file by design: the two statements fold different chunk counts (`FOLD_SK_BLOCKS`
+//! = 7 for join-split — anchor + 2·nf + 2·out_cm + [fee,mint,0,0] + tx_binding — and 9 for HTLC,
+//! which adds [current_height,0,0,0] + redeem_hashlock), so those constants are circuit shape, not
+//! shared machinery.
 
 use p3_air::AirBuilder;
 use p3_field::PrimeCharacteristicRing;
@@ -122,7 +124,8 @@ pub(crate) fn eval_tile_persistence<AB: AirBuilder<F = Goldilocks>>(
 /// `[n+2]` = root-in, `[n+3]` = root-update, where `n = chunks.len() = FOLD_SK_BLOCKS`); `root_col` is
 /// the running-ROOT column base.
 ///
-/// EMISSION ORDER (Horner α-fold, fingerprint-pinned — do NOT reorder): 1 chunk injection (bi ascending,
+/// EMISSION ORDER (fingerprint-pinned — the verifier combines the AIR's constraints by powers of the
+/// challenge α, so their emission ORDER is semantic; do NOT reorder): 1 chunk injection (bi ascending,
 /// lanes k=0..DIGEST) · 2 block-0 low-lane pin `[DOM_TXROOT,0,0,0]` · 3 s_k link · 4 s_k→root handoff ·
 /// 5 root-in bind · 6 ROOT IV=0 · 7 ROOT freeze/update pair per lane · 8 last-row == pis.
 pub(crate) fn eval_txroot_fold<AB: AirBuilder<F = Goldilocks>>(
