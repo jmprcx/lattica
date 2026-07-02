@@ -57,7 +57,11 @@ plateaus near 96 for this rate, so UDR is the binding (and reported) regime.
 
 ## Proof-size parameter sweep
 
-`cargo run --release --bin sweep` proves a real `DEPTH=32` spend at each FRI configuration and
+> **Frozen measurement** — the one-shot `sweep` harness that produced this table has been removed
+> (the chosen production parameters live in `lattica-prover-p3/src/config.rs`); the numbers remain
+> the decision record.
+
+`cargo run --release --bin sweep` (removed) proved a real `DEPTH=32` spend at each FRI configuration and
 measures proof size + timings next to the proven/conjectured bits. Headline rows (proven/conjectured
 are bits; proof in KB):
 
@@ -138,8 +142,11 @@ covers up to **64** transactions at the ≥100-bit floor; a larger block emits *
 ≤64 tiles each (or a future config raises `num_queries`). Enforced by `prove_batch_to_bytes` + the
 `batch_proven_security_floor` test.
 
-`cargo run --release --bin batch` proves a batch of `n` spends as a **single** proof (the spend AIR
-tiled `n` times in one trace) at the production FRI params:
+> **Frozen measurement** — the one-shot `batch` harness has been removed (the batch circuit lives in
+> `batch_joinsplit_air.rs` with its `--ignored` proving tests); the numbers remain the decision record.
+
+`cargo run --release --bin batch` (removed) proved a batch of `n` spends as a **single** proof (the
+spend AIR tiled `n` times in one trace) at the production FRI params:
 
 | n | proven | proof KB | per-spend KB | vs n separate | prove ms | verify ms |
 |---|---|---|---|---|---|---|

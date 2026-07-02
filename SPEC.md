@@ -8,7 +8,15 @@ shielded value transfer validated by zero-knowledge proofs — while removing ev
 elliptic-curve / discrete-log dependency that Shor's algorithm would break.
 
 This document specifies the protocol. A working proof of concept of every component lives
-alongside it in the `lattica/` Cargo workspace; see [§10](#10-implementation-map).
+alongside it in this repository; see [§10](#10-implementation-map).
+
+> **⚠ Historical note (implementation sections).** §8 and §10 describe the original from-scratch
+> Zig STARK proof-of-concept (`src/stark.zig`, `src/rescue.zig`, `src/membership.zig`,
+> `src/spend.zig`, `src/circuit.zig`), which has since been **replaced by the production Plonky3
+> prover crate** `lattica-prover-p3/` (Poseidon2-Goldilocks, hiding FRI; consumed by the node via
+> the C ABI in `lattica-prover-p3/include/lattica_prover_p3.h`). For current parameters and wire
+> formats see `docs/soundness-budget.md` and `docs/wire-format.md`. The protocol sections (§1–§7)
+> remain normative.
 
 ---
 
