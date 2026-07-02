@@ -78,6 +78,85 @@ fn parse_joinsplit_public_inputs(b: &[u8]) -> Option<Vec<Goldilocks>> {
     Some(pis)
 }
 
+// --- shared ABI core ---------------------------------------------------------------------------
+// The 10 #[no_mangle] entry points stay concrete (the frozen node seam), delegating their common
+// sequences here so every fail-closed property — null checks, the M-08 size bound, canonical
+// statement parsing, panic isolation, cap-before-store — is ONE audited implementation instead of
+// ten mirrored copies.
+
+/// Verify-side core: null → M-08 size bound → parse the statement bytes → panic-isolated verify.
+/// `0` accept / `1` reject, fail-closed at every step.
+///
+/// # Safety
+/// `proof_ptr`/`stmt_ptr` must point to `proof_len`/`stmt_len` readable bytes (or be null).
+unsafe fn verify_abi(
+    proof_ptr: *const u8,
+    proof_len: usize,
+    stmt_ptr: *const u8,
+    stmt_len: usize,
+    parse: impl Fn(&[u8]) -> Option<Vec<Goldilocks>>,
+    verify: impl Fn(&[u8], &[Goldilocks]) -> bool,
+) -> i32 {
+    if proof_ptr.is_null() || stmt_ptr.is_null() {
+        return 1;
+    }
+    // Bound the proof size before building/deserializing the slice, so C callers get fail-closed
+    // behaviour even if a Zig-side cap is bypassed (audit M-08). Must match `ffi.MAX_PROOF_LEN`.
+    if proof_len > MAX_PROOF_LEN {
+        return 1;
+    }
+    let proof = slice::from_raw_parts(proof_ptr, proof_len);
+    let sb = slice::from_raw_parts(stmt_ptr, stmt_len);
+    let pis = match parse(sb) {
+        Some(p) => p,
+        None => return 1,
+    };
+    // Isolate any panic in deserialization / the STARK verifier (malformed-but-deserializable proofs
+    // from the network must not unwind across `extern "C"`).
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(proof, &pis)));
+    if matches!(ok, Ok(true)) {
+        0
+    } else {
+        1
+    }
+}
+
+/// The batch statement parser: a 32-byte block tx-root digest → 4 canonical limbs.
+fn parse_root_digest(rb: &[u8]) -> Option<Vec<Goldilocks>> {
+    if rb.len() != DIGEST_BYTES {
+        return None;
+    }
+    let mut root = Vec::with_capacity(4);
+    push_digest(rb, &mut root)?;
+    Some(root)
+}
+
+/// Prove-side output writer: cap-checks BOTH buffers before ANY store (on `2` the `*_len` outputs
+/// are untouched — the documented header contract), then copies and sets the lengths.
+///
+/// # Safety
+/// The out pointers must be non-null with `*_cap` writable bytes; the len pointers writable.
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_out2(
+    a: &[u8],
+    a_out: *mut u8,
+    a_cap: usize,
+    a_len: *mut usize,
+    b: &[u8],
+    b_out: *mut u8,
+    b_cap: usize,
+    b_len: *mut usize,
+) -> i32 {
+    if a.len() > a_cap || b.len() > b_cap {
+        return 2;
+    }
+    core::ptr::copy_nonoverlapping(a.as_ptr(), a_out, a.len());
+    *a_len = a.len();
+    core::ptr::copy_nonoverlapping(b.as_ptr(), b_out, b.len());
+    *b_len = b.len();
+    0
+}
+
 /// C ABI: verify a serialized **join-split** proof against `JoinSplitPublicInputs` bytes.
 /// `0` accept / nonzero reject; **fail-closed**: returns nonzero on null pointers, wrong public-input
 /// length, non-canonical limbs, malformed proof bytes, or any panic inside the proof system (a node
@@ -93,28 +172,7 @@ pub unsafe extern "C" fn lattica_joinsplit_verify(
     pi_ptr: *const u8,
     pi_len: usize,
 ) -> i32 {
-    if proof_ptr.is_null() || pi_ptr.is_null() {
-        return 1;
-    }
-    // Bound the proof size before building/deserializing the slice, so C callers get fail-closed
-    // behaviour even if a Zig-side cap is bypassed (audit M-08). Must match `ffi.MAX_PROOF_LEN`.
-    if proof_len > MAX_PROOF_LEN {
-        return 1;
-    }
-    let proof = slice::from_raw_parts(proof_ptr, proof_len);
-    let pib = slice::from_raw_parts(pi_ptr, pi_len);
-    let pis = match parse_joinsplit_public_inputs(pib) {
-        Some(p) => p,
-        None => return 1,
-    };
-    // Isolate any panic in deserialization / the STARK verifier (malformed-but-deserializable proofs
-    // from the network must not unwind across `extern "C"`).
-    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| joinsplit_air::verify_bytes(proof, &pis)));
-    if matches!(ok, Ok(true)) {
-        0
-    } else {
-        1
-    }
+    verify_abi(proof_ptr, proof_len, pi_ptr, pi_len, parse_joinsplit_public_inputs, joinsplit_air::verify_bytes)
 }
 
 /// C ABI: prove the fixed demo join-split witness and write the proof + the `JoinSplitPublicInputs`
@@ -142,14 +200,7 @@ pub unsafe extern "C" fn lattica_joinsplit_prove_demo(
         Some(b) => b,
         None => return 1,
     };
-    if proof.len() > proof_cap || pib.len() > pi_cap {
-        return 2;
-    }
-    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
-    *proof_len = proof.len();
-    core::ptr::copy_nonoverlapping(pib.as_ptr(), pi_out, pib.len());
-    *pi_len = pib.len();
-    0
+    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
 }
 
 /// Encode the circuit's join-split public-input vector into the `JoinSplitPublicInputs` byte layout
@@ -278,24 +329,7 @@ pub unsafe extern "C" fn lattica_htlc_verify(
     pi_ptr: *const u8,
     pi_len: usize,
 ) -> i32 {
-    if proof_ptr.is_null() || pi_ptr.is_null() {
-        return 1;
-    }
-    if proof_len > MAX_PROOF_LEN {
-        return 1;
-    }
-    let proof = slice::from_raw_parts(proof_ptr, proof_len);
-    let pib = slice::from_raw_parts(pi_ptr, pi_len);
-    let pis = match parse_htlc_public_inputs(pib) {
-        Some(p) => p,
-        None => return 1,
-    };
-    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_air::verify_bytes(proof, &pis)));
-    if matches!(ok, Ok(true)) {
-        0
-    } else {
-        1
-    }
+    verify_abi(proof_ptr, proof_len, pi_ptr, pi_len, parse_htlc_public_inputs, htlc_air::verify_bytes)
 }
 
 /// C ABI: prove the fixed demo HTLC-redeem witness, writing the proof + `HtlcPublicInputs` bytes.
@@ -321,14 +355,7 @@ pub unsafe extern "C" fn lattica_htlc_prove_demo(
         Some(b) => b,
         None => return 1,
     };
-    if proof.len() > proof_cap || pib.len() > pi_cap {
-        return 2;
-    }
-    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
-    *proof_len = proof.len();
-    core::ptr::copy_nonoverlapping(pib.as_ptr(), pi_out, pib.len());
-    *pi_len = pib.len();
-    0
+    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
 }
 
 // --- wallet-side prover ABI -------------------------------------------------------------------
@@ -500,14 +527,7 @@ pub unsafe extern "C" fn lattica_joinsplit_prove(
         Ok(Some(x)) => x,
         _ => return 1,
     };
-    if proof.len() > proof_cap || pib.len() > pi_cap {
-        return 2;
-    }
-    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
-    *proof_len = proof.len();
-    core::ptr::copy_nonoverlapping(pib.as_ptr(), pi_out, pib.len());
-    *pi_len = pib.len();
-    0
+    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
 }
 
 // --- batch aggregation (one proof per block) C ABI --------------------------------------------
@@ -534,29 +554,7 @@ pub unsafe extern "C" fn lattica_batch_verify(
     root_ptr: *const u8,
     root_len: usize,
 ) -> i32 {
-    if proof_ptr.is_null() || root_ptr.is_null() {
-        return 1;
-    }
-    if proof_len > MAX_PROOF_LEN {
-        return 1; // M-08: bound before deserializing (a batch proof is ~hundreds of KB, well under the cap)
-    }
-    if root_len != DIGEST_BYTES {
-        return 1;
-    }
-    let proof = slice::from_raw_parts(proof_ptr, proof_len);
-    let rb = slice::from_raw_parts(root_ptr, root_len);
-    let mut root = Vec::with_capacity(4);
-    if push_digest(rb, &mut root).is_none() {
-        return 1; // non-canonical root limb
-    }
-    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        batch_joinsplit_air::verify_batch_bytes(proof, &root)
-    }));
-    if matches!(ok, Ok(true)) {
-        0
-    } else {
-        1
-    }
+    verify_abi(proof_ptr, proof_len, root_ptr, root_len, parse_root_digest, batch_joinsplit_air::verify_batch_bytes)
 }
 
 /// C ABI: prove `n_tx` concatenated join-split witnesses (each `JS_WITNESS_LEN` bytes) as ONE batch
@@ -606,14 +604,7 @@ pub unsafe extern "C" fn lattica_batch_prove(
         Err(_) => return 1,
     };
     let rb = encode_digest(&root);
-    if proof.len() > proof_cap || rb.len() > root_cap {
-        return 2;
-    }
-    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
-    *proof_len = proof.len();
-    core::ptr::copy_nonoverlapping(rb.as_ptr(), root_out, rb.len());
-    *root_len = rb.len();
-    0
+    write_out2(&proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len)
 }
 
 // --- HTLC batch aggregation C ABI (mirrors the join-split batch; HTLC witnesses + tx-root) ----
@@ -630,21 +621,7 @@ pub unsafe extern "C" fn lattica_htlc_batch_verify(
     root_ptr: *const u8,
     root_len: usize,
 ) -> i32 {
-    if proof_ptr.is_null() || root_ptr.is_null() || proof_len > MAX_PROOF_LEN || root_len != DIGEST_BYTES {
-        return 1;
-    }
-    let proof = slice::from_raw_parts(proof_ptr, proof_len);
-    let rb = slice::from_raw_parts(root_ptr, root_len);
-    let mut root = Vec::with_capacity(4);
-    if push_digest(rb, &mut root).is_none() {
-        return 1;
-    }
-    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch_htlc_air::verify_batch_bytes(proof, &root)));
-    if matches!(ok, Ok(true)) {
-        0
-    } else {
-        1
-    }
+    verify_abi(proof_ptr, proof_len, root_ptr, root_len, parse_root_digest, batch_htlc_air::verify_batch_bytes)
 }
 
 /// C ABI: prove `n_tx` concatenated **HTLC** witnesses (each `HTLC_WITNESS_LEN` bytes) as ONE batch
@@ -692,14 +669,7 @@ pub unsafe extern "C" fn lattica_htlc_batch_prove(
         Err(_) => return 1,
     };
     let rb = encode_digest(&root);
-    if proof.len() > proof_cap || rb.len() > root_cap {
-        return 2;
-    }
-    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
-    *proof_len = proof.len();
-    core::ptr::copy_nonoverlapping(rb.as_ptr(), root_out, rb.len());
-    *root_len = rb.len();
-    0
+    write_out2(&proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len)
 }
 
 // --- HTLC wallet-side prover ABI --------------------------------------------------------------
@@ -865,14 +835,7 @@ pub unsafe extern "C" fn lattica_htlc_prove(
         Ok(Some(x)) => x,
         _ => return 1,
     };
-    if proof.len() > proof_cap || pib.len() > pi_cap {
-        return 2;
-    }
-    core::ptr::copy_nonoverlapping(proof.as_ptr(), proof_out, proof.len());
-    *proof_len = proof.len();
-    core::ptr::copy_nonoverlapping(pib.as_ptr(), pi_out, pib.len());
-    *pi_len = pib.len();
-    0
+    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
 }
 
 #[cfg(test)]
