@@ -447,12 +447,17 @@ mod tests {
 
     #[test]
     fn htlc_batch_kat_dump() {
+        // CONSENSUS KAT (poseidon2.zig), seq statement = 1..=N_PUBLIC. PINNED at HEAD c7e54b1 — the node
+        // recomputes these natively; a change is a chain fork. Prints kept for cross-language diff.
         use p3_field::PrimeField64;
         let seq: Vec<Val> = (1..=N_PUBLIC as u64).map(Val::from_u64).collect();
-        let s = tx_statement_digest(&seq);
-        let d = dummy_sk();
-        println!("htlc_seq_digest = {:?}", s.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>());
-        println!("htlc_dummy_sk = {:?}", d.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>());
+        let felts = |x: &[Val; DIGEST]| x.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>();
+        let s = felts(&tx_statement_digest(&seq));
+        let d = felts(&dummy_sk());
+        println!("htlc_seq_digest = {s:?}");
+        println!("htlc_dummy_sk = {d:?}");
+        assert_eq!(s, [12024734340241841742, 6068874100855730733, 14239999004995857547, 2452102150457936639]);
+        assert_eq!(d, [10539992321146962576, 13450880049652540131, 10286920310671709176, 6485382129692956089]);
     }
 
     #[test]

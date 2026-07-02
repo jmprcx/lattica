@@ -585,16 +585,18 @@ mod tests {
 
     #[test]
     fn batch_kat_dump() {
-        // KAT for the Zig node's txStatementDigest/batchRoot fold (poseidon2.zig). seq statement = 1..=26.
+        // KAT for the Zig node's txStatementDigest/batchRoot fold (poseidon2.zig), seq statement = 1..=N_PUBLIC.
+        // PINNED (harvested at HEAD c7e54b1): these are CONSENSUS values — the node recomputes them
+        // natively and both sides must agree; a change is a chain fork. Prints kept for cross-language diff.
+        use p3_field::PrimeField64;
         let seq: Vec<Val> = (1..=N_PUBLIC as u64).map(Val::from_u64).collect();
-        let s = tx_statement_digest(&seq);
-        let d = dummy_sk();
-        let p = |label: &str, x: &[Val; DIGEST]| {
-            use p3_field::PrimeField64;
-            println!("{label} = {:?}", x.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>());
-        };
-        p("seq_statement_digest", &s);
-        p("dummy_sk", &d);
+        let felts = |x: &[Val; DIGEST]| x.iter().map(|f| f.as_canonical_u64()).collect::<Vec<_>>();
+        let s = felts(&tx_statement_digest(&seq));
+        let d = felts(&dummy_sk());
+        println!("seq_statement_digest = {s:?}");
+        println!("dummy_sk = {d:?}");
+        assert_eq!(s, [16413833029060099665, 4880920211288721702, 16696557975413361240, 12647866530414313287]);
+        assert_eq!(d, [10093663321021608916, 18280800825645272076, 7712995835321977355, 5336904204250640364]);
     }
 
     #[test]
