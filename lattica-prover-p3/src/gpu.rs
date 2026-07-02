@@ -559,4 +559,41 @@ mod tests {
             }
         }
     }
+
+    /// THE 2× BENCHMARK: prove the real join-split circuit under two apples-to-apples non-hiding configs
+    /// — CPU (`Radix2DitParallel` + `MerkleTreeMmcs`) vs GPU (`GpuDft` + `GpuMerkleMmcs`) — with identical
+    /// FRI params. Both LDE **and** Merkle now run on the GPU, so this measures the real acceleration
+    /// (not just the LDE slice). Asserts each proof verifies under its own config (self-consistent).
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU; benchmark"]
+    fn gpu_merkle_benchmark() {
+        use crate::config::gpu::{make_bench_config_cpu, make_bench_config_gpu};
+        use crate::joinsplit_air::{self, JoinSplitAir};
+        use p3_uni_stark::{prove, verify};
+        use std::time::Instant;
+        let w = joinsplit_air::demo_witness();
+        let pis = joinsplit_air::public_values(&w);
+        let cpu_cfg = make_bench_config_cpu();
+        let gpu_cfg = make_bench_config_gpu();
+        // correctness: each proof verifies under its own (self-consistent) config.
+        let p_cpu = prove(&cpu_cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+        assert!(verify(&cpu_cfg, &JoinSplitAir, &p_cpu, &pis).is_ok(), "CPU-bench proof must verify");
+        let p_gpu = prove(&gpu_cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+        assert!(verify(&gpu_cfg, &JoinSplitAir, &p_gpu, &pis).is_ok(), "GPU-bench proof must verify");
+        // timing: best-of-N wall clock.
+        let runs = 5;
+        let (mut cpu_ms, mut gpu_ms) = (f64::MAX, f64::MAX);
+        super::prof_reset();
+        for _ in 0..runs {
+            let t = Instant::now();
+            let _ = prove(&cpu_cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+            cpu_ms = cpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let _ = prove(&gpu_cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+            gpu_ms = gpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let (ntt_ms, ntt_calls, mk_ms, mk_calls) = super::prof_report();
+        println!("join-split prove, non-hiding (best of {runs}): CPU {cpu_ms:.1}ms | GPU(LDE+Merkle) {gpu_ms:.1}ms  ({:.2}x)", cpu_ms / gpu_ms);
+        println!("  GPU work across {runs} runs: NTT {ntt_ms:.0}ms / {ntt_calls} calls, Merkle {mk_ms:.0}ms / {mk_calls} commits");
+    }
 }

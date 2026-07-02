@@ -171,6 +171,53 @@ pub mod gpu {
         let proof = prove(&make_config(), air, trace, pis);
         postcard::to_allocvec(&proof).expect("proof serialization is infallible")
     }
+
+    // --- Non-hiding BENCHMARK configs (NOT production): isolate the GPU LDE + Merkle speedup against an
+    // apples-to-apples CPU baseline with identical FRI parameters. No ZK, no salts. `GpuMerkleMmcs`
+    // commits equal-height matrices with `cap_height = 0`, so the CPU baseline mirrors that exactly
+    // (`MerkleTreeMmcs`, cap 0). Proofs are self-consistent (proved+verified under the same config) — the
+    // point is a clean wall-clock comparison of the accelerated commit path, not a wire/consensus proof.
+    use crate::gpu::GpuMerkleMmcs;
+    use p3_fri::TwoAdicFriPcs;
+    use p3_merkle_tree::MerkleTreeMmcs;
+
+    pub type BenchValMmcsCpu = MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
+    pub type BenchChMmcsCpu = ExtensionMmcs<Val, Challenge, BenchValMmcsCpu>;
+    pub type BenchPcsCpu = TwoAdicFriPcs<Val, Dft, BenchValMmcsCpu, BenchChMmcsCpu>;
+    pub type BenchConfigCpu = StarkConfig<BenchPcsCpu, Challenge, Challenger>;
+
+    pub type BenchChMmcsGpu = ExtensionMmcs<Val, Challenge, GpuMerkleMmcs>;
+    pub type BenchPcsGpu = TwoAdicFriPcs<Val, GpuDft, GpuMerkleMmcs, BenchChMmcsGpu>;
+    pub type BenchConfigGpu = StarkConfig<BenchPcsGpu, Challenge, Challenger>;
+
+    /// Benchmark FRI params: the production literals, generic over the (non-hiding) challenge MMCS.
+    fn bench_fri<M>(mmcs: M) -> FriParameters<M> {
+        FriParameters {
+            log_blowup: LOG_BLOWUP,
+            log_final_poly_len: 0,
+            max_log_arity: 4,
+            num_queries: NUM_QUERIES,
+            commit_proof_of_work_bits: 0,
+            query_proof_of_work_bits: QUERY_POW_BITS,
+            mmcs,
+        }
+    }
+
+    /// Apples-to-apples CPU baseline: `Radix2DitParallel` LDE + plain `MerkleTreeMmcs`, non-hiding.
+    pub fn make_bench_config_cpu() -> BenchConfigCpu {
+        let perm = default_goldilocks_poseidon2_8();
+        let vm = BenchValMmcsCpu::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0);
+        let pcs = BenchPcsCpu::new(Dft::default(), vm.clone(), bench_fri(BenchChMmcsCpu::new(vm)));
+        BenchConfigCpu::new(pcs, Challenger::new(perm))
+    }
+
+    /// The same config with BOTH heavy steps on the GPU: `GpuDft` LDE + `GpuMerkleMmcs` tree build.
+    pub fn make_bench_config_gpu() -> BenchConfigGpu {
+        let perm = default_goldilocks_poseidon2_8();
+        let vm = GpuMerkleMmcs::new();
+        let pcs = BenchPcsGpu::new(GpuDft, vm.clone(), bench_fri(BenchChMmcsGpu::new(vm)));
+        BenchConfigGpu::new(pcs, Challenger::new(perm))
+    }
 }
 
 /// Dev/demo config family — deterministic salts, reduced parameters. NOT for production proofs.
