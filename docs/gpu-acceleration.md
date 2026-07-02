@@ -1,8 +1,10 @@
 # GPU-accelerated proving (opt-in)
 
-`lattica-prover-p3` can offload the low-degree extension (LDE) — the single heaviest step of proving —
-to a GPU via OpenCL. It is **opt-in, prove-only, and wire-compatible**: the default CPU proving path,
-the byte-exact wire format, and the C-ABI verifier are untouched.
+`lattica-prover-p3` can offload the two heaviest proving steps — the low-degree extension (LDE) and the
+Merkle tree build — to a GPU via OpenCL, for a **measured 2.42× speedup** on the real join-split circuit.
+It is **opt-in and prove-only**: the default CPU proving path, the byte-exact wire format, and the C-ABI
+verifier are untouched. The LDE path (`GpuDft`) is wire-compatible with the production hiding config; the
+Merkle path (`GpuMerkleMmcs`) currently runs under a non-hiding benchmark config (see *What's next*).
 
 ## Enabling it
 
@@ -47,29 +49,38 @@ assert!(joinsplit_air::verify_bytes(&proof_bytes, &pis));
 
 ## Status & performance
 
-Working today: real join-split and HTLC proofs run with GPU LDE and verify. On the reference machine,
-join-split proving is **CPU ~829 ms → GPU-LDE ~707 ms** (~15% faster end-to-end). `coset_lde_batch` is
-overridden to run the entire LDE device-side (iDFT → coset-scale → forward NTT, one upload + one
-download), so the LDE is fully offloaded.
+Two heavy proving steps run on the GPU today: the **LDE** (`GpuDft`) and the **Merkle tree build**
+(`GpuMerkleMmcs`). Together they deliver a **measured 2.42× over CPU** on the real join-split circuit.
 
-### Where the time goes (measured, p3 tracing spans, join-split)
+### The 2.42× (measured, `gpu_merkle_benchmark`, join-split, best of 5)
 
-| phase | CPU time | on GPU? |
-|---|---:|---|
-| commit quotient chunks — **Merkle hashing** | ~365 ms | ✗ (next lever) |
-| commit quotient chunks — LDE | ~322 ms | ✓ |
-| `quotient_values` (constraint eval) | ~170 ms | ✗ |
-| commit trace — **Merkle hashing** | ~71 ms | ✗ |
-| open / FRI | ~42 ms | partial |
+Apples-to-apples, non-hiding configs with identical FRI params:
 
-**Merkle hashing is ~45% of a proof** — and it's exactly the Poseidon2 workload the GPU crushes
-(validated bit-exact in the pipeline: 500K permutations, Merkle roots to the limb). It is the single
-biggest remaining win, but it requires a **custom GPU `Mmcs`** (the tree build on GPU) that is
-byte-compatible with `MerkleTreeHidingMmcs` so proofs still verify — a substantial, carefully-tested
-piece (p3's `MerkleTree` internals are `pub(crate)`, so it can't be reused; the whole commit/open/verify
-must be reimplemented). The `quotient_values` constraint-eval (~17%) is the other lever and needs a
-codegen pass (emit a GPU kernel from each AIR's `SymbolicExpression` DAG).
+| config | LDE | Merkle | join-split prove |
+|---|---|---|---:|
+| CPU baseline | `Radix2DitParallel` | `MerkleTreeMmcs` | **141.0 ms** |
+| GPU | `GpuDft` | `GpuMerkleMmcs` | **58.2 ms** (**2.42×**) |
 
-**Roadmap to ~2×:** GPU Merkle `Mmcs` (kernels validated, ready) → quotient constraint-eval codegen →
-shared-memory NTT butterflies → a `_prove_gpu` C-ABI entry for the node. The LDE slice is done; the next
-increment is the Merkle `Mmcs`, and it earns its own careful pass because it must verify.
+Of the GPU run, ~18 ms is NTT + ~10 ms is Merkle; the rest (quotient constraint-eval, FRI, challenger)
+is still CPU. Each proof **verifies under its own config** (self-consistent) — and the GPU Merkle commit
+was validated bit-exact against the CPU p3 hasher standalone (`gpu_merkle_mmcs_self_consistent`: GPU
+commit ↔ CPU verify agree across 2¹–2¹²; tampered values / wrong indices rejected).
+
+### How the Merkle offload works
+
+`crate::gpu::GpuMerkleMmcs` is a custom `p3_commit::Mmcs`: `commit` runs the whole tree on the GPU
+(Poseidon2 `leaf_hash` over concatenated rows → pairwise `compress_layer` up to the root), while
+`open_batch`/`verify_batch` stay on the CPU (cheap, per-query) using the **same** exported Poseidon2
+constants — so a GPU-built root verifies against the CPU hasher bit-for-bit. The kernels
+(`perm8`/`leaf_hash`/`compress_layer`) match `default_goldilocks_poseidon2_8` exactly. This was
+necessary because p3's `MerkleTree` internals are `pub(crate)` and can't be reused.
+
+### What's next
+
+- **Production (hiding) integration.** The 2.42× is measured on a *non-hiding* config (`GpuMerkleMmcs`
+  has no salts, `cap_height 0`, a `[Val;4]` root). Folding it into the production **hiding** wire format
+  means a salted variant whose `Commitment`/`Proof` are byte-compatible with `MerkleTreeHidingMmcs`
+  (`MerkleCap` + `(salts, siblings)`), so proofs still verify under the standard verifier / the node.
+- **Quotient constraint-eval** (`quotient_values`, the next ~17% CPU slice) — a codegen pass emitting a
+  GPU kernel from each AIR's `SymbolicExpression` DAG.
+- Shared-memory NTT butterflies; a `_prove_gpu` C-ABI entry for the node.
