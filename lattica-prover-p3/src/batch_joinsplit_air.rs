@@ -12,9 +12,10 @@
 //! is a power of two. The Zig node recomputes the same root from a block's transactions (no witnesses
 //! needed) to check the single proof.
 //!
-//! PHASE 1 (this commit): the native oracle only — `tx_statement_digest`, `dummy_sk`, `batch_root`. The
-//! in-circuit fold (a later phase) is differential-tested against this oracle, and the node's
-//! `poseidon2.zig` recompute is KAT-tested against it.
+//! The native oracle (`tx_statement_digest`, `dummy_sk`, `batch_root`) is the cross-checked contract:
+//! the in-circuit fold is differential-tested against it, and the node's `poseidon2.zig` recompute is
+//! KAT-tested against it. The per-tile spend constraints are `joinsplit_air::eval_spend`, reused
+//! verbatim (fed the per-tile staging statement + the `P_TILE_LAST` boundary selector).
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
@@ -113,10 +114,9 @@ pub fn padded_tiles(n: usize) -> usize {
 // The batch AIR: the join-split spend tiled n times in one trace, proven once. The per-tile
 // constraints are the audited `joinsplit_air` constraints made tile-safe (self-containment); the
 // periodic columns are reused verbatim from `joinsplit_air::periodic()` (Plonky3 repeats them per
-// tile) plus one new boundary selector `P_TILE_LAST`. PHASE 2: still binds each tile to the global
-// public inputs, so only IDENTICAL tiles verify — this validates tiling + self-containment. Phase 3
-// redirects the per-tile statement bindings to staging columns and adds the in-circuit tx-root fold,
-// so DISTINCT transactions verify under the single `batch_root` public input.
+// tile) plus one new boundary selector `P_TILE_LAST`. Each tile's statement bindings point at its
+// staging columns, and the in-circuit tx-root fold chains the staged statements to the single
+// `batch_root` public input — so DISTINCT transactions verify under one proof.
 // =============================================================================================
 
 const TILE_HEIGHT: usize = HEIGHT;

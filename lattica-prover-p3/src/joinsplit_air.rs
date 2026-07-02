@@ -182,9 +182,9 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
 }
 
 // ==============================================================================================
-// AIR — stage 1: multi-input membership to a shared anchor (domain-tagged ownership + commitment).
-// Later stages add nullifiers (A1 pos-binding), accumulator balance + range (A3), outputs, and the
-// per-instance public bindings. Built incrementally; each stage differential-tested vs the oracle.
+// AIR — the full spend statement: multi-input membership to a shared anchor (domain-tagged ownership +
+// commitment), nullifiers (A1 pos-binding), accumulator balance + range (A3), outputs, and the per-
+// instance public bindings. Built incrementally; each region differential-tested vs the native oracle.
 // ==============================================================================================
 
 const SPAN_BLOCKS: usize = 4 + DEPTH; // ownership, commit_a, commit_b, DEPTH merges, nullifier

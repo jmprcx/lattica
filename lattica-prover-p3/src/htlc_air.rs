@@ -11,10 +11,11 @@
 //! This started as a faithful clone of `joinsplit_air` (the audited v1 circuit)
 //! so the HTLC circuit reuses its proven machinery — Poseidon2 blocks, the two-permutation commitment
 //! (with the substrate's hidden `asset_id` in lane 6), multi-input membership to a shared anchor,
-//! value balance + range, the position-bound nullifier, and the `tx_binding` Fiat-Shamir binding. It
-//! currently behaves identically to the join-split; the HTLC extensions are layered on next.
+//! value balance + range, the position-bound nullifier, and the `tx_binding` Fiat-Shamir binding.
+//! The spend constraint body is `eval_spend` (statement/tile_last-parameterized), reused verbatim by
+//! `batch_htlc_air` — the same pattern `joinsplit_air::eval_spend` now follows.
 //!
-//! ## Planned HTLC extensions (see the v3 plan, Phase A1)
+//! ## The HTLC extensions (delivered; kept here as the design rationale)
 //! - commitment lane 7 = `note_type ∈ {PLAIN, HTLC}`; `owner` = `recipient = H(DOM_OWN‖nk‖div)` (PLAIN)
 //!   or `htlc_root = MD-chain(DOM_HTLC ‖ redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout)` (HTLC);
 //! - two spend modes gated by one persistent `MODE` boolean: redeem (claim == redeem_tag,
@@ -34,15 +35,18 @@
 //! **span end** (after the nullifier), carries the selected owner in 4 persistent `OWNER` columns
 //! (`OWNER = note_type ? htlc_root : recipient`), binds `commit_a.in[owner] == OWNER` (local, no
 //! adjacency), and binds `OWNER` to `own.out` (PLAIN) / the htlc chain output (HTLC) at those rows.
-//! Adding span-end blocks also requires extending the persistence region (`P_REGION_LAST`) and the
-//! NK/RHO/VAL/POSACC fills to the new span end. This is the remaining AIR work.
+//! Adding span-end blocks also required extending the persistence region (`P_REGION_LAST`) and the
+//! NK/RHO/VAL/POSACC fills to the new span end (done — see `span_last_row`).
 //!
-//! ## Hashes (A2 — domain separation)
+//! ## Hashes (A2 — domain separation; the normative tag table lives in `crate::domains`)
 //! Every data hash carries a distinct **domain tag in lane 0** of the Poseidon2 input, so a digest
 //! produced in one context can't be reinterpreted in another:
-//!   * ownership  `recipient = H(DOM_OWN ‖ nk)`
-//!   * commitment `cm        = H(DOM_CM  ‖ recipient(4) ‖ value ‖ rho ‖ rcm)`   (input & output notes)
-//!   * nullifier  `nf        = H(DOM_NF  ‖ nk ‖ rho ‖ pos)`
+//!   * ownership  `recipient = H(DOM_OWN ‖ nk ‖ div)`
+//!   * commitment `cm        = H(DOM_CM ‖ owner(4) ‖ value ‖ rho ‖ rcm)` with `asset` in lane 6 and
+//!     `note_type ∈ {NOTE_PLAIN, NOTE_HTLC}` in lane 7 of the second permutation
+//!   * nullifier  `nf        = H(DOM_NF ‖ nk ‖ rho ‖ pos)` (plain) /
+//!     `H(DOM_NF_HTLC ‖ owner ‖ rho ‖ pos)` (HTLC; owner-based, mode-independent)
+//!   * htlc root  `htlc_root = MD-chain(DOM_HTLC ‖ redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout)`
 //! The Merkle **merge** `H(l(4) ‖ r(4))` fills all 8 lanes (no tag); it is structurally separated —
 //! it only ever appears as an internal node over two 4-element digests, and the leaf entering the
 //! tree is constrained to be a `DOM_CM`-tagged commitment, so a node can't be presented as a leaf.
@@ -281,9 +285,9 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
 }
 
 // ==============================================================================================
-// AIR — stage 1: multi-input membership to a shared anchor (domain-tagged ownership + commitment).
-// Later stages add nullifiers (A1 pos-binding), accumulator balance + range (A3), outputs, and the
-// per-instance public bindings. Built incrementally; each stage differential-tested vs the oracle.
+// AIR — the full spend statement: multi-input membership to a shared anchor (domain-tagged ownership +
+// commitment), nullifiers (A1 pos-binding), accumulator balance + range (A3), outputs, and the per-
+// instance public bindings. Built incrementally; each region differential-tested vs the native oracle.
 // ==============================================================================================
 
 // ownership, commit_a, commit_b, DEPTH merges, nullifier, then 4 htlc_root blocks at the span END
