@@ -34,8 +34,8 @@ use crate::joinsplit_air::{
 
 type Val = Goldilocks;
 
-/// Domain tag for the per-transaction statement digest (1=OWN, 2=CM, 3=NF, 4=HTLC, 5=NF_HTLC).
-pub const DOM_TXROOT: u64 = 6;
+/// Domain tag for the per-transaction statement digest — the normative table lives in crate::domains.
+pub use crate::domains::DOM_TXROOT;
 
 /// Per-transaction statement digest `s_k`: a domain-tagged Merkle–Damgård chain over the public
 /// statement. Block 0 = `H(DOM_TXROOT,0,0,0 ‖ anchor)` (a `merge` with the domain in the low half);

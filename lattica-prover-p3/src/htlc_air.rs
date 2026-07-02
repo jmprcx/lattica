@@ -68,16 +68,9 @@ pub const BITS: usize = 52; // value range bound (2·2^BITS < p ⇒ no wraparoun
 pub const DIGEST: usize = 4;
 const W: usize = 8;
 
-// A2 domain-separation tags (lane 0 of each data hash). Distinct, nonzero.
-pub const DOM_OWN: u64 = 1;
-pub const DOM_CM: u64 = 2;
-pub const DOM_NF: u64 = 3;
-pub const DOM_HTLC: u64 = 4; // htlc_root = MD-chain over (redeem_tag, refund_tag, hashlock, timeout)
-pub const DOM_NF_HTLC: u64 = 5; // nullifier of an HTLC note (owner-based, mode-independent)
-
-/// Note types (committed in commitment lane 7).
-pub const NOTE_PLAIN: u64 = 0;
-pub const NOTE_HTLC: u64 = 1;
+// A2 domain-separation tags (lane 0 of each data hash) + note types (commitment lane 7) — the
+// normative table lives in crate::domains.
+pub use crate::domains::{DOM_CM, DOM_HTLC, DOM_NF, DOM_NF_HTLC, DOM_OWN, NOTE_HTLC, NOTE_PLAIN};
 
 type Val = Goldilocks;
 

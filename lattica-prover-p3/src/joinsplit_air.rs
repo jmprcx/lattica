@@ -38,10 +38,8 @@ pub const BITS: usize = 52; // value range bound (2·2^BITS < p ⇒ no wraparoun
 pub const DIGEST: usize = 4;
 const W: usize = 8;
 
-// A2 domain-separation tags (lane 0 of each data hash). Distinct, nonzero.
-pub const DOM_OWN: u64 = 1;
-pub const DOM_CM: u64 = 2;
-pub const DOM_NF: u64 = 3;
+// A2 domain-separation tags (lane 0 of each data hash) — the normative table lives in crate::domains.
+pub use crate::domains::{DOM_CM, DOM_NF, DOM_OWN};
 
 type Val = Goldilocks;
 

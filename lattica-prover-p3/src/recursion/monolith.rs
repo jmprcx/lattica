@@ -4526,7 +4526,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // row), and the final root == the block tx-root — the ONLY public input. Matches agg_root/batch_root.
         if self.fold {
             let txroot: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-            let dom = AB::Expr::from(Goldilocks::from_u64(6)); // DOM_AGG = DOM_TXROOT
+            let dom = AB::Expr::from(Goldilocks::from_u64(crate::domains::DOM_TXROOT)); // DOM_AGG = DOM_TXROOT
             // fold Poseidon step (reuses the period-BLOCK round schedule is_init/is_full/is_partial/rc),
             // gated to the two fold blocks by P_FOLD_ACTIVE.
             let fa = p[self.p_fold_active()].clone();
@@ -5341,7 +5341,7 @@ pub(crate) fn build_arity4_fold_chain_trace(
 // =================================================================================================
 const AF_ROOT: usize = W; // global-persistent running root (4 lanes) after the 8 Poseidon lanes
 const AF_W: usize = W + 4;
-const AF_DOM: u64 = 6; // = batch_joinsplit_air::DOM_TXROOT
+const AF_DOM: u64 = crate::domains::DOM_TXROOT; // the tx-root fold domain (normative table: crate::domains)
 #[allow(dead_code)]
 pub(crate) struct AggFoldAir {
     pub n_tiles: usize, // power of two
