@@ -48,9 +48,28 @@ assert!(joinsplit_air::verify_bytes(&proof_bytes, &pis));
 ## Status & performance
 
 Working today: real join-split and HTLC proofs run with GPU LDE and verify. On the reference machine,
-join-split proving is **CPU 844 ms → GPU-LDE 757 ms** (~10% faster end-to-end, with the un-optimized
-default coset-LDE composition).
+join-split proving is **CPU ~829 ms → GPU-LDE ~707 ms** (~15% faster end-to-end). `coset_lde_batch` is
+overridden to run the entire LDE device-side (iDFT → coset-scale → forward NTT, one upload + one
+download), so the LDE is fully offloaded.
 
-Follow-on wins (the LDE offload is the first slice): a GPU `coset_lde_batch` override (coset
-decomposition device-side), offloading Merkle / quotient / FRI (needs a constraint-eval codegen pass for
-the quotient), shared-memory NTT butterflies, and a `_prove_gpu` C-ABI entry for the node.
+### Where the time goes (measured, p3 tracing spans, join-split)
+
+| phase | CPU time | on GPU? |
+|---|---:|---|
+| commit quotient chunks — **Merkle hashing** | ~365 ms | ✗ (next lever) |
+| commit quotient chunks — LDE | ~322 ms | ✓ |
+| `quotient_values` (constraint eval) | ~170 ms | ✗ |
+| commit trace — **Merkle hashing** | ~71 ms | ✗ |
+| open / FRI | ~42 ms | partial |
+
+**Merkle hashing is ~45% of a proof** — and it's exactly the Poseidon2 workload the GPU crushes
+(validated bit-exact in the pipeline: 500K permutations, Merkle roots to the limb). It is the single
+biggest remaining win, but it requires a **custom GPU `Mmcs`** (the tree build on GPU) that is
+byte-compatible with `MerkleTreeHidingMmcs` so proofs still verify — a substantial, carefully-tested
+piece (p3's `MerkleTree` internals are `pub(crate)`, so it can't be reused; the whole commit/open/verify
+must be reimplemented). The `quotient_values` constraint-eval (~17%) is the other lever and needs a
+codegen pass (emit a GPU kernel from each AIR's `SymbolicExpression` DAG).
+
+**Roadmap to ~2×:** GPU Merkle `Mmcs` (kernels validated, ready) → quotient constraint-eval codegen →
+shared-memory NTT butterflies → a `_prove_gpu` C-ABI entry for the node. The LDE slice is done; the next
+increment is the Merkle `Mmcs`, and it earns its own careful pass because it must verify.
