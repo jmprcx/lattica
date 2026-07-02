@@ -1848,12 +1848,16 @@ mod tests {
         run_hiding_monolith_lh(8, 4, true);
     }
 
-    /// Degree-overflow discriminator: the OUTER MonolithAir's symbolic max constraint degree + log_nqc at
-    /// db=3 (passes) vs db=4 (fails). The merge-link `not_term` = Π(1−one_hot) gains a factor per commit
-    /// round (+3 hiding factors), so its degree GROWS with db — if log_nqc crosses between db=3 and db=4,
-    /// the quotient/LDE capacity is the failure mechanism (invisible to row-wise check_constraints).
+    /// DEGREE-BUDGET REGRESSION GUARD (fast, always-on). p3-0.6.1 SILENTLY produces unverifiable proofs
+    /// (OodEvaluationMismatch on honest traces) whenever an AIR's log_num_quotient_chunks exceeds the FRI
+    /// log_blowup: the quotient domain then exceeds the committed trace LDE and `get_evaluations_on_domain`'s
+    /// out-of-containment fallback returns bit-reverse-permuted evals ⇒ garbage quotient, invisible to
+    /// row-wise check_constraints (prover.rs's containment requirement is documented but unasserted). So the
+    /// OUTER MonolithAir must keep every constraint's formal degree ≤ 2^log_blowup = 16 (periodic factors
+    /// count 1 each; outer is_zk adds +1) FOREVER. This bit us once: the merge-link's Π(1−one_hot) gained a
+    /// factor per commit round (+3 hiding factors) and crossed 17 at db≥4 — fixed by the disjoint-one-hot
+    /// SUM form. Asserts the budget at both sides of the historical boundary.
     #[test]
-    #[ignore = "debug: outer-AIR symbolic max degree + log_nqc at db=3 vs db=4"]
     fn hiding_monolith_degree_probe() {
         use crate::recursion::monolith::MonolithAir;
         use p3_air::symbolic::get_symbolic_constraints;
@@ -1887,6 +1891,10 @@ mod tests {
                 lh + 1,
                 cs.len()
             );
+            // the p3 quotient-domain containment budget: log_nqc ≤ log_blowup (= 4), i.e. maxdeg ≤ 16 with
+            // the outer is_zk's +1. Crossing it does NOT error — it silently breaks every proof.
+            assert!(log_nqc <= 4, "outer log_nqc {log_nqc} exceeds log_blowup 4 ⇒ silent quotient corruption (lh={lh})");
+            assert!(maxd <= 16, "outer max constraint degree {maxd} exceeds the 16 = 2^log_blowup budget (lh={lh})");
         }
     }
 

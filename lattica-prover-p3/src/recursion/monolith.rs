@@ -4426,6 +4426,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 }
                 one.clone() - term_sum
             } else {
+                // LATENT DEGREE BUDGET (validated-byte-for-byte product kept deliberately): this product's
+                // degree is 7 + cm_rounds + (multi-block boundary factors) and the OUTER budget is 16
+                // (log_nqc ≤ log_blowup — exceeding it SILENTLY corrupts the quotient, see the is_zk=1 sum
+                // form above + hiding_monolith_degree_probe). Every current is_zk=0 config fits (db=8
+                // multi-block: 17 ⇒ log2_ceil(16)=4 exactly); a deeper/non-hiding config that crosses must
+                // migrate to the sum form as its OWN validated increment (it changes the constraint set).
                 let mut nt = (one.clone() - p[self.m_term()].clone()) * (one.clone() - p[self.q_term()].clone());
                 for r in 0..self.cm_rounds() {
                     nt = nt * (one.clone() - p[self.c_term(r)].clone());
