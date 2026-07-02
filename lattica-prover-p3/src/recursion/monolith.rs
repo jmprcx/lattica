@@ -2872,6 +2872,10 @@ const CM_ROUNDS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // FRI commit rounds = fold
 #[cfg(test)]
 const INPUT_DEPTH: usize = DP_LOG_HEIGHT - CM_CAP_HEIGHT; // input/quotient Merkle path depth to the cap (10 − 6 = 4)
 const M_INPUT_LEAF: usize = 1; // first input-leaf block; the leaf spans M_INPUT_LEAF .. +leaf_blocks (runtime)
+// HIDING (is_zk=1) width constants — the ZK wrapper's parameters (see native_verify / hiding_commit_layout).
+const HIDING_NUM_CW: usize = 4; // HidingFriPcs num_random_codewords added to each committed input matrix
+const HIDING_SALT: usize = 4; // MerkleTreeHidingMmcs SALT_ELEMS appended to each leaf preimage
+const HIDING_RAND_PUB: usize = 2; // random-round opened value width (one F_p²)
 // The LEAF-BLOCK / nqc dimensions of the layout (input-Merkle leaf blocks = ceil(W_inner/RATE), quotient-Merkle
 // leaf blocks = ceil(2·nqc/RATE), and everything downstream: M_INPUT_TERM, M_QUOT_LEAF/TERM, CM_LEAF/TERM,
 // M_NBLOCKS, M_PERIOD) vary PER INNER, so they are RUNTIME methods on `MonolithAir` (m_input_term()/…/m_period())
@@ -2934,19 +2938,16 @@ fn hiding_commit_layout(
     cap: usize,
     log_blowup: usize,
 ) -> (usize, usize, usize, Vec<usize>, Vec<usize>, usize, usize, [usize; 3]) {
-    const NUM_CW: usize = 4; // HidingFriPcs num_random_codewords
-    const SALT: usize = 4; // MerkleTreeHidingMmcs SALT_ELEMS
-    const RAND_PUB: usize = 2; // random-round opened value width (one F_p²)
     let cm_rounds = log_global - log_blowup;
     let input_depth = log_global - cap;
     // merged widths (public ‖ codewords) = the reduced-opening term widths (NO salt).
-    let random_merged = RAND_PUB + NUM_CW;
-    let trace_merged = w_inner + NUM_CW;
-    let quot_merged = 2 + NUM_CW; // per chunk: F_p² (2) + codewords
+    let random_merged = HIDING_RAND_PUB + HIDING_NUM_CW;
+    let trace_merged = w_inner + HIDING_NUM_CW;
+    let quot_merged = 2 + HIDING_NUM_CW; // per chunk: F_p² (2) + codewords
     // leaf felt widths = committed row ‖ salt; the quotient leaf is the multi-matrix concat over nqc chunks.
-    let rlb = (random_merged + SALT).div_ceil(RATE);
-    let ilb = (trace_merged + SALT).div_ceil(RATE);
-    let qlb = (nqc * (quot_merged + SALT)).div_ceil(RATE);
+    let rlb = (random_merged + HIDING_SALT).div_ceil(RATE);
+    let ilb = (trace_merged + HIDING_SALT).div_ceil(RATE);
+    let qlb = (nqc * (quot_merged + HIDING_SALT)).div_ceil(RATE);
     // super-tile: block 0 reserved (arith/opened-row setup), then random-leaf, trace-leaf, quot-leaf, each a
     // leaf-hash sponge + `input_depth` path merges; then the commit rounds. is_zk=0 would drop the random region
     // (m_input_leaf back to 1), recovering `commit_layout`.
@@ -3019,6 +3020,13 @@ pub(crate) struct MonolithAir {
     /// region after the commit caps), consumed by the symbolic evaluator's `Periodic` leaves. 0 for inners
     /// with no periodic columns (Fibonacci/Mul).
     pub n_periodic_f: usize,
+    /// HIDING (is_zk=1) mode. When 1, the inner is a ZK proof (HidingFriPcs): the super-tile gains a THIRD
+    /// input round (the random-polynomial commitment, prepended as a copy of the trace input-leaf region),
+    /// input/quotient leaves are SALTED (preimage = committed_row ‖ 4 salt) and the quotient leaf is the
+    /// multi-matrix concat over nqc chunks, the reduced opening spans the merged (public ‖ codewords) rows,
+    /// and the OOD epilogue's constraint domain is HALVED (z_h uses cm_rounds−is_zk). 0 = the exact
+    /// non-hiding path (every existing test), byte-for-byte. Geometry mirrors `hiding_commit_layout`.
+    pub is_zk: usize,
 }
 
 #[allow(dead_code)]
@@ -3048,18 +3056,38 @@ impl MonolithAir {
     // leaf_blocks=1/nqc=1 (every current inner: W≤RATE, degree-≤2 ⇒ nqc=1) they EQUAL M_INPUT_TERM/…/M_PERIOD
     // byte-for-byte; a wide inner (W>RATE) grows leaf_blocks and the whole super-tile follows. ----
     // input-Merkle leaf-hash blocks = ceil(W_inner / RATE) (PaddingFreeSponge absorbs RATE felts/block).
+    // input-Merkle leaf felt width (the opened row hashed to the leaf). is_zk=0 = the inner trace row (w_inner);
+    // is_zk=1 = the COMMITTED row (w_inner ‖ codewords) ‖ salt — the salted hiding leaf (hiding_commit_layout).
+    fn input_leaf_felts(&self) -> usize {
+        self.w_inner() + if self.is_zk == 1 { HIDING_NUM_CW + HIDING_SALT } else { 0 }
+    }
     fn leaf_blocks(&self) -> usize {
-        self.w_inner().div_ceil(RATE)
+        self.input_leaf_felts().div_ceil(RATE)
     }
-    // quotient chunks: the proof carries 2·nqc quotient reduced-opening terms (each chunk opens a 2-felt F_p²
-    // value), so nqc = n_quot()/2 — derived from the proof, not hardcoded. ConstAir/Counter/Fib/Mul/Periodic/
-    // Wide are all nqc=1 (degree ≤ 2); CubeAir (degree 3) is nqc=2; a real join-split (degree 7) is nqc=8.
+    // quotient chunks: is_zk=0 derives nqc = n_quot()/2 from the 2·nqc quotient reduced-opening terms. is_zk=1's
+    // reduced opening has a different decomposition (random round + merged widths + 2× chunks), so nqc is solved
+    // from n_terms = (RAND_PUB+CW) + 2·(W+CW) + nqc·(2+CW). ConstAir/…/Wide nqc=1; Cube nqc=2; join-split nqc=8;
+    // hiding ConstAir nqc=4 (2× the is_zk=0 count).
     fn nqc(&self) -> usize {
-        self.n_quot() / 2
+        if self.is_zk == 1 {
+            let random = HIDING_RAND_PUB + HIDING_NUM_CW;
+            let trace = self.w_inner() + HIDING_NUM_CW;
+            (self.n_terms - random - 2 * trace) / (2 + HIDING_NUM_CW)
+        } else {
+            self.n_quot() / 2
+        }
     }
-    // quotient-Merkle leaf-hash blocks = ceil(2·nqc / RATE) (each chunk opens a 2-felt F_p² value at the query row).
+    // quotient-Merkle leaf felts: is_zk=0 = 2·nqc (the chunk F_p² openings, one matrix); is_zk=1 = the
+    // MULTI-MATRIX concat over nqc chunks, each committed row (F_p² ‖ codewords) ‖ salt.
+    fn quot_leaf_felts(&self) -> usize {
+        if self.is_zk == 1 {
+            self.nqc() * (2 + HIDING_NUM_CW + HIDING_SALT)
+        } else {
+            2 * self.nqc()
+        }
+    }
     fn quot_leaf_blocks(&self) -> usize {
-        (2 * self.nqc()).div_ceil(RATE)
+        self.quot_leaf_felts().div_ceil(RATE)
     }
     // input/quotient Merkle path depth to the cap (= log_global − cap_height), runtime with the FRI depth.
     fn input_depth(&self) -> usize {
@@ -3069,8 +3097,24 @@ impl MonolithAir {
     fn cm_depth_r(&self, r: usize) -> usize {
         cm_depth_at(r, self.lg(), CM_CAP_HEIGHT)
     }
+    // HIDING random-round leaf blocks (is_zk=1): committed random row (RAND_PUB ‖ codewords) ‖ salt.
+    fn random_leaf_blocks(&self) -> usize {
+        (HIDING_RAND_PUB + HIDING_NUM_CW + HIDING_SALT).div_ceil(RATE)
+    }
+    // HIDING random-round terminal block (is_zk=1): leaf + input_depth path, prepended at M_INPUT_LEAF.
+    fn m_random_term(&self) -> usize {
+        M_INPUT_LEAF + (self.random_leaf_blocks() - 1) + self.input_depth()
+    }
+    // first input-(trace-)leaf block: M_INPUT_LEAF (is_zk=0), else after the random-round region (is_zk=1).
+    fn m_input_leaf(&self) -> usize {
+        if self.is_zk == 1 {
+            self.m_random_term() + 1
+        } else {
+            M_INPUT_LEAF
+        }
+    }
     fn m_input_term(&self) -> usize {
-        M_INPUT_LEAF + (self.leaf_blocks() - 1) + self.input_depth()
+        self.m_input_leaf() + (self.leaf_blocks() - 1) + self.input_depth()
     }
     fn m_quot_leaf(&self) -> usize {
         self.m_input_term() + 1
@@ -6532,7 +6576,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0 };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6648,6 +6692,7 @@ mod tests {
             w_inner_f: 1,
             n_pub_f: 1,
             n_periodic_f: 0,
+            is_zk: 0,
         };
         let mut pis = Vec::new();
         for ch in &chs {
@@ -6698,7 +6743,7 @@ mod tests {
             }
         }
         let (counts, binds, index_binds, n_terms) = params.unwrap();
-        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0 };
+        let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0 };
         let fw = air.fused_w();
         let w = air.fold_w();
         let inst_h = air.inst_h();
@@ -6839,7 +6884,7 @@ mod tests {
             quot_paths.push(qpath);
             commit_data.push(cm);
         }
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0 };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0 };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6925,7 +6970,7 @@ mod tests {
         let layout = AirLayout::from_air::<Val>(inner);
         let constraints = get_symbolic_constraints::<Val, A>(inner, layout);
         assert!(!constraints.is_empty(), "{label}: symbolic constraints extracted");
-        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, constraints, w_inner_f: w_inner, n_pub_f: n_pub, n_periodic_f: n_periodic };
+        let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, constraints, w_inner_f: w_inner, n_pub_f: n_pub, n_periodic_f: n_periodic, is_zk: 0 };
         // OOD openings + selectors + periodic-column values at ζ (verifier-computed publics).
         let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) = epilogue_openings(config, inner, proof, pvs);
         assert_eq!(eo_periodic.len(), n_periodic, "{label}: periodic column count matches n_periodic");
@@ -7203,6 +7248,7 @@ mod tests {
             w_inner_f: 0,
             n_pub_f: 0,
             n_periodic_f: 0,
+            is_zk: 0,
         }
     }
 
@@ -7253,6 +7299,40 @@ mod tests {
         assert_eq!(*term.last().unwrap() + 1, nb, "m_nblocks == last commit term + 1");
         assert!(rt < it && it < qt && qt < leaf[0], "regions are monotone and disjoint");
         println!("hiding super-tile layout: 3 salted leaf regions (terms at blocks {rt}/{it}/{qt}, blocks {rlb}/{ilb}/{qlb}) + 7 commit rounds → m_nblocks={nb}, n_terms={n_terms} (matches the native witness)");
+    }
+
+    /// #86 AIR mode — the is_zk field is THREADED into MonolithAir's block-layout methods: a MonolithAir in
+    /// hiding mode (is_zk=1) reproduces `hiding_commit_layout` exactly. Validates the runtime geometry (leaf
+    /// blocks, random-round region, m_input/quot_term, m_nblocks, nqc) matches the standalone layout for the
+    /// arity-2 hiding ConstAir. (is_zk=0 byte-for-byte is covered by the full existing suite staying green.)
+    #[test]
+    fn monolith_is_zk_geometry_matches_layout() {
+        use super::hiding_commit_layout;
+        // hiding ConstAir: is_zk=1, n_terms=40, w_inner=1 (non-symbolic), cm_rounds=7 (nb=3+7) ⇒ lg=11.
+        let air = super::MonolithAir {
+            counts: vec![],
+            binds: vec![0; 10],
+            index_binds: vec![],
+            n_queries: 1,
+            n_terms: 40,
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            constraints: vec![],
+            w_inner_f: 0,
+            n_pub_f: 0,
+            n_periodic_f: 0,
+            is_zk: 1,
+        };
+        let (rt, it, qt, _leaf, _term, nb, n_terms, [rlb, ilb, qlb]) = hiding_commit_layout(1, 4, 11, 6, 4);
+        assert_eq!(air.nqc(), 4, "hiding nqc solved from n_terms");
+        assert_eq!((air.random_leaf_blocks(), air.leaf_blocks(), air.quot_leaf_blocks()), (rlb, ilb, qlb), "leaf blocks");
+        assert_eq!((air.m_random_term(), air.m_input_term(), air.m_quot_term()), (rt, it, qt), "leaf-region terminals");
+        assert_eq!(air.m_nblocks(), nb, "m_nblocks");
+        assert_eq!(air.n_terms, n_terms, "n_terms");
+        assert_eq!(air.lg(), 11, "log_global from binds");
+        println!("MonolithAir is_zk=1 geometry threaded: nqc={}, leaf blocks {rlb}/{ilb}/{qlb}, terminals {rt}/{it}/{qt}, m_nblocks={nb} == hiding_commit_layout", air.nqc());
     }
 
     #[test]
