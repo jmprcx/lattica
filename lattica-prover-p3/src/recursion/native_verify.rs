@@ -11,25 +11,26 @@
 //! count). Transcript, openings, quotient, constraints are all exercised end-to-end.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_challenger::{CanObserve, CanSampleBits, DuplexChallenger, FieldChallenger, GrindingChallenger};
-use p3_commit::{BatchOpening, ExtensionMmcs, Mmcs, Pcs, PolynomialSpace};
-use p3_dft::Radix2DitParallel;
-use p3_field::extension::BinomialExtensionField;
+use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
+use p3_commit::{BatchOpening, Mmcs, Pcs, PolynomialSpace};
 use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
-use p3_fri::{FriParameters, HidingFriPcs, TwoAdicFriFolding};
-use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
+use p3_fri::{FriParameters, TwoAdicFriFolding};
+use p3_goldilocks::Goldilocks;
 use p3_matrix::Dimensions;
-use p3_merkle_tree::MerkleTreeHidingMmcs;
+#[cfg(test)]
 use rand_chacha::ChaCha20Rng;
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use super::native_fri::{eval_final_poly, final_query_point, reverse_bits_len, verify_query, CommitStep};
 use p3_uni_stark::{
     get_log_num_quotient_chunks, recompose_quotient_from_chunks, validate_degree_bits, verify_constraints,
-    AirLayout, Proof, StarkConfig, StarkGenericConfig,
+    AirLayout, Proof, StarkGenericConfig,
 };
 
-type Val = Goldilocks;
-type Challenge = BinomialExtensionField<Val, 2>;
+// The production hiding config family + Val/Challenge are single-sourced from crate::config (this
+// native re-verifier is validated against the REAL ZK path; `make_config_ar` below rebuilds the config
+// arity-parametrically, which the fixed `config::make_config` can't express).
+use crate::config::{Challenge, Challenger, ChallengeMmcs, MyConfig, MyPcs, Val, ValMmcs};
+#[cfg(test)]
+use crate::config::{Dft, MyCompress, MyHash};
 
 /// Minimal AIR: a single column constrained to a public constant on every row.
 pub struct ConstAir;
@@ -271,19 +272,6 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QuartAir {
         builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C2: a' = a + 1
     }
 }
-
-// --- hiding (ZK) FRI config — the PRODUCTION config family lattica uses (so the re-verifier is
-//     validated against the real ZK path: random commitment + hiding opening structure).
-type Perm = Poseidon2Goldilocks<8>;
-type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
-type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
-type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
-type Dft = Radix2DitParallel<Val>;
-type MyPcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
-type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
 
 /// Native re-verifier: re-implements `verify`'s orchestration step-by-step (production hiding/ZK config;
 /// the `is_zk=1` path — random commitment observed, `init_trace_domain = degree >> is_zk`, quotient-chunk
