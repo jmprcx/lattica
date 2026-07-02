@@ -14,8 +14,9 @@ use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::{prove, verify, Proof};
 
-use crate::batch_joinsplit_air::{padded_tiles, DOM_TXROOT};
-use crate::poseidon2_air::{native_permute, native_steps, BLOCK};
+use crate::batch_common::padded_tiles;
+use crate::domains::DOM_TXROOT;
+use crate::poseidon2_air::{native_permute, BLOCK};
 use crate::htlc_air::{
     build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST, HEIGHT,
     M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_HASHLOCK, PI_HEIGHT, PI_MINT, PI_NF, PI_OUTCM,
@@ -329,14 +330,6 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcBatchAir {
     }
 }
 
-fn set_fold_block(t: &mut [Val], toff: usize, block: usize, input: [Val; 8]) {
-    let rows = native_steps(input);
-    for (r, row) in rows.iter().enumerate() {
-        let base = (toff + block * BLOCK + r) * BATCH_WIDTH;
-        t[base..base + 8].copy_from_slice(row);
-    }
-}
-
 /// The 4-element statement chunk for s_k fold block `ci` (mirrors the oracle's chunk order).
 fn chunk_vals(pv: &[Val], ci: usize) -> [Val; DIGEST] {
     let g = |off: usize| -> [Val; DIGEST] { pv[off..off + DIGEST].try_into().unwrap() };
@@ -387,19 +380,19 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
         let mut inp = [Val::ZERO; 8];
         inp[0] = Val::from_u64(DOM_TXROOT);
         inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, 0));
-        set_fold_block(&mut t, toff, FOLD_BASE, inp);
+        crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE, BATCH_WIDTH, inp);
         let mut c: [Val; DIGEST] = native_permute(inp)[..DIGEST].try_into().unwrap();
         for bi in 1..FOLD_SK_BLOCKS {
             let mut inp = [Val::ZERO; 8];
             inp[..DIGEST].copy_from_slice(&c);
             inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, bi));
-            set_fold_block(&mut t, toff, FOLD_BASE + bi, inp);
+            crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE + bi, BATCH_WIDTH, inp);
             c = native_permute(inp)[..DIGEST].try_into().unwrap();
         }
         let mut rinp = [Val::ZERO; 8];
         rinp[..DIGEST].copy_from_slice(&root);
         rinp[DIGEST..].copy_from_slice(&c);
-        set_fold_block(&mut t, toff, ROOT_BLOCK, rinp);
+        crate::batch_common::set_fold_block(&mut t, toff, ROOT_BLOCK, BATCH_WIDTH, rinp);
         let new_root: [Val; DIGEST] = native_permute(rinp)[..DIGEST].try_into().unwrap();
         let rout = root_out_row();
         for r in 0..TILE_HEIGHT {
@@ -415,7 +408,7 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
 /// Prove a batch of HTLC transactions as one proof; the block tx-root is `batch_root(ws)`.
 pub fn prove_batch_to_bytes(ws: &[Witness]) -> Vec<u8> {
     assert!(
-        padded_tiles(ws.len()) <= crate::batch_joinsplit_air::MAX_BATCH_TILES,
+        padded_tiles(ws.len()) <= crate::batch_common::MAX_BATCH_TILES,
         "batch exceeds MAX_BATCH_TILES; split the block into multiple batch proofs"
     );
     let pis = batch_root(ws);
@@ -520,7 +513,7 @@ mod tests {
 
     #[test]
     fn htlc_batch_proven_security_floor() {
-        use crate::batch_joinsplit_air::MAX_BATCH_TILES;
+        use crate::batch_common::MAX_BATCH_TILES;
         assert!(proven_security_bits(1) >= 100);
         assert!(
             proven_security_bits(MAX_BATCH_TILES) >= 100,

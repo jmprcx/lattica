@@ -8,6 +8,7 @@ pub mod config; // crate-wide STARK config: the production (wire-pinned) + demo 
 pub mod domains; // consensus-frozen domain-separation tags (the normative table; mirrored by the Zig node)
 pub mod joinsplit_air;
 pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsplit_air, extended
+pub mod batch_common; // shared batch machinery: MAX_BATCH_TILES, tile padding, the fold-block writer
 pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-split tiling + tx-root fold)
 pub mod batch_htlc_air; // batch aggregation for the v3 shielded-HTLC spend (mirrors batch_joinsplit_air)
 pub mod poseidon2_air;
@@ -582,7 +583,7 @@ pub unsafe extern "C" fn lattica_batch_prove(
     if n_tx == 0 || witness_len != n_tx.checked_mul(JS_WITNESS_LEN).unwrap_or(usize::MAX) {
         return 1; // exactly n_tx concatenated join-split witness records
     }
-    if batch_joinsplit_air::padded_tiles(n_tx) > batch_joinsplit_air::MAX_BATCH_TILES {
+    if batch_common::padded_tiles(n_tx) > batch_common::MAX_BATCH_TILES {
         return 1; // beyond the proven-soundness floor — split into multiple batch proofs
     }
     let wb = slice::from_raw_parts(witness_ptr, witness_len);
@@ -648,7 +649,7 @@ pub unsafe extern "C" fn lattica_htlc_batch_prove(
     if n_tx == 0 || witness_len != n_tx.checked_mul(HTLC_WITNESS_LEN).unwrap_or(usize::MAX) {
         return 1;
     }
-    if batch_joinsplit_air::padded_tiles(n_tx) > batch_joinsplit_air::MAX_BATCH_TILES {
+    if batch_common::padded_tiles(n_tx) > batch_common::MAX_BATCH_TILES {
         return 1;
     }
     let wb = slice::from_raw_parts(witness_ptr, witness_len);

@@ -23,7 +23,7 @@ use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::{prove, verify, Proof};
 
-use crate::poseidon2_air::{native_permute, native_steps, BLOCK};
+use crate::poseidon2_air::{native_permute, BLOCK};
 use crate::joinsplit_air::{
     build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST,
     HEIGHT, M_OUT, N_IN, N_PERIODIC, NUM_PUBLIC_INPUTS, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_MINT, PI_NF,
@@ -105,10 +105,8 @@ pub fn batch_root(ws: &[Witness]) -> [Val; DIGEST] {
     root
 }
 
-/// The padded tile count for a batch of `n` transactions (a power of two; ≥ 1).
-pub fn padded_tiles(n: usize) -> usize {
-    n.max(1).next_power_of_two()
-}
+/// The padded tile count — shared batch machinery (re-exported so existing paths keep working).
+pub use crate::batch_common::padded_tiles;
 
 // =============================================================================================
 // The batch AIR: the join-split spend tiled n times in one trace, proven once. The per-tile
@@ -354,14 +352,6 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
 }
 
 /// Write the Poseidon2 permutation of `input` into fold `block`'s state columns (cols 0..8), tile `toff`.
-fn set_fold_block(t: &mut [Val], toff: usize, block: usize, input: [Val; 8]) {
-    let rows = native_steps(input);
-    for (r, row) in rows.iter().enumerate() {
-        let base = (toff + block * BLOCK + r) * BATCH_WIDTH;
-        t[base..base + 8].copy_from_slice(row);
-    }
-}
-
 /// The 4-element statement chunk absorbed by s_k fold block `bi` (mirrors `chunk_stage` / the oracle's
 /// `tx_statement_digest` order: anchor, nf_i, out_cm_j, [fee,mint,0,0], tx_binding).
 fn chunk_vals(pv: &[Val], bi: usize) -> [Val; DIGEST] {
@@ -414,20 +404,20 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
         let mut inp = [Val::ZERO; 8];
         inp[0] = Val::from_u64(DOM_TXROOT);
         inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, 0));
-        set_fold_block(&mut t, toff, FOLD_BASE, inp);
+        crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE, BATCH_WIDTH, inp);
         let mut c: [Val; DIGEST] = native_permute(inp)[..DIGEST].try_into().unwrap();
         for bi in 1..FOLD_SK_BLOCKS {
             let mut inp = [Val::ZERO; 8];
             inp[..DIGEST].copy_from_slice(&c);
             inp[DIGEST..].copy_from_slice(&chunk_vals(&pv, bi));
-            set_fold_block(&mut t, toff, FOLD_BASE + bi, inp);
+            crate::batch_common::set_fold_block(&mut t, toff, FOLD_BASE + bi, BATCH_WIDTH, inp);
             c = native_permute(inp)[..DIGEST].try_into().unwrap();
         }
         // root block: perm([root_{k-1} ‖ s_k])
         let mut rinp = [Val::ZERO; 8];
         rinp[..DIGEST].copy_from_slice(&root);
         rinp[DIGEST..].copy_from_slice(&c);
-        set_fold_block(&mut t, toff, ROOT_BLOCK, rinp);
+        crate::batch_common::set_fold_block(&mut t, toff, ROOT_BLOCK, BATCH_WIDTH, rinp);
         let new_root: [Val; DIGEST] = native_permute(rinp)[..DIGEST].try_into().unwrap();
         // 4. ROOT column: root_{k-1} up to (and incl.) the root block output row, then root_k onward.
         let rout = root_out_row();
@@ -453,10 +443,9 @@ pub fn prove_batch_to_bytes(ws: &[Witness]) -> Vec<u8> {
     postcard::to_allocvec(&proof).expect("proof serialization is infallible")
 }
 
-/// The largest batch (in tiles) that holds the ≥100-bit proven-soundness floor: measured 100 bits at
-/// n=64 (height 2^18), 99 at n=128. A block needing more transactions emits **multiple** batch proofs of
-/// ≤ `MAX_BATCH_TILES` tiles each (or a future config raises `num_queries`). See `batch_proven_security_floor`.
-pub const MAX_BATCH_TILES: usize = 64;
+/// The batch tile cap — shared batch machinery (re-exported so existing paths keep working); the
+/// ≥100-bit floor at this cap is pinned by `batch_proven_security_floor`.
+pub use crate::batch_common::MAX_BATCH_TILES;
 
 /// Proven (UDR) security bits at a batch of `n` transactions (trace height = `padded_tiles(n)·TILE_HEIGHT`).
 /// Mirrors `joinsplit_air::measure`'s computation; the batch grows the height ~log(n), slowly lowering the
