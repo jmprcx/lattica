@@ -16,35 +16,13 @@ const ffi = @import("ffi.zig");
 const poseidon2 = @import("poseidon2.zig");
 const testing = std.testing;
 
-// The production C ABI implemented by the prover crate.
-extern fn lattica_joinsplit_prove_demo(
-    proof_out: [*]u8,
-    proof_cap: usize,
-    proof_len: *usize,
-    pi_out: [*]u8,
-    pi_cap: usize,
-    pi_len: *usize,
-) callconv(.c) i32;
-extern fn lattica_joinsplit_verify(
-    proof: [*]const u8,
-    proof_len: usize,
-    pi: [*]const u8,
-    pi_len: usize,
-) callconv(.c) i32;
-extern fn lattica_htlc_prove_demo(
-    proof_out: [*]u8,
-    proof_cap: usize,
-    proof_len: *usize,
-    pi_out: [*]u8,
-    pi_cap: usize,
-    pi_len: *usize,
-) callconv(.c) i32;
-extern fn lattica_htlc_verify(
-    proof: [*]const u8,
-    proof_len: usize,
-    pi: [*]const u8,
-    pi_len: usize,
-) callconv(.c) i32;
+// The production C ABI implemented by the prover crate (extern declarations centralized in
+// prover_abi.zig, mirroring lattica-prover-p3/include/lattica_prover_p3.h).
+const prover_abi = @import("prover_abi.zig");
+const lattica_joinsplit_prove_demo = prover_abi.lattica_joinsplit_prove_demo;
+const lattica_joinsplit_verify = prover_abi.lattica_joinsplit_verify;
+const lattica_htlc_prove_demo = prover_abi.lattica_htlc_prove_demo;
+const lattica_htlc_verify = prover_abi.lattica_htlc_verify;
 
 const NullifierSet = std.AutoHashMap([32]u8, void);
 

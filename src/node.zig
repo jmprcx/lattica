@@ -53,6 +53,10 @@ const production: bool = @hasDecl(root_module, "lattica_production") and root_mo
 const TX_DOMAIN: []const u8 = "lattica:v1:tx-binding";
 const OUT_RHO_DOMAIN: []const u8 = "lattica:v1:out-rho";
 const OUT_RCM_DOMAIN: []const u8 = "lattica:v1:out-rcm";
+const STATE_ROOT_DOMAIN: []const u8 = "lattica:v1:state-root";
+const MINT_RHO_DOMAIN: []const u8 = "lattica:v1:mint-rho";
+const NULLIFIER_ACC_DOMAIN: []const u8 = "lattica:v1:nullifier-acc";
+const EVENT_ACC_DOMAIN: []const u8 = "lattica:v1:event-acc";
 
 /// Fixed join-split shape (must match the circuit `N_IN`/`M_OUT`).
 pub const N_IN: usize = ffi.JOINSPLIT_N_IN;
@@ -852,7 +856,7 @@ pub const Chain = struct {
     pub fn stateRoot(self: Chain) Hash32 {
         const note_root = self.tree.root();
         const supply_commit = self.supply.commitment();
-        return p.hashDomain("lattica:v1:state-root", &.{ &note_root, &self.nullifier_acc, &supply_commit });
+        return p.hashDomain(STATE_ROOT_DOMAIN, &.{ &note_root, &self.nullifier_acc, &supply_commit });
     }
 
     pub fn deinit(self: *Chain) void {
@@ -890,7 +894,7 @@ pub const Chain = struct {
         if (production) @compileError("bootstrapMint is genesis/test-only; production issuance must go through applyCoinbase");
         var value_le: [8]u8 = undefined;
         std.mem.writeInt(u64, &value_le, value, .little);
-        const rho = p.hashDomain("lattica:v1:mint-rho", &.{ &seed, &value_le });
+        const rho = p.hashDomain(MINT_RHO_DOMAIN, &.{ &seed, &value_le });
         const rcm = p.expand(&seed, "mint-rcm");
         const note = tx.Note{ .value = value, .recipient = address.recipientId(), .div = address.div, .rho = rho, .rcm = rcm };
         const ovk = p.expand(&seed, "ovk"); // genesis/test sender-side ovk (deterministic from the mint seed)
@@ -952,6 +956,121 @@ pub const Chain = struct {
         return self.applyChecked(t, reward);
     }
 
+    // ---- shared apply-pipeline helpers ----------------------------------------------------------
+    // `applyChecked` / `applyHtlc` / `applyBatch` / `applyHtlcBatch` share their stateless cheap
+    // checks, the seen-set nullifier scan, and the atomic two-phase-commit machinery (audit
+    // H-02/H-03/H-04). The helpers below hold those shared blocks verbatim; each pipeline KEEPS its
+    // own check order (they differ — e.g. `applyHtlc` bounds the fee before the anchor lookup — and
+    // the first-failing error is what callers observe, so orders are never normalized here).
+
+    /// Stateless per-tx caps + canonical-encoding checks, in the exact order shared by
+    /// `applyChecked`/`applyBatch`/`applyHtlcBatch`: output-ciphertext size caps (DoS — audit M-05),
+    /// the fee range bound (defense-in-depth with the circuit range), then the canonical-encoding
+    /// checks. (`applyHtlc` orders its fee bound earlier, so it inlines the size caps and calls
+    /// `canonicalTxFieldChecks` directly.)
+    fn statelessTxChecks(t: anytype) TxError!void {
+        for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
+        if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
+        return canonicalTxFieldChecks(t);
+    }
+
+    /// Reject non-canonical encodings of the public 32-byte field elements (anchor, nullifiers,
+    /// output commitments) before they key the nullifier set / enter the tree — a backstop to the
+    /// verifier's canonical parse.
+    fn canonicalTxFieldChecks(t: anytype) TxError!void {
+        if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
+        for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
+        for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
+    }
+
+    /// Reject any nullifier already spent on-chain, or duplicated within the transaction/batch being
+    /// validated (`seen` accumulates across a whole batch).
+    fn nullifierSeenScan(self: *const Chain, seen: *HashSet, nfs: []const Hash32) TxError!void {
+        for (nfs) |nf| {
+            if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
+            const gop = seen.getOrPut(nf) catch return TxError.Internal;
+            if (gop.found_existing) return TxError.DoubleSpend;
+        }
+    }
+
+    /// Two-phase apply, fallible phase (audit H-03): reserve ALL consensus-state capacity for
+    /// applying `n_tx` transactions up front, so the commit-phase inserts/appends cannot fail.
+    /// `htlc_event_cap` additionally reserves HTLC redeem-event slots (null on join-split pipelines).
+    fn reserveApplyCapacity(self: *Chain, n_tx: usize, htlc_event_cap: ?usize) TxError!void {
+        const out_cap = n_tx * M_OUT;
+        self.nullifiers.ensureUnusedCapacity(@intCast(n_tx * N_IN)) catch return TxError.Internal;
+        self.anchors.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
+        self.transmitted.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
+        self.tree.ensureUnusedCapacity(out_cap) catch return TxError.TreeFull;
+        self.cm_index.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
+        if (htlc_event_cap) |n| self.htlc_events.ensureUnusedCapacity(self.allocator, n) catch return TxError.Internal;
+    }
+
+    /// Two-phase apply, fallible phase (audit H-04): chain-own one tx's output ciphertexts via deep
+    /// copy. On any failure the copies made so far are freed (errdefer) and the tx is rejected before
+    /// any consensus state mutates; on success ownership passes to the infallible commit phase.
+    fn ownOutputCiphertexts(self: *Chain, outputs: [M_OUT]tx.TransmittedNote) TxError![M_OUT]tx.TransmittedNote {
+        var owned: [M_OUT]tx.TransmittedNote = undefined;
+        var copied: usize = 0;
+        errdefer for (owned[0..copied]) |o| self.allocator.free(o.ciphertext);
+        for (&owned, outputs) |*dst, o| {
+            const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
+            dst.* = .{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct };
+            copied += 1;
+        }
+        return owned;
+    }
+
+    /// Batch analog of `ownOutputCiphertexts`: deep-copy every tx's output ciphertexts, in tx order,
+    /// into one list (the caller deinits the list backing; the ciphertexts transfer to the chain on
+    /// commit). On any failure everything copied so far is freed and the whole batch is rejected.
+    fn ownBatchOutputCiphertexts(self: *Chain, txs: anytype) TxError!std.ArrayList(tx.TransmittedNote) {
+        var owned: std.ArrayList(tx.TransmittedNote) = .empty;
+        errdefer {
+            for (owned.items) |o| self.allocator.free(o.ciphertext);
+            owned.deinit(self.allocator);
+        }
+        owned.ensureUnusedCapacity(self.allocator, txs.len * M_OUT) catch return TxError.Internal;
+        for (txs) |t| {
+            for (t.outputs) |o| {
+                const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
+                owned.appendAssumeCapacity(.{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct });
+            }
+        }
+        return owned;
+    }
+
+    /// Commit phase (infallible): record nullifiers as spent, folding each into the
+    /// genesis-replayable accumulator (P-01). Infallible (capacity reserved; a hash).
+    fn commitNullifiers(self: *Chain, nfs: []const Hash32) void {
+        for (nfs) |nf| {
+            self.nullifiers.putAssumeCapacity(nf, {});
+            self.nullifier_acc = p.hashDomain(NULLIFIER_ACC_DOMAIN, &.{ &self.nullifier_acc, &nf });
+        }
+    }
+
+    /// Commit phase (infallible): append the chain-owned output notes — tree append, cm → position
+    /// index for watcher lookups (P-01), publish the new anchor, store the ciphertext.
+    fn commitOutputs(self: *Chain, notes: []const tx.TransmittedNote) void {
+        for (notes) |o| {
+            const pos = self.tree.appendAssumeCapacity(o.cm);
+            self.cm_index.putAssumeCapacity(o.cm, pos);
+            self.anchors.putAssumeCapacity(self.tree.root(), {});
+            self.transmitted.appendAssumeCapacity(o);
+        }
+    }
+
+    /// Commit phase (infallible): emit the redeem-preimage event (P-01) — a redeem reveals the
+    /// preimage, so record it for cross-chain watchers and fold it into the event accumulator. A
+    /// refund carries no preimage ⇒ no event.
+    fn commitRedeemEvent(self: *Chain, t: ShieldedHtlcTx) void {
+        if (t.redeem_preimage) |pre| {
+            const hl = t.redeemHashlock();
+            self.htlc_events.appendAssumeCapacity(.{ .redeem_hashlock = hl, .preimage = pre });
+            self.event_acc = p.hashDomain(EVENT_ACC_DOMAIN, &.{ &self.event_acc, &hl, &pre });
+        }
+    }
+
     /// Shared validation + application. `allowed_mint` is the only permitted issuance (0 for a normal
     /// tx; the block reward for a coinbase).
     fn applyChecked(self: *Chain, t: ShieldedTx, allowed_mint: u64) TxError!void {
@@ -966,23 +1085,15 @@ pub const Chain = struct {
         // The anchor must be one the chain published.
         if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
 
-        // Size limits before any heavy parsing/verification (DoS — audit M-05).
+        // Size limits before any heavy parsing/verification (DoS — audit M-05), then the shared
+        // stateless caps + canonical-encoding checks.
         if (t.proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
-        for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
-        if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee; // defense-in-depth with the circuit range
-        // Reject non-canonical public-field encodings before they key the nullifier set / enter the tree.
-        if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
-        for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
-        for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
+        try statelessTxChecks(t);
 
         // Nullifiers: reject any already spent, or duplicated within this transaction.
         var seen = HashSet.init(self.allocator);
         defer seen.deinit();
-        for (t.nullifiers) |nf| {
-            if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
-            const gop = seen.getOrPut(nf) catch return TxError.Internal;
-            if (gop.found_existing) return TxError.DoubleSpend;
-        }
+        try self.nullifierSeenScan(&seen, &t.nullifiers);
 
         // ---- Proof verification: the sole authorization (fail-closed, panic-isolated). It binds
         //      ownership, membership, nullifiers, balance, range, and the whole body — incl. every
@@ -997,35 +1108,15 @@ pub const Chain = struct {
         var candidate_supply = self.supply;
         candidate_supply.apply(.{ .issued = t.mint, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
         // (b) reserve all capacity up front (so the commit-phase inserts/appends cannot fail).
-        self.nullifiers.ensureUnusedCapacity(@intCast(N_IN)) catch return TxError.Internal;
-        self.anchors.ensureUnusedCapacity(@intCast(M_OUT)) catch return TxError.Internal;
-        self.transmitted.ensureUnusedCapacity(self.allocator, M_OUT) catch return TxError.Internal;
-        self.tree.ensureUnusedCapacity(M_OUT) catch return TxError.TreeFull;
-        self.cm_index.ensureUnusedCapacity(M_OUT) catch return TxError.Internal;
+        try self.reserveApplyCapacity(1, null);
         // (c) chain-own each output's ciphertext via deep copy (audit H-04); on any failure, free the
-        //     copies made so far (errdefer) and reject before mutating consensus state.
-        var owned: [M_OUT]tx.TransmittedNote = undefined;
-        var copied: usize = 0;
-        errdefer for (owned[0..copied]) |o| self.allocator.free(o.ciphertext);
-        for (&owned, t.outputs) |*dst, o| {
-            const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
-            dst.* = .{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct };
-            copied += 1;
-        }
+        //     copies made so far and reject before mutating consensus state.
+        const owned = try self.ownOutputCiphertexts(t.outputs);
 
         // ---- Infallible commit. ----
         self.supply = candidate_supply;
-        for (t.nullifiers) |nf| {
-            self.nullifiers.putAssumeCapacity(nf, {});
-            // fold the nullifier into the genesis-replayable accumulator (P-01). Infallible (a hash).
-            self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
-        }
-        for (owned) |o| {
-            const pos = self.tree.appendAssumeCapacity(o.cm);
-            self.cm_index.putAssumeCapacity(o.cm, pos); // index cm → position for watcher lookups (P-01)
-            self.anchors.putAssumeCapacity(self.tree.root(), {});
-            self.transmitted.appendAssumeCapacity(o);
-        }
+        self.commitNullifiers(&t.nullifiers);
+        self.commitOutputs(&owned);
     }
 
     /// Validate and apply a shielded **HTLC** spend (redeem or refund) at consensus height `at_height`.
@@ -1047,59 +1138,24 @@ pub const Chain = struct {
         if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
         if (t.proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
         for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
-        // Reject non-canonical encodings of the public field elements before they key the nullifier set
-        // or enter the tree (backstop to the verifier's canonical parse).
-        if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
-        for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
-        for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
+        try canonicalTxFieldChecks(t);
 
         var seen = HashSet.init(self.allocator);
         defer seen.deinit();
-        for (t.nullifiers) |nf| {
-            if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
-            const gop = seen.getOrPut(nf) catch return TxError.Internal;
-            if (gop.found_existing) return TxError.DoubleSpend;
-        }
+        try self.nullifierSeenScan(&seen, &t.nullifiers);
 
         if (!ffi.verifyHtlc(t.proof, t.publicInputs())) return TxError.BadAuthProof;
 
         // Atomic two-phase apply (H-03/H-04), identical discipline to applyChecked.
         var candidate_supply = self.supply;
         candidate_supply.apply(.{ .issued = 0, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
-        self.nullifiers.ensureUnusedCapacity(@intCast(N_IN)) catch return TxError.Internal;
-        self.anchors.ensureUnusedCapacity(@intCast(M_OUT)) catch return TxError.Internal;
-        self.transmitted.ensureUnusedCapacity(self.allocator, M_OUT) catch return TxError.Internal;
-        self.tree.ensureUnusedCapacity(M_OUT) catch return TxError.TreeFull;
-        self.cm_index.ensureUnusedCapacity(M_OUT) catch return TxError.Internal;
-        self.htlc_events.ensureUnusedCapacity(self.allocator, 1) catch return TxError.Internal; // ≤1 redeem event
-        var owned: [M_OUT]tx.TransmittedNote = undefined;
-        var copied: usize = 0;
-        errdefer for (owned[0..copied]) |o| self.allocator.free(o.ciphertext);
-        for (&owned, t.outputs) |*dst, o| {
-            const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
-            dst.* = .{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct };
-            copied += 1;
-        }
+        try self.reserveApplyCapacity(1, 1); // ≤1 redeem event
+        const owned = try self.ownOutputCiphertexts(t.outputs);
 
         self.supply = candidate_supply;
-        for (t.nullifiers) |nf| {
-            self.nullifiers.putAssumeCapacity(nf, {});
-            // fold the nullifier into the genesis-replayable accumulator (P-01). Infallible (a hash).
-            self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
-        }
-        for (owned) |o| {
-            const pos = self.tree.appendAssumeCapacity(o.cm);
-            self.cm_index.putAssumeCapacity(o.cm, pos); // index cm → position for watcher lookups (P-01)
-            self.anchors.putAssumeCapacity(self.tree.root(), {});
-            self.transmitted.appendAssumeCapacity(o);
-        }
-        // Emit the redeem preimage event (P-01): a redeem reveals the preimage, so record it for
-        // cross-chain watchers + fold it into the event root. A refund carries no preimage ⇒ no event.
-        if (t.redeem_preimage) |pre| {
-            const hl = t.redeemHashlock();
-            self.htlc_events.appendAssumeCapacity(.{ .redeem_hashlock = hl, .preimage = pre });
-            self.event_acc = p.hashDomain("lattica:v1:event-acc", &.{ &self.event_acc, &hl, &pre });
-        }
+        self.commitNullifiers(&t.nullifiers);
+        self.commitOutputs(&owned);
+        self.commitRedeemEvent(t);
     }
 
     /// Verify ONE batch proof for `txs` and apply them all — the consensus path for "one proof per
@@ -1120,16 +1176,8 @@ pub const Chain = struct {
         for (txs) |t| {
             if (t.mint != 0) return TxError.IllegalIssuance; // batches are non-coinbase
             if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
-            for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
-            if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
-            if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
-            for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
-            for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
-            for (t.nullifiers) |nf| {
-                if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
-                const gop = seen.getOrPut(nf) catch return TxError.Internal;
-                if (gop.found_existing) return TxError.DoubleSpend; // duplicate within the batch
-            }
+            try statelessTxChecks(t);
+            try self.nullifierSeenScan(&seen, &t.nullifiers); // also rejects duplicates within the batch
             candidate_supply.apply(.{ .issued = 0, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
         }
         if (proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
@@ -1138,37 +1186,14 @@ pub const Chain = struct {
         if (!ffi.verifyBatch(proof, batchRoot(txs))) return TxError.BadAuthProof;
 
         // ---- atomic two-phase apply over ALL txs (audit H-03/H-04) ----
-        const out_cap = txs.len * M_OUT;
-        self.nullifiers.ensureUnusedCapacity(@intCast(txs.len * N_IN)) catch return TxError.Internal;
-        self.anchors.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
-        self.transmitted.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
-        self.tree.ensureUnusedCapacity(out_cap) catch return TxError.TreeFull;
-        self.cm_index.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
-        var owned: std.ArrayList(tx.TransmittedNote) = .empty;
-        defer owned.deinit(self.allocator); // frees the Vec backing; ciphertexts transfer to the chain on commit
-        owned.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
-        errdefer for (owned.items) |o| self.allocator.free(o.ciphertext);
-        for (txs) |t| {
-            for (t.outputs) |o| {
-                const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
-                owned.appendAssumeCapacity(.{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct });
-            }
-        }
+        try self.reserveApplyCapacity(txs.len, null);
+        var owned = try self.ownBatchOutputCiphertexts(txs);
+        defer owned.deinit(self.allocator); // frees the Vec backing; ciphertexts transferred to the chain on commit
 
         // ---- infallible commit ----
         self.supply = candidate_supply;
-        for (txs) |t| {
-            for (t.nullifiers) |nf| {
-                self.nullifiers.putAssumeCapacity(nf, {});
-                self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
-            }
-        }
-        for (owned.items) |o| {
-            const pos = self.tree.appendAssumeCapacity(o.cm);
-            self.cm_index.putAssumeCapacity(o.cm, pos);
-            self.anchors.putAssumeCapacity(self.tree.root(), {});
-            self.transmitted.appendAssumeCapacity(o);
-        }
+        for (txs) |t| self.commitNullifiers(&t.nullifiers);
+        self.commitOutputs(owned.items);
     }
 
     /// Batch analog of `applyHtlc`: verify ONE HTLC batch proof and apply all redeems/refunds. Like
@@ -1188,62 +1213,27 @@ pub const Chain = struct {
             if (t.current_height >= MAX_RANGE_VALUE) return TxError.OversizeHeight;
             if (t.current_height != at_height) return TxError.HeightMismatch;
             if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
-            for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
-            if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
-            if (!isCanonicalDigest(t.anchor)) return TxError.NonCanonicalField;
-            for (t.nullifiers) |nf| if (!isCanonicalDigest(nf)) return TxError.NonCanonicalField;
-            for (t.outputs) |o| if (!isCanonicalDigest(o.cm)) return TxError.NonCanonicalField;
-            for (t.nullifiers) |nf| {
-                if (self.nullifiers.contains(nf)) return TxError.DoubleSpend;
-                const gop = seen.getOrPut(nf) catch return TxError.Internal;
-                if (gop.found_existing) return TxError.DoubleSpend;
-            }
+            try statelessTxChecks(t);
+            try self.nullifierSeenScan(&seen, &t.nullifiers);
             candidate_supply.apply(.{ .issued = 0, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
             if (t.redeem_preimage != null) n_events += 1;
         }
         if (proof.len > ffi.MAX_PROOF_LEN) return TxError.OversizeProof;
         if (!ffi.verifyHtlcBatch(proof, htlcBatchRoot(txs))) return TxError.BadAuthProof;
 
-        const out_cap = txs.len * M_OUT;
-        self.nullifiers.ensureUnusedCapacity(@intCast(txs.len * N_IN)) catch return TxError.Internal;
-        self.anchors.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
-        self.transmitted.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
-        self.tree.ensureUnusedCapacity(out_cap) catch return TxError.TreeFull;
-        self.cm_index.ensureUnusedCapacity(@intCast(out_cap)) catch return TxError.Internal;
-        self.htlc_events.ensureUnusedCapacity(self.allocator, n_events) catch return TxError.Internal;
-        var owned: std.ArrayList(tx.TransmittedNote) = .empty;
+        try self.reserveApplyCapacity(txs.len, n_events);
+        var owned = try self.ownBatchOutputCiphertexts(txs);
         defer owned.deinit(self.allocator);
-        owned.ensureUnusedCapacity(self.allocator, out_cap) catch return TxError.Internal;
-        errdefer for (owned.items) |o| self.allocator.free(o.ciphertext);
-        for (txs) |t| {
-            for (t.outputs) |o| {
-                const ct = self.allocator.dupe(u8, o.ciphertext) catch return TxError.Internal;
-                owned.appendAssumeCapacity(.{ .cm = o.cm, .kem_ct = o.kem_ct, .ciphertext = ct });
-            }
-        }
 
         self.supply = candidate_supply;
-        for (txs) |t| {
-            for (t.nullifiers) |nf| {
-                self.nullifiers.putAssumeCapacity(nf, {});
-                self.nullifier_acc = p.hashDomain("lattica:v1:nullifier-acc", &.{ &self.nullifier_acc, &nf });
-            }
-        }
+        for (txs) |t| self.commitNullifiers(&t.nullifiers);
+        // Commit each tx's outputs (`M_OUT` per tx, in tx order) interleaved with its redeem event,
+        // exactly as validated above.
         var oi: usize = 0;
         for (txs) |t| {
-            for (t.outputs) |_| {
-                const o = owned.items[oi];
-                const pos = self.tree.appendAssumeCapacity(o.cm);
-                self.cm_index.putAssumeCapacity(o.cm, pos);
-                self.anchors.putAssumeCapacity(self.tree.root(), {});
-                self.transmitted.appendAssumeCapacity(o);
-                oi += 1;
-            }
-            if (t.redeem_preimage) |pre| {
-                const hl = t.redeemHashlock();
-                self.htlc_events.appendAssumeCapacity(.{ .redeem_hashlock = hl, .preimage = pre });
-                self.event_acc = p.hashDomain("lattica:v1:event-acc", &.{ &self.event_acc, &hl, &pre });
-            }
+            self.commitOutputs(owned.items[oi..][0..M_OUT]);
+            oi += M_OUT;
+            self.commitRedeemEvent(t);
         }
     }
 };

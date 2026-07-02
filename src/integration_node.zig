@@ -16,73 +16,17 @@ const tx = @import("tx.zig");
 const ffi = @import("ffi.zig");
 const poseidon2 = @import("poseidon2.zig");
 
-// The production C ABI implemented by lattica-prover-p3.
-extern fn lattica_joinsplit_prove(
-    witness_ptr: [*]const u8,
-    witness_len: usize,
-    proof_out: [*]u8,
-    proof_cap: usize,
-    proof_len: *usize,
-    pi_out: [*]u8,
-    pi_cap: usize,
-    pi_len: *usize,
-) callconv(.c) i32;
-extern fn lattica_joinsplit_verify(
-    proof: [*]const u8,
-    proof_len: usize,
-    pi: [*]const u8,
-    pi_len: usize,
-) callconv(.c) i32;
-extern fn lattica_htlc_prove(
-    witness_ptr: [*]const u8,
-    witness_len: usize,
-    proof_out: [*]u8,
-    proof_cap: usize,
-    proof_len: *usize,
-    pi_out: [*]u8,
-    pi_cap: usize,
-    pi_len: *usize,
-) callconv(.c) i32;
-extern fn lattica_htlc_verify(
-    proof: [*]const u8,
-    proof_len: usize,
-    pi: [*]const u8,
-    pi_len: usize,
-) callconv(.c) i32;
-extern fn lattica_batch_prove(
-    witness_ptr: [*]const u8,
-    witness_len: usize,
-    n_tx: usize,
-    proof_out: [*]u8,
-    proof_cap: usize,
-    proof_len: *usize,
-    root_out: [*]u8,
-    root_cap: usize,
-    root_len: *usize,
-) callconv(.c) i32;
-extern fn lattica_batch_verify(
-    proof: [*]const u8,
-    proof_len: usize,
-    root: [*]const u8,
-    root_len: usize,
-) callconv(.c) i32;
-extern fn lattica_htlc_batch_prove(
-    witness_ptr: [*]const u8,
-    witness_len: usize,
-    n_tx: usize,
-    proof_out: [*]u8,
-    proof_cap: usize,
-    proof_len: *usize,
-    root_out: [*]u8,
-    root_cap: usize,
-    root_len: *usize,
-) callconv(.c) i32;
-extern fn lattica_htlc_batch_verify(
-    proof: [*]const u8,
-    proof_len: usize,
-    root: [*]const u8,
-    root_len: usize,
-) callconv(.c) i32;
+// The production C ABI implemented by lattica-prover-p3 (extern declarations centralized in
+// prover_abi.zig, mirroring lattica-prover-p3/include/lattica_prover_p3.h).
+const prover_abi = @import("prover_abi.zig");
+const lattica_joinsplit_prove = prover_abi.lattica_joinsplit_prove;
+const lattica_joinsplit_verify = prover_abi.lattica_joinsplit_verify;
+const lattica_htlc_prove = prover_abi.lattica_htlc_prove;
+const lattica_htlc_verify = prover_abi.lattica_htlc_verify;
+const lattica_batch_prove = prover_abi.lattica_batch_prove;
+const lattica_batch_verify = prover_abi.lattica_batch_verify;
+const lattica_htlc_batch_prove = prover_abi.lattica_htlc_batch_prove;
+const lattica_htlc_batch_verify = prover_abi.lattica_htlc_batch_verify;
 
 export fn main() callconv(.c) c_int {
     run() catch |e| {
