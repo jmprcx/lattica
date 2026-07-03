@@ -1,7 +1,7 @@
 # GPU-accelerated proving (opt-in)
 
 `lattica-prover-p3` can offload the two heaviest proving steps — the low-degree extension (LDE) and the
-Merkle tree build — to a GPU via OpenCL, for a **measured 2.12× speedup on the production (hiding)
+Merkle tree build — to a GPU via OpenCL, for a **measured ~2.45× speedup on the production (hiding)
 config**, with the GPU proof **verifying under the existing production verifier unchanged**. It is
 **opt-in and prove-only**: the default CPU proving path, the byte-exact wire format, and the C-ABI
 verifier are untouched. Both GPU paths — `GpuDft` (LDE) and `GpuHidingMerkleMmcs` (Merkle) — are
@@ -66,13 +66,20 @@ production `verify_bytes`**:
 
 | config | LDE | Merkle | join-split prove |
 |---|---|---|---:|
-| CPU (production) | `Radix2DitParallel` | `MerkleTreeHidingMmcs` | **955.9 ms** |
-| GPU | `GpuDft` | `GpuHidingMerkleMmcs` | **450.6 ms** (**2.12×**) |
+| CPU (production) | `Radix2DitParallel` | `MerkleTreeHidingMmcs` | **~955 ms** |
+| GPU | `GpuDft` | `GpuHidingMerkleMmcs` | **~390 ms** (**~2.45×**) |
 
-Of the GPU run, ~80 ms is NTT + ~116 ms is Merkle per proof; the rest (quotient constraint-eval, FRI,
-challenger) is still CPU. The killer test `gpu_{joinsplit,htlc}_proof_verifies_hiding` proves a circuit
-with the GPU hiding config and asserts the **standard production verifier accepts it** — the whole FRI
-query/open/verify path over the salted GPU tree round-trips.
+The killer test `gpu_{joinsplit,htlc}_proof_verifies_hiding` proves a circuit with the GPU hiding config
+and asserts the **standard production verifier accepts it** — the whole FRI query/open/verify path over
+the salted GPU tree round-trips.
+
+**Where the time actually goes** (phase timing on the byte-identical `prove_gpu` fork corrected an earlier
+mis-attribution): the dominant phase is `commit_quotient` (~370 ms — LDE + Merkle over the 2¹⁷ × 160-wide
+× 16-chunk quotient), not the FRI open (~64 ms). Within the Merkle commit, the CPU-side leaf-buffer
+marshalling (materializing the wide LDE rows to canonical `u64`) was a **sequential** loop; parallelizing
+it (`rayon` `par_chunks_mut` over rows, in both MMCS `commit`s) is what took the production path from
+~2.12× to ~2.45× — byte-exactness preserved (`gpu_hiding_mmcs_matches_p3` still passes). The remaining
+`commit_quotient` cost is real GPU work (the quotient LDE + hashing ~5 M Poseidon2 leaf permutations).
 
 (An isolated non-hiding micro-benchmark, `gpu_merkle_benchmark`, measures the same two offloads at 2.42×
 on a small 141 ms → 58.2 ms workload; the production number above is the one that matters.)
@@ -111,6 +118,11 @@ kept as validated infrastructure: a real quotient win needs the trace kept **on-
 
 ### What's next
 
-- **FRI + commit glue** (~180 ms CPU, the new dominant remainder) — the next real lever.
+- The remaining `commit_quotient` cost is the **quotient LDE + GPU leaf-hashing** (~5 M Poseidon2
+  permutations over the 16 wide chunks). A faster Poseidon2 kernel (shared-memory / fewer global-scratch
+  round-trips) is the next real lever; batching the per-chunk `coset_lde` calls into fewer GPU
+  round-trips may also help. (Note: parallelizing the LDE's host-side `u64` conversion was tried and
+  *reverted* — per-matrix `rayon` overhead over the many small quotient-chunk / FRI-layer matrices made
+  it slower.)
 - On-GPU trace persistence across LDE→quotient (would make the quotient offload pay off).
-- Shared-memory NTT butterflies; a `_prove_gpu` C-ABI entry for the node.
+- A `_prove_gpu` C-ABI entry for the node.
