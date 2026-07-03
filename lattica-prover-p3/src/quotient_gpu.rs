@@ -502,4 +502,21 @@ mod tests {
         let ph = prove_gpu(&cfg, &HtlcAir, htlc_air::build_trace(&hw), &hpis, QuotientMode::Gpu);
         assert!(verify(&cfg, &HtlcAir, &ph, &hpis).is_ok(), "gpu-quotient HTLC proof must verify");
     }
+
+    /// The FULL GPU path is production-compatible: `prove_gpu(Gpu)` under the hiding config (GPU LDE +
+    /// Merkle + quotient) produces a proof the STANDARD production verifier accepts. Kept as validated
+    /// infrastructure even though the quotient offload is net-neutral and not wired into the default path.
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU; runs a real proof"]
+    fn prove_gpu_hiding_verifies_under_production() {
+        let cfg = crate::config::gpu::make_config_hiding();
+        let w = joinsplit_air::demo_witness();
+        let pis = joinsplit_air::public_values(&w);
+        let proof = prove_gpu(&cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis, QuotientMode::Gpu);
+        let bytes = postcard::to_allocvec(&proof).unwrap();
+        assert!(
+            joinsplit_air::verify_bytes(&bytes, &pis),
+            "full-GPU hiding proof must verify under the production verifier"
+        );
+    }
 }
