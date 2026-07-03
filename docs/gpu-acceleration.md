@@ -1,14 +1,15 @@
 # GPU-accelerated proving (opt-in)
 
-`lattica-prover-p3` can offload the two heaviest proving steps — the low-degree extension (LDE) and the
-Merkle tree build — to a GPU via OpenCL, for a **measured ~2.1× speedup over an AVX2-optimized CPU** on
-the production (hiding) config, with the GPU proof **verifying under the existing production verifier
-unchanged**. (The CPU baseline uses p3's packed-Goldilocks SIMD — see *CPU SIMD* below; against a
-scalar CPU the ratio is ~2.45×, but the AVX2 comparison is the honest one.) It is
+`lattica-prover-p3` can offload the heavy proving steps — the low-degree extension (LDE), the Merkle
+tree build, and the hiding PCS's quotient-randomization pipeline — to a GPU via OpenCL, for a
+**measured ~4.6× speedup over an AVX2-optimized CPU** on the production (hiding) config, with the GPU
+proof **verifying under the existing production verifier unchanged**. (The CPU baseline uses p3's
+packed-Goldilocks SIMD — see *CPU SIMD* below.) It is
 **opt-in and prove-only**: the default CPU proving path, the byte-exact wire format, and the C-ABI
-verifier are untouched. Both GPU paths — `GpuDft` (LDE) and `GpuHidingMerkleMmcs` (Merkle) — are
-byte-compatible with the production `HidingFriPcs` + `MerkleTreeHidingMmcs`, so a GPU-produced proof
-deserializes and verifies exactly like a CPU one (accepted by `verify_bytes` / the C-ABI / the node).
+verifier are untouched. All three GPU paths — `GpuDft` (LDE), `GpuHidingMerkleMmcs` (Merkle), and
+`GpuHidingPcs` (quotient randomization) — are byte-compatible with the production `HidingFriPcs` +
+`MerkleTreeHidingMmcs` stack, so a GPU-produced proof deserializes and verifies exactly like a CPU one
+(accepted by `verify_bytes` / the C-ABI / the node).
 
 ## Enabling it
 
@@ -58,33 +59,55 @@ assert!(joinsplit_air::verify_bytes(&proof_bytes, &pis));
 
 ## Status & performance
 
-Two heavy proving steps run on the GPU: the **LDE** (`GpuDft`) and the **Merkle tree build**. Both are
-byte-compatible with the production **hiding** config, so GPU proofs verify under the standard verifier.
+Three heavy proving steps run on the GPU: the **LDE** (`GpuDft`), the **Merkle tree build**
+(`GpuHidingMerkleMmcs`), and the hiding PCS's **quotient-randomization pipeline** (`GpuHidingPcs`). All
+are byte-compatible with the production **hiding** config, so GPU proofs verify under the standard
+verifier.
 
-### The 2.12× on the production (hiding) config (`gpu_hiding_benchmark`, join-split, best of 5)
+### The 4.6× on the production (hiding) config (`gpu_hiding_benchmark`, join-split, best of 5)
 
 Production `HidingFriPcs` + `is_zk` + salts + `CAP_HEIGHT = 6`, GPU vs CPU, **both verified under the
 production `verify_bytes`**:
 
-| config | LDE | Merkle | join-split prove |
-|---|---|---|---:|
-| CPU (AVX2, production) | `Radix2DitParallel` | `MerkleTreeHidingMmcs` | **~845 ms** |
-| GPU | `GpuDft` | `GpuHidingMerkleMmcs` | **~400 ms** (**~2.1×**) |
+| config | LDE | Merkle | quotient LDEs | join-split prove |
+|---|---|---|---|---:|
+| CPU (AVX2 + LTO, production) | `Radix2DitParallel` | `MerkleTreeHidingMmcs` | CPU | **~785 ms** |
+| GPU | `GpuDft` | `GpuHidingMerkleMmcs` | `GpuHidingPcs` | **~172 ms** (**~4.6×**) |
 
 The killer test `gpu_{joinsplit,htlc}_proof_verifies_hiding` proves a circuit with the GPU hiding config
 and asserts the **standard production verifier accepts it** — the whole FRI query/open/verify path over
-the salted GPU tree round-trips.
+the salted GPU tree round-trips. Of the ~172 ms: ~39 ms GPU NTT (51 calls), ~52 ms GPU Merkle
+(7 commits), the rest CPU (FRI fold, challenger, opens, glue).
 
-**Where the time actually goes** (phase timing on the byte-identical `prove_gpu` fork corrected an earlier
-mis-attribution): the dominant phase is `commit_quotient` (~370 ms — LDE + Merkle over the 2¹⁷ × 160-wide
-× 16-chunk quotient), not the FRI open (~64 ms). Within the Merkle commit, the CPU-side leaf-buffer
-marshalling (materializing the wide LDE rows to canonical `u64`) was a **sequential** loop; parallelizing
-it (`rayon` `par_chunks_mut` over rows, in both MMCS `commit`s) is what took the production path from
-~2.12× to ~2.45× — byte-exactness preserved (`gpu_hiding_mmcs_matches_p3` still passes). The remaining
-`commit_quotient` cost is real GPU work (the quotient LDE + hashing ~5 M Poseidon2 leaf permutations).
+The 2.1× → 4.6× step came from three findings (2026-07-03):
 
-(An isolated non-hiding micro-benchmark, `gpu_merkle_benchmark`, measures the same two offloads at 2.42×
-on a small 141 ms → 58.2 ms workload; the production number above is the one that matters.)
+1. **The NTT was launch- and transfer-bound, not butterfly-bound.** The per-stage kernel did `log h + 1`
+   full global-memory round-trips; the `ntt_tile` kernel now runs ~8–12 stages per launch in a 32 KiB
+   local-memory tile (rows `hi<<(s0+lt) | t<<s0 | lo` × up to 16 columns), with the stage-`s` twiddle
+   split as `w_s^lo · w_k^(t mod 2^(k-1))` off p3's generator squaring chain — no twiddle tables. The
+   bit-reversal is fused into the first group's load, the `1/h`/coset-shift/canonicalize tails into the
+   last group's store, and the last group can emit rows **bit-reversed (p3's storage order) directly**,
+   deleting the CPU `reverse_matrix_index_bits` pass per LDE. Stage generators are cached per
+   `(log_h, inverse)`.
+2. **Transfers ran at pageable speed (~3–6 GB/s) on a PCIe5 ×16 link that does 38–54 GB/s pinned.**
+   `GpuCtx` now keeps pooled device scratch buffers and a persistently-mapped pinned
+   (`CL_MEM_ALLOC_HOST_PTR`) staging window; every upload/download memcpys through it with the host-side
+   copy parallelized (a fresh `Vec`'s cold-page single-threaded memcpy costs more than the DMA). Merkle
+   commits marshal leaf rows **directly into the window** (`upload_rows`) instead of materializing the
+   combined leaf matrix host-side — the 16-chunk quotient commit moves ~170 MB/proof through that path.
+3. **p3's hiding quotient randomization was doing 16 full-size mostly-zero DFTs + ~48 host permutation
+   passes per proof.** `HidingFriPcs::get_quotient_ldes` randomizes each quotient chunk with a coset-LDE
+   plus a **full-size `dft_batch` whose input is ~94% zero rows**, materializes both natural-order on the
+   host, adds them on the CPU, and re-bit-reverses. `get_quotient_ldes` is a `Pcs` *trait* method, so
+   `gpu_pcs::GpuHidingPcs` wraps the production stack, delegates everything else (associated types are
+   the inner's — the wire is untouched), and overrides just that one: same randomization math (draws,
+   `get_zp_cis`, last-chunk adjustment), but per chunk the coset-LDE, the vanishing-poly NTT (only the
+   `2h`-row nonzero coefficient prefix is uploaded; the GPU zero-pads), the elementwise add
+   (`add_canon`), and the bit-reversed store run device-side with ONE download. **Gold gate**
+   `gpu_quotient_ldes_match_p3`: with the same seed, the returned chunk LDEs are byte-identical to p3's.
+
+(An isolated non-hiding micro-benchmark, `gpu_merkle_benchmark`, measures the LDE+Merkle offloads on a
+small workload; the production number above is the one that matters.)
 
 ### How the Merkle offload works
 
@@ -112,11 +135,11 @@ alpha powers × `inv_vanishing`. It is correct and **verifies under the producti
 heavy steps now on GPU; `gpu_{joinsplit,htlc}_proof_verifies_hiding` + `gpu_quotient_verifies`).
 
 **But it is net-neutral.** The kernel is fast (~10 ms/proof), yet marshalling the trace to `u64` buffers
-on the CPU (~50 ms) offsets it — the quotient's cost is *data movement*, not arithmetic. Profiling the
-~443 ms GPU hiding proof: ~109 ms Merkle + ~84 ms NTT + ~10 ms quotient are on GPU; the remaining ~180 ms
-CPU is **FRI + commit glue** — that is the real next lever, not the quotient. The fork + interpreters are
-kept as validated infrastructure: a real quotient win needs the trace kept **on-GPU across LDE→quotient**
-(a deeper PCS integration that avoids the round-trip).
+on the CPU (~50 ms) offsets it — the quotient *constraint evaluation*'s cost is *data movement*, not
+arithmetic. The fork + interpreters are kept as validated infrastructure, not wired into the default
+path: a real win here needs the trace kept **on-GPU across LDE→quotient**. (Distinct from this, the
+quotient *randomization/commit* pipeline — which profiling showed was the actual dominant cost — DID
+move to the GPU via `GpuHidingPcs`; see above.)
 
 ### CPU SIMD (AVX2)
 
@@ -131,20 +154,23 @@ round dependencies and the NTT's memory-bound nature); a server with AVX-512 wou
 
 ### GPU kernel tuning (done + learned)
 
-- **NTT memory coalescing** (done): `ntt_stage` now uses `col` as the fast-varying thread index, so
-  adjacent threads touch contiguous global memory (was strided by `w`). Bit-exact; NTT ~82→~74 ms.
-- **Twiddle precompute** (tried, *reverted*): replacing the per-butterfly `gl_pow` with a master-table
-  lookup made the NTT *slower*. The NTT is **memory-bound** — `gl_pow` (pure compute) was hidden behind
-  memory latency, and a table lookup only adds global reads. Lesson: cut memory traffic, don't add it.
-- Also reverted earlier: parallelizing the LDE's host-side `u64` conversion (per-matrix `rayon` overhead
-  over the many small quotient-chunk / FRI-layer matrices made it slower).
+- **NTT shared-memory tiling** (done, see above): the definitive fix for the per-stage global
+  round-trips; superseded the earlier coalescing-only `ntt_stage` kernel.
+- **Pinned staging** (done, see above): measure transfer paths before kernels — the "slow NTT" was
+  mostly the driver staging pageable memory (probe: `gpu-smoke/xfer` in the session scratchpad).
+- **Twiddle precompute in global memory** (tried, *reverted*): replacing the per-butterfly `gl_pow`
+  with a master-table lookup made the NTT *slower*. `gl_pow` (pure compute) hides behind memory
+  latency; a table adds global reads. The tiled kernel keeps computing twiddles.
+- Parallelizing the host-side `u64` conversion is size-thresholded (`to_u64s`, ≥ 4 MiB): per-matrix
+  `rayon` overhead loses on the many small quotient-chunk / FRI-layer matrices.
 
 ### What's next
 
-- **NTT shared-memory tiling** — the one substantive GPU lever left. The NTT is memory-bound (global
-  butterflies every stage); local-memory sub-transforms cut the global passes (~74 → ~40 ms). A real
-  radix-N kernel rewrite that must stay bit-exact — a focused effort.
-- The Merkle **leaf-hashing** (the dominant GPU cost, ~110 ms) is *compute*-bound (~40 Poseidon2 perms per
-  wide quotient leaf) and already near-optimal — no cheap win there.
-- On-GPU trace persistence across LDE→Merkle→quotient (the structural win; also makes the quotient
-  offload pay off). A `_prove_gpu` C-ABI entry for the node.
+- The Merkle **leaf-hashing** (~52 ms, the dominant GPU cost now) is *compute*-bound (~40 Poseidon2
+  perms per wide quotient leaf) and near-optimal per-kernel; the remaining waste is re-uploading LDEs
+  the GPU just produced — on-GPU LDE persistence across LDE→Merkle (device-resident matrix handles in
+  the PCS) is the structural fix.
+- The residual ~80 ms CPU tail is the FRI commit phase (ext-field folds + challenger) and the opens —
+  p3's FRI prover is not behind a trait seam, so offloading it means forking `commit_phase` (the
+  validated S4 fold kernel exists).
+- A `_prove_gpu` C-ABI entry (or runtime GPU/CPU switch) + Zig-node wiring, once the node wants it.
