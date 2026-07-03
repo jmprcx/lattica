@@ -1651,6 +1651,95 @@ fn phase8_joinsplit_aggregator() {
     println!("R4: K=2 real join-split inners verified + folded to the block tx-root in ONE AIR at 2^{log2h} / {} MiB", rss / (1 << 20));
 }
 
+/// R5 PROBE (self-recursion): can the monolith verify ANOTHER monolith's proof? Build + prove a small ConstAir
+/// monolith (the INNER), then have `build_symbolic_inner_window` construct the OUTER witness that verifies it
+/// (its full-fold pre-check + window/pz/cap binds VALIDATE the witness — success ⇒ the mechanism works over an
+/// arbitrary AIR, MonolithAir included), and measure the outer geometry to answer R3 §3.4's size-stability
+/// question. NO outer prove (the outer is measured, not proven — it is far too large for this box).
+#[test]
+#[ignore = "R5 probe: self-recursion geometry (monolith-verifies-monolith); builds outer witness, no outer prove"]
+fn phase9_self_recursion_probe() {
+    use super::{monolith_build_trace, MonolithAir, CM_ROUNDS};
+    use crate::recursion::native_fri::{gen_const_proof, query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle, query_terms};
+    use p3_air::BaseAir;
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, AirLayout};
+    // (1) INNER: a small ConstAir monolith (pis-mode), built + proven — this becomes the "inner proof" the OUTER
+    // monolith must verify. (Mirrors run_monolith's ConstAir-monolith setup.)
+    let config = make_config(1, 4);
+    let (proof, pvs) = gen_const_proof(&config, 42, 6);
+    let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+    let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+    let (mut per_query, mut quot_paths, mut commit_data, mut n_terms) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
+    let (mut final0, mut cap0, mut qcap0) = (Challenge::ZERO, [Val::ZERO; 4], [Val::ZERO; 4]);
+    let mut ccap0 = [[Val::ZERO; 4]; CM_ROUNDS];
+    for q in 0..4 {
+        let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+        let (_r, rounds, _f, f0) = query_fold_data(&config, &proof, &pvs, q);
+        let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
+        let (_l, path, ce) = query_input_merkle(&config, &proof, &pvs, q);
+        let (_ql, qpath, qce, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
+        let cm = query_commit_merkle_all(&config, &proof, &pvs, q);
+        if q == 0 {
+            final0 = f0;
+            cap0 = ce;
+            qcap0 = qce;
+            for (r, (_g, _l, _p, c)) in cm.iter().enumerate() {
+                ccap0[r] = *c;
+            }
+        }
+        n_terms = terms.len();
+        let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+        per_query.push(((index, terms, alpha, ro, rounds), v, path));
+        quot_paths.push(qpath);
+        commit_data.push(cm);
+    }
+    let inner = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
+    let mut pis = Vec::new();
+    for ch in &chs {
+        pis.push(ch[0]);
+        pis.push(ch[1]);
+    }
+    for f in &index_felts {
+        pis.push(*f);
+    }
+    let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+    pis.push(fp[0]);
+    pis.push(fp[1]);
+    pis.extend_from_slice(&cap0);
+    pis.extend_from_slice(&qcap0);
+    pis.push(pvs[0]);
+    for ce in &ccap0 {
+        pis.extend_from_slice(ce);
+    }
+    let inner_trace = monolith_build_trace(&inner, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], None);
+    let inner_prf = prove(&config, &inner, inner_trace, &pis);
+    assert!(verify(&config, &inner, &inner_prf, &pis).is_ok(), "inner ConstAir monolith proves");
+    let (w_in, np_in, nper_in) = (inner.fused_w(), pis.len(), BaseAir::<Val>::num_periodic_columns(&inner));
+    let inner_cs = get_symbolic_constraints::<Val, MonolithAir>(&inner, AirLayout::from_air::<Val>(&inner));
+    println!("R5 INNER (ConstAir monolith): W={w_in} n_pub={np_in} n_periodic={nper_in} n_constraints={} height=2^{}", inner_cs.len(), inner.height().trailing_zeros());
+    // (2) OUTER: the monolith verifying the INNER monolith proof. build_symbolic_inner_window does the witness
+    // AND validates it (full-fold pre-check + window/pz/cap binds); if it returns, the self-recursion mechanism
+    // works over MonolithAir-as-inner. NO outer prove — we only measure its geometry.
+    let (_otr, ocounts, obinds, oib, ont, _pv0) = build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in);
+    let cap_height = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
+    let outer = MonolithAir { counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(), w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height };
+    let olayout = AirLayout::from_air::<Val>(&outer);
+    let ocs = get_symbolic_constraints::<Val, MonolithAir>(&outer, olayout);
+    let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
+    let (ow, oh) = (outer.fused_w(), outer.height());
+    let lde_gb = (oh as u128 * ow as u128 * 8 * 16) / (1 << 30);
+    println!("R5 OUTER (monolith-verifies-monolith): W={ow} height=2^{} log_nqc={log_nqc} n_cs={} | est. blowup-LDE ~{lde_gb} GB | build_symbolic_inner_window SUCCEEDED ⇒ mechanism works", oh.trailing_zeros(), ocs.len());
+    // R5 FINDING (matches R3 §3.4): the self-recursion MECHANISM works (the monolith built + self-validated a
+    // witness for verifying another monolith), but it is neither SIZE-stable nor DEGREE-stable — verifying a
+    // small inner monolith (W=193, 384 constraints) yields a FAR larger outer (W≈8520, ~44×; ~133 GB LDE) whose
+    // fold over the inner's degree-16 constraints has log_nqc=7 > log_blowup 4 (unprovable at blowup 4). So each
+    // tree level explodes; naive self-composition can't converge. A fixed-size WRAP (re-prove each level's output
+    // at a canonical small/low-degree shape) or a different outer proof system is required — R5's open problem.
+    assert!(ow > 8 * w_in, "self-recursion is SIZE-explosive: outer W {ow} ≫ inner W {w_in} (not size-stable)");
+    assert!(log_nqc > 4, "self-recursion is DEGREE-explosive: outer log_nqc {log_nqc} > log_blowup 4 (inner's high-degree constraints fold past the quotient budget)");
+}
+
 #[test]
 #[ignore = "slow: Phase 6.6 tiled aggregator (K inners verified + folded to tx-root in one AIR)"]
 fn phase6_tiled_aggregator() {

@@ -100,3 +100,40 @@ underneath the same seam.
   server to confirm the 2^20 / ~116 GB single-inner point before deployment.
 - The reduced-query milestones (`phase8_joinsplit_monolith` at 4q) stay as the always-runnable
   dev-box correctness gate; the full-query proof is a server-only `--ignored` measurement.
+
+## 5. Tree self-composition (R5) — measured: mechanism works, but NOT size- or degree-stable
+
+§3.4 flagged the open question: do aggregator outputs compose as inners to the next level cheaply, or does
+the per-level super-tile grow unboundedly? `phase9_self_recursion_probe` (2026-07-03) measures it directly —
+it builds + proves a small inner monolith, then has the generic column-window builder construct **and
+self-validate** (full-fold pre-check + window/pz/cap binds) the OUTER witness that verifies it, and reads the
+outer geometry. Result:
+
+| | width W | constraints | height | log_nqc | est. blowup LDE |
+|---|---|---|---|---|---|
+| INNER: a ConstAir **monolith** (the smallest monolith) | 193 | 384 | 2^15 | ≤4 | — |
+| OUTER: a monolith **verifying that monolith** | **8520** | 8414 | 2^17 | **7** | **~133 GB** |
+
+**Finding 1 — the mechanism works.** The builder succeeded and self-validated over `MonolithAir`-as-inner: the
+in-circuit verifier is genuinely AIR-generic, so a monolith CAN witness verifying another monolith. There is no
+wiring blocker to self-recursion.
+
+**Finding 2 — it does not converge.** Verifying the *smallest* monolith (W=193, 384 constraints) yields an
+outer that is **~44× wider (W=8520)**, has **~22× the constraints**, and needs **~133 GB** just for the
+blow-up LDE — and its constraint-fold over the inner's degree-16 constraints reaches **log_nqc = 7 > log_blowup
+4**, so the outer is not even provable at blowup 4. Both axes explode per level: the inner monolith's width
+(opened-row carrier + 2·W reduced-opening terms) and its high-degree constraints (which the outer's α-fold
+inherits) are each far larger than a leaf join-split's (W=19, 81 constraints, degree ≤9). So a level-N monolith
+is strictly bigger and higher-degree than level N−1 — **naive tree self-recursion diverges**, exactly the
+concern §3.4 raised.
+
+**Consequence — a WRAP (or a different outer system) is required, and it is a distinct future effort.** To make
+the tree converge, each level's output must be re-attested at a *canonical, small, low-degree* shape before the
+next level verifies it. Two viable directions, neither in scope here: (a) a purpose-built **uniform/wrap
+verifier** whose size and constraint degree are fixed (independent of what it verifies) — a substantially
+different circuit than the current inner-specific monolith; (b) a **SNARK wrap** (e.g. verify the STARK inside a
+constant-size pairing proof) — needs proving infrastructure this crate does not have. Until then, the
+production scale-out is the **flat aggregation tree of depth 1** (R4): one aggregator over K leaves per proof,
+the node folding multiple aggregate roots exactly as it folds multiple batch roots (`MAX_AGG_TILES`, §3.5) —
+which needs no self-recursion. R5's deliverable is this determination; deep self-recursion is deferred behind
+the wrap.
