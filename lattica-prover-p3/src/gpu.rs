@@ -30,7 +30,7 @@ use p3_matrix::bitrev::{BitReversalPerm, BitReversedMatrixView};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::util::reverse_matrix_index_bits;
 use p3_matrix::{Dimensions, Matrix};
-use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+use p3_symmetric::{CryptographicHasher, MerkleCap, PseudoCompressionFunction};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -346,6 +346,25 @@ fn gpu_merkle_layers(combined: &[u64], h: usize, w: usize) -> Vec<Vec<[Goldilock
     out
 }
 
+/// Build the GPU tree and extract the `MerkleCap` at `cap_height` — byte-identical to
+/// `MerkleTreeMmcs`/`MerkleTreeHidingMmcs`'s commitment. The cap is the layer `2^cap_height` nodes wide
+/// (`digest_layers[num_layers-1-cap_height]`, `merkle_tree.rs::cap`); for a tree shorter than the cap
+/// (small FRI layers) the cap clamps to the leaf layer (`effective_cap_height = min(cap_height, depth)`).
+/// Returns the cap plus every layer (leaf..root) so `open_batch` can read sibling paths up to the cap.
+#[allow(dead_code)] // consumed by `GpuHidingMerkleMmcs` (next increment); currently only the H1 test.
+fn gpu_merkle_cap(
+    combined: &[u64],
+    h: usize,
+    w: usize,
+    cap_height: usize,
+) -> (MerkleCap<Goldilocks, [Goldilocks; 4]>, Vec<Vec<[Goldilocks; 4]>>) {
+    let layers = gpu_merkle_layers(combined, h, w);
+    let num_layers = layers.len();
+    let eff = cap_height.min(num_layers - 1);
+    let cap_idx = num_layers - 1 - eff;
+    (MerkleCap::new(layers[cap_idx].clone()), layers)
+}
+
 /// A GPU-backed Merkle-tree `Mmcs` — a self-consistent drop-in for the PCS's `ValMmcs` that offloads the
 /// Poseidon2 leaf-hash + tree compression (≈45% of a proof) to the GPU. `commit` runs on the GPU;
 /// `open_batch`/`verify_batch` are CPU (cheap, per-query) using the *same* Poseidon2 constants, so a
@@ -556,6 +575,54 @@ mod tests {
                     let wref = BatchOpeningRef::new(&opening.opened_values, &opening.opening_proof);
                     assert_eq!(mmcs.verify_batch(&commit, &dims, wrong, wref), Err(()), "wrong index accepted");
                 }
+            }
+        }
+    }
+
+    /// H1 gate: the GPU `MerkleCap` + sibling paths are BYTE-IDENTICAL to CPU `MerkleTreeMmcs` with
+    /// `cap_height = 6` (the production cap). This de-risks the cap + sibling mechanics against the p3
+    /// reference in isolation — and confirms the scalar GPU leaf-hash matches p3's SIMD-packed hashing.
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU"]
+    fn gpu_merkle_cap_matches_p3() {
+        use p3_field::Field;
+        use p3_merkle_tree::MerkleTreeMmcs;
+        type Cpu = MerkleTreeMmcs<<Goldilocks as Field>::Packing, <Goldilocks as Field>::Packing, MyHash, MyCompress, 2, 4>;
+        let perm = default_goldilocks_poseidon2_8();
+        let cpu = Cpu::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6);
+        let mut rng = ChaCha20Rng::seed_from_u64(9);
+        for &(log_h, widths) in &[(7usize, &[1usize][..]), (8, &[2, 5]), (10, &[4]), (12, &[2, 2, 3]), (16, &[7])] {
+            let h = 1usize << log_h;
+            let mats: Vec<RowMajorMatrix<Goldilocks>> = widths
+                .iter()
+                .map(|&w| RowMajorMatrix::new((0..h * w).map(|_| Goldilocks::new(rng.random::<u64>() % 0xFFFF_FFFF_0000_0001)).collect(), w))
+                .collect();
+            let (cap_cpu, data_cpu) = cpu.commit(mats.clone());
+            // GPU: build the concatenated-row leaf buffer, then the cap.
+            let total_w: usize = widths.iter().sum();
+            let mut combined = vec![0u64; h * total_w];
+            for i in 0..h {
+                let mut off = i * total_w;
+                for m in &mats {
+                    for v in m.row(i).unwrap() {
+                        combined[off] = v.as_canonical_u64();
+                        off += 1;
+                    }
+                }
+            }
+            let (cap_gpu, layers) = gpu_merkle_cap(&combined, h, total_w, 6);
+            assert_eq!(cap_cpu.roots(), cap_gpu.roots(), "cap mismatch at h=2^{log_h}");
+            // sibling paths (up to the cap) must match p3's open_batch.
+            let cap_idx = layers.len() - 1 - 6usize.min(layers.len() - 1);
+            for &idx in &[0usize, 1, h / 2, h - 1] {
+                let (_, sib_cpu) = cpu.open_batch(idx, &data_cpu).unpack();
+                let mut sib_gpu = Vec::new();
+                let mut j = idx;
+                for layer in &layers[..cap_idx] {
+                    sib_gpu.push(layer[j ^ 1]);
+                    j >>= 1;
+                }
+                assert_eq!(sib_cpu, sib_gpu, "siblings mismatch at h=2^{log_h} idx={idx}");
             }
         }
     }
