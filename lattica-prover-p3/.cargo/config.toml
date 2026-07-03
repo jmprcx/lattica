@@ -1,0 +1,16 @@
+# Enable p3's packed-Goldilocks SIMD (AVX2/BMI2), which is DORMANT under Rust's default `x86-64`
+# baseline (SSE2 only). p3-goldilocks ships `x86_64_avx2` / `x86_64_avx512` packed-field modules gated
+# behind `target_feature`; without this they compile out and all CPU field arithmetic runs scalar.
+#
+# `x86-64-v3` is the standard modern-x86 microarchitecture level (AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE),
+# portable to every Intel Haswell+ (2013) and AMD Zen+ CPU. Measured ~10% faster CPU proving on the
+# reference machine (p3 has no hand-vectorized Poseidon2, so the gain is from packed field arithmetic
+# only; a server with AVX-512 would additionally use p3's 8-lane `x86_64_avx512` path).
+#
+# Scoped to x86_64 so aarch64 builds (NEON via p3's separate module) are unaffected. Bit-identical
+# results — packed field arithmetic equals scalar; the wire format and verifier are unchanged.
+#
+# RUNTIME REQUIREMENT: x86_64 binaries built with this REQUIRE a v3-capable CPU (Haswell/Zen+). For a
+# deployment target older than that, drop this file or narrow the feature set (e.g. `+avx2,+bmi2`).
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
