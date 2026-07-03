@@ -379,6 +379,43 @@ mod tests {
         w
     }
 
+    // Peak resident set (VmHWM, process-lifetime) in MiB — for the RAM-vs-block-size benchmark.
+    fn peak_rss_mib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(String::from))
+            .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+            .map(|kib| kib / 1024)
+            .unwrap_or(0)
+    }
+
+    /// RAM-vs-BLOCK-SIZE benchmark for the PRODUCTION batch path (one STARK proof per block). Run ONE N per
+    /// process (`LATTICA_BATCH_N=<n>`) so VmHWM (peak RSS) is isolated to that block size. Tiles are valid
+    /// balanced 2-in/2-out join-split spends; the trace is `padded_tiles(n)·HEIGHT` rows at the production
+    /// config (cap-6, q96/lb4 — ≥100-bit proven up to MAX_BATCH_TILES=64). Reports peak RSS, prove time, and
+    /// proof size.
+    #[test]
+    #[ignore = "bench: batch RAM vs block size (LATTICA_BATCH_N=<n>, one N per process)"]
+    fn batch_ram_bench() {
+        use p3_matrix::Matrix;
+        let n: usize = std::env::var("LATTICA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
+        let ws: Vec<Witness> = (0..n).map(|i| variant_asset(1000 + i as u64)).collect();
+        let root = batch_root(&ws);
+        let trace = build_batch_trace(&ws);
+        let (rows, w) = (trace.height(), trace.width());
+        let t0 = std::time::Instant::now();
+        let proof = prove(&make_config(), &JoinSplitBatchAir, trace, &root);
+        let prove_s = t0.elapsed().as_secs_f64();
+        let bytes = postcard::to_allocvec(&proof).unwrap();
+        assert!(verify_batch_bytes(&bytes, &root), "batch of {n} verifies");
+        println!(
+            "BATCH-BENCH n={n} padded_tiles={} tile_height={HEIGHT} rows={rows} width={w} peak_rss={}MiB prove={prove_s:.1}s proof={}KiB",
+            padded_tiles(n),
+            peak_rss_mib(),
+            bytes.len() / 1024
+        );
+    }
+
     #[test]
     fn batch_root_folds_in_order_with_iv_and_padding() {
         let ws = [variant(1), variant(2), variant(3)];
