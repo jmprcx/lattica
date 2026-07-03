@@ -255,6 +255,9 @@ struct GpuCtx {
     /// Kept alive so the mapping stays valid for `staging_map`'s lifetime.
     _staging_buf: Option<ocl::Buffer<u64>>,
     staging_map: Option<ocl::MemMap<u64>>,
+    /// Stage-generator buffers keyed by `(log_h, inverse)` — tiny but rebuilt on every NTT call
+    /// otherwise (~100 host-pointer buffer creations per proof).
+    wlens: std::collections::HashMap<(usize, bool), ocl::Buffer<u64>>,
 }
 
 thread_local! {
@@ -270,7 +273,7 @@ fn with_ctx<R>(f: impl FnOnce(&mut GpuCtx) -> R) -> R {
                 .dims(1)
                 .build()
                 .expect("GpuDft: OpenCL program build failed (is an OpenCL runtime + GPU present?)");
-            GpuCtx { pq, dev: [None, None, None], _staging_buf: None, staging_map: None }
+            GpuCtx { pq, dev: [None, None, None], _staging_buf: None, staging_map: None, wlens: Default::default() }
         });
         f(ctx)
     })
@@ -347,6 +350,28 @@ impl GpuCtx {
         }
     }
 
+    /// The `(1..=log_h)` stage-generator buffer (`wlens[s-1]` = `two_adic_generator(s)`, inverted
+    /// for iDFTs), cached per `(log_h, inv)`.
+    fn wlens_buf(&mut self, log_h: usize, inv: bool) -> ocl::Buffer<u64> {
+        if !self.wlens.contains_key(&(log_h, inv)) {
+            let gens: Vec<u64> = (1..=log_h)
+                .map(|s| {
+                    let g = Goldilocks::two_adic_generator(s);
+                    (if inv { g.inverse() } else { g }).as_canonical_u64()
+                })
+                .collect();
+            let buf = ocl::Buffer::<u64>::builder()
+                .queue(self.pq.queue().clone())
+                .flags(ocl::flags::MEM_READ_ONLY | ocl::flags::MEM_COPY_HOST_PTR)
+                .len(gens.len())
+                .copy_host_slice(&gens)
+                .build()
+                .unwrap();
+            self.wlens.insert((log_h, inv), buf);
+        }
+        self.wlens[&(log_h, inv)].clone()
+    }
+
     /// Blocking download of `src[0..n]` into a fresh Vec, chunked through the pinned window. The
     /// copy out of the window is parallel (rayon writes the uninitialized spare directly): the fresh
     /// Vec's pages are cold, and single-threaded fault-and-copy costs several × the DMA itself.
@@ -371,29 +396,24 @@ impl GpuCtx {
 /// (pass 1, 1 for none) and, if `do_canon`, canonicalization. With `store_brev` the last group also
 /// stores rows bit-reversed — p3's storage order — which forces it out-of-place: it then writes back
 /// into `src`, and the function returns the buffer holding the result (`true` = `dst`).
-/// `wlens[s-1]` = the stage-`s` twiddle generator (forward or inverse); its length = the transform size.
+/// The transform size is `2^log_h = h`; `inv` selects the inverse stage generators (iDFT).
 #[allow(clippy::too_many_arguments)]
 fn enqueue_tiled_ntt(
-    pq: &ProQue,
+    ctx: &mut GpuCtx,
     src: &ocl::Buffer<u64>,
     dst: &ocl::Buffer<u64>,
     h: usize,
     w: usize,
-    wlens: &[u64],
+    log_h: usize,
+    inv: bool,
     post_c: u64,
     post_b: u64,
     do_canon: bool,
     store_brev: bool,
 ) -> bool {
-    let log_h = wlens.len();
-    debug_assert_eq!(1usize << log_h, h, "wlens must hold one generator per stage");
-    let wlens_buf = ocl::Buffer::<u64>::builder()
-        .queue(pq.queue().clone())
-        .flags(ocl::flags::MEM_READ_ONLY | ocl::flags::MEM_COPY_HOST_PTR)
-        .len(wlens.len())
-        .copy_host_slice(wlens)
-        .build()
-        .unwrap();
+    debug_assert_eq!(1usize << log_h, h, "log_h must match the transform size");
+    let wlens_buf = ctx.wlens_buf(log_h, inv);
+    let pq = &ctx.pq;
     // C = columns per tile: wide enough for coalesced runs, capped by the matrix width (w=2 quotient
     // chunks waste no lanes) and at 16 (128-byte runs). Tile budget: 2^(lt+log_c) u64 = 32 KiB.
     let log_c = (w.next_power_of_two().trailing_zeros() as usize).min(4);
@@ -453,12 +473,11 @@ fn enqueue_tiled_ntt(
 fn gpu_ntt(coeffs: &[u64], h: usize, w: usize, log_h: usize) -> Vec<u64> {
     let _t0 = std::time::Instant::now();
     let n = h * w;
-    let wlens: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
     with_ctx(|ctx| {
         let cb = ctx.dev_buf(0, n);
         let ab = ctx.dev_buf(1, n);
         ctx.upload(&cb, coeffs);
-        let in_dst = enqueue_tiled_ntt(&ctx.pq, &cb, &ab, h, w, &wlens, 1, 1, true, true);
+        let in_dst = enqueue_tiled_ntt(ctx, &cb, &ab, h, w, log_h, false, 1, 1, true, true);
         let out = ctx.download(if in_dst { &ab } else { &cb }, n);
         if std::env::var_os("LATTICA_GPU_PROF").is_some() {
             eprintln!("ntt h={h} w={w}: total {:.3}ms", _t0.elapsed().as_secs_f64() * 1e3);
@@ -481,9 +500,6 @@ fn gpu_coset_lde_bitrev(evals: &[u64], h: usize, w: usize, added_bits: usize, sh
     let big = h << added_bits;
     let log_big = log_h + added_bits;
     let n_big = big * w;
-    // iDFT twiddles per stage = two_adic_generator(s).inverse(); forward (big) twiddles = generator(s).
-    let wl_inv: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).inverse().as_canonical_u64()).collect();
-    let wl_big: Vec<u64> = (1..=log_big).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
     let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
     let prof = std::env::var_os("LATTICA_GPU_PROF").is_some();
     with_ctx(|ctx| {
@@ -502,11 +518,11 @@ fn gpu_coset_lde_bitrev(evals: &[u64], h: usize, w: usize, added_bits: usize, sh
         }
         // iDFT on the first h rows (a → b), the last group fusing scale-by-1/h + coset shift^row;
         // rows ≥ h of `b` stay 0 (the zero-pad).
-        enqueue_tiled_ntt(&ctx.pq, &a, &b, h, w, &wl_inv, h_inv, shift, false, false);
+        enqueue_tiled_ntt(ctx, &a, &b, h, w, log_h, true, h_inv, shift, false, false);
         // forward NTT of size `big` (b → a…, reading the zero-pad through the fused bit-reversal),
         // canonicalized + stored bit-reversed by the last group (which bounces back into `b` when
         // there are ≥ 2 groups).
-        let in_dst = enqueue_tiled_ntt(&ctx.pq, &b, &a, big, w, &wl_big, 1, 1, true, true);
+        let in_dst = enqueue_tiled_ntt(ctx, &b, &a, big, w, log_big, false, 1, 1, true, true);
         if prof {
             ctx.pq.queue().finish().unwrap();
             eprintln!("  kernels {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
@@ -544,8 +560,6 @@ pub(crate) fn gpu_quotient_chunk_lde(
     let big = h << added_bits;
     let log_big = log_h + added_bits;
     let n_big = big * w;
-    let wl_inv: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).inverse().as_canonical_u64()).collect();
-    let wl_big: Vec<u64> = (1..=log_big).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
     let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
     with_ctx(|ctx| {
         let a = ctx.dev_buf(0, n_big);
@@ -555,14 +569,14 @@ pub(crate) fn gpu_quotient_chunk_lde(
         // add_canon canonicalizes the sum).
         b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
         ctx.upload(&a, evals);
-        enqueue_tiled_ntt(&ctx.pq, &a, &b, h, w, &wl_inv, h_inv, shift, false, false);
-        let in_dst = enqueue_tiled_ntt(&ctx.pq, &b, &a, big, w, &wl_big, 1, 1, false, true);
+        enqueue_tiled_ntt(ctx, &a, &b, h, w, log_h, true, h_inv, shift, false, false);
+        let in_dst = enqueue_tiled_ntt(ctx, &b, &a, big, w, log_big, false, 1, 1, false, true);
         let (r, s) = if in_dst { (a, b) } else { (b, a) };
         // v_H·r: zero-pad the freed scratch buffer, upload the 2h-row coefficient prefix, forward NTT.
         // (The in-order queue sequences the fill after the LDE kernels that read `s`.)
         s.cmd().fill(0u64, Some(n_big)).enq().unwrap();
         ctx.upload(&s, van_prefix);
-        let v_in_dst = enqueue_tiled_ntt(&ctx.pq, &s, &c, big, w, &wl_big, 1, 1, false, true);
+        let v_in_dst = enqueue_tiled_ntt(ctx, &s, &c, big, w, log_big, false, 1, 1, false, true);
         let v = if v_in_dst { c } else { s };
         // sum + canonicalize, single download of the stored (bit-reversed) chunk LDE.
         unsafe {
