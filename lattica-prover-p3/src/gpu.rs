@@ -32,6 +32,7 @@ use p3_matrix::util::reverse_matrix_index_bits;
 use p3_matrix::{Dimensions, Matrix};
 use p3_symmetric::{CryptographicHasher, MerkleCap, PseudoCompressionFunction};
 use rand_chacha::ChaCha20Rng;
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -530,16 +531,17 @@ impl Mmcs<Goldilocks> for GpuMerkleMmcs {
         assert!(inputs.iter().all(|m| m.height() == h), "GpuMerkleMmcs: matrices must be equal height");
         let total_w: usize = inputs.iter().map(|m| m.width()).sum();
         // combined[i] = concat of every matrix's logical row i (matrix order) — the leaf preimage.
+        // Parallel over rows (independent); the marshalling dominates the commit's CPU cost.
         let mut combined = vec![0u64; h * total_w];
-        for i in 0..h {
-            let mut off = i * total_w;
+        combined.par_chunks_mut(total_w).enumerate().for_each(|(i, row_buf)| {
+            let mut off = 0;
             for m in &inputs {
                 for v in m.row(i).expect("row < height") {
-                    combined[off] = v.as_canonical_u64();
+                    row_buf[off] = v.as_canonical_u64();
                     off += 1;
                 }
             }
-        }
+        });
         let layers = gpu_merkle_layers(&combined, h, total_w);
         let root = *layers.last().unwrap().first().unwrap();
         (root, GpuMerkleData { matrices: inputs, layers })
@@ -647,21 +649,23 @@ impl Mmcs<Goldilocks> for GpuHidingMerkleMmcs {
             inputs.iter().map(|_| RowMajorMatrix::rand(&mut *rng, h, 4).values).collect()
         };
         // combined[i] = concat over matrices of [mat_k row i ‖ salt_k row i] (p3's HorizontalPair order).
+        // Parallel over rows — this marshalling (materializing the wide LDE rows to canonical u64) is the
+        // dominant CPU cost of the quotient commit; each row is independent.
         let total_w: usize = inputs.iter().map(|m| m.width() + 4).sum();
         let mut combined = vec![0u64; h * total_w];
-        for i in 0..h {
-            let mut off = i * total_w;
+        combined.par_chunks_mut(total_w).enumerate().for_each(|(i, row_buf)| {
+            let mut off = 0;
             for (m, salt) in inputs.iter().zip(&salts) {
                 for v in m.row(i).expect("row < height") {
-                    combined[off] = v.as_canonical_u64();
+                    row_buf[off] = v.as_canonical_u64();
                     off += 1;
                 }
                 for c in 0..4 {
-                    combined[off] = salt[i * 4 + c].as_canonical_u64();
+                    row_buf[off] = salt[i * 4 + c].as_canonical_u64();
                     off += 1;
                 }
             }
-        }
+        });
         let (cap, layers) = gpu_merkle_cap(&combined, h, total_w, self.cap_height);
         (cap, GpuHidingData { matrices: inputs, salts, layers })
     }
@@ -1007,7 +1011,7 @@ mod tests {
         }
         let (ntt_ms, ntt_calls, mk_ms, mk_calls) = super::prof_report();
         let (q_ms, q_calls) = super::prof_report_quotient();
-        println!("join-split prove, HIDING/production (best of {runs}): CPU {cpu_ms:.1}ms | GPU(LDE+Merkle+quotient) {gpu_ms:.1}ms  ({:.2}x)", cpu_ms / gpu_ms);
-        println!("  GPU work across {runs} runs: NTT {ntt_ms:.0}ms / {ntt_calls} calls, Merkle {mk_ms:.0}ms / {mk_calls} commits, quotient {q_ms:.0}ms / {q_calls} calls");
+        println!("join-split prove, HIDING/production (best of {runs}): CPU {cpu_ms:.1}ms | GPU {gpu_ms:.1}ms  ({:.2}x)", cpu_ms / gpu_ms);
+        println!("  GPU work across {runs} runs: NTT {ntt_ms:.0}ms / {ntt_calls} calls, Merkle {mk_ms:.0}ms / {mk_calls} commits, quotient {q_ms:.0}ms / {q_calls} calls (0 = CPU-quotient production path)");
     }
 }

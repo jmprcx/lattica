@@ -36,10 +36,11 @@ rand = "0.10"
 rand_chacha = "0.10"
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
-# GPU-accelerated proving (opt-in): OpenCL DFT/LDE. Default build never pulls this.
+# GPU-accelerated proving (opt-in): OpenCL DFT/LDE. Default build never pulls these.
 ocl = { version = "0.19", optional = true }
+rayon = { version = "1", optional = true } # parallelize the GPU leaf-buffer marshalling
 
 [features]
 # Enable GPU (OpenCL) acceleration of the LDE. Additive + prove-only: the default CPU proving path,
 # the wire format, and the verifier are untouched. Requires an OpenCL runtime + a GPU at runtime.
-gpu = ["dep:ocl"]
+gpu = ["dep:ocl", "dep:rayon"]
