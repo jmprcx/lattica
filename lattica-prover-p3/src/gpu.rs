@@ -31,6 +31,7 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::util::reverse_matrix_index_bits;
 use p3_matrix::{Dimensions, Matrix};
 use p3_symmetric::{CryptographicHasher, MerkleCap, PseudoCompressionFunction};
+use rand_chacha::ChaCha20Rng;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -351,7 +352,6 @@ fn gpu_merkle_layers(combined: &[u64], h: usize, w: usize) -> Vec<Vec<[Goldilock
 /// (`digest_layers[num_layers-1-cap_height]`, `merkle_tree.rs::cap`); for a tree shorter than the cap
 /// (small FRI layers) the cap clamps to the leaf layer (`effective_cap_height = min(cap_height, depth)`).
 /// Returns the cap plus every layer (leaf..root) so `open_batch` can read sibling paths up to the cap.
-#[allow(dead_code)] // consumed by `GpuHidingMerkleMmcs` (next increment); currently only the H1 test.
 fn gpu_merkle_cap(
     combined: &[u64],
     h: usize,
@@ -456,6 +456,132 @@ impl Mmcs<Goldilocks> for GpuMerkleMmcs {
             idx >>= 1;
         }
         if &cur == commit {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// A GPU-backed **hiding** Merkle-tree `Mmcs`, byte-compatible with `MerkleTreeHidingMmcs<…, 2, 4, 4>`.
+///
+/// Like p3's hiding MMCS this is a salted wrapper over the plain Merkle tree: `commit` appends
+/// `SALT_ELEMS = 4` random columns to each matrix (`RowMajorMatrix::rand`, the same draw as p3 — a shared
+/// RNG seed reproduces p3's salts), builds the tree over the salted rows **on the GPU** (`gpu_merkle_cap`,
+/// reusing the bit-exact Poseidon2 kernels), and emits a `MerkleCap`. `open_batch` returns
+/// `(openings, (salts, siblings))` and `verify_batch` re-hashes `(opening ‖ salt)` and folds to the cap —
+/// the associated types (`MerkleCap<Val,[Val;4]>`, `(Vec<Vec<Val>>, Vec<[Val;4]>)`) are **identical** to
+/// `MerkleTreeHidingMmcs`, so a `Proof` produced under this MMCS serializes byte-identically and is
+/// accepted by the production verifier. Non-hiding note: equal-height matrices only (what the PCS commits).
+pub struct GpuHidingMerkleMmcs {
+    rng: std::sync::Mutex<ChaCha20Rng>,
+    hash: MyHash,
+    compress: MyCompress,
+    cap_height: usize,
+}
+
+impl GpuHidingMerkleMmcs {
+    /// Mirror of `MerkleTreeHidingMmcs::new(hash, compress, cap_height, rng)`.
+    pub fn new(hash: MyHash, compress: MyCompress, cap_height: usize, rng: ChaCha20Rng) -> Self {
+        Self { rng: std::sync::Mutex::new(rng), hash, compress, cap_height }
+    }
+}
+
+impl Clone for GpuHidingMerkleMmcs {
+    fn clone(&self) -> Self {
+        // Mirror hiding_mmcs.rs:79-91 — clone the inner rng under the lock.
+        Self {
+            rng: std::sync::Mutex::new(self.rng.lock().unwrap().clone()),
+            hash: self.hash.clone(),
+            compress: self.compress.clone(),
+            cap_height: self.cap_height,
+        }
+    }
+}
+
+/// Prover data: the committed matrices (unsalted, for opening), the per-matrix salt rows (flat `h×4`),
+/// and every tree layer (leaf..root) for sibling extraction.
+pub struct GpuHidingData<M> {
+    matrices: Vec<M>,
+    salts: Vec<Vec<Goldilocks>>,
+    layers: Vec<Vec<[Goldilocks; 4]>>,
+}
+
+impl Mmcs<Goldilocks> for GpuHidingMerkleMmcs {
+    type ProverData<M> = GpuHidingData<M>;
+    type Commitment = MerkleCap<Goldilocks, [Goldilocks; 4]>;
+    /// (salts, siblings) — identical to `MerkleTreeHidingMmcs::Proof`.
+    type Proof = (Vec<Vec<Goldilocks>>, Vec<[Goldilocks; 4]>);
+    type Error = ();
+
+    fn commit<M: Matrix<Goldilocks>>(&self, inputs: Vec<M>) -> (Self::Commitment, Self::ProverData<M>) {
+        let h = inputs[0].height();
+        assert!(h.is_power_of_two(), "GpuHidingMerkleMmcs: height {h} must be a power of two");
+        assert!(inputs.iter().all(|m| m.height() == h), "GpuHidingMerkleMmcs: matrices must be equal height");
+        // Salts: one 4-wide random matrix per input, drawn in input order — the exact p3 call
+        // (`RowMajorMatrix::rand(rng, h, SALT_ELEMS)` per matrix), so a shared seed reproduces p3's salts.
+        let salts: Vec<Vec<Goldilocks>> = {
+            let mut rng = self.rng.lock().unwrap();
+            inputs.iter().map(|_| RowMajorMatrix::rand(&mut *rng, h, 4).values).collect()
+        };
+        // combined[i] = concat over matrices of [mat_k row i ‖ salt_k row i] (p3's HorizontalPair order).
+        let total_w: usize = inputs.iter().map(|m| m.width() + 4).sum();
+        let mut combined = vec![0u64; h * total_w];
+        for i in 0..h {
+            let mut off = i * total_w;
+            for (m, salt) in inputs.iter().zip(&salts) {
+                for v in m.row(i).expect("row < height") {
+                    combined[off] = v.as_canonical_u64();
+                    off += 1;
+                }
+                for c in 0..4 {
+                    combined[off] = salt[i * 4 + c].as_canonical_u64();
+                    off += 1;
+                }
+            }
+        }
+        let (cap, layers) = gpu_merkle_cap(&combined, h, total_w, self.cap_height);
+        (cap, GpuHidingData { matrices: inputs, salts, layers })
+    }
+
+    fn open_batch<M: Matrix<Goldilocks>>(&self, index: usize, prover_data: &Self::ProverData<M>) -> BatchOpening<Goldilocks, Self> {
+        let openings: Vec<Vec<Goldilocks>> =
+            prover_data.matrices.iter().map(|m| m.row(index).expect("row < height").into_iter().collect()).collect();
+        let salts: Vec<Vec<Goldilocks>> = prover_data.salts.iter().map(|s| s[index * 4..index * 4 + 4].to_vec()).collect();
+        let num_layers = prover_data.layers.len();
+        let cap_idx = num_layers - 1 - self.cap_height.min(num_layers - 1);
+        let mut siblings = Vec::with_capacity(cap_idx);
+        let mut idx = index;
+        for layer in &prover_data.layers[..cap_idx] {
+            siblings.push(layer[idx ^ 1]);
+            idx >>= 1;
+        }
+        BatchOpening::new(openings, (salts, siblings))
+    }
+
+    fn get_matrices<'a, M: Matrix<Goldilocks>>(&self, prover_data: &'a Self::ProverData<M>) -> Vec<&'a M> {
+        prover_data.matrices.iter().collect()
+    }
+
+    fn verify_batch(
+        &self,
+        commit: &Self::Commitment,
+        _dimensions: &[Dimensions],
+        index: usize,
+        batch_opening: BatchOpeningRef<'_, Goldilocks, Self>,
+    ) -> Result<(), Self::Error> {
+        let (openings, proof) = batch_opening.unpack();
+        let (salts, siblings) = (&proof.0, &proof.1);
+        // leaf = hash of concat [opening_k ‖ salt_k] in matrix order (same as commit's `combined`).
+        let leaf_input = openings.iter().zip(salts.iter()).flat_map(|(o, s)| o.iter().chain(s.iter()).copied());
+        let mut cur: [Goldilocks; 4] = self.hash.hash_iter(leaf_input);
+        let mut idx = index;
+        for sib in siblings {
+            cur = if idx & 1 == 0 { self.compress.compress([cur, *sib]) } else { self.compress.compress([*sib, cur]) };
+            idx >>= 1;
+        }
+        // after folding to the cap layer, `idx` is the position within the cap.
+        if commit.roots().get(idx) == Some(&cur) {
             Ok(())
         } else {
             Err(())
@@ -623,6 +749,46 @@ mod tests {
                     j >>= 1;
                 }
                 assert_eq!(sib_cpu, sib_gpu, "siblings mismatch at h=2^{log_h} idx={idx}");
+            }
+        }
+    }
+
+    /// H2 GOLD-STANDARD gate: `GpuHidingMerkleMmcs` is byte-compatible with p3's `MerkleTreeHidingMmcs`.
+    /// Seed BOTH with the same `ChaCha20Rng` → identical salts → the GPU `MerkleCap` and the
+    /// `(salts, siblings)` proof are byte-identical to p3's; and the production CPU hiding verifier
+    /// ACCEPTS the GPU commit+opening. This proves byte-compatibility at the MMCS level before the FRI.
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU"]
+    fn gpu_hiding_mmcs_matches_p3() {
+        use p3_field::Field;
+        use p3_merkle_tree::MerkleTreeHidingMmcs;
+        type CpuHiding = MerkleTreeHidingMmcs<<Goldilocks as Field>::Packing, <Goldilocks as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
+        let perm = default_goldilocks_poseidon2_8();
+        let seed = 123u64;
+        let cpu = CpuHiding::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::seed_from_u64(seed));
+        let gpu = GpuHidingMerkleMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), 6, ChaCha20Rng::seed_from_u64(seed));
+        let mut rng = ChaCha20Rng::seed_from_u64(999);
+        for &(log_h, widths) in &[(7usize, &[1usize][..]), (8, &[2, 5]), (10, &[4]), (12, &[3, 3]), (16, &[7])] {
+            let h = 1usize << log_h;
+            let mats: Vec<RowMajorMatrix<Goldilocks>> = widths
+                .iter()
+                .map(|&w| RowMajorMatrix::new((0..h * w).map(|_| Goldilocks::new(rng.random::<u64>() % 0xFFFF_FFFF_0000_0001)).collect(), w))
+                .collect();
+            let dims: Vec<Dimensions> = mats.iter().map(|m| m.dimensions()).collect();
+            let (cap_cpu, data_cpu) = cpu.commit(mats.clone());
+            let (cap_gpu, data_gpu) = gpu.commit(mats.clone());
+            assert_eq!(cap_cpu.roots(), cap_gpu.roots(), "hiding cap mismatch at h=2^{log_h}");
+            for &idx in &[0usize, 1, h / 2, h - 1] {
+                let op_cpu = cpu.open_batch(idx, &data_cpu);
+                let op_gpu = gpu.open_batch(idx, &data_gpu);
+                assert_eq!(op_cpu.opened_values, op_gpu.opened_values, "openings mismatch h=2^{log_h} idx={idx}");
+                assert_eq!(op_cpu.opening_proof, op_gpu.opening_proof, "(salts,siblings) mismatch h=2^{log_h} idx={idx}");
+                // THE byte-compat proof: the production CPU hiding verifier accepts the GPU cap + opening.
+                let cpu_ref = BatchOpeningRef::<Goldilocks, CpuHiding>::new(&op_gpu.opened_values, &op_gpu.opening_proof);
+                assert!(cpu.verify_batch(&cap_gpu, &dims, idx, cpu_ref).is_ok(), "CPU verifier rejects GPU cap+opening h=2^{log_h} idx={idx}");
+                // and self-consistent: the GPU verifier accepts its own opening.
+                let gpu_ref = BatchOpeningRef::<Goldilocks, GpuHidingMerkleMmcs>::new(&op_gpu.opened_values, &op_gpu.opening_proof);
+                assert!(gpu.verify_batch(&cap_gpu, &dims, idx, gpu_ref).is_ok(), "GPU verifier rejects its own opening");
             }
         }
     }
