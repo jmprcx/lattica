@@ -44,6 +44,11 @@ rayon = { version = "1", optional = true } # parallelize the GPU leaf-buffer mar
 # Enable GPU (OpenCL) acceleration of the LDE. Additive + prove-only: the default CPU proving path,
 # the wire format, and the verifier are untouched. Requires an OpenCL runtime + a GPU at runtime.
 gpu = ["dep:ocl", "dep:rayon"]
+# Enable the RESEARCH in-circuit recursive STARK verifier (`src/recursion`: the monolith + aggregator). OFF by
+# default — it is NOT on any production path (zero of the 10 `lattica_*` externs reach it) and is NOT audited;
+# gating it out keeps the default staticlib to the frozen node seam. Its ~80 `#[ignore]` tests + the 2 monolith
+# constraint-fingerprint pins compile only under this feature. Run with `--features recursion`.
+recursion = []
 
 [profile.release]
 # Cross-crate inlining of p3's hot field-arithmetic / NTT / Poseidon2 loops (thin LTO + one codegen

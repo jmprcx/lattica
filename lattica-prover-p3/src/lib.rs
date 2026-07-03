@@ -13,6 +13,7 @@ pub mod batch_common; // shared batch machinery: MAX_BATCH_TILES, tile padding, 
 pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-split tiling + tx-root fold)
 pub mod batch_htlc_air; // batch aggregation for the v3 shielded-HTLC spend (mirrors batch_joinsplit_air)
 pub mod poseidon2_air;
+#[cfg(feature = "recursion")]
 pub mod recursion; // Phase B: recursive STARK verifier (B1 spike = in-circuit FRI Merkle-opening verifier)
 #[cfg(feature = "gpu")]
 pub mod gpu; // opt-in OpenCL LDE acceleration (additive, prove-only; --features gpu)
