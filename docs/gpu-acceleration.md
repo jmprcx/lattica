@@ -129,13 +129,22 @@ p3 has **no hand-vectorized Poseidon2** (the speedup is from packed field ops on
 round dependencies and the NTT's memory-bound nature); a server with AVX-512 would additionally use p3's
 8-lane `x86_64_avx512` path. **Runtime requirement:** x86_64 binaries now need a v3 CPU (2013+).
 
+### GPU kernel tuning (done + learned)
+
+- **NTT memory coalescing** (done): `ntt_stage` now uses `col` as the fast-varying thread index, so
+  adjacent threads touch contiguous global memory (was strided by `w`). Bit-exact; NTT ~82→~74 ms.
+- **Twiddle precompute** (tried, *reverted*): replacing the per-butterfly `gl_pow` with a master-table
+  lookup made the NTT *slower*. The NTT is **memory-bound** — `gl_pow` (pure compute) was hidden behind
+  memory latency, and a table lookup only adds global reads. Lesson: cut memory traffic, don't add it.
+- Also reverted earlier: parallelizing the LDE's host-side `u64` conversion (per-matrix `rayon` overhead
+  over the many small quotient-chunk / FRI-layer matrices made it slower).
+
 ### What's next
 
-- The remaining `commit_quotient` cost is the **quotient LDE + GPU leaf-hashing** (~5 M Poseidon2
-  permutations over the 16 wide chunks). A faster Poseidon2 kernel (shared-memory / fewer global-scratch
-  round-trips) is the next real lever; batching the per-chunk `coset_lde` calls into fewer GPU
-  round-trips may also help. (Note: parallelizing the LDE's host-side `u64` conversion was tried and
-  *reverted* — per-matrix `rayon` overhead over the many small quotient-chunk / FRI-layer matrices made
-  it slower.)
-- On-GPU trace persistence across LDE→quotient (would make the quotient offload pay off).
-- A `_prove_gpu` C-ABI entry for the node.
+- **NTT shared-memory tiling** — the one substantive GPU lever left. The NTT is memory-bound (global
+  butterflies every stage); local-memory sub-transforms cut the global passes (~74 → ~40 ms). A real
+  radix-N kernel rewrite that must stay bit-exact — a focused effort.
+- The Merkle **leaf-hashing** (the dominant GPU cost, ~110 ms) is *compute*-bound (~40 Poseidon2 perms per
+  wide quotient leaf) and already near-optimal — no cheap win there.
+- On-GPU trace persistence across LDE→Merkle→quotient (the structural win; also makes the quotient
+  offload pay off). A `_prove_gpu` C-ABI entry for the node.
