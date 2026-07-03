@@ -7,11 +7,14 @@
 //! deserializes and verifies under the standard config exactly like a CPU one — the DFT never appears
 //! in `verify` or in the serialized `Proof`.
 //!
-//! Correctness is validated bit-for-bit against p3 (see `gpu_dft_matches_p3` + the session's GPU
-//! pipeline): a radix-2 DIT NTT over Goldilocks (bit-reverse rows → `log h` butterfly stages), twiddle
-//! base per stage = `Goldilocks::two_adic_generator(s)` — p3's exact roots, so the evaluations are
-//! identical. Field arithmetic matches p3's `reduce128`/`add` (canonical only at the boundary; the
-//! serde encoding is canonical, so intermediate representation is irrelevant).
+//! Correctness is validated bit-for-bit against p3 (see `gpu_dft_matches_p3` /
+//! `gpu_coset_lde_matches_p3`): a radix-2 DIT NTT over Goldilocks, twiddle base per stage =
+//! `Goldilocks::two_adic_generator(s)` — p3's exact roots, so the evaluations are identical. The NTT is
+//! memory-bound, so stages run tiled in local memory (`ntt_tile`): ~8–11 stages per launch with the
+//! bit-reversal fused into the first load and the scale/canonicalize tails fused into the last store —
+//! 2–3 global round-trips total instead of one per stage. Field arithmetic matches p3's
+//! `reduce128`/`add` (canonical only at the boundary; the serde encoding is canonical, so intermediate
+//! representation is irrelevant).
 //!
 //! Runtime requirement: an OpenCL runtime + a GPU. The kernel program is compiled once per thread
 //! (cached), so per-DFT cost is just buffer transfer + the butterfly launches.
@@ -28,7 +31,6 @@ use p3_goldilocks::{
 };
 use p3_matrix::bitrev::{BitReversalPerm, BitReversedMatrixView};
 use p3_matrix::dense::RowMajorMatrix;
-use p3_matrix::util::reverse_matrix_index_bits;
 use p3_matrix::{Dimensions, Matrix};
 use p3_symmetric::{CryptographicHasher, MerkleCap, PseudoCompressionFunction};
 use rand_chacha::ChaCha20Rng;
@@ -81,25 +83,66 @@ inline ulong gl_canon(ulong c){ return (c>=GP)?(c-GP):c; }
 inline ulong gl_pow(ulong b,ulong e){ ulong r=1UL; while(e){ if(e&1UL)r=gl_mul(r,b); b=gl_mul(b,b); e>>=1;} return r; }
 inline uint brev(uint x, uint bits){ uint r=0; for(uint i=0;i<bits;i++){ r=(r<<1)|(x&1u); x>>=1; } return r; }
 
-__kernel void bitrev_rows(__global const ulong* in,__global ulong* out,const uint h,const uint w,const uint bits){
-  size_t gid=get_global_id(0); uint i=(uint)(gid/w),c=(uint)(gid%w); if(i>=h) return;
-  out[(size_t)i*w+c]=in[(size_t)brev(i,bits)*w+c];
+// ---- tiled NTT: radix-2 DIT, `lt` stages per kernel launch in local memory ----
+// The NTT is MEMORY-bound: one butterfly stage per launch means a full global round-trip per stage.
+// Here one workgroup owns a TILE=2^lt-row × C=2^log_c-column tile — rows r(t) = hi<<(s0+lt) | t<<s0 | lo
+// (t = 0..TILE) are exactly the rows whose stage-(s0+1 ..= s0+lt) butterflies interconnect (those stages
+// pair rows differing in bits [s0, s0+lt)) — for C consecutive columns (coalesced global runs). It loads
+// the tile once, runs the `lt` stages against local memory (barrier between stages), and stores once:
+// ONE global round-trip for `lt` stages. The twiddle for stage s = s0+k at row r, j = r mod 2^(s-1),
+// splits as w_s^j = w_s^lo · w_k^(t mod 2^(k-1)) — p3's generators form one squaring chain
+// (gen(s)^(2^s0) = gen(s-s0), forward and inverse alike), so the per-stage generators `wlens` suffice;
+// no twiddle table (a table would ADD memory traffic; gl_pow is compute, hidden behind the loads).
+// fuse_bitrev (first group only, s0 = 0): load from bit-reversed source rows, fusing the bit-reversal
+// pass — requires in != out. store_brev (last group of a forward NTT): store row r to row brev(r),
+// emitting the matrix directly in p3's bit-reversed storage order (kills the CPU re-permutation pass);
+// scattered stores land outside the workgroup's own rows, so it too requires in != out. Groups with
+// neither flag pass in == out (in-place is safe: a workgroup touches only its own rows). The store also
+// fuses the elementwise tails so they cost no extra pass:
+//   out = canon?(x · post_c · post_b^row)   — post_c = post_b = 1, do_canon = 0 for a plain store;
+// the iDFT's last group passes post_c = 1/h, post_b = coset shift; a forward NTT's last group canons.
+__kernel void ntt_tile(__global const ulong* in,__global ulong* out,const uint w,const uint h,
+                       const uint s0,const uint lt,const uint log_c,const uint fuse_bitrev,
+                       const uint log_h,const uint do_canon,const uint store_brev,
+                       const ulong post_c,const ulong post_b,
+                       __global const ulong* wlens,__local ulong* tile){
+  const uint C=1u<<log_c, lid=get_local_id(0), wg=get_local_size(0);
+  const uint tiles=h>>lt, g=(uint)get_group_id(0);
+  const uint tidx=g%tiles, cg=g/tiles;
+  const uint lo=tidx&((1u<<s0)-1u), hi=tidx>>s0;
+  const uint row0=(hi<<(s0+lt))|lo, col0=cg<<log_c;
+  const uint n_el=(1u<<lt)<<log_c;
+  for(uint e=lid;e<n_el;e+=wg){
+    uint t=e>>log_c, col=col0+(e&(C-1u));
+    uint r=row0+(t<<s0);
+    uint sr=fuse_bitrev?brev(r,log_h):r;
+    tile[e]=(col<w)?in[(size_t)sr*w+col]:0UL;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for(uint k=1;k<=lt;k++){
+    uint hl=1u<<(k-1u);
+    ulong outer=gl_pow(wlens[s0+k-1u],(ulong)lo);
+    for(uint b=lid;b<(n_el>>1);b+=wg){
+      uint t2=b>>log_c, lc=b&(C-1u);
+      uint j=t2&(hl-1u);
+      uint tl=((((t2>>(k-1u))<<k)|j)<<log_c)|lc, th=tl+(hl<<log_c);
+      ulong tw=gl_mul(outer,gl_pow(wlens[k-1u],(ulong)j));
+      ulong u=tile[tl], v=gl_mul(tile[th],tw);
+      tile[tl]=gl_add(u,v); tile[th]=gl_sub(u,v);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  for(uint e=lid;e<n_el;e+=wg){
+    uint t=e>>log_c, col=col0+(e&(C-1u));
+    if(col<w){
+      uint r=row0+(t<<s0);
+      ulong x=tile[e];
+      if(post_c!=1UL||post_b!=1UL) x=gl_mul(x,gl_mul(post_c,gl_pow(post_b,(ulong)r)));
+      uint orow=store_brev?brev(r,log_h):r;
+      out[(size_t)orow*w+col]=do_canon?gl_canon(x):x;
+    }
+  }
 }
-// one thread per butterfly per column; nb = h/2 butterflies per column. `col` is the fast-varying thread
-// index so adjacent threads touch adjacent columns (contiguous global memory → coalesced loads/stores);
-// the per-butterfly computation is unchanged.
-__kernel void ntt_stage(__global ulong* a,const uint w,const uint h,const uint half_len,const ulong wlen){
-  size_t t=get_global_id(0); uint nb=h>>1; uint bfly=(uint)(t/w), col=(uint)(t%w); if(bfly>=nb) return;
-  uint block=bfly/half_len, j=bfly%half_len; uint i=block*(half_len<<1)+j;
-  ulong tw=gl_pow(wlen,(ulong)j);
-  size_t iu=(size_t)i*w+col, iv=(size_t)(i+half_len)*w+col;
-  ulong u=a[iu], v=gl_mul(a[iv],tw);
-  a[iu]=gl_add(u,v); a[iv]=gl_sub(u,v);
-}
-__kernel void canon(__global ulong* a,const uint n){ size_t i=get_global_id(0); if(i<n) a[i]=gl_canon(a[i]); }
-// scale every element by the base-field scalar `s`.
-__kernel void scale_const(__global ulong* a,const uint n,const ulong s){ size_t i=get_global_id(0); if(i<n) a[i]=gl_mul(a[i],s); }
-// coset shift: row k (k<h) *= base^k; used to turn an inner-domain iDFT into a coset evaluation.
 // ---- Poseidon2-Goldilocks width-8 (matches p3 `default_goldilocks_poseidon2_8`) ----
 inline ulong gl_pow7(ulong x){ ulong x2=gl_mul(x,x); ulong x3=gl_mul(x2,x); ulong x4=gl_mul(x2,x2); return gl_mul(x4,x3); }
 // apply_mat4 on x[0..4] (p3 external.rs; order matters — overwrite 0/2 after 1/3).
@@ -149,10 +192,6 @@ __kernel void compress_layer(__global const ulong* in,__global ulong* out,const 
   perm8(s,rci,rcp,rcf,diag);
   for(int k=0;k<4;k++) out[(size_t)j*4+k]=gl_canon(s[k]);
 }
-__kernel void scale_pow(__global ulong* a,const uint w,const uint h,const ulong base){
-  size_t gid=get_global_id(0); uint k=(uint)(gid/w),c=(uint)(gid%w); if(k>=h) return;
-  a[(size_t)k*w+c]=gl_mul(a[(size_t)k*w+c], gl_pow(base,(ulong)k));
-}
 // Quotient evaluator: one thread per row (grid-stride over `qsize`). Interpret the flattened constraint
 // DAG (`op_*`/`consts`/`roots`) into per-node scratch `v`, then fold the constraint roots with the F_p^2
 // alpha powers (`alpha0`/`alpha1`) and scale by inv_vanishing → the two base coeffs of the F_p^2 quotient.
@@ -196,52 +235,229 @@ __kernel void quotient(
 }
 "#;
 
-thread_local! {
-    /// The compiled OpenCL program, built once per thread (kernel compilation is the expensive part).
-    static PROQUE: RefCell<Option<ProQue>> = const { RefCell::new(None) };
+/// Pinned staging window size in u64 elements (8 Mi × 8 B = 64 MiB). Transfers chunk through it.
+const STAGING_LEN: usize = 8 << 20;
+
+/// Thread-local GPU state: the compiled program (compilation is the expensive part) plus reusable
+/// buffers — two device scratch buffers grown to the largest size seen, and a persistently mapped
+/// **pinned** host staging window (`CL_MEM_ALLOC_HOST_PTR` + map, the standard OpenCL pinned-transfer
+/// pattern). Every upload/download memcpys through the window so the PCIe DMA runs at full speed;
+/// transferring straight to/from pageable `Vec` memory makes the driver stage it internally at
+/// ~3–6 GB/s, which profiling showed was the dominant cost of the GPU NTT path (~47 of ~79 ms/proof).
+struct GpuCtx {
+    pq: ProQue,
+    dev: [Option<ocl::Buffer<u64>>; 2],
+    /// Kept alive so the mapping stays valid for `staging_map`'s lifetime.
+    _staging_buf: Option<ocl::Buffer<u64>>,
+    staging_map: Option<ocl::MemMap<u64>>,
 }
 
-fn with_proque<R>(f: impl FnOnce(&ProQue) -> R) -> R {
-    PROQUE.with(|cell| {
-        if cell.borrow().is_none() {
+thread_local! {
+    static GPU_CTX: RefCell<Option<GpuCtx>> = const { RefCell::new(None) };
+}
+
+fn with_ctx<R>(f: impl FnOnce(&mut GpuCtx) -> R) -> R {
+    GPU_CTX.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let ctx = opt.get_or_insert_with(|| {
             let pq = ProQue::builder()
                 .src(KERNEL_SRC)
                 .dims(1)
                 .build()
                 .expect("GpuDft: OpenCL program build failed (is an OpenCL runtime + GPU present?)");
-            *cell.borrow_mut() = Some(pq);
-        }
-        f(cell.borrow().as_ref().unwrap())
+            GpuCtx { pq, dev: [None, None], _staging_buf: None, staging_map: None }
+        });
+        f(ctx)
     })
 }
 
-/// Run the radix-2 DIT NTT on the GPU: bit-reverse rows, then `log_h` butterfly stages, then
-/// canonicalize. Returns evaluations in **natural** row order (matching p3's `dft_batch` logical order).
+/// Compatibility shim for call sites that only need the compiled program.
+fn with_proque<R>(f: impl FnOnce(&ProQue) -> R) -> R {
+    with_ctx(|ctx| f(&ctx.pq))
+}
+
+impl GpuCtx {
+    /// Device scratch buffer for `slot`, at least `n` elements — grown geometrically, reused across
+    /// calls (buffer churn is avoidable overhead on every NTT/commit).
+    fn dev_buf(&mut self, slot: usize, n: usize) -> ocl::Buffer<u64> {
+        if self.dev[slot].as_ref().is_none_or(|b| b.len() < n) {
+            self.dev[slot] = Some(
+                ocl::Buffer::<u64>::builder()
+                    .queue(self.pq.queue().clone())
+                    .flags(ocl::flags::MEM_READ_WRITE)
+                    .len(n.next_power_of_two())
+                    .build()
+                    .unwrap(),
+            );
+        }
+        self.dev[slot].as_ref().unwrap().clone()
+    }
+
+    /// The persistently mapped pinned staging window.
+    fn staging(&mut self) -> &mut ocl::MemMap<u64> {
+        if self.staging_map.is_none() {
+            let buf = ocl::Buffer::<u64>::builder()
+                .queue(self.pq.queue().clone())
+                .flags(ocl::flags::MEM_ALLOC_HOST_PTR | ocl::flags::MEM_READ_WRITE)
+                .len(STAGING_LEN)
+                .build()
+                .unwrap();
+            // SAFETY: the single persistent mapping per thread-local context; access is serialized by
+            // the in-order queue and the blocking transfer calls below.
+            let map = unsafe {
+                buf.map().flags(ocl::flags::MAP_READ | ocl::flags::MAP_WRITE).len(STAGING_LEN).enq().unwrap()
+            };
+            self._staging_buf = Some(buf);
+            self.staging_map = Some(map);
+        }
+        self.staging_map.as_mut().unwrap()
+    }
+
+    /// Blocking upload of `data` into `dst[0..data.len()]`, chunked through the pinned window.
+    /// The copy into the window is parallel — a single-threaded memcpy (and its page faults) costs
+    /// more than the PCIe DMA itself at these sizes.
+    fn upload(&mut self, dst: &ocl::Buffer<u64>, data: &[u64]) {
+        let map = self.staging();
+        for (ci, chunk) in data.chunks(STAGING_LEN).enumerate() {
+            map[..chunk.len()]
+                .par_chunks_mut(1 << 18)
+                .zip(chunk.par_chunks(1 << 18))
+                .for_each(|(d, s)| d.copy_from_slice(s));
+            dst.cmd().offset(ci * STAGING_LEN).write(&map[..chunk.len()]).enq().unwrap();
+        }
+    }
+
+    /// Blocking upload of `rows` logical rows (`row_w` u64s each) into `dst`, marshalling each row
+    /// directly into the pinned window via `fill(row, buf)` — parallel over rows, no intermediate
+    /// host-side Vec. This is the Merkle leaf-buffer path (its input is the widest data we move).
+    fn upload_rows(&mut self, dst: &ocl::Buffer<u64>, rows: usize, row_w: usize, fill: impl Fn(usize, &mut [u64]) + Sync) {
+        let rows_per_chunk = (STAGING_LEN / row_w).max(1);
+        let map = self.staging();
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let nr = rows_per_chunk.min(rows - r0);
+            map[..nr * row_w].par_chunks_mut(row_w).enumerate().for_each(|(i, buf)| fill(r0 + i, buf));
+            dst.cmd().offset(r0 * row_w).write(&map[..nr * row_w]).enq().unwrap();
+            r0 += nr;
+        }
+    }
+
+    /// Blocking download of `src[0..n]` into a fresh Vec, chunked through the pinned window. The
+    /// copy out of the window is parallel (rayon writes the uninitialized spare directly): the fresh
+    /// Vec's pages are cold, and single-threaded fault-and-copy costs several × the DMA itself.
+    fn download(&mut self, src: &ocl::Buffer<u64>, n: usize) -> Vec<u64> {
+        let mut out = Vec::<u64>::with_capacity(n);
+        let map = self.staging();
+        let mut off = 0usize;
+        while off < n {
+            let len = STAGING_LEN.min(n - off);
+            src.cmd().offset(off).read(&mut map[..len]).enq().unwrap();
+            out.par_extend(map[..len].par_iter().copied());
+            off += len;
+        }
+        out
+    }
+}
+
+/// Enqueue a full tiled NTT (see the `ntt_tile` kernel): even-split the `log_h = wlens.len()` stages
+/// into groups of ≤ `12 − log_c` stages (tile = 2^lt rows × 2^log_c columns ≤ 32 KiB local memory).
+/// Group 1 loads via fused bit-reversal from `src` into `dst` (distinct buffers required); middle
+/// groups run in-place on `dst`. The last group fuses the elementwise tail `x · post_c · post_b^row`
+/// (pass 1, 1 for none) and, if `do_canon`, canonicalization. With `store_brev` the last group also
+/// stores rows bit-reversed — p3's storage order — which forces it out-of-place: it then writes back
+/// into `src`, and the function returns the buffer holding the result (`true` = `dst`).
+/// `wlens[s-1]` = the stage-`s` twiddle generator (forward or inverse); its length = the transform size.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_tiled_ntt(
+    pq: &ProQue,
+    src: &ocl::Buffer<u64>,
+    dst: &ocl::Buffer<u64>,
+    h: usize,
+    w: usize,
+    wlens: &[u64],
+    post_c: u64,
+    post_b: u64,
+    do_canon: bool,
+    store_brev: bool,
+) -> bool {
+    let log_h = wlens.len();
+    debug_assert_eq!(1usize << log_h, h, "wlens must hold one generator per stage");
+    let wlens_buf = ocl::Buffer::<u64>::builder()
+        .queue(pq.queue().clone())
+        .flags(ocl::flags::MEM_READ_ONLY | ocl::flags::MEM_COPY_HOST_PTR)
+        .len(wlens.len())
+        .copy_host_slice(wlens)
+        .build()
+        .unwrap();
+    // C = columns per tile: wide enough for coalesced runs, capped by the matrix width (w=2 quotient
+    // chunks waste no lanes) and at 16 (128-byte runs). Tile budget: 2^(lt+log_c) u64 = 32 KiB.
+    let log_c = (w.next_power_of_two().trailing_zeros() as usize).min(4);
+    let lt_cap = (12 - log_c).min(log_h);
+    let n_groups = log_h.div_ceil(lt_cap);
+    let (base, rem) = (log_h / n_groups, log_h % n_groups);
+    let mut s0 = 0usize;
+    let mut result_in_dst = true;
+    for gi in 0..n_groups {
+        let lt = base + usize::from(gi < rem);
+        let n_el = 1usize << (lt + log_c);
+        let wg = (n_el / 2).clamp(32, 256);
+        let n_wgs = (h >> lt) * w.div_ceil(1 << log_c);
+        let last = gi + 1 == n_groups;
+        // Buffer choreography: group 1 reads `src` (fused bit-reversal ⇒ out-of-place); a store_brev
+        // last group scatters rows ⇒ out-of-place too, bouncing back into `src` unless it IS group 1.
+        let (inb, outb) = match (gi == 0, last && store_brev) {
+            (true, _) => (src, dst),
+            (false, true) => (dst, src),
+            (false, false) => (dst, dst),
+        };
+        if last {
+            result_in_dst = std::ptr::eq(outb, dst);
+        }
+        unsafe {
+            pq.kernel_builder("ntt_tile")
+                .arg(inb)
+                .arg(outb)
+                .arg(w as u32)
+                .arg(h as u32)
+                .arg(s0 as u32)
+                .arg(lt as u32)
+                .arg(log_c as u32)
+                .arg(u32::from(gi == 0))
+                .arg(log_h as u32)
+                .arg(u32::from(last && do_canon))
+                .arg(u32::from(last && store_brev))
+                .arg(if last { post_c } else { 1u64 })
+                .arg(if last { post_b } else { 1u64 })
+                .arg(&wlens_buf)
+                .arg_local::<u64>(n_el)
+                .global_work_size(n_wgs * wg)
+                .local_work_size(wg)
+                .build()
+                .unwrap()
+                .enq()
+                .unwrap();
+        }
+        s0 += lt;
+    }
+    result_in_dst
+}
+
+/// Run the radix-2 DIT NTT on the GPU (tiled; bit-reversal fused into the first group's load,
+/// canonicalization into the last group's store). Returns evaluations in **bit-reversed** row order —
+/// p3's storage order, ready to wrap in `BitReversalPerm::new_view` with no CPU re-permutation.
 fn gpu_ntt(coeffs: &[u64], h: usize, w: usize, log_h: usize) -> Vec<u64> {
     let _t0 = std::time::Instant::now();
     let n = h * w;
     let wlens: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
-    with_proque(|pq| {
-        let cb = ocl::Buffer::<u64>::builder()
-            .queue(pq.queue().clone())
-            .flags(ocl::flags::MEM_READ_ONLY | ocl::flags::MEM_COPY_HOST_PTR)
-            .len(n)
-            .copy_host_slice(coeffs)
-            .build()
-            .unwrap();
-        let ab = ocl::Buffer::<u64>::builder().queue(pq.queue().clone()).flags(ocl::flags::MEM_READ_WRITE).len(n).build().unwrap();
-        unsafe {
-            pq.kernel_builder("bitrev_rows").arg(&cb).arg(&ab).arg(h as u32).arg(w as u32).arg(log_h as u32)
-                .global_work_size(n).build().unwrap().enq().unwrap();
-            for s in 1..=log_h {
-                let half = 1u32 << (s - 1);
-                pq.kernel_builder("ntt_stage").arg(&ab).arg(w as u32).arg(h as u32).arg(half).arg(wlens[s - 1])
-                    .global_work_size((h / 2) * w).build().unwrap().enq().unwrap();
-            }
-            pq.kernel_builder("canon").arg(&ab).arg(n as u32).global_work_size(n).build().unwrap().enq().unwrap();
+    with_ctx(|ctx| {
+        let cb = ctx.dev_buf(0, n);
+        let ab = ctx.dev_buf(1, n);
+        ctx.upload(&cb, coeffs);
+        let in_dst = enqueue_tiled_ntt(&ctx.pq, &cb, &ab, h, w, &wlens, 1, 1, true, true);
+        let out = ctx.download(if in_dst { &ab } else { &cb }, n);
+        if std::env::var_os("LATTICA_GPU_PROF").is_some() {
+            eprintln!("ntt h={h} w={w}: total {:.3}ms", _t0.elapsed().as_secs_f64() * 1e3);
         }
-        let mut out = vec![0u64; n];
-        ab.read(&mut out).enq().unwrap();
         NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         NTT_CALLS.fetch_add(1, Ordering::Relaxed);
         out
@@ -249,51 +465,67 @@ fn gpu_ntt(coeffs: &[u64], h: usize, w: usize, log_h: usize) -> Vec<u64> {
 }
 
 /// Full coset-LDE on the GPU, **device-side** (one upload + one download): iDFT → coset-scale +
-/// zero-pad → forward NTT on `shift·K` (|K| = `h << added_bits`). Returns evaluations in NATURAL row
-/// order (matching p3's `coset_lde_batch` logical order). This is what `TwoAdicFriPcs` actually calls;
-/// keeping the two NTTs + the coset shift on-device eliminates the host round-trips (and the CPU
-/// reverse/scale/coset-shift) of the trait's default composition — the LDE's dominant overhead.
-fn gpu_coset_lde_natural(evals: &[u64], h: usize, w: usize, added_bits: usize, shift: u64) -> Vec<u64> {
+/// zero-pad → forward NTT on `shift·K` (|K| = `h << added_bits`). Returns evaluations in
+/// **bit-reversed** row order — p3's storage order, ready to wrap in `BitReversalPerm::new_view`.
+/// This is what `TwoAdicFriPcs` actually calls; keeping the two NTTs + the coset shift on-device
+/// eliminates the host round-trips (and the CPU reverse/scale/coset-shift) of the trait's default
+/// composition — the LDE's dominant overhead.
+fn gpu_coset_lde_bitrev(evals: &[u64], h: usize, w: usize, added_bits: usize, shift: u64) -> Vec<u64> {
     let _t0 = std::time::Instant::now();
     let log_h = h.trailing_zeros() as usize;
     let big = h << added_bits;
     let log_big = log_h + added_bits;
-    let (n_small, n_big) = (h * w, big * w);
+    let n_big = big * w;
     // iDFT twiddles per stage = two_adic_generator(s).inverse(); forward (big) twiddles = generator(s).
     let wl_inv: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).inverse().as_canonical_u64()).collect();
     let wl_big: Vec<u64> = (1..=log_big).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
     let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
-    with_proque(|pq| {
-        let mk = || ocl::Buffer::<u64>::builder().queue(pq.queue().clone()).flags(ocl::flags::MEM_READ_WRITE).len(n_big).build().unwrap();
-        let a = mk();
-        let b = mk();
-        unsafe {
-            // Only `b` needs zeroing: its tail `b[n_small..]` is the forward NTT's zero-pad (read at the
-            // second bitrev). `a` needs none — `a[0..n_small]` is overwritten by `write(evals)` and
-            // `a[n_small..]` is never read before the forward NTT overwrites all of `a`.
-            b.cmd().fill(0u64, None).enq().unwrap();
-            a.write(evals).enq().unwrap(); // a[0..n_small] = input evals
-            // --- iDFT on the first h rows: bitrev(a[0..hw]) -> b, inverse-twiddle stages, scale 1/h ---
-            pq.kernel_builder("bitrev_rows").arg(&a).arg(&b).arg(h as u32).arg(w as u32).arg(log_h as u32).global_work_size(n_small).build().unwrap().enq().unwrap();
-            for s in 1..=log_h {
-                pq.kernel_builder("ntt_stage").arg(&b).arg(w as u32).arg(h as u32).arg(1u32 << (s - 1)).arg(wl_inv[s - 1]).global_work_size((h / 2) * w).build().unwrap().enq().unwrap();
-            }
-            pq.kernel_builder("scale_const").arg(&b).arg(n_small as u32).arg(h_inv).global_work_size(n_small).build().unwrap().enq().unwrap();
-            // --- coset shift: b[k] *= shift^k (k<h); b[hw..] stays 0 (the zero-pad) ---
-            pq.kernel_builder("scale_pow").arg(&b).arg(w as u32).arg(h as u32).arg(shift).global_work_size(n_small).build().unwrap().enq().unwrap();
-            // --- forward NTT of size `big` on b: bitrev(b, log_big) -> a, forward stages, canon ---
-            pq.kernel_builder("bitrev_rows").arg(&b).arg(&a).arg(big as u32).arg(w as u32).arg(log_big as u32).global_work_size(n_big).build().unwrap().enq().unwrap();
-            for s in 1..=log_big {
-                pq.kernel_builder("ntt_stage").arg(&a).arg(w as u32).arg(big as u32).arg(1u32 << (s - 1)).arg(wl_big[s - 1]).global_work_size((big / 2) * w).build().unwrap().enq().unwrap();
-            }
-            pq.kernel_builder("canon").arg(&a).arg(n_big as u32).global_work_size(n_big).build().unwrap().enq().unwrap();
+    let prof = std::env::var_os("LATTICA_GPU_PROF").is_some();
+    with_ctx(|ctx| {
+        let mut last_tick = std::time::Instant::now();
+        let a = ctx.dev_buf(0, n_big);
+        let b = ctx.dev_buf(1, n_big);
+        // Only `b` needs zeroing (rows h..big are the forward NTT's zero-pad, read at its fused
+        // bit-reversal): the first h·w elements of `a` are overwritten by the upload and the rest of
+        // `a` is never read before the forward NTT overwrites all of it.
+        b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+        ctx.upload(&a, evals); // a[0..h·w] = input evals
+        if prof {
+            ctx.pq.queue().finish().unwrap();
+            eprintln!("lde h={h} w={w} big={big}: fill+upload {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
+            last_tick = std::time::Instant::now();
         }
-        let mut out = vec![0u64; n_big];
-        a.read(&mut out).enq().unwrap();
+        // iDFT on the first h rows (a → b), the last group fusing scale-by-1/h + coset shift^row;
+        // rows ≥ h of `b` stay 0 (the zero-pad).
+        enqueue_tiled_ntt(&ctx.pq, &a, &b, h, w, &wl_inv, h_inv, shift, false, false);
+        // forward NTT of size `big` (b → a…, reading the zero-pad through the fused bit-reversal),
+        // canonicalized + stored bit-reversed by the last group (which bounces back into `b` when
+        // there are ≥ 2 groups).
+        let in_dst = enqueue_tiled_ntt(&ctx.pq, &b, &a, big, w, &wl_big, 1, 1, true, true);
+        if prof {
+            ctx.pq.queue().finish().unwrap();
+            eprintln!("  kernels {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
+            last_tick = std::time::Instant::now();
+        }
+        let out = ctx.download(if in_dst { &a } else { &b }, n_big);
+        if prof {
+            eprintln!("  download {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
+        }
         NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         NTT_CALLS.fetch_add(1, Ordering::Relaxed);
         out
     })
+}
+
+/// Canonical-u64 conversion of a field slice — parallel above ~4 MiB (the per-matrix rayon overhead
+/// loses on the many small quotient-chunk/FRI-layer matrices, but the full-size randomization
+/// matrices the hiding PCS feeds `dft_batch` are 6+ MiB of mostly-cold pages).
+fn to_u64s(vals: &[Goldilocks]) -> Vec<u64> {
+    if vals.len() >= (1 << 19) {
+        vals.par_iter().map(|f| f.as_canonical_u64()).collect()
+    } else {
+        vals.iter().map(|f| f.as_canonical_u64()).collect()
+    }
 }
 
 /// A GPU-backed two-adic DFT: a drop-in for `Radix2DitParallel` in the PCS's `Dft` slot.
@@ -306,34 +538,31 @@ impl TwoAdicSubgroupDft<Goldilocks> for GpuDft {
     fn dft_batch(&self, mat: RowMajorMatrix<Goldilocks>) -> Self::Evaluations {
         let (h, w) = (mat.height(), mat.width());
         // Match Radix2DitParallel::dft_batch: logical order = natural DFT, stored = bit-reversed.
-        let evals = if h <= 1 {
+        // The GPU emits the bit-reversed storage order directly (store_brev), so no CPU permutation.
+        let stored = if h <= 1 {
             mat.values.iter().map(|f| f.as_canonical_u64()).collect::<Vec<u64>>()
         } else {
             let log_h = h.trailing_zeros() as usize;
-            let coeffs: Vec<u64> = mat.values.iter().map(|f| f.as_canonical_u64()).collect();
+            let coeffs = to_u64s(&mat.values);
             gpu_ntt(&coeffs, h, w, log_h)
         };
-        let mut stored = RowMajorMatrix::new(evals.into_iter().map(Goldilocks::new).collect(), w);
-        reverse_matrix_index_bits(&mut stored); // stored = bit-reverse(natural) ⇒ view = natural
-        BitReversalPerm::new_view(stored)
+        BitReversalPerm::new_view(RowMajorMatrix::new(stored.into_iter().map(Goldilocks::new).collect(), w))
     }
 
-    /// Override the trait default: do the whole coset-LDE device-side (see `gpu_coset_lde_natural`),
+    /// Override the trait default: do the whole coset-LDE device-side (see `gpu_coset_lde_bitrev`),
     /// which is what the PCS calls to commit. Bit-identical to `Radix2DitParallel::coset_lde_batch`.
     fn coset_lde_batch(&self, mat: RowMajorMatrix<Goldilocks>, added_bits: usize, shift: Goldilocks) -> Self::Evaluations {
         let (h, w) = (mat.height(), mat.width());
         let big = h << added_bits;
-        let natural: Vec<u64> = if h < 2 {
+        let stored: Vec<u64> = if h < 2 {
             // degree-<1 (constant) poly ⇒ the same value at every coset point; replicate the single row.
             let row: Vec<u64> = (0..w).map(|c| mat.values.get(c).map(|f| f.as_canonical_u64()).unwrap_or(0)).collect();
             (0..big).flat_map(|_| row.clone()).collect()
         } else {
-            let evals: Vec<u64> = mat.values.iter().map(|f| f.as_canonical_u64()).collect();
-            gpu_coset_lde_natural(&evals, h, w, added_bits, shift.as_canonical_u64())
+            let evals = to_u64s(&mat.values);
+            gpu_coset_lde_bitrev(&evals, h, w, added_bits, shift.as_canonical_u64())
         };
-        let mut stored = RowMajorMatrix::new(natural.into_iter().map(Goldilocks::new).collect(), w);
-        reverse_matrix_index_bits(&mut stored);
-        BitReversalPerm::new_view(stored)
+        BitReversalPerm::new_view(RowMajorMatrix::new(stored.into_iter().map(Goldilocks::new).collect(), w))
     }
 }
 
@@ -352,13 +581,18 @@ fn poseidon2_consts() -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
 }
 
 /// Build the whole Merkle tree on the GPU: leaf-hash the `h` rows of the row-major (canonical) `h×w`
-/// `combined` matrix (Poseidon2 sponge), then compress pairwise up to the root. Returns every layer
-/// (layer 0 = leaves, last = `[root]`), digests canonical. `h` must be a power of two.
-fn gpu_merkle_layers(combined: &[u64], h: usize, w: usize) -> Vec<Vec<[Goldilocks; 4]>> {
+/// leaf matrix (Poseidon2 sponge), then compress pairwise up to the root. The leaf matrix is produced
+/// row-by-row by `fill(row, buf)` (parallel over rows) and marshalled straight into the pinned staging
+/// window — the leaf input is by far the widest data we move (the 16-chunk quotient commit's is
+/// ~170 MB), so it never materializes host-side. Returns every layer (layer 0 = leaves, last =
+/// `[root]`), digests canonical. `h` must be a power of two.
+fn gpu_merkle_layers_rows(h: usize, w: usize, fill: impl Fn(usize, &mut [u64]) + Sync) -> Vec<Vec<[Goldilocks; 4]>> {
     let _t0 = std::time::Instant::now();
     let (rci, rcp, rcf, diag) = poseidon2_consts();
-    let out = with_proque(|pq| {
-        let q = pq.queue().clone();
+    let out = with_ctx(|ctx| {
+        let inb = ctx.dev_buf(0, h * w);
+        ctx.upload_rows(&inb, h, w, fill);
+        let q = ctx.pq.queue().clone();
         let ro = |data: &[u64]| {
             ocl::Buffer::<u64>::builder()
                 .queue(q.clone())
@@ -369,28 +603,28 @@ fn gpu_merkle_layers(combined: &[u64], h: usize, w: usize) -> Vec<Vec<[Goldilock
                 .unwrap()
         };
         let rw = |n: usize| ocl::Buffer::<u64>::builder().queue(q.clone()).flags(ocl::flags::MEM_READ_WRITE).len(n).build().unwrap();
-        let (inb, rci_b, rcp_b, rcf_b, diag_b) = (ro(combined), ro(&rci), ro(&rcp), ro(&rcf), ro(&diag));
-        let read_layer = |buf: &ocl::Buffer<u64>, n: usize| -> Vec<[Goldilocks; 4]> {
-            let mut raw = vec![0u64; n * 4];
-            buf.read(&mut raw).enq().unwrap();
-            raw.chunks_exact(4).map(|c| [Goldilocks::new(c[0]), Goldilocks::new(c[1]), Goldilocks::new(c[2]), Goldilocks::new(c[3])]).collect()
-        };
+        let (rci_b, rcp_b, rcf_b, diag_b) = (ro(&rci), ro(&rcp), ro(&rcf), ro(&diag));
         let leaves = rw(h * 4);
         unsafe {
-            pq.kernel_builder("leaf_hash").arg(&inb).arg(&leaves).arg(h as u32).arg(w as u32)
+            ctx.pq.kernel_builder("leaf_hash").arg(&inb).arg(&leaves).arg(h as u32).arg(w as u32)
                 .arg(&rci_b).arg(&rcp_b).arg(&rcf_b).arg(&diag_b).global_work_size(h).build().unwrap().enq().unwrap();
         }
-        let mut layers = vec![read_layer(&leaves, h)];
+        let to_digests = |raw: Vec<u64>| -> Vec<[Goldilocks; 4]> {
+            raw.chunks_exact(4).map(|c| [Goldilocks::new(c[0]), Goldilocks::new(c[1]), Goldilocks::new(c[2]), Goldilocks::new(c[3])]).collect()
+        };
+        let raw = ctx.download(&leaves, h * 4);
+        let mut layers = vec![to_digests(raw)];
         let mut cur = leaves;
         let mut n = h;
         while n > 1 {
             let n_out = n / 2;
             let next = rw(n_out * 4);
             unsafe {
-                pq.kernel_builder("compress_layer").arg(&cur).arg(&next).arg(n_out as u32)
+                ctx.pq.kernel_builder("compress_layer").arg(&cur).arg(&next).arg(n_out as u32)
                     .arg(&rci_b).arg(&rcp_b).arg(&rcf_b).arg(&diag_b).global_work_size(n_out).build().unwrap().enq().unwrap();
             }
-            layers.push(read_layer(&next, n_out));
+            let raw = ctx.download(&next, n_out * 4);
+            layers.push(to_digests(raw));
             cur = next;
             n = n_out;
         }
@@ -401,11 +635,19 @@ fn gpu_merkle_layers(combined: &[u64], h: usize, w: usize) -> Vec<Vec<[Goldilock
     out
 }
 
+/// `gpu_merkle_layers_rows` over an already-materialized row-major leaf matrix (test harness).
+#[cfg(test)]
+fn gpu_merkle_layers(combined: &[u64], h: usize, w: usize) -> Vec<Vec<[Goldilocks; 4]>> {
+    gpu_merkle_layers_rows(h, w, |i, buf| buf.copy_from_slice(&combined[i * w..(i + 1) * w]))
+}
+
 /// Build the GPU tree and extract the `MerkleCap` at `cap_height` — byte-identical to
 /// `MerkleTreeMmcs`/`MerkleTreeHidingMmcs`'s commitment. The cap is the layer `2^cap_height` nodes wide
 /// (`digest_layers[num_layers-1-cap_height]`, `merkle_tree.rs::cap`); for a tree shorter than the cap
 /// (small FRI layers) the cap clamps to the leaf layer (`effective_cap_height = min(cap_height, depth)`).
 /// Returns the cap plus every layer (leaf..root) so `open_batch` can read sibling paths up to the cap.
+/// (Test harness — the production hiding commit inlines this cap extraction over `_rows`.)
+#[cfg(test)]
 fn gpu_merkle_cap(
     combined: &[u64],
     h: usize,
@@ -534,10 +776,10 @@ impl Mmcs<Goldilocks> for GpuMerkleMmcs {
         assert!(h.is_power_of_two(), "GpuMerkleMmcs: height {h} must be a power of two");
         assert!(inputs.iter().all(|m| m.height() == h), "GpuMerkleMmcs: matrices must be equal height");
         let total_w: usize = inputs.iter().map(|m| m.width()).sum();
-        // combined[i] = concat of every matrix's logical row i (matrix order) — the leaf preimage.
-        // Parallel over rows (independent); the marshalling dominates the commit's CPU cost.
-        let mut combined = vec![0u64; h * total_w];
-        combined.par_chunks_mut(total_w).enumerate().for_each(|(i, row_buf)| {
+        // leaf row i = concat of every matrix's logical row i (matrix order), marshalled straight into
+        // the pinned staging window (parallel over rows — the marshalling dominates the commit's CPU
+        // cost; each row is independent).
+        let layers = gpu_merkle_layers_rows(h, total_w, |i, row_buf| {
             let mut off = 0;
             for m in &inputs {
                 for v in m.row(i).expect("row < height") {
@@ -546,7 +788,6 @@ impl Mmcs<Goldilocks> for GpuMerkleMmcs {
                 }
             }
         });
-        let layers = gpu_merkle_layers(&combined, h, total_w);
         let root = *layers.last().unwrap().first().unwrap();
         (root, GpuMerkleData { matrices: inputs, layers })
     }
@@ -652,12 +893,12 @@ impl Mmcs<Goldilocks> for GpuHidingMerkleMmcs {
             let mut rng = self.rng.lock().unwrap();
             inputs.iter().map(|_| RowMajorMatrix::rand(&mut *rng, h, 4).values).collect()
         };
-        // combined[i] = concat over matrices of [mat_k row i ‖ salt_k row i] (p3's HorizontalPair order).
-        // Parallel over rows — this marshalling (materializing the wide LDE rows to canonical u64) is the
-        // dominant CPU cost of the quotient commit; each row is independent.
+        // leaf row i = concat over matrices of [mat_k row i ‖ salt_k row i] (p3's HorizontalPair
+        // order), marshalled straight into the pinned staging window. Parallel over rows — this
+        // marshalling (materializing the wide LDE rows to canonical u64) is the dominant CPU cost of
+        // the quotient commit; each row is independent.
         let total_w: usize = inputs.iter().map(|m| m.width() + 4).sum();
-        let mut combined = vec![0u64; h * total_w];
-        combined.par_chunks_mut(total_w).enumerate().for_each(|(i, row_buf)| {
+        let layers = gpu_merkle_layers_rows(h, total_w, |i, row_buf| {
             let mut off = 0;
             for (m, salt) in inputs.iter().zip(&salts) {
                 for v in m.row(i).expect("row < height") {
@@ -670,7 +911,8 @@ impl Mmcs<Goldilocks> for GpuHidingMerkleMmcs {
                 }
             }
         });
-        let (cap, layers) = gpu_merkle_cap(&combined, h, total_w, self.cap_height);
+        let eff = self.cap_height.min(layers.len() - 1);
+        let cap = MerkleCap::new(layers[layers.len() - 1 - eff].clone());
         (cap, GpuHidingData { matrices: inputs, salts, layers })
     }
 
@@ -738,6 +980,24 @@ mod tests {
             let cpu = Radix2DitParallel::<Goldilocks>::default().dft_batch(mat.clone()).to_row_major_matrix();
             let gpu = GpuDft.dft_batch(mat).to_row_major_matrix();
             assert_eq!(cpu.values, gpu.values, "GpuDft != p3 at h=2^{log_h} w={w}");
+        }
+    }
+
+    /// GpuDft.coset_lde_batch — the device-side iDFT → coset-scale → forward-NTT pipeline, the exact
+    /// call the PCS commits through — is bit-identical to `Radix2DitParallel::coset_lde_batch` across
+    /// sizes/widths including the production shapes (2^12×19 trace, 2^12×2 quotient chunks, blowup 4).
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU"]
+    fn gpu_coset_lde_matches_p3() {
+        let mut rng = ChaCha20Rng::seed_from_u64(2);
+        let shift = Goldilocks::GENERATOR;
+        for &(log_h, w, added) in &[(1usize, 1usize, 1usize), (4, 3, 2), (8, 5, 3), (12, 2, 4), (12, 19, 4)] {
+            let h = 1 << log_h;
+            let vals: Vec<Goldilocks> = (0..h * w).map(|_| Goldilocks::new(rng.random::<u64>() % 0xFFFF_FFFF_0000_0001)).collect();
+            let mat = RowMajorMatrix::new(vals, w);
+            let cpu = Radix2DitParallel::<Goldilocks>::default().coset_lde_batch(mat.clone(), added, shift).to_row_major_matrix();
+            let gpu = GpuDft.coset_lde_batch(mat, added, shift).to_row_major_matrix();
+            assert_eq!(cpu.values, gpu.values, "GpuDft coset_lde != p3 at h=2^{log_h} w={w} added={added}");
         }
     }
 
