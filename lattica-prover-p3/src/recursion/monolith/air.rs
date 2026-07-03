@@ -67,6 +67,14 @@ pub(crate) struct MonolithAir {
     /// and the OOD epilogue's constraint domain is HALVED (z_h uses cm_rounds−is_zk). 0 = the exact
     /// non-hiding path (every existing test), byte-for-byte. Geometry mirrors `hiding_commit_layout`.
     pub is_zk: usize,
+    /// The inner config's Merkle-cap height (caps have 2^cap_height entries; = log2 of the proof's
+    /// `MerkleCap.roots().len()`, proof-derivable). The wire/milestone config uses 6; RECURSION-path inner
+    /// configs choose SMALL caps — each cap observe absorbs 2^cap_height·4 felts into the transcript, so at
+    /// cap 6 the (2+is_zk+cm_rounds) cap absorbs dominate the whole trace (~64 sponge blocks EACH; the
+    /// hiding join-split's 16 absorbs alone forced 2^17 rows), while a small cap trades them for slightly
+    /// deeper per-query Merkle paths. Every existing construction passes 6 ⇒ all geometry methods reproduce
+    /// the old CM_CAP_HEIGHT-const values byte-for-byte.
+    pub cap_height: usize,
 }
 
 #[allow(dead_code)]
@@ -131,11 +139,11 @@ impl MonolithAir {
     }
     // input/quotient Merkle path depth to the cap (= log_global − cap_height), runtime with the FRI depth.
     pub(crate) fn input_depth(&self) -> usize {
-        self.lg() - CM_CAP_HEIGHT
+        self.lg() - self.cap_height
     }
     // commit round r's Merkle-path depth, runtime with the FRI depth (was the DP_LOG_HEIGHT-pinned cm_depth(r)).
     pub(crate) fn cm_depth_r(&self, r: usize) -> usize {
-        cm_depth_at(r, self.lg(), CM_CAP_HEIGHT)
+        cm_depth_at(r, self.lg(), self.cap_height)
     }
     // HIDING random-round leaf felts (is_zk=1): committed random row (RAND_PUB ‖ codewords) ‖ salt.
     pub(crate) fn random_leaf_felts(&self) -> usize {
@@ -419,7 +427,7 @@ impl MonolithAir {
     // give the exact current offsets (cap, cap+4, cap+8, cap+9).
     pub(crate) fn cap_stride(&self) -> usize {
         if self.full_cap() {
-            (1 << CM_CAP_HEIGHT) * 4 // full trace/quotient cap: 64 entries × 4
+            (1 << self.cap_height) * 4 // full trace/quotient cap: 2^cap_height entries × 4
         } else {
             4
         }
@@ -439,13 +447,13 @@ impl MonolithAir {
     // commit-phase round r cap: the codeword folds to height 2^(log_global−(r+1)); its cap has
     // 2^min(cap_height, that) entries, and the selecting index is `index >> ((r+1)+depth_r)`.
     pub(crate) fn commit_bits(&self, r: usize) -> usize {
-        core::cmp::min(CM_CAP_HEIGHT, self.lg() - (r + 1))
+        core::cmp::min(self.cap_height, self.lg() - (r + 1))
     }
     pub(crate) fn commit_cap_size(&self, r: usize) -> usize {
         1 << self.commit_bits(r)
     }
     pub(crate) fn commit_shift(&self, r: usize) -> usize {
-        (r + 1) + (self.lg() - (r + 1)).saturating_sub(CM_CAP_HEIGHT)
+        (r + 1) + (self.lg() - (r + 1)).saturating_sub(self.cap_height)
     }
     pub(crate) fn commit_cap_base(&self, r: usize) -> usize {
         self.ccap_base() + (0..r).map(|r2| self.commit_cap_size(r2) * 4).sum::<usize>()
@@ -1507,14 +1515,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             }
             // (cg_offset, shift, bits, cap_base) per opening: trace, quotient, then self.cm_rounds() commit rounds.
             // trace/quotient are at the max height, so the cap-selecting shift is input_depth (log_global−cap), runtime.
-            let mut openings = vec![(0usize, self.input_depth(), CM_CAP_HEIGHT, self.cap_base()), (4, self.input_depth(), CM_CAP_HEIGHT, self.qcap_base())];
+            let mut openings = vec![(0usize, self.input_depth(), self.cap_height, self.cap_base()), (4, self.input_depth(), self.cap_height, self.qcap_base())];
             for r in 0..self.cm_rounds() {
                 openings.push((8 + 4 * r, self.commit_shift(r), self.commit_bits(r), self.commit_cap_base(r)));
             }
             // HIDING random round (is_zk=1): a full cap at max height (shift = input_depth), cap_c group
             // (8 + 4·cm_rounds), selecting cap[index>>input_depth] from the random commitment's cap pis region.
             if self.is_zk == 1 {
-                openings.push((8 + 4 * self.cm_rounds(), self.input_depth(), CM_CAP_HEIGHT, self.random_cap_base()));
+                openings.push((8 + 4 * self.cm_rounds(), self.input_depth(), self.cap_height, self.random_cap_base()));
             }
             for (cg_off, shift, bits, cbase) in openings {
                 for k in 0..4 {

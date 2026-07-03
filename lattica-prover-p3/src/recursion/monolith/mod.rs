@@ -75,7 +75,11 @@ const QT_BIT: usize = 6; // fold: group-order bit
 const QT_SPT: usize = 7; // fold: point s_r
 const QT_I2S: usize = 8; // fold: inv(2 s_r)
 const QT_DBITS: usize = 9; // DEEP index bits (row 0)
-const CM_CAP_HEIGHT: usize = 6; // = CAP_HEIGHT; cap has 2^6 = 64 entries of 4 felts
+// The db=6 milestone reference cap height (2^6 = 64 entries of 4 felts). `MonolithAir.cap_height` is the
+// RUNTIME per-inner value (proof-derivable: log2 of MerkleCap.roots().len()); this const now serves only
+// the cfg(test) reference values + the frozen standalone-gadget/lineage tests.
+#[cfg(test)]
+const CM_CAP_HEIGHT: usize = 6;
 
 // ── Monolith super-tile geometry, DERIVED from the base params so re-pinning the FRI depth is a config change,
 //    not a rewrite. Base params: DP_LOG_HEIGHT (= log_global = degree_bits + log_blowup), CM_CAP_HEIGHT (the

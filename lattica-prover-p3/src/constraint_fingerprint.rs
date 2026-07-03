@@ -85,6 +85,7 @@ fn monolith_air(is_zk: usize) -> crate::recursion::monolith::MonolithAir {
         n_pub_f: 1,
         n_periodic_f: 0,
         is_zk,
+        cap_height: 6,
     }
 }
 
