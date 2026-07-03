@@ -179,20 +179,32 @@ pub mod gpu {
     // exactly like `Proof<MyConfig>` and **verifies under the standard production verifier**
     // (`<circuit>::verify_bytes` / the C-ABI / the node), unchanged — see `gpu_*_proof_verifies_hiding`.
     use crate::gpu::GpuHidingMerkleMmcs;
+    use crate::gpu_pcs::GpuHidingPcs;
 
-    pub type ChallengeMmcsGpuHiding = ExtensionMmcs<Val, Challenge, GpuHidingMerkleMmcs>;
-    pub type MyPcsGpuHiding = HidingFriPcs<Val, GpuDft, GpuHidingMerkleMmcs, ChallengeMmcsGpuHiding, ChaCha20Rng>;
+    pub use crate::gpu_pcs::ChallengeMmcsGpuHiding;
+    /// The GPU-hiding PCS: `HidingFriPcs` (GPU LDE + GPU Merkle) wrapped so the quotient-chunk
+    /// randomization pipeline also runs device-side (`gpu_pcs::GpuHidingPcs`). Associated types —
+    /// and therefore the serialized `Proof` — are identical to the plain `HidingFriPcs` stack.
+    pub type MyPcsGpuHiding = GpuHidingPcs;
     pub type MyConfigGpuHiding = StarkConfig<MyPcsGpuHiding, Challenge, Challenger>;
 
-    /// The production config with LDE + Merkle on the GPU. Mirror of `super::make_config` — only the
-    /// `Dft` (`GpuDft`) and the inner MMCS (`GpuHidingMerkleMmcs`) differ; identical `CAP_HEIGHT`,
-    /// `NUM_RANDOM_CODEWORDS`, FRI params, and fresh per-proof ChaCha20 salts.
+    /// The production config with LDE + Merkle + quotient randomization on the GPU. Mirror of
+    /// `super::make_config` — only the `Dft` (`GpuDft`), the inner MMCS (`GpuHidingMerkleMmcs`), and
+    /// the quotient-LDE pipeline differ; identical `CAP_HEIGHT`, `NUM_RANDOM_CODEWORDS`, FRI params,
+    /// and fresh per-proof ChaCha20 randomness.
     pub fn make_config_hiding() -> MyConfigGpuHiding {
         let perm = default_goldilocks_poseidon2_8();
         let val_mmcs = GpuHidingMerkleMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
         let challenge_mmcs = ChallengeMmcsGpuHiding::new(val_mmcs.clone());
         let fri = gpu_fri_params(challenge_mmcs);
-        let pcs = MyPcsGpuHiding::new(GpuDft, val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let pcs = GpuHidingPcs::new(
+            GpuDft,
+            val_mmcs,
+            fri,
+            NUM_RANDOM_CODEWORDS,
+            ChaCha20Rng::from_rng(&mut rand::rng()),
+            ChaCha20Rng::from_rng(&mut rand::rng()),
+        );
         MyConfigGpuHiding::new(pcs, Challenger::new(perm))
     }
 

@@ -17,6 +17,8 @@ pub mod recursion; // Phase B: recursive STARK verifier (B1 spike = in-circuit F
 #[cfg(feature = "gpu")]
 pub mod gpu; // opt-in OpenCL LDE acceleration (additive, prove-only; --features gpu)
 #[cfg(feature = "gpu")]
+pub mod gpu_pcs; // GPU-hiding PCS wrapper: quotient randomization pipeline device-side
+#[cfg(feature = "gpu")]
 pub mod quotient_gpu; // opt-in GPU quotient offload (fork of p3 prove; --features gpu)
 #[cfg(test)]
 mod constraint_fingerprint; // refactor/audit oracle: pinned constraint-set fingerprints for every production AIR

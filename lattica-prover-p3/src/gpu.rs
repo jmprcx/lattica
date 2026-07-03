@@ -192,6 +192,11 @@ __kernel void compress_layer(__global const ulong* in,__global ulong* out,const 
   perm8(s,rci,rcp,rcf,diag);
   for(int k=0;k<4;k++) out[(size_t)j*4+k]=gl_canon(s[k]);
 }
+// elementwise dst[i] = canon(dst[i] + src[i]) — the hiding-quotient "add the vanishing randomizer"
+// step, fused with the final canonicalization (both NTT results arrive uncanonicalized).
+__kernel void add_canon(__global ulong* dst,__global const ulong* src,const uint n){
+  size_t i=get_global_id(0); if(i<n) dst[i]=gl_canon(gl_add(dst[i],src[i]));
+}
 // Quotient evaluator: one thread per row (grid-stride over `qsize`). Interpret the flattened constraint
 // DAG (`op_*`/`consts`/`roots`) into per-node scratch `v`, then fold the constraint roots with the F_p^2
 // alpha powers (`alpha0`/`alpha1`) and scale by inv_vanishing → the two base coeffs of the F_p^2 quotient.
@@ -246,7 +251,7 @@ const STAGING_LEN: usize = 8 << 20;
 /// ~3–6 GB/s, which profiling showed was the dominant cost of the GPU NTT path (~47 of ~79 ms/proof).
 struct GpuCtx {
     pq: ProQue,
-    dev: [Option<ocl::Buffer<u64>>; 2],
+    dev: [Option<ocl::Buffer<u64>>; 3],
     /// Kept alive so the mapping stays valid for `staging_map`'s lifetime.
     _staging_buf: Option<ocl::Buffer<u64>>,
     staging_map: Option<ocl::MemMap<u64>>,
@@ -265,7 +270,7 @@ fn with_ctx<R>(f: impl FnOnce(&mut GpuCtx) -> R) -> R {
                 .dims(1)
                 .build()
                 .expect("GpuDft: OpenCL program build failed (is an OpenCL runtime + GPU present?)");
-            GpuCtx { pq, dev: [None, None], _staging_buf: None, staging_map: None }
+            GpuCtx { pq, dev: [None, None, None], _staging_buf: None, staging_map: None }
         });
         f(ctx)
     })
@@ -511,6 +516,68 @@ fn gpu_coset_lde_bitrev(evals: &[u64], h: usize, w: usize, added_bits: usize, sh
         if prof {
             eprintln!("  download {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
         }
+        NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        NTT_CALLS.fetch_add(1, Ordering::Relaxed);
+        out
+    })
+}
+
+/// One hiding-PCS quotient chunk, fully device-side (see `gpu_pcs::GpuHidingPcs::get_quotient_ldes`):
+/// the coset-LDE of the randomized chunk evals (iDFT → fused 1/h·shift^k scale → forward NTT) PLUS the
+/// forward NTT of the vanishing-poly randomizer `v_H·r` — whose coefficients are nonzero only in the
+/// first `2h` rows, so only that prefix is uploaded and the GPU zero-pads — summed elementwise and
+/// canonicalized on device. ONE download, in p3's bit-reversed storage order. Replaces, per chunk:
+/// p3's coset_lde_batch + a full-size mostly-zeros dft_batch + three host bit-reversal
+/// materializations + a host-side add.
+pub(crate) fn gpu_quotient_chunk_lde(
+    evals: &[u64],
+    van_prefix: &[u64],
+    h: usize,
+    w: usize,
+    added_bits: usize,
+    shift: u64,
+) -> Vec<u64> {
+    let _t0 = std::time::Instant::now();
+    assert!(h >= 2 && h.is_power_of_two(), "quotient chunk height must be a power of two ≥ 2");
+    assert_eq!(van_prefix.len(), 2 * h * w, "vanishing randomizer prefix is 2h rows");
+    let log_h = h.trailing_zeros() as usize;
+    let big = h << added_bits;
+    let log_big = log_h + added_bits;
+    let n_big = big * w;
+    let wl_inv: Vec<u64> = (1..=log_h).map(|s| Goldilocks::two_adic_generator(s).inverse().as_canonical_u64()).collect();
+    let wl_big: Vec<u64> = (1..=log_big).map(|s| Goldilocks::two_adic_generator(s).as_canonical_u64()).collect();
+    let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
+    with_ctx(|ctx| {
+        let a = ctx.dev_buf(0, n_big);
+        let b = ctx.dev_buf(1, n_big);
+        let c = ctx.dev_buf(2, n_big);
+        // coset-LDE of the chunk (as in gpu_coset_lde_bitrev, but NOT canonicalized — the final
+        // add_canon canonicalizes the sum).
+        b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+        ctx.upload(&a, evals);
+        enqueue_tiled_ntt(&ctx.pq, &a, &b, h, w, &wl_inv, h_inv, shift, false, false);
+        let in_dst = enqueue_tiled_ntt(&ctx.pq, &b, &a, big, w, &wl_big, 1, 1, false, true);
+        let (r, s) = if in_dst { (a, b) } else { (b, a) };
+        // v_H·r: zero-pad the freed scratch buffer, upload the 2h-row coefficient prefix, forward NTT.
+        // (The in-order queue sequences the fill after the LDE kernels that read `s`.)
+        s.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+        ctx.upload(&s, van_prefix);
+        let v_in_dst = enqueue_tiled_ntt(&ctx.pq, &s, &c, big, w, &wl_big, 1, 1, false, true);
+        let v = if v_in_dst { c } else { s };
+        // sum + canonicalize, single download of the stored (bit-reversed) chunk LDE.
+        unsafe {
+            ctx.pq
+                .kernel_builder("add_canon")
+                .arg(&r)
+                .arg(&v)
+                .arg(n_big as u32)
+                .global_work_size(n_big)
+                .build()
+                .unwrap()
+                .enq()
+                .unwrap();
+        }
+        let out = ctx.download(&r, n_big);
         NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         NTT_CALLS.fetch_add(1, Ordering::Relaxed);
         out
