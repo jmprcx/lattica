@@ -92,8 +92,25 @@ verifies under production `verify_bytes`. A custom MMCS was necessary because p3
 are `pub(crate)` and can't be reused. (`GpuMerkleMmcs`, the non-hiding `cap_height 0` variant, remains for
 the isolated benchmark.)
 
+### Quotient offload (done, but net-neutral)
+
+The quotient evaluation is not behind a trait seam (it is inline in p3's `prove`), so it is offloaded by
+`crate::quotient_gpu::prove_gpu` — a faithful fork of `prove` (preprocessed = None) that reuses every p3
+public function and swaps only `quotient_values` for a GPU evaluator. The evaluator (`gpu_quotient_values`
++ the `quotient` kernel) flattens each AIR's `get_symbolic_constraints` DAG (~800–1300 nodes, `Arc`-CSE)
+into an instruction stream and interprets it one-row-per-thread, folding the constraints with the F_p²
+alpha powers × `inv_vanishing`. It is correct and **verifies under the production verifier** (all three
+heavy steps now on GPU; `gpu_{joinsplit,htlc}_proof_verifies_hiding` + `gpu_quotient_verifies`).
+
+**But it is net-neutral.** The kernel is fast (~10 ms/proof), yet marshalling the trace to `u64` buffers
+on the CPU (~50 ms) offsets it — the quotient's cost is *data movement*, not arithmetic. Profiling the
+~443 ms GPU hiding proof: ~109 ms Merkle + ~84 ms NTT + ~10 ms quotient are on GPU; the remaining ~180 ms
+CPU is **FRI + commit glue** — that is the real next lever, not the quotient. The fork + interpreters are
+kept as validated infrastructure: a real quotient win needs the trace kept **on-GPU across LDE→quotient**
+(a deeper PCS integration that avoids the round-trip).
+
 ### What's next
 
-- **Quotient constraint-eval** (`quotient_values`, the next ~17% CPU slice) — a codegen pass emitting a
-  GPU kernel from each AIR's `SymbolicExpression` DAG.
+- **FRI + commit glue** (~180 ms CPU, the new dominant remainder) — the next real lever.
+- On-GPU trace persistence across LDE→quotient (would make the quotient offload pay off).
 - Shared-memory NTT butterflies; a `_prove_gpu` C-ABI entry for the node.
