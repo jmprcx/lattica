@@ -1,10 +1,12 @@
 # GPU-accelerated proving (opt-in)
 
 `lattica-prover-p3` can offload the two heaviest proving steps — the low-degree extension (LDE) and the
-Merkle tree build — to a GPU via OpenCL, for a **measured 2.42× speedup** on the real join-split circuit.
-It is **opt-in and prove-only**: the default CPU proving path, the byte-exact wire format, and the C-ABI
-verifier are untouched. The LDE path (`GpuDft`) is wire-compatible with the production hiding config; the
-Merkle path (`GpuMerkleMmcs`) currently runs under a non-hiding benchmark config (see *What's next*).
+Merkle tree build — to a GPU via OpenCL, for a **measured 2.12× speedup on the production (hiding)
+config**, with the GPU proof **verifying under the existing production verifier unchanged**. It is
+**opt-in and prove-only**: the default CPU proving path, the byte-exact wire format, and the C-ABI
+verifier are untouched. Both GPU paths — `GpuDft` (LDE) and `GpuHidingMerkleMmcs` (Merkle) — are
+byte-compatible with the production `HidingFriPcs` + `MerkleTreeHidingMmcs`, so a GPU-produced proof
+deserializes and verifies exactly like a CPU one (accepted by `verify_bytes` / the C-ABI / the node).
 
 ## Enabling it
 
@@ -33,54 +35,65 @@ assert!(joinsplit_air::verify_bytes(&proof_bytes, &pis));
 
 ## Why it's safe (consensus)
 
-- **The DFT is not in the wire or the verifier.** A GPU-produced `Proof` serializes to the same bytes a
-  CPU proof would and deserializes/verifies under the standard `MyConfig` — the `Dft` type never appears
-  in `verify` or in the serialized `Proof`. So GPU proofs are accepted by the existing verifier and the
-  Zig node unchanged.
+- **The DFT is not in the wire or the verifier.** The `Dft` type never appears in `verify` or in the
+  serialized `Proof`, so swapping `Radix2DitParallel → GpuDft` cannot change the wire.
+- **The GPU MMCS is byte-compatible, not a new wire type.** `GpuHidingMerkleMmcs`'s `Commitment`
+  (`MerkleCap<Val,[Val;4]>`) and `Proof` (`(salts, siblings)`) are the *identical* types as
+  `MerkleTreeHidingMmcs`, and its GPU tree reproduces p3's tree bit-for-bit — so `Proof<GpuConfig>`
+  serializes exactly like `Proof<MyConfig>` and the CPU verifier reconstructs the same caps/paths. GPU
+  proofs are therefore accepted by the existing verifier and the Zig node unchanged.
 - **Bit-exact kernels.** Every GPU primitive is validated bit-for-bit against p3: Goldilocks field, the
   NTT/coset-LDE (`GpuDft` matches `Radix2DitParallel` up to the real 2¹⁶ LDE), Poseidon2-8, the Merkle
-  root, F_p², the quotient selectors, and the FRI fold. The kernels reproduce p3's exact roots
-  (`two_adic_generator`) and reduction; the serde encoding is canonical, so intermediate representation
-  is irrelevant.
+  cap + sibling paths (`gpu_merkle_cap_matches_p3`, `gpu_hiding_mmcs_matches_p3`), F_p², the quotient
+  selectors, and the FRI fold. The kernels reproduce p3's exact roots (`two_adic_generator`) and
+  reduction; the serde encoding is canonical, so intermediate representation is irrelevant.
 - **The correctness gate:**
   - *non-hiding* (deterministic) → a GPU proof is **byte-identical** to the CPU proof;
   - *production (hiding)* → salts are a fresh CSPRNG per proof, so full proofs differ CPU-vs-CPU too;
-    the criterion is **"the standard verifier accepts it"** (`gpu_{joinsplit,htlc}_proof_verifies`).
+    the criterion is **"the standard verifier accepts it"** — the LDE-only path
+    (`gpu_{joinsplit,htlc}_proof_verifies`) and the full LDE+Merkle path
+    (`gpu_{joinsplit,htlc}_proof_verifies_hiding`).
 
 ## Status & performance
 
-Two heavy proving steps run on the GPU today: the **LDE** (`GpuDft`) and the **Merkle tree build**
-(`GpuMerkleMmcs`). Together they deliver a **measured 2.42× over CPU** on the real join-split circuit.
+Two heavy proving steps run on the GPU: the **LDE** (`GpuDft`) and the **Merkle tree build**. Both are
+byte-compatible with the production **hiding** config, so GPU proofs verify under the standard verifier.
 
-### The 2.42× (measured, `gpu_merkle_benchmark`, join-split, best of 5)
+### The 2.12× on the production (hiding) config (`gpu_hiding_benchmark`, join-split, best of 5)
 
-Apples-to-apples, non-hiding configs with identical FRI params:
+Production `HidingFriPcs` + `is_zk` + salts + `CAP_HEIGHT = 6`, GPU vs CPU, **both verified under the
+production `verify_bytes`**:
 
 | config | LDE | Merkle | join-split prove |
 |---|---|---|---:|
-| CPU baseline | `Radix2DitParallel` | `MerkleTreeMmcs` | **141.0 ms** |
-| GPU | `GpuDft` | `GpuMerkleMmcs` | **58.2 ms** (**2.42×**) |
+| CPU (production) | `Radix2DitParallel` | `MerkleTreeHidingMmcs` | **955.9 ms** |
+| GPU | `GpuDft` | `GpuHidingMerkleMmcs` | **450.6 ms** (**2.12×**) |
 
-Of the GPU run, ~18 ms is NTT + ~10 ms is Merkle; the rest (quotient constraint-eval, FRI, challenger)
-is still CPU. Each proof **verifies under its own config** (self-consistent) — and the GPU Merkle commit
-was validated bit-exact against the CPU p3 hasher standalone (`gpu_merkle_mmcs_self_consistent`: GPU
-commit ↔ CPU verify agree across 2¹–2¹²; tampered values / wrong indices rejected).
+Of the GPU run, ~80 ms is NTT + ~116 ms is Merkle per proof; the rest (quotient constraint-eval, FRI,
+challenger) is still CPU. The killer test `gpu_{joinsplit,htlc}_proof_verifies_hiding` proves a circuit
+with the GPU hiding config and asserts the **standard production verifier accepts it** — the whole FRI
+query/open/verify path over the salted GPU tree round-trips.
+
+(An isolated non-hiding micro-benchmark, `gpu_merkle_benchmark`, measures the same two offloads at 2.42×
+on a small 141 ms → 58.2 ms workload; the production number above is the one that matters.)
 
 ### How the Merkle offload works
 
-`crate::gpu::GpuMerkleMmcs` is a custom `p3_commit::Mmcs`: `commit` runs the whole tree on the GPU
-(Poseidon2 `leaf_hash` over concatenated rows → pairwise `compress_layer` up to the root), while
-`open_batch`/`verify_batch` stay on the CPU (cheap, per-query) using the **same** exported Poseidon2
-constants — so a GPU-built root verifies against the CPU hasher bit-for-bit. The kernels
-(`perm8`/`leaf_hash`/`compress_layer`) match `default_goldilocks_poseidon2_8` exactly. This was
-necessary because p3's `MerkleTree` internals are `pub(crate)` and can't be reused.
+`crate::gpu::GpuHidingMerkleMmcs` is a custom `p3_commit::Mmcs` byte-compatible with
+`MerkleTreeHidingMmcs<…, 2, 4, 4>`: `commit` appends 4 salt columns per matrix (the exact p3 draw) and
+runs the whole salted tree on the GPU (Poseidon2 `leaf_hash` → pairwise `compress_layer`, extracting the
+`cap_height = 6` `MerkleCap`), while `open_batch`/`verify_batch` stay on the CPU using the **same**
+exported Poseidon2 constants. Its `Commitment` (`MerkleCap<Val,[Val;4]>`) and `Proof`
+(`(salts, siblings)`) are the *identical* types p3 uses, so a `Proof<GpuConfig>` serializes byte-for-byte
+like `Proof<MyConfig>`. Validated at three levels: the GPU cap matches CPU `MerkleTreeMmcs` byte-for-byte
+(`gpu_merkle_cap_matches_p3`); seeding both MMCS the same reproduces p3's salts and cap exactly and the
+CPU verifier accepts the GPU opening (`gpu_hiding_mmcs_matches_p3`); and the full GPU-hiding proof
+verifies under production `verify_bytes`. A custom MMCS was necessary because p3's `MerkleTree` internals
+are `pub(crate)` and can't be reused. (`GpuMerkleMmcs`, the non-hiding `cap_height 0` variant, remains for
+the isolated benchmark.)
 
 ### What's next
 
-- **Production (hiding) integration.** The 2.42× is measured on a *non-hiding* config (`GpuMerkleMmcs`
-  has no salts, `cap_height 0`, a `[Val;4]` root). Folding it into the production **hiding** wire format
-  means a salted variant whose `Commitment`/`Proof` are byte-compatible with `MerkleTreeHidingMmcs`
-  (`MerkleCap` + `(salts, siblings)`), so proofs still verify under the standard verifier / the node.
 - **Quotient constraint-eval** (`quotient_values`, the next ~17% CPU slice) — a codegen pass emitting a
   GPU kernel from each AIR's `SymbolicExpression` DAG.
 - Shared-memory NTT butterflies; a `_prove_gpu` C-ABI entry for the node.
