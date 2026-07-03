@@ -268,9 +268,11 @@ fn gpu_coset_lde_natural(evals: &[u64], h: usize, w: usize, added_bits: usize, s
         let a = mk();
         let b = mk();
         unsafe {
-            a.cmd().fill(0u64, None).enq().unwrap();
+            // Only `b` needs zeroing: its tail `b[n_small..]` is the forward NTT's zero-pad (read at the
+            // second bitrev). `a` needs none — `a[0..n_small]` is overwritten by `write(evals)` and
+            // `a[n_small..]` is never read before the forward NTT overwrites all of `a`.
             b.cmd().fill(0u64, None).enq().unwrap();
-            a.write(evals).enq().unwrap(); // a[0..n_small] = input evals, rest 0
+            a.write(evals).enq().unwrap(); // a[0..n_small] = input evals
             // --- iDFT on the first h rows: bitrev(a[0..hw]) -> b, inverse-twiddle stages, scale 1/h ---
             pq.kernel_builder("bitrev_rows").arg(&a).arg(&b).arg(h as u32).arg(w as u32).arg(log_h as u32).global_work_size(n_small).build().unwrap().enq().unwrap();
             for s in 1..=log_h {
