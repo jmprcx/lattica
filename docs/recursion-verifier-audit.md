@@ -1,10 +1,89 @@
-# Recursive STARK verifier — in-circuit spec & constraint budget (Phase B0)
+# Recursive STARK verifier — in-circuit constraint audit + spec
 
-**Status: spec for an in-development circuit (Phase B of `recursion-design.md`).** This pins down exactly
-what an in-circuit Plonky3 verifier AIR must compute (so the work is auditable like
-`joinsplit-constraint-audit.md`), and sizes it against lattica's existing gadgets. It is the spec the
-B1 spike validates and the eventual full verifier (B3) implements. Numbers below are from a read of
-Plonky3 0.6.1 (`p3-uni-stark`/`p3-fri`/`p3-challenger`) + lattica's config.
+**Status (2026-07-03): BUILT + VALIDATED (R1–R5).** The in-circuit verifier ("the monolith", `MonolithAir` in
+`lattica-prover-p3/src/recursion/monolith`) is ONE AIR, proven by the audited `p3_uni_stark::prove`/`verify`,
+that **accepts iff `p3::verify(inner_proof)` accepts** — validated on a REAL production `JoinSplitAir` proof,
+both non-hiding and hiding (`is_zk=1`), through a data-driven symbolic epilogue; and the aggregator verifies K
+real join-split inners and folds them to a block tx-root **byte-identical to `batch_joinsplit_air::batch_root`**.
+RESEARCH — feature-gated behind `--features recursion` (`scripts/check-abi-symbols.sh` proves zero recursion
+symbols in the default staticlib), NOT on any production path, NOT externally audited. §0 below is this crate's
+own constraint self-audit (the artifact this doc's §7 promised to grow); §1–§10 are the original B0 design spec,
+kept as history.
+
+## 0. Constraint audit of the built verifier
+
+### 0.1 The soundness claim and its shape
+
+`MonolithAir` lays out, in ONE trace proven at `p3` FRI params: a **transcript region** (rows `0..tr`) that
+replays the inner proof's Fiat–Shamir sponge; then one **super-tile per replayed inner query** (each a full
+in-circuit FRI + Merkle + DEEP re-verification of that query); then the **OOD epilogue** (at the terminal-fold
+row `tf`) that checks the inner's constraint relation at `ζ`; and — in the aggregator — a **fold region** that
+folds each verified inner's statement into the single public tx-root. Soundness = **accept ⇒ p3::verify**: every
+value `p3::verify` derives is either (a) RE-DERIVED in-circuit from the transcript (all Fiat–Shamir challenges +
+query indices) or (b) AUTHENTICATED in-circuit (every opening → its committed cap; every query → the FRI
+final-poly; the constraints → the quotient at `ζ`). A prover feeding a proof `p3::verify` would REJECT cannot
+satisfy all the cross-region binds below at once. The proof is itself an audited-`p3` STARK, so the outer
+soundness is the batch path's (q96/lb4 for proven-100 — `soundness-budget.md` + `recursion-aggregation-params.md`
+§1; the reduced-query dev-box milestones are CORRECTNESS gates only, flagged where they run).
+
+### 0.2 Cross-region binding table (the soundness backbone)
+
+Every row is the mechanism by which a region's data is pinned so it cannot be forged, plus the corrupted-trace
+negative that exercises it. All tests are in `recursion/monolith/tests.rs` (+ `native_verify.rs` for hiding).
+
+| # | Binding | What it pins | In-circuit mechanism | Corrupted-trace negative(s) |
+|---|---|---|---|---|
+| 1 | transcript → challenges | `α_stark, ζ, α_fri, β_r` are the REAL FS challenges | in-circuit `DuplexChallenger` duplex sponge replayed over the observed commitments; each squeeze bound to its downstream use — or, in column-window mode, to the held pi window | `tampered α_fri ⇒ reject`; `wrong α ⇒ reject`; `wrong transcript output ⇒ reject`; `tampered pis window ⇒ internal bind fails ⇒ reject` |
+| 2 | transcript → query index | each query index is the REAL `sample_bits` output | `sample_bits` from the sponge; a canonical 64-bit decomposition (`SB`) bound to the index felt (`sb_x == Σ b_i 2^i`, bits boolean, canonical `< p`) | `tampered index felt ⇒ reject (canonical index binding)`; `wrong index felt ⇒ reject`; `wrong high index bit ⇒ wrong cap entry ⇒ reject` |
+| 3 | openings → committed caps | each opened row authenticates to the committed Merkle cap at `index >> shift` | leaf-hash (multi-block PaddingFree sponge) → `input_depth` path-fold (bit-ordered `merge`) → **cap-mux** selects `cap[index>>shift]` and binds it to the folded terminal (`shift = input_depth`, cap-height RUNTIME) | `tampered leaf ⇒ reject`; `tampered selected trace cap ⇒ cap-mux reject`; `tampered commit-phase cap ⇒ reject`; `wrong cap entry ⇒ reject` |
+| 4 | openings → DEEP reduced opening → FRI fold chain | the query's codeword folds to `final_poly[0]` | `ro = Σ_k α_fri^k (pz_k − px_k)·inv(z_k − x)` seeds `E_0`; round-by-round arity-2 fold `(e0+e1)/2 + sign·(e0−e1)·β·inv(2s)` with the squaring point map reaches the final poly | `wrong ro ⇒ reject`; `tampered β_0 ⇒ reject (fold binding)`; `tampered folded ⇒ reject`; `wrong s_r ⇒ reject`; `tampered final_poly ⇒ reject`; `wrong final_poly target ⇒ reject` |
+| 5 | px-sharing | one authenticated opened value feeds BOTH its `ζ` and `ζ_next` DEEP terms AND the Merkle leaf | `px(c) == px(W+c) == opened_row[c]` (one committed value → two reduced-opening terms + the leaf preimage) | `tampered opened value ⇒ reject` (breaks both terms + the leaf simultaneously) |
+| 6 | OOD constraint relation | the inner AIR's constraints hold at `ζ` | the symbolic epilogue walks `get_symbolic_constraints(inner)` (`eval_symbolic_circuit`) with witnessed Lagrange selectors bound to their ζ-defs, α-folds them, and checks `folded·inv_van == quot(ζ)` recomposed from the nqc chunk-openings — exactly `p3::verify_constraints` | `tampered inner pub ⇒ symbolic epilogue rejects`; `tampered quotient ⇒ reject` |
+| 7 | (aggregator) statement fold → block tx-root | each verified inner's statement folds into the ONLY public input, byte-matching `batch_root` | per instance, the `tx_statement_digest` MD-chain (`merge([DOM_TXROOT,0,0,0],anchor)…tx_binding` from the pi window) → `merge(root, s_k)` into the global-persistent root; final row == the public tx-root | `tampered tx-root ⇒ reject`; `corrupted instance 1 ⇒ reject` |
+
+### 0.3 Two soundness/correctness bugs found + fixed while landing the real-inner path (audit-relevant)
+
+Both were LATENT in the cap<6 column-window path — unreachable until a real join-split was proven in
+column-window mode (which the degree bug blocked), so neither ever produced a wrong ACCEPT in a shipped test;
+both were caught by in-tree guards before the path was declared working.
+
+- **Degree-91 fold (soundness).** In column-window mode `α_stark` is a degree-1 witness column (the pi window),
+  so folding all 81 inner constraints inline made the OOD check degree 91 ⇒ `log_nqc = 7 > log_blowup 4` — the
+  quotient could not be committed at blowup 4 (silently unsound) and p3 evaluated it on a 2^23 domain (~90 GB).
+  FIX: chunk the α-Horner (`FOLD_CHUNK`), witnessing each chunk boundary's running fold, capping the degree at
+  ≤16. Guard: `phase8_joinsplit_aggregator_probe` now asserts `log_nqc ≤ log_blowup` for EVERY monolith shape
+  (the check the original probe lacked — it only built `column_window=false`).
+- **Cap-6 hardcode (correctness).** `native_fri::query_quotient_merkle` computed the quotient-cap index
+  reduction as `log_global − 6`, assuming `cap_height=6`; at cap<6 it selected the WRONG quotient cap entry,
+  and the cap-mux (row 3) rejected. FIX: derive the cap height at runtime (regression-safe — reduces to 6 at
+  cap-6, so the committed cap-6 tests are unchanged). Guard: `phase8_window_discriminator` verifies the cap-2
+  column-window monolith across inner shapes (degree 1..4, nqc 1/2/4, periodic, W=8 leaf, db 6/12).
+
+### 0.4 Constraint fingerprints + geometry pins
+
+`constraint_fingerprint.rs::pinned_constraint_fingerprints` pins `MonolithAir` at its two canonical shapes
+(`is_zk=0,db=6` and `is_zk=1,hiding`) — `(width, periodic, publics, n_constraints, max_degree, fnv)` — so any
+unintended constraint-set drift is a test failure; a deliberate change re-pins in the same commit (the doc-block
+policy). Under `--features recursion` these 2 pins run alongside the 5 production-AIR pins. `geometry_matches_
+milestone` pins the runtime super-tile geometry (block layout / periods) at the db=6 ConstAir shape.
+
+### 0.5 Self-recursion (R5) — measured, does not converge without a wrap
+
+`phase9_self_recursion_probe` confirms the verifier is genuinely AIR-generic (it builds + self-validates a
+witness for verifying ANOTHER monolith), but verifying the SMALLEST monolith (W=193, 384 constraints) yields an
+outer of W≈8520 (~44×), ~133 GB LDE, `log_nqc=7` — both size- and degree-explosive per level. So naive tree
+self-recursion diverges; a fixed-size wrap (or a different outer proof system) is required — `recursion-
+aggregation-params.md` §5. The production scale-out is the flat depth-1 aggregation tree (R4), which needs no
+self-recursion.
+
+### 0.6 Audit posture
+
+RESEARCH, feature-gated, NOT externally audited. If recursion is ever slated for deployment, the audit surface
+is: this constraint table (§0.2) verified region-by-region against `air.rs::eval`; the corrupted-trace suite
+extended to a per-column exhaustive sweep at the HTLC-precedent bar; the transcript replay's fidelity to the
+real `DuplexChallenger` (the `ModelChallenger` executable spec, §8); and the two fixes in §0.3 re-derived. The
+node consensus seam is UNCHANGED regardless (aggregate root byte-matches `batch_root`), so the batch path — which
+IS in the production audit — carries production until then.
 
 ## 1. What the native verifier does (`p3-uni-stark::verify`)
 The in-circuit verifier must replay, as constraints, the native algorithm:
@@ -116,6 +195,10 @@ differential-tested in-circuit spikes in `lattica-prover-p3/src/recursion/`:
   random commitment, `degree >> is_zk` domain, quotient-chunk count `1 << (log + is_zk)`). The FRI test is
   delegated to `pcs.verify` (= the validated primitives). This is the §9 plan, executed natively — the
   porting blueprint for the in-circuit verifier.
+
+> **Superseded by §0 (2026-07-03): this "remaining work" is DONE.** The in-circuit integration (the AIR port,
+> the ZK/hiding branches, B4 aggregation, and B5's determination) all landed — see §0 for the built + validated
+> state. The paragraph below is the B0 forecast, kept as history.
 
 The remaining work is the **in-circuit integration** (port the native skeleton to an AIR: replace
 `pcs.verify` with the `fri_merkle`/`transcript`/`fri_fold` gadgets + the constraint folder as
