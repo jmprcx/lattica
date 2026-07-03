@@ -1437,9 +1437,11 @@ where
     let mut bad = pis.clone();
     bad[air.pub_pi()] += Val::ONE;
     assert!(verify(config, &air, &prf, &bad).is_err(), "{label}: tampered inner pub ⇒ symbolic epilogue rejects");
-    // tamper the FULL trace cap entry query 0 selects (index0>>4) ⇒ cap-mux ≠ real terminal ⇒ reject.
+    // tamper the FULL trace cap entry query 0 selects (index0 >> input_depth — the runtime depth-to-cap,
+    // lg−CM_CAP_HEIGHT; the old hardcoded `>> 4` was the db=6 value and indexes out of the cap at deeper
+    // inners) ⇒ cap-mux ≠ real terminal ⇒ reject.
     let cap_base = 2 * chs.len() + index_felts.len() + 2;
-    let sel0 = ((index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1)) >> 4;
+    let sel0 = ((index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1)) >> air.input_depth();
     let mut bad_cap = pis.clone();
     bad_cap[cap_base + sel0 * 4] += Val::ONE;
     assert!(verify(config, &air, &prf, &bad_cap).is_err(), "{label}: tampered selected trace cap ⇒ cap-mux reject");
@@ -1501,6 +1503,78 @@ fn run_quart_monolith(n_queries: usize) -> (u32, u64) {
     let config = make_config(1, n_queries);
     let (proof, pvs) = gen_quart_proof(&config, 2, 6);
     run_symbolic_monolith(&config, &QuartAir, &proof, &pvs, 2, 1, 0, "quart") // W=2, degree-4 ⇒ nqc=4 (2-block quotient leaf)
+}
+
+// Verify the REAL production join-split circuit (demo witness) — W=19 (5-block input leaf), 33 periodic
+// columns, 26 pubs, 81 constraints at degree 8 ⇒ nqc=8 (2·nqc=16 quotient terms, 4-block quotient leaf),
+// db=12 ⇒ log_global=16 / cm_rounds=12. Every runtime-geometry dimension at its production value at once;
+// the inner proof is non-hiding (the recursion path's own inner config), arity-2, `n_queries` reduced.
+fn run_joinsplit_monolith(n_queries: usize) -> (u32, u64) {
+    use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+    let config = make_config(1, n_queries);
+    let w = demo_witness();
+    let pvs = public_values(&w);
+    let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+    run_symbolic_monolith(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, "joinsplit")
+}
+
+/// Phase 8.1 — THE PRODUCTION LIFT: the monolith accept-iff-p3::verify's a proof of the REAL production
+/// `JoinSplitAir`. Everything the phase-7 ladder generalized meets at its production value simultaneously:
+/// W=19 → a 5-block input-Merkle leaf; degree-8 constraints → nqc=8 chunks, a 16-term recompose + 4-block
+/// quotient leaf; db=12 → log_global=16, cm_rounds=12; 33 periodic columns + 26 pubs through the
+/// data-driven symbolic epilogue. Reduced queries (correctness milestone; production soundness goes via
+/// the aggregation tree's parameters). Rejects a tampered inner pub + a tampered selected trace cap.
+#[test]
+#[ignore = "slow: Phase 8.1 the monolith verifies a REAL production join-split proof"]
+fn phase8_joinsplit_monolith() {
+    let (log2h, rss) = run_joinsplit_monolith(4);
+    assert!((1usize << log2h) <= (1 << 19), "join-split monolith within 2^19 rows");
+    println!("Phase 8.1: the monolith verifies a REAL production join-split proof at 2^{log2h} / {} MiB", rss / (1 << 20));
+}
+
+/// Degree probe for the JOIN-SPLIT monolith (is_zk=0): the outer max constraint degree + log_nqc for the
+/// exact `MonolithAir` `run_joinsplit_monolith` builds — a db=12 inner (cm_rounds=12), multi-block leaves
+/// (5 input + 4 quotient), and the degree-8 inner constraint trees walked by the symbolic epilogue. The p3
+/// quotient-containment budget is maxdeg ≤ 16 (log_nqc ≤ log_blowup = 4); crossing it does NOT error — it
+/// silently breaks every honest proof (`OodEvaluationMismatch`), invisible to row-wise check_constraints.
+#[test]
+#[ignore = "slow: builds a real join-split proof to shape the probe"]
+fn phase8_joinsplit_degree_probe() {
+    use super::MonolithAir;
+    use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+    use crate::recursion::native_fri::multicol_query_terms;
+    use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, AirLayout};
+    let config = make_config(1, 4);
+    let w = demo_witness();
+    let pvs = public_values(&w);
+    let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+    let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+    let (terms, _x, _a, _ro, _w) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+    let layout_in = AirLayout::from_air::<Val>(&JoinSplitAir);
+    let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, layout_in);
+    let air = MonolithAir {
+        counts,
+        binds,
+        index_binds,
+        n_queries: index_felts.len(),
+        n_terms: terms.len(),
+        inner_counter: false,
+        column_window: false,
+        k_instances: 1,
+        fold: false,
+        constraints,
+        w_inner_f: WIDTH,
+        n_pub_f: N_PUBLIC,
+        n_periodic_f: N_PERIODIC,
+        is_zk: 0,
+    };
+    let layout = AirLayout::from_air::<Val>(&air);
+    let cs = get_symbolic_constraints::<Val, MonolithAir>(&air, layout);
+    let maxd = cs.iter().map(|c| c.degree_multiple()).max().unwrap();
+    let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
+    println!("join-split monolith probe: outer max_constraint_degree={maxd}, outer log_nqc={log_nqc} ({} constraints)", cs.len());
+    assert!(log_nqc <= 4, "outer log_nqc {log_nqc} exceeds log_blowup 4 ⇒ silent quotient corruption");
+    assert!(maxd <= 16, "outer max constraint degree {maxd} exceeds the 16 = 2^log_blowup budget");
 }
 
 #[test]

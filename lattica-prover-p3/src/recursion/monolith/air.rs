@@ -1439,13 +1439,20 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             // random/commit) — the block after a terminal is a fresh leaf-hash seeded from its carrier, not a
             // merge — and EXCEPT a multi-block leaf's INTERNAL boundary (a sponge absorb-continuation).
             // All excluded one-hots fire on last rows of DISTINCT blocks (the super-tile layout is strictly
-            // sequential), so Π(1−t_i) == 1−Σ t_i on every trace row. is_zk=1 MUST use the SUM form: the
-            // product's degree grows by one per commit round and crosses the outer quotient/LDE capacity
-            // (log_nqc 4→5 ⇒ quotient domain 2^21 > the 2^20 blowup-4 LDE) at db≥4 — row-wise-satisfied
-            // trace, garbage quotient, OodEvaluationMismatch. The sum form is degree-1 at any db. is_zk=0
-            // keeps the validated product byte-for-byte.
-            let not_term = if self.is_zk == 1 {
-                let mut term_sum = p[self.m_term()].clone() + p[self.q_term()].clone() + p[self.p_random_term()].clone();
+            // sequential), so Π(1−t_i) == 1−Σ t_i on every trace row — and the SUM form is degree-1 in the
+            // exclusions at ANY depth. BOTH modes use it: the product's degree grew by one per commit round
+            // (7 + cm_rounds + boundary factors) and crossed the outer quotient/LDE capacity budget
+            // (log_nqc ≤ log_blowup, maxdeg ≤ 16 — exceeding it SILENTLY corrupts the quotient:
+            // row-wise-satisfied trace, garbage quotient, OodEvaluationMismatch) first at hiding db≥4, then
+            // at the is_zk=0 REAL join-split shape (db=12, cm_rounds=12, multi-block leaves ⇒ product degree
+            // 21 — caught by phase8_joinsplit_degree_probe, exactly as the latent-budget note predicted).
+            // The is_zk=1 expression tree is unchanged term-for-term; is_zk=0 migrated product→sum
+            // (a deliberate constraint-set change, re-pinned in constraint_fingerprint).
+            let not_term = {
+                let mut term_sum = p[self.m_term()].clone() + p[self.q_term()].clone();
+                if self.is_zk == 1 {
+                    term_sum = term_sum + p[self.p_random_term()].clone();
+                }
                 for r in 0..self.cm_rounds() {
                     term_sum = term_sum + p[self.c_term(r)].clone();
                 }
@@ -1455,31 +1462,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 if self.quot_leaf_blocks() > 1 {
                     term_sum = term_sum + p[self.q_boundary()].clone();
                 }
-                if self.random_leaf_blocks() > 1 {
-                    term_sum = term_sum + p[self.p_random_boundary()].clone();
-                }
-                if self.cm_leaf_blocks() > 1 {
-                    term_sum = term_sum + p[self.c_bnd()].clone(); // commit-leaf block-0→block-1 boundary
+                if self.is_zk == 1 {
+                    if self.random_leaf_blocks() > 1 {
+                        term_sum = term_sum + p[self.p_random_boundary()].clone();
+                    }
+                    if self.cm_leaf_blocks() > 1 {
+                        term_sum = term_sum + p[self.c_bnd()].clone(); // commit-leaf block-0→block-1 boundary
+                    }
                 }
                 one.clone() - term_sum
-            } else {
-                // LATENT DEGREE BUDGET (validated-byte-for-byte product kept deliberately): this product's
-                // degree is 7 + cm_rounds + (multi-block boundary factors) and the OUTER budget is 16
-                // (log_nqc ≤ log_blowup — exceeding it SILENTLY corrupts the quotient, see the is_zk=1 sum
-                // form above + hiding_monolith_degree_probe). Every current is_zk=0 config fits (db=8
-                // multi-block: 17 ⇒ log2_ceil(16)=4 exactly); a deeper/non-hiding config that crosses must
-                // migrate to the sum form as its OWN validated increment (it changes the constraint set).
-                let mut nt = (one.clone() - p[self.m_term()].clone()) * (one.clone() - p[self.q_term()].clone());
-                for r in 0..self.cm_rounds() {
-                    nt = nt * (one.clone() - p[self.c_term(r)].clone());
-                }
-                if self.leaf_blocks() > 1 {
-                    nt = nt * (one.clone() - p[self.in_boundary()].clone());
-                }
-                if self.quot_leaf_blocks() > 1 {
-                    nt = nt * (one.clone() - p[self.q_boundary()].clone());
-                }
-                nt
             };
             let link = s_merkle.clone() * p[FT_P_BLOCK_LAST].clone() * (one.clone() - p[self.p_st_last()].clone()) * not_term;
             let nb_ = nxt[self.m_bit()].clone();

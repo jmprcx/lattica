@@ -112,7 +112,13 @@ fn pinned_constraint_fingerprints() {
         ("JoinSplitBatchAir", (49, 45, 4, 167, 8, 9176787058577691560, 6216047000859822608)),
         ("HtlcBatchAir", (71, 57, 4, 244, 9, 14186304468083107211, 7128159627846454138)),
         ("Poseidon2RowsAir", (8, 11, 8, 16, 8, 4555829733017345773, 3694726246285696047)),
-        ("MonolithAir[is_zk=0,db=6]", (193, 56, 53, 380, 13, 2831239969576965911, 4845014777825624174)),
+        // MonolithAir[is_zk=0] re-pinned 2026-07-03 (was maxdeg 13, fnv 2831239969576965911): the
+        // merge-link `not_term` migrated from the product Π(1−one_hot) to the row-wise-identical
+        // disjoint-one-hot SUM form — the product's degree (7 + cm_rounds + boundary factors) crossed
+        // the outer maxdeg-16 / log_nqc-4 budget at the REAL join-split shape (db=12 ⇒ degree 21;
+        // caught by phase8_joinsplit_degree_probe). Same exclusions, same trace, degree-1 link. The
+        // is_zk=1 pin is UNCHANGED (it already used the sum form; term order preserved).
+        ("MonolithAir[is_zk=0,db=6]", (193, 56, 53, 380, 9, 8931234269209497483, 4845014777825624174)),
         ("MonolithAir[is_zk=1,hiding]", (619, 81, 2271, 875, 9, 5788871046264575537, 9300941697942390572)),
     ];
     for (name, fp) in pinned {
