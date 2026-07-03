@@ -376,8 +376,12 @@ fn verify_fri_native(
 /// `num_queries` selects the FRI query count (the production config is 96; the monolith milestone uses a
 /// reduced count to fit the 8 GB budget — the construction is query-count-agnostic, production restores 96).
 pub(crate) fn build_mmcs_and_params(max_log_arity: usize, num_queries: usize) -> (Perm, InputMmcs, FriParameters<ChallengeMmcs>) {
+    build_mmcs_and_params_cap(max_log_arity, num_queries, 6)
+}
+
+pub(crate) fn build_mmcs_and_params_cap(max_log_arity: usize, num_queries: usize, cap_height: usize) -> (Perm, InputMmcs, FriParameters<ChallengeMmcs>) {
     let perm = default_goldilocks_poseidon2_8();
-    let input_mmcs = InputMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6);
+    let input_mmcs = InputMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), cap_height);
     let params = FriParameters {
         log_blowup: 4,
         log_final_poly_len: 0,
@@ -394,7 +398,16 @@ pub(crate) fn build_mmcs_and_params(max_log_arity: usize, num_queries: usize) ->
 /// (Test/oracle helper: the aggregator receives inner proofs; only tests build configs + generate them.)
 #[cfg(test)]
 pub(crate) fn make_config(max_log_arity: usize, num_queries: usize) -> MyConfig {
-    let (perm, input_mmcs, params) = build_mmcs_and_params(max_log_arity, num_queries);
+    make_config_cap(max_log_arity, num_queries, 6)
+}
+
+/// `make_config` with an explicit Merkle-cap height. A SMALL cap shrinks the aggregator's column-window
+/// width dramatically: each full cap the cap-mux selects over is `2^cap_height · 4` witness columns
+/// (256 at cap 6 → 16 at cap 2, per trace/quotient/commit round), the dominant term in the aggregator's
+/// per-instance width. See `docs/recursion-aggregation-params.md`.
+#[cfg(test)]
+pub(crate) fn make_config_cap(max_log_arity: usize, num_queries: usize, cap_height: usize) -> MyConfig {
+    let (perm, input_mmcs, params) = build_mmcs_and_params_cap(max_log_arity, num_queries, cap_height);
     let pcs = MyPcs::new(Dft::default(), input_mmcs, params);
     MyConfig::new(pcs, Chal::new(perm))
 }
@@ -1146,10 +1159,15 @@ pub(crate) fn query_quotient_merkle(
     let leaf: [Val; 4] = hasher.hash_iter(row.iter().copied());
     let siblings = &batch.opening_proof;
     let depth = siblings.len();
-    let reduction = (log_global - 6) - depth; // cap_height = 6 ⇒ total drop to the cap is log_global − 6
+    let cap = proof.commitments.quotient_chunks.roots();
+    // The total index drop from the log_global query space to the quotient cap is `log_global − cap_height`
+    // (cap_height = log2 of the quotient cap-entry count, RUNTIME — was hardcoded to 6, breaking cap<6). The
+    // path folds `depth` of those levels; the remaining `reduction` shifts the query index into the quotient
+    // commitment's (possibly reduced) leaf-index space.
+    let cap_h = cap.len().trailing_zeros() as usize;
+    let reduction = (log_global - cap_h) - depth;
     let reduced = index >> reduction;
     let path: Vec<([Val; 4], bool)> = siblings.iter().enumerate().map(|(lvl, &s)| (s, (reduced >> lvl) & 1 == 1)).collect();
-    let cap = proof.commitments.quotient_chunks.roots();
     let cap_entry = cap[reduced >> depth];
     (leaf, path, cap_entry, row.len())
 }

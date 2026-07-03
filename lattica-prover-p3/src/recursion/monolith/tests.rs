@@ -1099,6 +1099,190 @@ fn build_inner_window(config: &MyConfig, value: u64, n_queries: usize) -> (Vec<V
     (trace.values, counts, binds, index_binds, n_terms, pvs[0])
 }
 
+/// R4: build ONE column-window monolith instance verifying an ARBITRARY (symbolic) inner AIR — the
+/// symbolic-epilogue twin of `build_inner_window`. Merges `run_symbolic_monolith`'s witness extraction +
+/// symbolic pis assembly with `build_inner_window`'s column-window build (inner pis held in a witness
+/// window, ζ-squaring chain filled) + the witnessed-selector fill. Returns the instance's fused-width
+/// columns + geometry params + the fold seed `pvs[0]` (its first inner public = the tx statement digest).
+/// The AIR-level composition is free: `eval`'s `pis` accessor already reads the window in column-window
+/// mode, so the symbolic epilogue reads pubs/periodic/qwt from the window transparently.
+#[allow(clippy::too_many_arguments)]
+fn build_symbolic_inner_window<A>(
+    config: &MyConfig,
+    inner: &A,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+    w_inner: usize,
+    n_pub: usize,
+    n_periodic: usize,
+) -> (Vec<Val>, Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize, Val)
+where
+    A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
+{
+    use super::{monolith_build_trace, MonolithAir};
+    use crate::recursion::native_fri::{epilogue_openings, eval_symbolic_native, multicol_query_terms, query_commit_merkle_all, query_fold_data, query_input_merkle, query_quotient_merkle, quotient_recompose_weights};
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+    let n_queries = proof.opening_proof.query_proofs.len();
+    let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(config, proof, pvs);
+    let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+    let mut per_query = Vec::new();
+    let mut quot_paths = Vec::new();
+    let mut commit_data = Vec::new();
+    let mut n_terms = 0;
+    let mut final0 = Challenge::ZERO;
+    for q in 0..n_queries {
+        let (terms, _x, alpha, ro, _w) = multicol_query_terms(config, inner, proof, pvs, q);
+        let (_ro2, rounds, _folded, f0) = query_fold_data(config, proof, pvs, q);
+        let (_leaf, path, _cap_entry) = query_input_merkle(config, proof, pvs, q);
+        let (_ql, qpath, _qce, _qw) = query_quotient_merkle(config, proof, pvs, q);
+        let cm = query_commit_merkle_all(config, proof, pvs, q);
+        if q == 0 {
+            final0 = f0;
+        }
+        n_terms = terms.len();
+        let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+        per_query.push(((index, terms, alpha, ro, rounds), Val::ZERO, path));
+        quot_paths.push(qpath);
+        commit_data.push(cm);
+    }
+    let nqc = proof.opened_values.quotient_chunks.len();
+    let layout = AirLayout::from_air::<Val>(inner);
+    let constraints = get_symbolic_constraints::<Val, A>(inner, layout);
+    // column_window = true (inner pis in the witness window so K instances tile); fold stays false (the
+    // aggregator lays these fused-width columns into its wider fold trace and adds the fold columns itself).
+    let air = MonolithAir {
+        counts: counts.clone(),
+        binds: binds.clone(),
+        index_binds: index_binds.clone(),
+        n_queries,
+        n_terms,
+        inner_counter: false,
+        column_window: true,
+        k_instances: 1,
+        fold: false,
+        constraints,
+        w_inner_f: w_inner,
+        n_pub_f: n_pub,
+        n_periodic_f: n_periodic,
+        is_zk: 0,
+        cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+    };
+    let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) = epilogue_openings(config, inner, proof, pvs);
+    let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    // pis (identical order to run_symbolic_monolith; here they fill the WINDOW instead of public_values).
+    let mut pis = Vec::new();
+    for ch in &chs {
+        pis.push(ch[0]);
+        pis.push(ch[1]);
+    }
+    for f in &index_felts {
+        pis.push(*f);
+    }
+    let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+    pis.push(fp[0]);
+    pis.push(fp[1]);
+    for e in proof.commitments.trace.roots().iter() {
+        pis.extend_from_slice(e);
+    }
+    for e in proof.commitments.quotient_chunks.roots().iter() {
+        pis.extend_from_slice(e);
+    }
+    for &pv in pvs {
+        pis.push(pv);
+    }
+    for cm in proof.opening_proof.commit_phase_commits.iter() {
+        for e in cm.roots().iter() {
+            pis.extend_from_slice(e);
+        }
+    }
+    for pv in &eo_periodic {
+        let c = cc(*pv);
+        pis.push(c[0]);
+        pis.push(c[1]);
+    }
+    if nqc > 1 {
+        for z in quotient_recompose_weights(config, inner, proof, pvs) {
+            let c = cc(z);
+            pis.push(c[0]);
+            pis.push(c[1]);
+        }
+    }
+    assert_eq!(pis.len(), air.pis_count(), "symbolic column-window pis layout matches pis_count");
+    // monolith_build_trace fills the pis window + the ζ-squaring chain (column-window branch).
+    let mut trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &pis, None);
+    // witnessed Lagrange selectors at ζ (bound in-circuit to their ζ-defs via the halved-domain z_h chain).
+    let (isf, isl, iv) = (cc(is_first), cc(is_last), cc(inv_van));
+    let fw = air.fused_w();
+    let sb = air.sel_base();
+    for r in 0..air.height() {
+        trace.values[r * fw + sb..r * fw + sb + 2].copy_from_slice(&isf);
+        trace.values[r * fw + sb + 2..r * fw + sb + 4].copy_from_slice(&isl);
+        trace.values[r * fw + sb + 4..r * fw + sb + 6].copy_from_slice(&iv);
+    }
+    // witnessed constraint-fold accumulators (column-window: α_stark is degree-1, so the in-circuit α-Horner is
+    // chunked — witness each FOLD_CHUNK boundary's partial fold to cap the outer degree). Native Horner mirrors
+    // the in-circuit schedule EXACTLY (same modulus, same `< n` cutoff) so every accumulator bind holds; the
+    // native pre-check (run_symbolic_monolith) already proved the full fold == quot(ζ).
+    if air.symbolic() {
+        use p3_field::BasedVectorSpace;
+        // DIAGNOSTIC (localizes cw=true failures): the native full α-fold on these openings/periodic/pubs must
+        // equal quot(ζ) — the same invariant run_symbolic_monolith pre-checks for cw=false. If THIS fails, the
+        // window openings are wrong (not the accumulators).
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let mut full = Challenge::ZERO;
+        for c in air.constraints.iter() {
+            full = full * eo_alpha + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, &eo_periodic, is_first, is_last, is_trans);
+        }
+        assert_eq!(full * inv_van, eo_quot, "cw=true FULL native fold == quot(ζ)");
+        // DIAGNOSTIC: verify the WINDOW (what the in-circuit epilogue actually reads) holds the α/pubs/periodic/
+        // qwt values the pre-check used. Reads row 0's window columns. Pinpoints a misplaced pis region (the
+        // periodic + nqc>1 coexistence is untested by the reference inners: none has both).
+        let rd2 = |j: usize| -> Challenge { Challenge::from_basis_coefficients_fn(|k| trace.values[air.pw(j) + k]) };
+        assert_eq!(rd2(0), eo_alpha, "window α == eo_alpha");
+        for i in 0..air.n_pub() {
+            assert_eq!(trace.values[air.pw(air.pub_pi() + i)], pvs[i], "window pub[{i}]");
+        }
+        for i in 0..air.n_periodic() {
+            assert_eq!(rd2(air.periodic_base() + 2 * i), eo_periodic[i], "window periodic[{i}] misplaced");
+        }
+        if air.nqc() > 1 {
+            let zps = quotient_recompose_weights(config, inner, proof, pvs);
+            for i in 0..air.nqc() {
+                assert_eq!(rd2(air.qwt_base() + 2 * i), zps[i], "window qwt[{i}] misplaced");
+            }
+        }
+        // pz opened-trace columns (local/next at ζ) — read at q=0's super-tile arith head (M_TF row = tr).
+        let tf_row = air.tr();
+        let rd_at = |row: usize, col: usize| -> Challenge { Challenge::from_basis_coefficients_fn(|k| trace.values[row * fw + col + k]) };
+        for c in 0..air.w_inner() {
+            assert_eq!(rd_at(tf_row, air.pz(air.trm_trace(c))), eo_local[c], "pz local[{c}] wrong (w_inner={})", air.w_inner());
+            assert_eq!(rd_at(tf_row, air.pz(air.trm_next(c))), eo_next[c], "pz next[{c}] wrong");
+        }
+        // selectors + accumulators present at the tf row?
+        assert_eq!(rd_at(tf_row, air.sel(0)), is_first, "sel is_first at tf row");
+        assert_eq!(rd_at(tf_row, air.sel(4)), inv_van, "sel inv_van at tf row");
+    }
+    if air.n_fold_acc() > 0 {
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let mut folded = Challenge::ZERO;
+        let mut acc_i = 0usize;
+        let n_c = air.constraints.len();
+        for (k, c) in air.constraints.iter().enumerate() {
+            folded = folded * eo_alpha + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, &eo_periodic, is_first, is_last, is_trans);
+            if (k + 1) % MonolithAir::FOLD_CHUNK == 0 && k + 1 < n_c {
+                let fc = cc(folded);
+                let col = air.fold_acc(acc_i);
+                for r in 0..air.height() {
+                    trace.values[r * fw + col..r * fw + col + 2].copy_from_slice(&fc);
+                }
+                acc_i += 1;
+            }
+        }
+    }
+    (trace.values, counts, binds, index_binds, n_terms, pvs[0])
+}
+
 /// Phase 6.6: the TILED AGGREGATOR — K column-window monolith instances FUSED with the block tx-root fold
 /// in ONE AIR. Each instance verifies a distinct inner ConstAir proof (accept-iff-p3::verify) AND folds its
 /// verified public value `pvs[0]` into a global-persistent Merkle–Damgård root; the ONLY public input is
@@ -1192,6 +1376,265 @@ fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
     let rss = peak_rss_bytes();
     println!("  -> peak RSS {} MiB", rss / (1 << 20));
     (hh.trailing_zeros(), rss)
+}
+
+/// R4: the SYMBOLIC tiled aggregator — K column-window monolith instances, each verifying a REAL
+/// join-split proof (accept-iff-p3::verify via the symbolic epilogue) AND folding its verified `pvs[0]`
+/// into the block tx-root, fused in ONE AIR. The symbolic twin of `run_aggregator` (which did ConstAir
+/// inners). Proves iff all K join-split inners verify and fold to the emitted root; rejects a wrong
+/// tx-root and a corrupted instance. Returns (log2 height, RSS). (The fold seed is `pvs[0]` here — the
+/// batch-root-matching full-statement-digest fold is a follow-on refinement.)
+fn run_symbolic_aggregator(k: usize, n_queries: usize, cap_h: usize) -> (u32, u64) {
+    use super::{MonolithAir, MAX_AGG_TILES};
+    use crate::joinsplit_air::{build_trace, demo_witness, merge, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+    use crate::poseidon2_air::{native_permute, native_steps};
+    use crate::recursion::native_fri::{agg_statement_digest, make_config_cap, DOM_AGG};
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+    assert!(k.is_power_of_two() && k <= MAX_AGG_TILES, "K power of two ≤ MAX_AGG_TILES");
+    // A SMALL inner cap shrinks the column-window width (the full caps the cap-mux selects over are
+    // 2^cap · 4 witness columns each) — the lever that keeps the wide aggregator inside RAM.
+    let config = make_config_cap(1, n_queries, cap_h);
+    // K join-split inner proofs (demo witness — size-representative; the fold binds each instance's pvs[0]).
+    let w = demo_witness();
+    let pvs = public_values(&w);
+    let mut insts: Vec<Vec<Val>> = Vec::new();
+    let mut pvs0s: Vec<Val> = Vec::new();
+    let mut params: Option<(Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize, usize)> = None;
+    for _i in 0..k {
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let cap_height = proof.commitments.trace.roots().len().trailing_zeros() as usize;
+        let (tr, counts, binds, ib, nt, pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC);
+        insts.push(tr);
+        pvs0s.push(pv0);
+        if _i == 0 {
+            params = Some((counts, binds, ib, nt, cap_height));
+        }
+    }
+    let (counts, binds, index_binds, n_terms, cap_height) = params.unwrap();
+    let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+    let air = MonolithAir {
+        counts,
+        binds,
+        index_binds,
+        n_queries,
+        n_terms,
+        inner_counter: false,
+        column_window: true,
+        k_instances: k,
+        fold: true,
+        constraints,
+        w_inner_f: WIDTH,
+        n_pub_f: N_PUBLIC,
+        n_periodic_f: N_PERIODIC,
+        is_zk: 0,
+        cap_height,
+    };
+    let (fw, w_fold, inst_h, hh, fb) = (air.fused_w(), air.fold_w(), air.inst_h(), air.height(), air.fold_sk_block());
+    assert!(fb * BLOCK >= air.tr() + n_queries * air.m_period(), "fold blocks land in the instance tail slack");
+    let mut all = vec![Val::ZERO; hh * w_fold];
+    let mut root = [Val::ZERO; 4];
+    for i in 0..k {
+        let tr = &insts[i];
+        for r in 0..inst_h {
+            let dst = (i * inst_h + r) * w_fold;
+            all[dst..dst + fw].copy_from_slice(&tr[r * fw..r * fw + fw]);
+            all[dst + air.af_root(0)..dst + air.af_root(0) + 4].copy_from_slice(&root);
+        }
+        let mut sk_in = [Val::ZERO; W];
+        sk_in[0] = Val::from_u64(DOM_AGG);
+        sk_in[4] = pvs0s[i];
+        let sk_rows = native_steps(sk_in);
+        for r in 0..BLOCK {
+            let base = (i * inst_h + fb * BLOCK + r) * w_fold + air.af_p(0);
+            all[base..base + W].copy_from_slice(&sk_rows[r]);
+        }
+        let s_k: [Val; 4] = native_permute(sk_in)[..4].try_into().unwrap();
+        let mut rt_in = [Val::ZERO; W];
+        rt_in[..4].copy_from_slice(&root);
+        rt_in[4..].copy_from_slice(&s_k);
+        let rt_rows = native_steps(rt_in);
+        for r in 0..BLOCK {
+            let base = (i * inst_h + (fb + 1) * BLOCK + r) * w_fold + air.af_p(0);
+            all[base..base + W].copy_from_slice(&rt_rows[r]);
+        }
+        root = native_permute(rt_in)[..4].try_into().unwrap();
+    }
+    let mut ref_root = [Val::ZERO; 4];
+    for &pv in &pvs0s {
+        ref_root = merge(ref_root, agg_statement_digest(pv));
+    }
+    assert_eq!(root, ref_root, "built tx-root == agg oracle root");
+    let txroot: Vec<Val> = root.to_vec();
+    let trace = RowMajorMatrix::new(all, w_fold);
+    println!("symbolic aggregator+fold: {k} join-split inners × 2^{} = 2^{} rows (width {w_fold})", inst_h.trailing_zeros(), hh.trailing_zeros());
+    let prf = prove(&config, &air, trace.clone(), &txroot);
+    assert!(verify(&config, &air, &prf, &txroot).is_ok(), "{k} join-split inners verify + fold to the block tx-root in ONE AIR");
+    let mut bad_root = txroot.clone();
+    bad_root[0] += Val::ONE;
+    assert!(verify(&config, &air, &prf, &bad_root).is_err(), "tampered tx-root ⇒ reject");
+    // corrupted instance 1 (its α_stark window column across all rows) ⇒ its squeeze↦window bind fails ⇒ reject.
+    let mut bad_vals = trace.values.clone();
+    for r in inst_h..(2 * inst_h) {
+        bad_vals[r * w_fold + air.pw(0)] += Val::ONE;
+    }
+    let bp = prove(&config, &air, RowMajorMatrix::new(bad_vals, w_fold), &txroot);
+    assert!(verify(&config, &air, &bp, &txroot).is_err(), "corrupted instance 1 ⇒ reject");
+    let rss = peak_rss_bytes();
+    println!("  -> peak RSS {} MiB", rss / (1 << 20));
+    (hh.trailing_zeros(), rss)
+}
+
+/// R4 ISOLATION: the COLUMN-WINDOW join-split monolith standalone (k=1, NO fold, NO tiling) — verifies a real
+/// join-split inner reading its pis from the witness window, exercising the CHUNKED α-fold with witnessed
+/// accumulators in isolation from the aggregator's fold/tiling. If this verifies but the aggregator doesn't,
+/// the bug is in fold/tiling; if this fails, it's the epilogue/accumulators.
+#[test]
+#[ignore = "slow: R4 column-window join-split monolith (chunked α-fold), standalone"]
+fn phase8_joinsplit_window_monolith() {
+    use super::MonolithAir;
+    use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+    use crate::recursion::native_fri::make_config_cap;
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+    let config = make_config_cap(1, 4, 2);
+    let w = demo_witness();
+    let pvs = public_values(&w);
+    let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+    let (tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC);
+    let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+    let air = MonolithAir {
+        counts, binds, index_binds, n_queries: 4, n_terms,
+        inner_counter: false, column_window: true, k_instances: 1, fold: false,
+        constraints, w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
+        cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+    };
+    let fw = air.fused_w();
+    let trace = RowMajorMatrix::new(tr, fw);
+    let prf = prove(&config, &air, trace, &[]); // cw=true k=1: all pis in the window, nothing public
+    assert!(verify(&config, &air, &prf, &[]).is_ok(), "column-window join-split monolith (chunked α-fold) verifies");
+    println!("R4 isolation: column-window join-split monolith verifies (chunked α-fold, width {fw})");
+}
+
+/// Build the cw=true k=1 (no fold) monolith over `inner` and return (n_fold_acc, verify-ok). Shared by the
+/// column-window isolation/discriminator tests.
+fn window_verify<A>(config: &MyConfig, inner: &A, proof: &Proof<MyConfig>, pvs: &[Val], w: usize, np: usize, nper: usize) -> (usize, bool)
+where
+    A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
+{
+    use super::MonolithAir;
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+    let (tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(config, inner, proof, pvs, w, np, nper);
+    let constraints = get_symbolic_constraints::<Val, A>(inner, AirLayout::from_air::<Val>(inner));
+    let air = MonolithAir {
+        counts, binds, index_binds, n_queries: proof.opening_proof.query_proofs.len(), n_terms,
+        inner_counter: false, column_window: true, k_instances: 1, fold: false,
+        constraints, w_inner_f: w, n_pub_f: np, n_periodic_f: nper, is_zk: 0,
+        cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+    };
+    let fw = air.fused_w();
+    let prf = prove(config, &air, RowMajorMatrix::new(tr, fw), &[]);
+    (air.n_fold_acc(), verify(config, &air, &prf, &[]).is_ok())
+}
+
+/// R4 GUARD: the CAP-2 column-window monolith verifies a broad matrix of inner shapes — degree (1..4), periodic
+/// (0/1), quotient chunks (nqc 1/2/4), multi-block input leaf (W=8), and FRI depth (db 6/12). Regression guard
+/// for the two cap<6 fixes (the chunked α-fold + the runtime quotient-cap-height) — each of these shapes failed
+/// before the fixes. (Deriving accumulators from a low FOLD_CHUNK also isolates the fold-degree lever.)
+#[test]
+#[ignore = "slow: R4 cap-2 column-window guard (fib/mul/periodic/cube/quart/wide/db12)"]
+fn phase8_window_discriminator() {
+    use crate::recursion::native_fri::{gen_cube_proof, gen_fib_proof, gen_mul_proof, gen_periodic_proof, gen_quart_proof, gen_wide_proof, make_config_cap};
+    use crate::recursion::native_verify::{CubeAir, FibonacciAir, MulAir, PeriodicAir, QuartAir, WideAir, WIDE_W};
+    let config = make_config_cap(1, 4, 2); // CAP-2 (matches the join-split window test) — the suspected bug lever
+    let (fp, fpv) = gen_fib_proof(&config, 1, 1, 6);
+    let (mp, mpv) = gen_mul_proof(&config, 3, 5, 6);
+    let (pp, ppv) = gen_periodic_proof(&config, 5, 6);
+    let (cp, cpv) = gen_cube_proof(&config, 5, 6);
+    let (qp, qpv) = gen_quart_proof(&config, 5, 6);
+    let (wp, wpv) = gen_wide_proof(&config, 5, 6);
+    let (cp12, cpv12) = gen_cube_proof(&config, 5, 12); // db=12 (deep FRI, like join-split) + nqc=2
+    let (qp12, qpv12) = gen_quart_proof(&config, 5, 12); // db=12 + nqc=4 + multi-block quotient leaf
+    let fib = window_verify(&config, &FibonacciAir, &fp, &fpv, 2, 3, 0);
+    let mul = window_verify(&config, &MulAir, &mp, &mpv, 3, 2, 0);
+    let per = window_verify(&config, &PeriodicAir, &pp, &ppv, 1, 1, 1);
+    let cube = window_verify(&config, &CubeAir, &cp, &cpv, 2, 1, 0);
+    let quart = window_verify(&config, &QuartAir, &qp, &qpv, 2, 1, 0);
+    let wide = window_verify(&config, &WideAir, &wp, &wpv, WIDE_W, WIDE_W, 0);
+    let cube12 = window_verify(&config, &CubeAir, &cp12, &cpv12, 2, 1, 0);
+    let quart12 = window_verify(&config, &QuartAir, &qp12, &qpv12, 2, 1, 0);
+    let p = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    println!("WINDOW [fib      deg1 nper0 nqc1  W2  db6 ]: n_fold_acc={} verify={}", fib.0, p(fib.1));
+    println!("WINDOW [mul      deg2 nper0 nqc1  W3  db6 ]: n_fold_acc={} verify={}", mul.0, p(mul.1));
+    println!("WINDOW [periodic deg1 nper1 nqc1  W1  db6 ]: n_fold_acc={} verify={}", per.0, p(per.1));
+    println!("WINDOW [cube     deg3 nper0 nqc2  W2  db6 ]: n_fold_acc={} verify={}", cube.0, p(cube.1));
+    println!("WINDOW [quart    deg4 nper0 nqc4  W2  db6 ]: n_fold_acc={} verify={}", quart.0, p(quart.1));
+    println!("WINDOW [wide     deg1 nper0 nqc1  W8  db6 ]: n_fold_acc={} verify={}", wide.0, p(wide.1));
+    println!("WINDOW [cube     deg3 nper0 nqc2  W2  db12]: n_fold_acc={} verify={}", cube12.0, p(cube12.1));
+    println!("WINDOW [quart    deg4 nper0 nqc4  W2  db12]: n_fold_acc={} verify={}", quart12.0, p(quart12.1));
+    for (name, (_, ok)) in [("fib", fib), ("mul", mul), ("periodic", per), ("cube", cube), ("quart", quart), ("wide", wide), ("cube12", cube12), ("quart12", quart12)] {
+        assert!(ok, "cap-2 column-window monolith over {name} must verify");
+    }
+}
+
+/// R4 GUARD (cheap, no outer prove): every symbolic monolith shape — plain, column-window, k-tiled, folded,
+/// and the full aggregator — must have `log_nqc ≤ log_blowup (4)`, i.e. its quotient fits the FRI codeword.
+/// This is the check the original degree probe LACKED (it only built `column_window=false`): the aggregator's
+/// α-Horner fold with a degree-1 window `α_stark` reached `log_nqc = 7` (max_deg 91) — a silent unsound
+/// quotient — until the chunked accumulator fix (`FOLD_CHUNK`). Asserting it here catches any regression that
+/// re-inflates the fold degree.
+#[test]
+#[ignore = "guard: symbolic monolith quotient geometry (no prove)"]
+fn phase8_joinsplit_aggregator_probe() {
+    use super::MonolithAir;
+    use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+    use crate::recursion::native_fri::make_config_cap;
+    use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, AirLayout};
+    let (n_queries, cap_h) = (4usize, 2usize);
+    let config = make_config_cap(1, n_queries, cap_h);
+    let w = demo_witness();
+    let pvs = public_values(&w);
+    let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+    let (counts, binds, index_binds, n_terms, cap_height) = {
+        let (_tr, counts, binds, ib, nt, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC);
+        (counts, binds, ib, nt, proof.commitments.trace.roots().len().trailing_zeros() as usize)
+    };
+    let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+    let mk = |cw: bool, ki: usize, fold: bool| MonolithAir {
+        counts: counts.clone(), binds: binds.clone(), index_binds: index_binds.clone(), n_queries, n_terms,
+        inner_counter: false, column_window: cw, k_instances: ki, fold,
+        constraints: constraints.clone(), w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0, cap_height,
+    };
+    for (tag, cw, ki, fold) in [
+        ("plain       cw0 k1 f0", false, 1, false),
+        ("R1 window    cw1 k1 f0", true, 1, false),
+        ("k-tiled      cw1 k2 f0", true, 2, false),
+        ("fold k1      cw1 k1 f1", true, 1, true),
+        ("AGGREGATOR   cw1 k2 f1", true, 2, true),
+    ] {
+        let air = mk(cw, ki, fold);
+        let layout = AirLayout::from_air::<Val>(&air);
+        let cs = get_symbolic_constraints::<Val, MonolithAir>(&air, layout);
+        let mut degs: Vec<usize> = cs.iter().map(|c| c.degree_multiple()).collect();
+        degs.sort_unstable_by(|a, b| b.cmp(a));
+        let maxd = degs[0];
+        let n_at_max = degs.iter().filter(|&&d| d == maxd).count();
+        let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
+        println!("AGG PROBE [{tag}]: width={} height=2^{} max_deg={maxd} (×{n_at_max}; next={}) log_nqc={log_nqc} n_cs={} C_inner={}",
+            air.fold_w(), air.height().trailing_zeros(), degs.get(n_at_max).copied().unwrap_or(0), cs.len(), constraints.len());
+        assert!(log_nqc <= 4, "{tag}: log_nqc {log_nqc} exceeds log_blowup 4 ⇒ the quotient can't be committed (unsound). Lower FOLD_CHUNK.");
+    }
+}
+
+/// R4: the symbolic aggregator verifies K=2 REAL join-split proofs + folds to the block tx-root in ONE AIR.
+#[test]
+#[ignore = "slow + large RSS: R4 symbolic aggregator over K=2 real join-split inners"]
+fn phase8_joinsplit_aggregator() {
+    // cap_height=2 keeps the wide column-window aggregator inside this box's RAM (full caps 16 cols
+    // each vs 256 at cap 6). Cap height is a FRI encoding choice with no soundness effect.
+    let (log2h, rss) = run_symbolic_aggregator(2, 4, 2);
+    println!("R4: K=2 real join-split inners verified + folded to the block tx-root in ONE AIR at 2^{log2h} / {} MiB", rss / (1 << 20));
 }
 
 #[test]

@@ -459,7 +459,29 @@ impl MonolithAir {
         self.ccap_base() + (0..r).map(|r2| self.commit_cap_size(r2) * 4).sum::<usize>()
     }
     pub(crate) fn fused_w(&self) -> usize {
-        self.sel_base() + if self.symbolic() { 6 } else { 0 } // sel_base = pw_base (+ column-window window); + 3 witnessed selectors (symbolic)
+        // sel_base = pw_base (+ column-window window); + 3 witnessed Lagrange selectors (6 felts, symbolic);
+        // + the witnessed constraint-fold accumulators (column-window only — see fold_acc / FOLD_CHUNK).
+        self.sel_base() + if self.symbolic() { 6 + 2 * self.n_fold_acc() } else { 0 }
+    }
+    // The α-Horner fold of the inner AIR's C_inner constraints (`folded = folded·α_stark + c_k`) is checked
+    // against quotient(ζ) in ONE expression. In COLUMN-WINDOW mode α_stark is a degree-1 witness column (the
+    // pi window), so folding all C_inner inline makes that expression degree ≈ base + C_inner (91 for the
+    // 81-constraint join-split ⇒ log_nqc 7 ⇒ the quotient can't be committed at log_blowup 4: unsound AND a
+    // 2^23-domain RAM blow-up). Fix: CHUNK the fold — witness the running partial fold every FOLD_CHUNK
+    // constraints (`fold_acc`) and continue the Horner from that degree-1 column, capping the degree at
+    // ≈ base + FOLD_CHUNK (≤ 16). pis-mode folds α as a degree-0 public constant, so it needs no chunking (0
+    // accumulators). Verified by `phase8_joinsplit_aggregator_probe` (max_deg / log_nqc).
+    pub(crate) const FOLD_CHUNK: usize = 7;
+    pub(crate) fn n_fold_acc(&self) -> usize {
+        if self.symbolic() && self.column_window {
+            self.constraints.len().div_ceil(Self::FOLD_CHUNK).saturating_sub(1) // chunk boundaries = n_chunks − 1
+        } else {
+            0
+        }
+    }
+    // witnessed constraint-fold accumulator i (F_p² pair), after the 3 Lagrange selectors in the fused region.
+    pub(crate) fn fold_acc(&self, i: usize) -> usize {
+        self.sel_base() + 6 + 2 * i
     }
     // aggregator fold columns (only when `fold`): 8 Poseidon lanes (the two merge permutations) + 4 lanes for
     // the global-persistent running root, appended after the column-window window.
@@ -1195,11 +1217,24 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub()).map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO)).collect();
                 // periodic column values at ζ (verifier-computed publics in the periodic pis region).
                 let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic()).map(|i| (pis[self.periodic_base() + 2 * i].clone(), pis[self.periodic_base() + 2 * i + 1].clone())).collect();
+                // α-Horner fold of the inner constraints, CHUNKED in column-window mode (α_stark degree-1):
+                // witness the running fold every FOLD_CHUNK constraints and continue from that degree-1 column,
+                // so this stays ≈ base+FOLD_CHUNK instead of base+C_inner. pis-mode (α degree-0) folds inline.
+                let chunked = self.column_window;
                 let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
-                for c in &self.constraints {
+                let mut acc_i = 0usize;
+                let n_c = self.constraints.len();
+                for (k, c) in self.constraints.iter().enumerate() {
                     let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w);
                     let fa = emul(folded.clone(), alpha_stark.clone());
                     folded = (fa.0 + ci.0, fa.1 + ci.1);
+                    if chunked && (k + 1) % Self::FOLD_CHUNK == 0 && k + 1 < n_c {
+                        let a = gg(self.fold_acc(acc_i)); // bind the witnessed partial fold, then Horner on from it
+                        builder.assert_zero(tf.clone() * (a.0.clone() - folded.0.clone()));
+                        builder.assert_zero(tf.clone() * (a.1.clone() - folded.1.clone()));
+                        folded = a;
+                        acc_i += 1;
+                    }
                 }
                 let chk = emul(folded, inv_van);
                 builder.assert_zero(tf.clone() * (chk.0 - quot.0));
