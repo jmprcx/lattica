@@ -1641,6 +1641,45 @@ fn phase8_joinsplit_aggregator_probe() {
     }
 }
 
+/// RAM-vs-cap projection for the PRODUCTION aggregator (q96 / K=2, real join-split inner) — geometry only, NO
+/// aggregator prove. Inner cap height has NO soundness effect but trades the column-window WIDTH (∝ 2^cap) against
+/// the Merkle-path DEPTH per query (∝ log_global − cap, which grows the super-tile ⇒ rows). So min(rows × width)
+/// sits at some middle cap, not the extremes. Projects LDE = rows·width·8·2^log_blowup and RAM ≈ 1.4·LDE
+/// (calibrated: the measured cap-2/q4 aggregator was ~13 GB at ~9.4 GB LDE).
+#[test]
+#[ignore = "measurement: aggregator RAM vs inner cap height at q96/K=2 (geometry, no aggregator prove)"]
+fn aggregator_ram_cap_curve() {
+    use super::MonolithAir;
+    use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+    use crate::recursion::native_fri::{make_config_cap, multicol_query_terms};
+    use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+    let w = demo_witness();
+    let pvs = public_values(&w);
+    let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+    println!("PRODUCTION aggregator (q96 / K=2 / join-split inner) — RAM projection by inner cap height:");
+    for cap_h in [2usize, 3, 4, 5, 6] {
+        let config = make_config_cap(1, 96, cap_h);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs); // q96 inner (the user's own proof)
+        let cap_height = proof.commitments.trace.roots().len().trailing_zeros() as usize;
+        let (_bi, counts, binds, _chs, index_binds, _if) = sim_full(&config, &proof, &pvs);
+        let n_terms = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0).0.len();
+        let air = MonolithAir {
+            counts, binds, index_binds, n_queries: 96, n_terms, inner_counter: false,
+            column_window: true, k_instances: 2, fold: true, fold_txstmt: true,
+            constraints: constraints.clone(), w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC,
+            is_zk: 0, cap_height,
+        };
+        let (rows, width) = (air.height() as u128, air.fold_w() as u128);
+        let lde_gb = rows * width * 8 * 16 / (1 << 30);
+        let ram_gb = lde_gb * 7 / 5; // ≈ 1.4× LDE, calibrated to the measured cap-2/q4 point
+        println!(
+            "  cap-{cap_h}: inst_h=2^{} rows=2^{} width={width} | LDE ~{lde_gb} GB → est. RAM ~{ram_gb} GB",
+            air.inst_h().trailing_zeros(),
+            air.height().trailing_zeros(),
+        );
+    }
+}
+
 /// R4: the symbolic aggregator verifies K=2 REAL join-split proofs + folds to the block tx-root in ONE AIR.
 #[test]
 #[ignore = "slow + large RSS: R4 symbolic aggregator over K=2 real join-split inners"]
