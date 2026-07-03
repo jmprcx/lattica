@@ -635,6 +635,31 @@ mod tests {
         assert!(htlc_air::verify_bytes(&bytes, &pis), "GPU-proved HTLC must verify under the standard verifier");
     }
 
+    /// H3 KILLER TEST: a proof made with the GPU **hiding** config — GPU LDE *and* GPU Merkle
+    /// (`GpuHidingMerkleMmcs`) — verifies under the STANDARD production verifier. This proves the GPU
+    /// hiding path is byte-compatible end-to-end (the whole FRI query/open/verify exercises the salted
+    /// tree), so the existing verifier / C-ABI / node accept GPU-accelerated proofs unchanged.
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU; runs a real proof"]
+    fn gpu_joinsplit_proof_verifies_hiding() {
+        use crate::joinsplit_air::{self, JoinSplitAir};
+        let w = joinsplit_air::demo_witness();
+        let pis = joinsplit_air::public_values(&w);
+        let bytes = crate::config::gpu::proof_to_bytes_hiding(&JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+        assert!(joinsplit_air::verify_bytes(&bytes, &pis), "GPU-hiding join-split proof must verify under the standard production verifier");
+    }
+
+    /// H3 killer test, HTLC.
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU; runs a real proof"]
+    fn gpu_htlc_proof_verifies_hiding() {
+        use crate::htlc_air::{self, HtlcAir};
+        let w = htlc_air::demo_htlc_witness();
+        let pis = htlc_air::public_values(&w);
+        let bytes = crate::config::gpu::proof_to_bytes_hiding(&HtlcAir, htlc_air::build_trace(&w), &pis);
+        assert!(htlc_air::verify_bytes(&bytes, &pis), "GPU-hiding HTLC proof must verify under the standard production verifier");
+    }
+
     /// Honest CPU-vs-GPU wall-clock for proving the real join-split circuit (prints; never asserts a
     /// speedup — the LDE kernel is faster per-DFT, but the end-to-end win needs a GPU coset_lde override,
     /// which is a follow-on). Both proofs verify.

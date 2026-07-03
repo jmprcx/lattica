@@ -172,6 +172,42 @@ pub mod gpu {
         postcard::to_allocvec(&proof).expect("proof serialization is infallible")
     }
 
+    // --- GPU HIDING config: production-identical, with BOTH heavy steps on the GPU -------------------
+    // `HidingFriPcs` + `is_zk` + `NUM_RANDOM_CODEWORDS` + `CAP_HEIGHT` + FRI params all match production;
+    // only `GpuDft` (LDE) and `GpuHidingMerkleMmcs` (Merkle) differ. `GpuHidingMerkleMmcs`'s
+    // `Commitment`/`Proof` are byte-identical to `MerkleTreeHidingMmcs`, so a proof made here serializes
+    // exactly like `Proof<MyConfig>` and **verifies under the standard production verifier**
+    // (`<circuit>::verify_bytes` / the C-ABI / the node), unchanged — see `gpu_*_proof_verifies_hiding`.
+    use crate::gpu::GpuHidingMerkleMmcs;
+
+    pub type ChallengeMmcsGpuHiding = ExtensionMmcs<Val, Challenge, GpuHidingMerkleMmcs>;
+    pub type MyPcsGpuHiding = HidingFriPcs<Val, GpuDft, GpuHidingMerkleMmcs, ChallengeMmcsGpuHiding, ChaCha20Rng>;
+    pub type MyConfigGpuHiding = StarkConfig<MyPcsGpuHiding, Challenge, Challenger>;
+
+    /// The production config with LDE + Merkle on the GPU. Mirror of `super::make_config` — only the
+    /// `Dft` (`GpuDft`) and the inner MMCS (`GpuHidingMerkleMmcs`) differ; identical `CAP_HEIGHT`,
+    /// `NUM_RANDOM_CODEWORDS`, FRI params, and fresh per-proof ChaCha20 salts.
+    pub fn make_config_hiding() -> MyConfigGpuHiding {
+        let perm = default_goldilocks_poseidon2_8();
+        let val_mmcs = GpuHidingMerkleMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let challenge_mmcs = ChallengeMmcsGpuHiding::new(val_mmcs.clone());
+        let fri = gpu_fri_params(challenge_mmcs);
+        let pcs = MyPcsGpuHiding::new(GpuDft, val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::from_rng(&mut rand::rng()));
+        MyConfigGpuHiding::new(pcs, Challenger::new(perm))
+    }
+
+    /// Prove `air` with GPU LDE + GPU Merkle. **Wire-compatible**: verify with the standard
+    /// `<circuit>::verify_bytes`, unchanged. The ONE GPU-hiding prove-and-serialize path.
+    pub fn proof_to_bytes_hiding<A>(air: &A, trace: RowMajorMatrix<Val>, pis: &[Val]) -> Vec<u8>
+    where
+        A: Air<SymbolicAirBuilder<Val>>
+            + for<'a> Air<ProverConstraintFolder<'a, MyConfigGpuHiding>>
+            + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+    {
+        let proof = prove(&make_config_hiding(), air, trace, pis);
+        postcard::to_allocvec(&proof).expect("proof serialization is infallible")
+    }
+
     // --- Non-hiding BENCHMARK configs (NOT production): isolate the GPU LDE + Merkle speedup against an
     // apples-to-apples CPU baseline with identical FRI parameters. No ZK, no salts. `GpuMerkleMmcs`
     // commits equal-height matrices with `cap_height = 0`, so the CPU baseline mirrors that exactly
@@ -190,8 +226,9 @@ pub mod gpu {
     pub type BenchPcsGpu = TwoAdicFriPcs<Val, GpuDft, GpuMerkleMmcs, BenchChMmcsGpu>;
     pub type BenchConfigGpu = StarkConfig<BenchPcsGpu, Challenge, Challenger>;
 
-    /// Benchmark FRI params: the production literals, generic over the (non-hiding) challenge MMCS.
-    fn bench_fri<M>(mmcs: M) -> FriParameters<M> {
+    /// The production FRI literals (`LOG_BLOWUP` / `NUM_QUERIES` / `QUERY_POW_BITS` / …), generic over the
+    /// challenge MMCS — identical to `super::production_fri`, shared by the GPU-module configs.
+    fn gpu_fri_params<M>(mmcs: M) -> FriParameters<M> {
         FriParameters {
             log_blowup: LOG_BLOWUP,
             log_final_poly_len: 0,
@@ -207,7 +244,7 @@ pub mod gpu {
     pub fn make_bench_config_cpu() -> BenchConfigCpu {
         let perm = default_goldilocks_poseidon2_8();
         let vm = BenchValMmcsCpu::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0);
-        let pcs = BenchPcsCpu::new(Dft::default(), vm.clone(), bench_fri(BenchChMmcsCpu::new(vm)));
+        let pcs = BenchPcsCpu::new(Dft::default(), vm.clone(), gpu_fri_params(BenchChMmcsCpu::new(vm)));
         BenchConfigCpu::new(pcs, Challenger::new(perm))
     }
 
@@ -215,7 +252,7 @@ pub mod gpu {
     pub fn make_bench_config_gpu() -> BenchConfigGpu {
         let perm = default_goldilocks_poseidon2_8();
         let vm = GpuMerkleMmcs::new();
-        let pcs = BenchPcsGpu::new(GpuDft, vm.clone(), bench_fri(BenchChMmcsGpu::new(vm)));
+        let pcs = BenchPcsGpu::new(GpuDft, vm.clone(), gpu_fri_params(BenchChMmcsGpu::new(vm)));
         BenchConfigGpu::new(pcs, Challenger::new(perm))
     }
 }
