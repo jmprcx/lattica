@@ -854,4 +854,37 @@ mod tests {
         println!("join-split prove, non-hiding (best of {runs}): CPU {cpu_ms:.1}ms | GPU(LDE+Merkle) {gpu_ms:.1}ms  ({:.2}x)", cpu_ms / gpu_ms);
         println!("  GPU work across {runs} runs: NTT {ntt_ms:.0}ms / {ntt_calls} calls, Merkle {mk_ms:.0}ms / {mk_calls} commits");
     }
+
+    /// H4 — THE PRODUCTION-WORKLOAD BENCHMARK: prove the real join-split circuit under the production CPU
+    /// hiding config (`joinsplit_air::prove_to_bytes`) vs the GPU hiding config
+    /// (`config::gpu::proof_to_bytes_hiding`) — both `HidingFriPcs` + `is_zk` + salts, and **both verified
+    /// under the production verifier**. This is the speedup on the *hiding* workload the node runs.
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU; benchmark"]
+    fn gpu_hiding_benchmark() {
+        use crate::joinsplit_air::{self, JoinSplitAir};
+        use std::time::Instant;
+        let w = joinsplit_air::demo_witness();
+        let pis = joinsplit_air::public_values(&w);
+        // correctness: both proofs verify under the STANDARD production verifier.
+        let c = joinsplit_air::prove_to_bytes(&w);
+        assert!(joinsplit_air::verify_bytes(&c, &pis), "CPU hiding proof must verify");
+        let g = crate::config::gpu::proof_to_bytes_hiding(&JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+        assert!(joinsplit_air::verify_bytes(&g, &pis), "GPU hiding proof must verify under production verifier");
+        // timing: best-of-N wall clock.
+        let runs = 5;
+        let (mut cpu_ms, mut gpu_ms) = (f64::MAX, f64::MAX);
+        super::prof_reset();
+        for _ in 0..runs {
+            let t = Instant::now();
+            let _ = joinsplit_air::prove_to_bytes(&w);
+            cpu_ms = cpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let _ = crate::config::gpu::proof_to_bytes_hiding(&JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+            gpu_ms = gpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let (ntt_ms, ntt_calls, mk_ms, mk_calls) = super::prof_report();
+        println!("join-split prove, HIDING/production (best of {runs}): CPU {cpu_ms:.1}ms | GPU(LDE+Merkle) {gpu_ms:.1}ms  ({:.2}x)", cpu_ms / gpu_ms);
+        println!("  GPU work across {runs} runs: NTT {ntt_ms:.0}ms / {ntt_calls} calls, Merkle {mk_ms:.0}ms / {mk_calls} commits");
+    }
 }
