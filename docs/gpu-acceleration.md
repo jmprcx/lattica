@@ -1,8 +1,10 @@
 # GPU-accelerated proving (opt-in)
 
 `lattica-prover-p3` can offload the two heaviest proving steps — the low-degree extension (LDE) and the
-Merkle tree build — to a GPU via OpenCL, for a **measured ~2.45× speedup on the production (hiding)
-config**, with the GPU proof **verifying under the existing production verifier unchanged**. It is
+Merkle tree build — to a GPU via OpenCL, for a **measured ~2.1× speedup over an AVX2-optimized CPU** on
+the production (hiding) config, with the GPU proof **verifying under the existing production verifier
+unchanged**. (The CPU baseline uses p3's packed-Goldilocks SIMD — see *CPU SIMD* below; against a
+scalar CPU the ratio is ~2.45×, but the AVX2 comparison is the honest one.) It is
 **opt-in and prove-only**: the default CPU proving path, the byte-exact wire format, and the C-ABI
 verifier are untouched. Both GPU paths — `GpuDft` (LDE) and `GpuHidingMerkleMmcs` (Merkle) — are
 byte-compatible with the production `HidingFriPcs` + `MerkleTreeHidingMmcs`, so a GPU-produced proof
@@ -66,8 +68,8 @@ production `verify_bytes`**:
 
 | config | LDE | Merkle | join-split prove |
 |---|---|---|---:|
-| CPU (production) | `Radix2DitParallel` | `MerkleTreeHidingMmcs` | **~955 ms** |
-| GPU | `GpuDft` | `GpuHidingMerkleMmcs` | **~390 ms** (**~2.45×**) |
+| CPU (AVX2, production) | `Radix2DitParallel` | `MerkleTreeHidingMmcs` | **~845 ms** |
+| GPU | `GpuDft` | `GpuHidingMerkleMmcs` | **~400 ms** (**~2.1×**) |
 
 The killer test `gpu_{joinsplit,htlc}_proof_verifies_hiding` proves a circuit with the GPU hiding config
 and asserts the **standard production verifier accepts it** — the whole FRI query/open/verify path over
@@ -115,6 +117,17 @@ on the CPU (~50 ms) offsets it — the quotient's cost is *data movement*, not a
 CPU is **FRI + commit glue** — that is the real next lever, not the quotient. The fork + interpreters are
 kept as validated infrastructure: a real quotient win needs the trace kept **on-GPU across LDE→quotient**
 (a deeper PCS integration that avoids the round-trip).
+
+### CPU SIMD (AVX2)
+
+Rust's default `x86-64` target is SSE2-only, so p3-goldilocks's `target_feature`-gated AVX2 packed-field
+module compiled out and all CPU field arithmetic ran scalar. `.cargo/config.toml` now pins
+`target-cpu=x86-64-v3` (AVX2 + BMI2 + FMA; portable to all Haswell+/Zen+ CPUs, scoped to `x86_64` so
+aarch64 NEON builds are unaffected). Measured **~10% faster CPU proving** (~940 → ~845 ms) — bit-identical
+(packed field arithmetic equals scalar; fingerprints + verifier unchanged). The gain is modest because
+p3 has **no hand-vectorized Poseidon2** (the speedup is from packed field ops only, capped by Poseidon2's
+round dependencies and the NTT's memory-bound nature); a server with AVX-512 would additionally use p3's
+8-lane `x86_64_avx512` path. **Runtime requirement:** x86_64 binaries now need a v3 CPU (2013+).
 
 ### What's next
 
