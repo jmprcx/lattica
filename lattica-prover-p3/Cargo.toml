@@ -44,3 +44,9 @@ rayon = { version = "1", optional = true } # parallelize the GPU leaf-buffer mar
 # Enable GPU (OpenCL) acceleration of the LDE. Additive + prove-only: the default CPU proving path,
 # the wire format, and the verifier are untouched. Requires an OpenCL runtime + a GPU at runtime.
 gpu = ["dep:ocl", "dep:rayon"]
+
+[profile.release]
+# Cross-crate inlining of p3's hot field-arithmetic / NTT / Poseidon2 loops (thin LTO + one codegen
+# unit). Longer compile, faster prover; results bit-identical.
+lto = "thin"
+codegen-units = 1
