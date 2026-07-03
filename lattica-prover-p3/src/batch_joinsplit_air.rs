@@ -416,6 +416,13 @@ mod tests {
         );
     }
 
+    // NOTE (GPU + batch): routing the batch prove through the GPU PCS (`config::gpu::make_config_hiding`) fails
+    // with CL_INVALID_BUFFER_SIZE — at even a 16-tx block the LDE/NTT needs a single ~4 GiB device buffer, just
+    // over this GPU's 3.88 GB CL_DEVICE_MAX_MEM_ALLOC_SIZE. The GPU pipeline (`gpu.rs`) was sized for the
+    // join-split SPEND (2^12 rows → tiny buffers) and does not sub-tile that buffer below the device limit for
+    // the batch's 2^16..2^18 traces. GPU-accelerating the batch is a `gpu.rs` buffer-tiling effort, not a config
+    // swap — deferred. The CPU curve above is the current measured production batch path.
+
     #[test]
     fn batch_root_folds_in_order_with_iv_and_padding() {
         let ws = [variant(1), variant(2), variant(3)];
