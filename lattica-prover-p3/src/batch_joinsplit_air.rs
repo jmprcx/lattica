@@ -416,12 +416,34 @@ mod tests {
         );
     }
 
-    // NOTE (GPU + batch): routing the batch prove through the GPU PCS (`config::gpu::make_config_hiding`) fails
-    // with CL_INVALID_BUFFER_SIZE — at even a 16-tx block the LDE/NTT needs a single ~4 GiB device buffer, just
-    // over this GPU's 3.88 GB CL_DEVICE_MAX_MEM_ALLOC_SIZE. The GPU pipeline (`gpu.rs`) was sized for the
-    // join-split SPEND (2^12 rows → tiny buffers) and does not sub-tile that buffer below the device limit for
-    // the batch's 2^16..2^18 traces. GPU-accelerating the batch is a `gpu.rs` buffer-tiling effort, not a config
-    // swap — deferred. The CPU curve above is the current measured production batch path.
+    /// Same block-size RAM/time bench, proven on the GPU (`config::gpu::make_config_hiding` = GpuHidingPcs:
+    /// device-side LDE + Merkle + quotient randomization). Proof is BYTE-IDENTICAL to CPU and verifies under the
+    /// production verifier (asserted). Works while the LDE/NTT device buffer stays under this GPU's ~3.88 GB
+    /// CL_DEVICE_MAX_MEM_ALLOC_SIZE (≈ block ≤ 8 tx); larger blocks panic with CL_INVALID_BUFFER_SIZE until
+    /// `gpu.rs` sub-tiles that buffer.
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "bench: batch RAM/time on the GPU (LATTICA_BATCH_N=<n>, one N per process)"]
+    fn batch_ram_bench_gpu() {
+        use p3_matrix::Matrix;
+        let n: usize = std::env::var("LATTICA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
+        let ws: Vec<Witness> = (0..n).map(|i| variant_asset(1000 + i as u64)).collect();
+        let root = batch_root(&ws);
+        let trace = build_batch_trace(&ws);
+        let (rows, w) = (trace.height(), trace.width());
+        let cfg = crate::config::gpu::make_config_hiding();
+        let t0 = std::time::Instant::now();
+        let proof = prove(&cfg, &JoinSplitBatchAir, trace, &root);
+        let prove_s = t0.elapsed().as_secs_f64();
+        let bytes = postcard::to_allocvec(&proof).unwrap();
+        assert!(verify_batch_bytes(&bytes, &root), "batch of {n} verifies (GPU-proven, CPU verifier)");
+        println!(
+            "BATCH-BENCH-GPU n={n} padded_tiles={} rows={rows} width={w} peak_rss={}MiB prove={prove_s:.1}s proof={}KiB",
+            padded_tiles(n),
+            peak_rss_mib(),
+            bytes.len() / 1024
+        );
+    }
 
     #[test]
     fn batch_root_folds_in_order_with_iv_and_padding() {
