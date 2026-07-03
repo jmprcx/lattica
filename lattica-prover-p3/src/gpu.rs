@@ -85,9 +85,11 @@ __kernel void bitrev_rows(__global const ulong* in,__global ulong* out,const uin
   size_t gid=get_global_id(0); uint i=(uint)(gid/w),c=(uint)(gid%w); if(i>=h) return;
   out[(size_t)i*w+c]=in[(size_t)brev(i,bits)*w+c];
 }
-// one thread per butterfly per column; nb = h/2 butterflies per column.
+// one thread per butterfly per column; nb = h/2 butterflies per column. `col` is the fast-varying thread
+// index so adjacent threads touch adjacent columns (contiguous global memory → coalesced loads/stores);
+// the per-butterfly computation is unchanged.
 __kernel void ntt_stage(__global ulong* a,const uint w,const uint h,const uint half_len,const ulong wlen){
-  size_t t=get_global_id(0); uint nb=h>>1; uint col=(uint)(t/nb), bfly=(uint)(t%nb); if(col>=w) return;
+  size_t t=get_global_id(0); uint nb=h>>1; uint bfly=(uint)(t/w), col=(uint)(t%w); if(bfly>=nb) return;
   uint block=bfly/half_len, j=bfly%half_len; uint i=block*(half_len<<1)+j;
   ulong tw=gl_pow(wlen,(ulong)j);
   size_t iu=(size_t)i*w+col, iv=(size_t)(i+half_len)*w+col;
