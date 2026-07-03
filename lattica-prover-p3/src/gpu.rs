@@ -41,12 +41,20 @@ pub static NTT_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static NTT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MERKLE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static MERKLE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static QUOTIENT_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static QUOTIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Reset the GPU profiling counters.
 pub fn prof_reset() {
     NTT_NANOS.store(0, Ordering::Relaxed);
     NTT_CALLS.store(0, Ordering::Relaxed);
     MERKLE_NANOS.store(0, Ordering::Relaxed);
     MERKLE_CALLS.store(0, Ordering::Relaxed);
+    QUOTIENT_NANOS.store(0, Ordering::Relaxed);
+    QUOTIENT_CALLS.store(0, Ordering::Relaxed);
+}
+/// `(GPU-quotient ms, quotient calls)` since the last reset.
+pub fn prof_report_quotient() -> (f64, u64) {
+    (QUOTIENT_NANOS.load(Ordering::Relaxed) as f64 / 1e6, QUOTIENT_CALLS.load(Ordering::Relaxed))
 }
 /// `(GPU-NTT ms, dft_batch calls, GPU-Merkle ms, commit calls)` since the last reset.
 pub fn prof_report() -> (f64, u64, f64, u64) {
@@ -141,6 +149,47 @@ __kernel void compress_layer(__global const ulong* in,__global ulong* out,const 
 __kernel void scale_pow(__global ulong* a,const uint w,const uint h,const ulong base){
   size_t gid=get_global_id(0); uint k=(uint)(gid/w),c=(uint)(gid%w); if(k>=h) return;
   a[(size_t)k*w+c]=gl_mul(a[(size_t)k*w+c], gl_pow(base,(ulong)k));
+}
+// Quotient evaluator: one thread per row (grid-stride over `qsize`). Interpret the flattened constraint
+// DAG (`op_*`/`consts`/`roots`) into per-node scratch `v`, then fold the constraint roots with the F_p^2
+// alpha powers (`alpha0`/`alpha1`) and scale by inv_vanishing → the two base coeffs of the F_p^2 quotient.
+__kernel void quotient(
+    __global const uint* op_code,__global const uint* op_a,__global const uint* op_b,
+    __global const ulong* consts,__global const uint* roots,const uint n_ops,const uint n_roots,
+    __global const ulong* trace,const uint width,const uint qsize,const uint next_step,
+    __global const ulong* periodic,const uint n_periodic,__global const ulong* pub_vals,
+    __global const ulong* is_first,__global const ulong* is_last,__global const ulong* is_trans,__global const ulong* inv_van,
+    __global const ulong* alpha0,__global const ulong* alpha1,
+    __global ulong* scratch,const uint n_threads,__global ulong* out)
+{
+  uint tid=get_global_id(0);
+  __global ulong* v=scratch+(size_t)tid*n_ops;
+  for(uint row=tid; row<qsize; row+=n_threads){
+    uint nrow=(row+next_step)%qsize;
+    for(uint i=0;i<n_ops;i++){
+      uint oc=op_code[i],a=op_a[i],b=op_b[i]; ulong r;
+      switch(oc){
+        case 0: r=trace[(size_t)row*width+a]; break;
+        case 1: r=trace[(size_t)nrow*width+a]; break;
+        case 2: r=periodic[(size_t)row*n_periodic+a]; break;
+        case 3: r=pub_vals[a]; break;
+        case 4: r=is_first[row]; break;
+        case 5: r=is_last[row]; break;
+        case 6: r=is_trans[row]; break;
+        case 7: r=consts[a]; break;
+        case 8: r=gl_add(v[a],v[b]); break;
+        case 9: r=gl_sub(v[a],v[b]); break;
+        case 10: r=gl_mul(v[a],v[b]); break;
+        default: r=gl_neg(v[a]); break;
+      }
+      v[i]=r;
+    }
+    ulong c0=0UL,c1=0UL;
+    for(uint k=0;k<n_roots;k++){ ulong cv=v[roots[k]]; c0=gl_add(c0,gl_mul(cv,alpha0[k])); c1=gl_add(c1,gl_mul(cv,alpha1[k])); }
+    ulong iv=inv_van[row];
+    out[(size_t)row*2+0]=gl_canon(gl_mul(c0,iv));
+    out[(size_t)row*2+1]=gl_canon(gl_mul(c1,iv));
+  }
 }
 "#;
 
@@ -363,6 +412,79 @@ fn gpu_merkle_cap(
     let eff = cap_height.min(num_layers - 1);
     let cap_idx = num_layers - 1 - eff;
     (MerkleCap::new(layers[cap_idx].clone()), layers)
+}
+
+/// Run the quotient DAG interpreter on the GPU (grid-stride, one row per thread). All inputs are flat
+/// canonical-`u64` buffers built by `quotient_gpu::gpu_quotient_values`; returns the `qsize` F_p² quotient
+/// values as `(c0, c1)` pairs (canonical). See the `quotient` kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_run_quotient(
+    op_code: &[u32],
+    op_a: &[u32],
+    op_b: &[u32],
+    consts: &[u64],
+    roots: &[u32],
+    trace: &[u64],
+    width: usize,
+    qsize: usize,
+    next_step: usize,
+    periodic: &[u64],
+    n_periodic: usize,
+    public: &[u64],
+    is_first: &[u64],
+    is_last: &[u64],
+    is_transition: &[u64],
+    inv_vanishing: &[u64],
+    alpha0: &[u64],
+    alpha1: &[u64],
+) -> Vec<u64> {
+    let _t0 = std::time::Instant::now();
+    let n_ops = op_code.len();
+    let n_roots = roots.len();
+    let n_threads = qsize.min(1 << 15) as u32; // grid-stride pool cap (scratch = n_threads × n_ops)
+    let out = with_proque(|pq| {
+        let q = pq.queue().clone();
+        let ro64 = |d: &[u64]| {
+            ocl::Buffer::<u64>::builder()
+                .queue(q.clone())
+                .flags(ocl::flags::MEM_READ_ONLY | ocl::flags::MEM_COPY_HOST_PTR)
+                .len(d.len().max(1))
+                .copy_host_slice(if d.is_empty() { &[0u64] } else { d })
+                .build()
+                .unwrap()
+        };
+        let ro32 = |d: &[u32]| {
+            ocl::Buffer::<u32>::builder()
+                .queue(q.clone())
+                .flags(ocl::flags::MEM_READ_ONLY | ocl::flags::MEM_COPY_HOST_PTR)
+                .len(d.len().max(1))
+                .copy_host_slice(if d.is_empty() { &[0u32] } else { d })
+                .build()
+                .unwrap()
+        };
+        let (opc, opa, opb, cst, rts) = (ro32(op_code), ro32(op_a), ro32(op_b), ro64(consts), ro32(roots));
+        let (tr, per, pb) = (ro64(trace), ro64(periodic), ro64(public));
+        let (isf, isl, ist, ivn) = (ro64(is_first), ro64(is_last), ro64(is_transition), ro64(inv_vanishing));
+        let (a0, a1) = (ro64(alpha0), ro64(alpha1));
+        let scratch = ocl::Buffer::<u64>::builder().queue(q.clone()).flags(ocl::flags::MEM_READ_WRITE).len((n_threads as usize) * n_ops).build().unwrap();
+        let outb = ocl::Buffer::<u64>::builder().queue(q.clone()).flags(ocl::flags::MEM_WRITE_ONLY).len(qsize * 2).build().unwrap();
+        unsafe {
+            pq.kernel_builder("quotient")
+                .arg(&opc).arg(&opa).arg(&opb).arg(&cst).arg(&rts).arg(n_ops as u32).arg(n_roots as u32)
+                .arg(&tr).arg(width as u32).arg(qsize as u32).arg(next_step as u32)
+                .arg(&per).arg(n_periodic as u32).arg(&pb)
+                .arg(&isf).arg(&isl).arg(&ist).arg(&ivn)
+                .arg(&a0).arg(&a1)
+                .arg(&scratch).arg(n_threads).arg(&outb)
+                .global_work_size(n_threads as usize).build().unwrap().enq().unwrap();
+        }
+        let mut out = vec![0u64; qsize * 2];
+        outb.read(&mut out).enq().unwrap();
+        out
+    });
+    QUOTIENT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    QUOTIENT_CALLS.fetch_add(1, Ordering::Relaxed);
+    out
 }
 
 /// A GPU-backed Merkle-tree `Mmcs` — a self-consistent drop-in for the PCS's `ValMmcs` that offloads the
@@ -884,7 +1006,8 @@ mod tests {
             gpu_ms = gpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
         }
         let (ntt_ms, ntt_calls, mk_ms, mk_calls) = super::prof_report();
-        println!("join-split prove, HIDING/production (best of {runs}): CPU {cpu_ms:.1}ms | GPU(LDE+Merkle) {gpu_ms:.1}ms  ({:.2}x)", cpu_ms / gpu_ms);
-        println!("  GPU work across {runs} runs: NTT {ntt_ms:.0}ms / {ntt_calls} calls, Merkle {mk_ms:.0}ms / {mk_calls} commits");
+        let (q_ms, q_calls) = super::prof_report_quotient();
+        println!("join-split prove, HIDING/production (best of {runs}): CPU {cpu_ms:.1}ms | GPU(LDE+Merkle+quotient) {gpu_ms:.1}ms  ({:.2}x)", cpu_ms / gpu_ms);
+        println!("  GPU work across {runs} runs: NTT {ntt_ms:.0}ms / {ntt_calls} calls, Merkle {mk_ms:.0}ms / {mk_calls} commits, quotient {q_ms:.0}ms / {q_calls} calls");
     }
 }

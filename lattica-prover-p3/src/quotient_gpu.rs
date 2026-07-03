@@ -20,7 +20,7 @@ use p3_air::symbolic::{
 use p3_air::{Air, DebugConstraintBuilder};
 use p3_challenger::{CanObserve, FieldChallenger};
 use p3_commit::{Pcs, PolynomialSpace};
-use p3_field::{Field, PrimeCharacteristicRing};
+use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField64};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
 use p3_uni_stark::{
@@ -37,6 +37,7 @@ use std::sync::Arc;
 pub enum QuotientMode {
     P3,
     Cpu,
+    Gpu,
 }
 
 /// One node of the flattened constraint DAG. Leaves read from the row context; interior ops reference
@@ -205,6 +206,115 @@ where
         .collect()
 }
 
+/// The GPU quotient evaluator — same as `cpu_quotient_values` but the per-row DAG interpretation runs on
+/// the GPU (`gpu::gpu_run_quotient`). Setup (selectors, alpha powers, periodic table) reuses p3's public
+/// helpers; the flattened program + all row data are marshalled to canonical-`u64` buffers, the kernel
+/// evaluates every row in parallel, and the `(c0, c1)` pairs are reassembled into `SC::Challenge`.
+/// Goldilocks-specialized (canonical-`u64` marshalling); our only production field.
+pub fn gpu_quotient_values<SC, A, Mat>(
+    pcs: &SC::Pcs,
+    air: &A,
+    public_values: &[Val<SC>],
+    layout: AirLayout,
+    trace_domain: <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain,
+    quotient_domain: <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain,
+    trace_on_quotient_domain: &Mat,
+    _preprocessed_on_quotient_domain: Option<&Mat>,
+    alpha: SC::Challenge,
+) -> Vec<SC::Challenge>
+where
+    SC: StarkGenericConfig,
+    Val<SC>: PrimeField64,
+    SC::Challenge: BasedVectorSpace<Val<SC>>,
+    A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+    Mat: Matrix<Val<SC>> + Sync,
+{
+    let qsize = quotient_domain.size();
+    let sels = trace_domain.selectors_on_coset(quotient_domain);
+    let next_step = qsize / trace_domain.size();
+    let periodic_cols = air.periodic_columns();
+    let periodic_table = pcs.build_periodic_lde_table(&periodic_cols, trace_domain, quotient_domain);
+    let n_periodic = periodic_table.width();
+    let width = trace_on_quotient_domain.width();
+
+    // Flatten + encode the program to flat u32/u64 arrays for the kernel.
+    let prog = flatten_air::<Val<SC>, A>(air, layout);
+    let n = prog.ops.len();
+    let (mut op_code, mut op_a, mut op_b) = (vec![0u32; n], vec![0u32; n], vec![0u32; n]);
+    let mut consts: Vec<u64> = Vec::new();
+    for (i, op) in prog.ops.iter().enumerate() {
+        let (c, a, b) = match op {
+            Op::MainLocal(x) => (0, *x as u32, 0),
+            Op::MainNext(x) => (1, *x as u32, 0),
+            Op::Periodic(x) => (2, *x as u32, 0),
+            Op::Public(x) => (3, *x as u32, 0),
+            Op::IsFirst => (4, 0, 0),
+            Op::IsLast => (5, 0, 0),
+            Op::IsTransition => (6, 0, 0),
+            Op::Const(v) => {
+                let idx = consts.len() as u32;
+                consts.push(v.as_canonical_u64());
+                (7, idx, 0)
+            }
+            Op::Add(a, b) => (8, *a as u32, *b as u32),
+            Op::Sub(a, b) => (9, *a as u32, *b as u32),
+            Op::Mul(a, b) => (10, *a as u32, *b as u32),
+            Op::Neg(a) => (11, *a as u32, 0),
+        };
+        (op_code[i], op_a[i], op_b[i]) = (c, a, b);
+    }
+    let roots: Vec<u32> = prog.roots.iter().map(|&r| r as u32).collect();
+    let total = roots.len();
+
+    // Marshal the row data (canonical u64).
+    let mut trace_flat = vec![0u64; qsize * width];
+    for i in 0..qsize {
+        let mut off = i * width;
+        for v in trace_on_quotient_domain.row(i).unwrap() {
+            trace_flat[off] = v.as_canonical_u64();
+            off += 1;
+        }
+    }
+    let mut periodic_flat = vec![0u64; qsize * n_periodic];
+    for i in 0..qsize {
+        for c in 0..n_periodic {
+            periodic_flat[i * n_periodic + c] = periodic_table.get(i, c).as_canonical_u64();
+        }
+    }
+    let to_u64 = |v: &[Val<SC>]| v.iter().map(|x| x.as_canonical_u64()).collect::<Vec<u64>>();
+    let (isf, isl, ist, ivn) = (
+        to_u64(&sels.is_first_row),
+        to_u64(&sels.is_last_row),
+        to_u64(&sels.is_transition),
+        to_u64(&sels.inv_vanishing),
+    );
+    let public: Vec<u64> = public_values.iter().map(|x| x.as_canonical_u64()).collect();
+
+    // Alpha powers (α^{total-1-j}) → base coeff pairs.
+    let mut alpha_powers: Vec<SC::Challenge> = alpha.powers().take(total).collect();
+    alpha_powers.reverse();
+    let (mut alpha0, mut alpha1) = (vec![0u64; total], vec![0u64; total]);
+    for (j, a) in alpha_powers.iter().enumerate() {
+        let c = a.as_basis_coefficients_slice();
+        alpha0[j] = c[0].as_canonical_u64();
+        alpha1[j] = c[1].as_canonical_u64();
+    }
+
+    let out = crate::gpu::gpu_run_quotient(
+        &op_code, &op_a, &op_b, &consts, &roots, &trace_flat, width, qsize, next_step, &periodic_flat,
+        n_periodic, &public, &isf, &isl, &ist, &ivn, &alpha0, &alpha1,
+    );
+
+    // Reassemble F_p² quotient values from the (c0, c1) pairs.
+    (0..qsize)
+        .map(|i| {
+            <SC::Challenge as BasedVectorSpace<Val<SC>>>::from_basis_coefficients_fn(|d| {
+                Val::<SC>::from_u64(out[i * 2 + d])
+            })
+        })
+        .collect()
+}
+
 /// A fork of `p3_uni_stark::prove` (preprocessed = None) whose quotient evaluation runs on the GPU.
 /// Every step other than the quotient reuses p3's public API verbatim; see the module docs for the
 /// safety/audit rationale. Generic over any `StarkGenericConfig` so it serves joinsplit + htlc.
@@ -217,6 +327,8 @@ pub fn prove_gpu<SC, A>(
 ) -> Proof<SC>
 where
     SC: StarkGenericConfig,
+    Val<SC>: PrimeField64,
+    SC::Challenge: BasedVectorSpace<Val<SC>>,
     A: Air<SymbolicAirBuilder<Val<SC>>>
         + for<'a> Air<ProverConstraintFolder<'a, SC>>
         + for<'a> Air<DebugConstraintBuilder<'a, Val<SC>>>,
@@ -269,6 +381,9 @@ where
             pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
         ),
         QuotientMode::Cpu => cpu_quotient_values(
+            pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
+        ),
+        QuotientMode::Gpu => gpu_quotient_values(
             pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
         ),
     };
@@ -369,5 +484,22 @@ mod tests {
         let hpis = htlc_air::public_values(&hw);
         let ph = prove_gpu(&cfg, &HtlcAir, htlc_air::build_trace(&hw), &hpis, QuotientMode::Cpu);
         assert!(verify(&cfg, &HtlcAir, &ph, &hpis).is_ok(), "cpu-quotient HTLC proof must verify");
+    }
+
+    /// Q3 gate: the GPU quotient kernel produces VALID proofs. Uses the CPU (bench) config for LDE+Merkle
+    /// so this isolates the GPU `quotient` kernel; the proof must verify (rejects a wrong quotient).
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU"]
+    fn gpu_quotient_verifies() {
+        let cfg = crate::config::gpu::make_bench_config_cpu();
+        let w = joinsplit_air::demo_witness();
+        let pis = joinsplit_air::public_values(&w);
+        let pj = prove_gpu(&cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis, QuotientMode::Gpu);
+        assert!(verify(&cfg, &JoinSplitAir, &pj, &pis).is_ok(), "gpu-quotient join-split proof must verify");
+        use crate::htlc_air::{self, HtlcAir};
+        let hw = htlc_air::demo_htlc_witness();
+        let hpis = htlc_air::public_values(&hw);
+        let ph = prove_gpu(&cfg, &HtlcAir, htlc_air::build_trace(&hw), &hpis, QuotientMode::Gpu);
+        assert!(verify(&cfg, &HtlcAir, &ph, &hpis).is_ok(), "gpu-quotient HTLC proof must verify");
     }
 }

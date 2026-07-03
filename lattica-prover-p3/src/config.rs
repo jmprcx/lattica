@@ -196,15 +196,22 @@ pub mod gpu {
         MyConfigGpuHiding::new(pcs, Challenger::new(perm))
     }
 
-    /// Prove `air` with GPU LDE + GPU Merkle. **Wire-compatible**: verify with the standard
-    /// `<circuit>::verify_bytes`, unchanged. The ONE GPU-hiding prove-and-serialize path.
+    /// Prove `air` with GPU LDE + GPU Merkle + GPU quotient. **Wire-compatible**: verify with the standard
+    /// `<circuit>::verify_bytes`, unchanged. The ONE GPU-hiding prove-and-serialize path. Uses
+    /// `quotient_gpu::prove_gpu` (a fork of p3's `prove` with the quotient on the GPU) — see that module.
     pub fn proof_to_bytes_hiding<A>(air: &A, trace: RowMajorMatrix<Val>, pis: &[Val]) -> Vec<u8>
     where
         A: Air<SymbolicAirBuilder<Val>>
             + for<'a> Air<ProverConstraintFolder<'a, MyConfigGpuHiding>>
             + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
     {
-        let proof = prove(&make_config_hiding(), air, trace, pis);
+        let proof = crate::quotient_gpu::prove_gpu(
+            &make_config_hiding(),
+            air,
+            trace,
+            pis,
+            crate::quotient_gpu::QuotientMode::Gpu,
+        );
         postcard::to_allocvec(&proof).expect("proof serialization is infallible")
     }
 
