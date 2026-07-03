@@ -222,6 +222,15 @@ fidelity, F_p² folding correctness) are now **retired** — each primitive veri
 native. What remains is faithful, high-volume *wiring* against p3's exact proof format + the
 circuit-specific quotient check — large and audit-bearing, but no longer a feasibility question.
 
-See also: `docs/recursion-verifier-audit.md` (the in-circuit verifier spec + constraint budget),
+**Update (2026-07-03): the in-circuit verifier now accept-iff-`p3::verify`s a REAL production
+`JoinSplitAir` proof, both non-hiding and hiding (`is_zk=1`)** — the §3/§10 "remaining" in-circuit
+verifier is built (`recursion/monolith`, `phase8_joinsplit_monolith` / `phase8_joinsplit_hiding_monolith`,
+commits `165a577`/`7d6a5ad`). What remains is productionization (aggregator over K real inners → tx-root,
+self-recursive tree, C-ABI/Zig seam, audit artifacts) + the **aggregation-level parameters**, now designed
++ measured in `docs/recursion-aggregation-params.md` (every level q96/lb4 for proven-100; a full 96-query
+inner ≈ 2^20 rows / ~116 GB ⇒ a ≥128 GB production-server capability; the node seam is unchanged).
+
+See also: `docs/recursion-aggregation-params.md` (R3 — the tree's soundness parameters + the measured
+cost curve), `docs/recursion-verifier-audit.md` (the in-circuit verifier spec + constraint budget),
 `docs/soundness-budget.md` (the batch measurements + the "batching → recursion" conclusion),
 `batch_joinsplit_air` / `batch_htlc_air` (the implemented aggregation + the reusable tx-root fold).

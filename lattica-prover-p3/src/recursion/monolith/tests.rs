@@ -1533,6 +1533,28 @@ fn phase8_joinsplit_monolith() {
     println!("Phase 8.1: the monolith verifies a REAL production join-split proof at 2^{log2h} / {} MiB", rss / (1 << 20));
 }
 
+/// R3 measurement: the rows/RSS/prove-time curve of the (is_zk=0, the recursion-path shape) join-split
+/// monolith as the replayed inner-query count grows — the empirical basis for the aggregation-level
+/// parameter design (how many inner queries one monolith can replay on this box, and thus how the tree
+/// must shard the 96 wire queries to preserve the ≥100-bit proven floor). Prints a table; no assert.
+#[test]
+#[ignore = "slow + large RSS: R3 join-split monolith query-scaling curve"]
+fn phase8_joinsplit_query_curve() {
+    use std::time::Instant;
+    println!("R3 join-split monolith (is_zk=0, W=19) query-scaling curve:");
+    println!("  queries | rows | RSS MiB | prove+verify s");
+    for &nq in &[4usize, 8, 12, 16] {
+        let t = Instant::now();
+        let (log2h, rss) = run_joinsplit_monolith(nq);
+        let secs = t.elapsed().as_secs_f64();
+        println!("  {nq:>7} | 2^{log2h} | {:>7} | {secs:.1}", rss / (1 << 20));
+        if rss > 55 * (1u64 << 30) {
+            println!("  (stopping — approaching box RAM)");
+            break;
+        }
+    }
+}
+
 /// Degree probe for the JOIN-SPLIT monolith (is_zk=0): the outer max constraint degree + log_nqc for the
 /// exact `MonolithAir` `run_joinsplit_monolith` builds — a db=12 inner (cm_rounds=12), multi-block leaves
 /// (5 input + 4 quotient), and the degree-8 inner constraint trees walked by the symbolic epilogue. The p3
