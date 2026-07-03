@@ -959,7 +959,7 @@ fn run_monolith(n_queries: usize, column_window: bool) -> (u32, u64) {
         quot_paths.push(qpath);
         commit_data.push(cm);
     }
-    let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
+    let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
     let mut pis = Vec::new();
     for ch in &chs {
         pis.push(ch[0]);
@@ -1070,7 +1070,7 @@ fn build_inner_window(config: &MyConfig, value: u64, n_queries: usize) -> (Vec<V
         inner_counter: false,
         column_window: true,
         k_instances: 1,
-        fold: false,
+        fold: false, fold_txstmt: false,
         constraints: vec![],
         w_inner_f: 1,
         n_pub_f: 1,
@@ -1160,7 +1160,7 @@ where
         inner_counter: false,
         column_window: true,
         k_instances: 1,
-        fold: false,
+        fold: false, fold_txstmt: false,
         constraints,
         w_inner_f: w_inner,
         n_pub_f: n_pub,
@@ -1311,7 +1311,7 @@ fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
         }
     }
     let (counts, binds, index_binds, n_terms) = params.unwrap();
-    let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
+    let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, fold_txstmt: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
     let fw = air.fused_w();
     let w = air.fold_w();
     let inst_h = air.inst_h();
@@ -1387,26 +1387,26 @@ fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
 fn run_symbolic_aggregator(k: usize, n_queries: usize, cap_h: usize) -> (u32, u64) {
     use super::{MonolithAir, MAX_AGG_TILES};
     use crate::joinsplit_air::{build_trace, demo_witness, merge, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+    use crate::batch_joinsplit_air::{tx_statement_digest, DOM_TXROOT};
     use crate::poseidon2_air::{native_permute, native_steps};
-    use crate::recursion::native_fri::{agg_statement_digest, make_config_cap, DOM_AGG};
+    use crate::recursion::native_fri::make_config_cap;
     use p3_matrix::dense::RowMajorMatrix;
     use p3_uni_stark::{get_symbolic_constraints, AirLayout};
     assert!(k.is_power_of_two() && k <= MAX_AGG_TILES, "K power of two ≤ MAX_AGG_TILES");
     // A SMALL inner cap shrinks the column-window width (the full caps the cap-mux selects over are
     // 2^cap · 4 witness columns each) — the lever that keeps the wide aggregator inside RAM.
     let config = make_config_cap(1, n_queries, cap_h);
-    // K join-split inner proofs (demo witness — size-representative; the fold binds each instance's pvs[0]).
+    // K join-split inner proofs (demo witness — identical statements; the fold binds each instance's full pi
+    // window into the batch tx_statement_digest, so `pvs` IS every instance's statement here).
     let w = demo_witness();
     let pvs = public_values(&w);
     let mut insts: Vec<Vec<Val>> = Vec::new();
-    let mut pvs0s: Vec<Val> = Vec::new();
     let mut params: Option<(Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize, usize)> = None;
     for _i in 0..k {
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let cap_height = proof.commitments.trace.roots().len().trailing_zeros() as usize;
-        let (tr, counts, binds, ib, nt, pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC);
+        let (tr, counts, binds, ib, nt, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC);
         insts.push(tr);
-        pvs0s.push(pv0);
         if _i == 0 {
             params = Some((counts, binds, ib, nt, cap_height));
         }
@@ -1423,6 +1423,7 @@ fn run_symbolic_aggregator(k: usize, n_queries: usize, cap_h: usize) -> (u32, u6
         column_window: true,
         k_instances: k,
         fold: true,
+        fold_txstmt: true,
         constraints,
         w_inner_f: WIDTH,
         n_pub_f: N_PUBLIC,
@@ -1441,30 +1442,43 @@ fn run_symbolic_aggregator(k: usize, n_queries: usize, cap_h: usize) -> (u32, u6
             all[dst..dst + fw].copy_from_slice(&tr[r * fw..r * fw + fw]);
             all[dst + air.af_root(0)..dst + air.af_root(0) + 4].copy_from_slice(&root);
         }
-        let mut sk_in = [Val::ZERO; W];
-        sk_in[0] = Val::from_u64(DOM_AGG);
-        sk_in[4] = pvs0s[i];
-        let sk_rows = native_steps(sk_in);
-        for r in 0..BLOCK {
-            let base = (i * inst_h + fb * BLOCK + r) * w_fold + air.af_p(0);
-            all[base..base + W].copy_from_slice(&sk_rows[r]);
+        // s_k = tx_statement_digest(pvs): the join-split statement MD-chain — merge([DOM,0,0,0], anchor), then
+        // merge(prev, chunk_b) over nf/out_cm/[fee,mint,0,0]/tx_binding. Each merge is one Poseidon block.
+        let srcs = air.fold_chunk_srcs();
+        let n_sk = srcs.len();
+        let mut prev = [Val::from_u64(DOM_TXROOT), Val::ZERO, Val::ZERO, Val::ZERO];
+        for (b, s) in srcs.iter().enumerate() {
+            let chunk: [Val; 4] = core::array::from_fn(|k| s[k].map(|off| pvs[off]).unwrap_or(Val::ZERO));
+            let mut inp = [Val::ZERO; W];
+            inp[..4].copy_from_slice(&prev);
+            inp[4..].copy_from_slice(&chunk);
+            let rows = native_steps(inp);
+            for r in 0..BLOCK {
+                let base = (i * inst_h + (fb + b) * BLOCK + r) * w_fold + air.af_p(0);
+                all[base..base + W].copy_from_slice(&rows[r]);
+            }
+            prev = native_permute(inp)[..4].try_into().unwrap();
         }
-        let s_k: [Val; 4] = native_permute(sk_in)[..4].try_into().unwrap();
+        let s_k: [Val; 4] = prev; // = tx_statement_digest(pvs)
+        assert_eq!(s_k, tx_statement_digest(&pvs), "built s_k == batch tx_statement_digest");
+        // ROOT block: merge(root, s_k).
         let mut rt_in = [Val::ZERO; W];
         rt_in[..4].copy_from_slice(&root);
         rt_in[4..].copy_from_slice(&s_k);
         let rt_rows = native_steps(rt_in);
         for r in 0..BLOCK {
-            let base = (i * inst_h + (fb + 1) * BLOCK + r) * w_fold + air.af_p(0);
+            let base = (i * inst_h + (fb + n_sk) * BLOCK + r) * w_fold + air.af_p(0);
             all[base..base + W].copy_from_slice(&rt_rows[r]);
         }
         root = native_permute(rt_in)[..4].try_into().unwrap();
     }
+    // oracle: the built root == the batch's block tx-root (IV=0, K pow2 ⇒ no dummy padding) — BYTE-IDENTICAL to
+    // batch_joinsplit_air::batch_root, so the node consensus seam is unchanged.
     let mut ref_root = [Val::ZERO; 4];
-    for &pv in &pvs0s {
-        ref_root = merge(ref_root, agg_statement_digest(pv));
+    for _ in 0..k {
+        ref_root = merge(ref_root, tx_statement_digest(&pvs));
     }
-    assert_eq!(root, ref_root, "built tx-root == agg oracle root");
+    assert_eq!(root, ref_root, "built tx-root == batch_root (tx_statement_digest fold)");
     let txroot: Vec<Val> = root.to_vec();
     let trace = RowMajorMatrix::new(all, w_fold);
     println!("symbolic aggregator+fold: {k} join-split inners × 2^{} = 2^{} rows (width {w_fold})", inst_h.trailing_zeros(), hh.trailing_zeros());
@@ -1505,7 +1519,7 @@ fn phase8_joinsplit_window_monolith() {
     let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
     let air = MonolithAir {
         counts, binds, index_binds, n_queries: 4, n_terms,
-        inner_counter: false, column_window: true, k_instances: 1, fold: false,
+        inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
         constraints, w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
         cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
     };
@@ -1529,7 +1543,7 @@ where
     let constraints = get_symbolic_constraints::<Val, A>(inner, AirLayout::from_air::<Val>(inner));
     let air = MonolithAir {
         counts, binds, index_binds, n_queries: proof.opening_proof.query_proofs.len(), n_terms,
-        inner_counter: false, column_window: true, k_instances: 1, fold: false,
+        inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
         constraints, w_inner_f: w, n_pub_f: np, n_periodic_f: nper, is_zk: 0,
         cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
     };
@@ -1603,7 +1617,7 @@ fn phase8_joinsplit_aggregator_probe() {
     let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
     let mk = |cw: bool, ki: usize, fold: bool| MonolithAir {
         counts: counts.clone(), binds: binds.clone(), index_binds: index_binds.clone(), n_queries, n_terms,
-        inner_counter: false, column_window: cw, k_instances: ki, fold,
+        inner_counter: false, column_window: cw, k_instances: ki, fold, fold_txstmt: false,
         constraints: constraints.clone(), w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0, cap_height,
     };
     for (tag, cw, ki, fold) in [
@@ -1711,7 +1725,7 @@ fn run_counter_monolith(n_queries: usize) -> (u32, u64) {
         quot_paths.push(qpath);
         commit_data.push(cm);
     }
-    let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
+    let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: true, column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
     let mut pis = Vec::new();
     for ch in &chs {
         pis.push(ch[0]);
@@ -1797,7 +1811,7 @@ where
     let layout = AirLayout::from_air::<Val>(inner);
     let constraints = get_symbolic_constraints::<Val, A>(inner, layout);
     assert!(!constraints.is_empty(), "{label}: symbolic constraints extracted");
-    let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, constraints, w_inner_f: w_inner, n_pub_f: n_pub, n_periodic_f: n_periodic, is_zk: 0, cap_height: (proof.commitments.trace.roots().len().trailing_zeros() as usize) };
+    let air = MonolithAir { counts: counts.clone(), binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints, w_inner_f: w_inner, n_pub_f: n_pub, n_periodic_f: n_periodic, is_zk: 0, cap_height: (proof.commitments.trace.roots().len().trailing_zeros() as usize) };
     // OOD openings + selectors + periodic-column values at ζ (verifier-computed publics).
     let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) = epilogue_openings(config, inner, proof, pvs);
     assert_eq!(eo_periodic.len(), n_periodic, "{label}: periodic column count matches n_periodic");
@@ -2027,7 +2041,7 @@ fn phase8_joinsplit_degree_probe() {
         inner_counter: false,
         column_window: false,
         k_instances: 1,
-        fold: false,
+        fold: false, fold_txstmt: false,
         constraints,
         w_inner_f: WIDTH,
         n_pub_f: N_PUBLIC,
@@ -2167,7 +2181,7 @@ fn milestone_geom_air() -> super::MonolithAir {
         inner_counter: false,
         column_window: false,
         k_instances: 1,
-        fold: false,
+        fold: false, fold_txstmt: false,
         constraints: vec![],
         w_inner_f: 0,
         n_pub_f: 0,
@@ -2243,7 +2257,7 @@ fn monolith_is_zk_geometry_matches_layout() {
         inner_counter: false,
         column_window: false,
         k_instances: 1,
-        fold: false,
+        fold: false, fold_txstmt: false,
         constraints: vec![],
         w_inner_f: 0,
         n_pub_f: 0,

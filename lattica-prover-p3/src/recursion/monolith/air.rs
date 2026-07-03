@@ -45,6 +45,13 @@ pub(crate) struct MonolithAir {
     /// [pvs0,0,0,0])` then `root = merge(root, s_k)` (IV=0), exactly as `agg_root`/`batch_root`. The root's 4
     /// lanes are the ONLY public inputs (the node-seam block tx-root); every inner datum stays witness.
     pub fold: bool,
+    /// When true (requires `fold`), the per-instance s_k is the FULL `batch_joinsplit_air::tx_statement_digest`
+    /// — a `FOLD_SK_BLOCKS`-chunk Merkle–Damgård chain `merge(...merge(merge([DOM_TXROOT,0,0,0], anchor), nf₀)
+    /// …, tx_binding)` over the join-split statement (anchor ‖ nullifiers ‖ out_cms ‖ [fee,mint,0,0] ‖
+    /// tx_binding), read from the inner-pi window at the join-split PI offsets — so the emitted block tx-root is
+    /// BYTE-IDENTICAL to `batch_root` (the node consensus seam is unchanged). `false` keeps the 1-value
+    /// `s_k = merge([DOM,0,0,0],[pvs0,0,0,0])` fold (the ConstAir aggregator milestone), byte-for-byte.
+    pub fold_txstmt: bool,
     /// The inner AIR's constraints as p3 `SymbolicExpression` trees (from `get_symbolic_constraints`). When
     /// NON-EMPTY, the monolith verifies a general MULTI-COLUMN inner data-driven: the OOD epilogue walks these
     /// trees (`eval_symbolic_circuit`) with witnessed selectors (folded·inv_van==quot), the opened-row carrier
@@ -494,10 +501,43 @@ impl MonolithAir {
     pub(crate) fn af_root(&self, k: usize) -> usize {
         self.fused_w() + W + k // running-root lane k (0..4)
     }
-    // the two fold blocks live in the instance's tail slack: SK block = block (inst_h/BLOCK − 2), ROOT block
-    // = block (inst_h/BLOCK − 1); ROOT block's last row == inst_h−1 (coincident with P_INST_LAST).
+    // The fold blocks live in the instance's tail slack: n_sk_blocks() s_k-chain blocks then 1 ROOT block, the
+    // last ending at inst_h−1 (coincident with P_INST_LAST). Old (1-value) fold: 1 s_k + 1 root = 2 blocks.
+    // tx_statement fold: FOLD_SK_BLOCKS (7 for join-split) s_k blocks + 1 root = 8.
+    pub(crate) fn n_sk_blocks(&self) -> usize {
+        if self.fold_txstmt {
+            self.fold_chunk_srcs().len()
+        } else {
+            1
+        }
+    }
+    pub(crate) fn n_fold_blocks(&self) -> usize {
+        if self.fold {
+            self.n_sk_blocks() + 1
+        } else {
+            0
+        }
+    }
     pub(crate) fn fold_sk_block(&self) -> usize {
-        self.inst_h() / BLOCK - 2
+        self.inst_h() / BLOCK - self.n_fold_blocks()
+    }
+    // The join-split statement chunks in `tx_statement_digest` fold order — each entry is the 4 inner-pi-window
+    // pub-region offsets of a merge chunk (None = a zero lane), matching `batch_joinsplit_air::statement_chunks`
+    // EXACTLY: anchor, each nullifier, each out_cm, [fee, mint, 0, 0], tx_binding. Only used when fold_txstmt.
+    pub(crate) fn fold_chunk_srcs(&self) -> Vec<[Option<usize>; 4]> {
+        use crate::joinsplit_air::{PI_ANCHOR, PI_FEE, PI_MINT, PI_NF, PI_OUTCM, PI_TXBIND};
+        use crate::spend_common::{DIGEST, M_OUT, N_IN};
+        let mut v: Vec<[Option<usize>; 4]> = Vec::new();
+        v.push(core::array::from_fn(|k| Some(PI_ANCHOR + k)));
+        for i in 0..N_IN {
+            v.push(core::array::from_fn(|k| Some(PI_NF + i * DIGEST + k)));
+        }
+        for j in 0..M_OUT {
+            v.push(core::array::from_fn(|k| Some(PI_OUTCM + j * DIGEST + k)));
+        }
+        v.push([Some(PI_FEE), Some(PI_MINT), None, None]);
+        v.push(core::array::from_fn(|k| Some(PI_TXBIND + k)));
+        v
     }
     // Merkle columns overlay the arith Poseidon lanes on the Merkle rows (disjoint rows).
     pub(crate) fn m_sib(&self) -> usize {
@@ -627,22 +667,43 @@ impl MonolithAir {
         self.quot_absorb_base() + self.n_quot_absorb()
     }
     pub(crate) fn n_fold_p(&self) -> usize {
-        if self.fold { 5 } else { 0 }
+        if !self.fold {
+            0
+        } else if self.fold_txstmt {
+            5 + self.n_sk_blocks() // active + n_sk s_k-block first-rows + sklink + sklast + rootin + rootupd
+        } else {
+            5 // active + sk (block-0 seed) + sklast + rootin + rootupd
+        }
     }
     pub(crate) fn p_fold_active(&self) -> usize {
         self.fold_base()
     }
+    // 1-value-fold block-0 seed (fold_txstmt=false); in tx_statement mode block 0's first row is p_fold_first(0).
     pub(crate) fn p_fold_sk(&self) -> usize {
         self.fold_base() + 1
     }
+    // tx_statement mode: per-s_k-block first-row one-hot (chunk injection; b=0 also seeds [DOM,0,0,0]).
+    pub(crate) fn p_fold_first(&self, b: usize) -> usize {
+        self.fold_base() + 1 + b // b in 0..n_sk_blocks()
+    }
+    // tx_statement mode: the union one-hot over the s_k-chain internal boundaries (last rows of s_k blocks
+    // 0..n_sk−2), carrying each merge output → the next block's rate-low.
+    pub(crate) fn p_fold_sklink(&self) -> usize {
+        self.fold_base() + 1 + self.n_sk_blocks()
+    }
+    // sklast/rootin/rootupd shift past the per-block first-rows in tx_statement mode; unchanged (base+2..4) in
+    // 1-value mode.
+    fn fold_tail_base(&self) -> usize {
+        self.fold_base() + if self.fold_txstmt { 2 + self.n_sk_blocks() } else { 2 }
+    }
     pub(crate) fn p_fold_sklast(&self) -> usize {
-        self.fold_base() + 2
+        self.fold_tail_base()
     }
     pub(crate) fn p_fold_rootin(&self) -> usize {
-        self.fold_base() + 3
+        self.fold_tail_base() + 1
     }
     pub(crate) fn p_fold_rootupd(&self) -> usize {
-        self.fold_base() + 4
+        self.fold_tail_base() + 2
     }
     // ---- HIDING random-round leaf periodic selectors (is_zk=1): the random-polynomial commitment opens as a
     // THIRD input round, laid out as a salted leaf (blocks M_INPUT_LEAF..) + input_depth path, mirroring the
@@ -848,8 +909,8 @@ impl MonolithAir {
                 cols.push(tiled((self.m_quot_leaf() + self.quot_leaf_blocks() - 1) * BLOCK - 1)); // q_last_carry
             }
         }
-        if self.fold {
-            // two fold blocks in the tail slack: SK block (fb) then ROOT block (fb+1, ends at inst_h-1).
+        if self.fold && !self.fold_txstmt {
+            // 1-value fold: two blocks in the tail slack — SK block (fb) then ROOT block (fb+1, ends at inst_h-1).
             let fb = self.fold_sk_block();
             let mut active = vec![Val::ZERO; h];
             let mut sk = vec![Val::ZERO; h];
@@ -867,6 +928,35 @@ impl MonolithAir {
             cols.push(sk);
             cols.push(sklast);
             cols.push(rootin);
+            cols.push(rootupd);
+        } else if self.fold {
+            // tx_statement fold: n_sk s_k-chain blocks (each merge(prev, chunk_b)) then 1 ROOT block, in the tail
+            // slack. Order (matching p_fold_* indices): active, first(0..n_sk), sklink, sklast, rootin, rootupd.
+            let fb = self.fold_sk_block();
+            let n_sk = self.n_sk_blocks();
+            let mut active = vec![Val::ZERO; h];
+            for r in 0..((n_sk + 1) * BLOCK) {
+                active[fb * BLOCK + r] = Val::ONE; // all n_sk+1 fold blocks (Poseidon step gate)
+            }
+            cols.push(active);
+            for b in 0..n_sk {
+                let mut first = vec![Val::ZERO; h];
+                first[(fb + b) * BLOCK] = Val::ONE; // s_k block b first row (chunk inject; b=0 also seeds DOM)
+                cols.push(first);
+            }
+            let mut sklink = vec![Val::ZERO; h];
+            for b in 0..(n_sk - 1) {
+                sklink[(fb + b) * BLOCK + BLOCK - 1] = Val::ONE; // block b output → block b+1 rate-low
+            }
+            cols.push(sklink);
+            let mut sklast = vec![Val::ZERO; h];
+            sklast[(fb + n_sk - 1) * BLOCK + BLOCK - 1] = Val::ONE; // last s_k block output (s_k) → ROOT rate-high
+            cols.push(sklast);
+            let mut rootin = vec![Val::ZERO; h];
+            rootin[(fb + n_sk) * BLOCK] = Val::ONE; // ROOT block first row (rate-low = running root)
+            cols.push(rootin);
+            let mut rootupd = vec![Val::ZERO; h];
+            rootupd[(fb + n_sk) * BLOCK + BLOCK - 1] = Val::ONE; // ROOT block last row (root update)
             cols.push(rootupd);
         }
         // HIDING random-round leaf one-hots (is_zk=1): the random-polynomial commitment's salted leaf (blocks
@@ -1590,16 +1680,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         }
 
         // ---------- aggregator tx-root fold (only when `fold`) ----------
-        // Two Poseidon blocks in each instance's tail slack fold the verified inner public value (the
-        // `pw(pub_pi)` carrier) into a global-persistent Merkle–Damgård root: `s_k = merge([DOM,0,0,0],
-        // [pvs0,0,0,0])` (SK block) then `root = merge(root, s_k)` (ROOT block). IV=0 at global row 0, held
-        // except at each instance's ROOT update (which writes the new root into the next instance's first
-        // row), and the final root == the block tx-root — the ONLY public input. Matches agg_root/batch_root.
+        // Poseidon blocks in each instance's tail slack fold the verified inner statement into a global-
+        // persistent Merkle–Damgård root, IV=0, held except at each instance's ROOT update (which writes the
+        // new root into the next instance's first row); the final root == the block tx-root, the ONLY public
+        // input. `!fold_txstmt`: 1-value `s_k = merge([DOM,0,0,0],[pvs0,0,0,0])` (matches agg_root). `fold_txstmt`:
+        // the FULL `tx_statement_digest` — n_sk s_k-chain blocks `merge(...merge([DOM,0,0,0],anchor)…,tx_binding)`
+        // over the statement chunks read from the pi window — so root is BYTE-IDENTICAL to `batch_root`.
         if self.fold {
             let txroot: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
             let dom = AB::Expr::from(Goldilocks::from_u64(crate::domains::DOM_TXROOT)); // DOM_AGG = DOM_TXROOT
-            // fold Poseidon step (reuses the period-BLOCK round schedule is_init/is_full/is_partial/rc),
-            // gated to the two fold blocks by P_FOLD_ACTIVE.
+            // fold Poseidon step (reuses the period-BLOCK round schedule is_init/is_full/is_partial/rc), gated to
+            // ALL fold blocks by P_FOLD_ACTIVE. The round schedule zeroes at each block's last row (the output
+            // row), so the block-boundary transitions are step-free and the seed/link/inject one-hots take over.
             let fa = p[self.p_fold_active()].clone();
             let mut f_init: [AB::Expr; W] = core::array::from_fn(|i| cur[self.af_p(i)].clone());
             ext_linear(&mut f_init);
@@ -1614,19 +1706,53 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                     + is_partial.clone() * (nxt[self.af_p(i)].clone() - f_part[i].clone());
                 builder.when_transition().assert_zero(fa.clone() * step);
             }
-            // SK block seed: [DOM, 0,0,0, pvs0, 0,0,0].
-            let psk = p[self.p_fold_sk()].clone();
-            builder.assert_zero(psk.clone() * (cur[self.af_p(0)].clone() - dom.clone()));
-            builder.assert_zero(psk.clone() * (cur[self.af_p(4)].clone() - cur[self.pw(self.pub_pi())].clone()));
-            for i in [1usize, 2, 3, 5, 6, 7] {
-                builder.assert_zero(psk.clone() * cur[self.af_p(i)].clone());
+            if !self.fold_txstmt {
+                // SK block seed: [DOM, 0,0,0, pvs0, 0,0,0].
+                let psk = p[self.p_fold_sk()].clone();
+                builder.assert_zero(psk.clone() * (cur[self.af_p(0)].clone() - dom.clone()));
+                builder.assert_zero(psk.clone() * (cur[self.af_p(4)].clone() - cur[self.pw(self.pub_pi())].clone()));
+                for i in [1usize, 2, 3, 5, 6, 7] {
+                    builder.assert_zero(psk.clone() * cur[self.af_p(i)].clone());
+                }
+                // SK block last row: s_k (output lanes 0..4) → ROOT block rate-high (next row lanes 4..8).
+                let pskl = p[self.p_fold_sklast()].clone();
+                for k in 0..4 {
+                    builder.when_transition().assert_zero(pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()));
+                }
+            } else {
+                // tx_statement s_k chain: each s_k block b injects chunk_b into rate-high (lanes 4..8) at its
+                // first row (from the pi window at the join-split PI offsets); block 0 also seeds rate-low
+                // (lanes 0..4) = [DOM, 0,0,0]. Block b's rate-low for b>0 is the previous block's output, via
+                // the sklink carry below. This reproduces `merge(prev, chunk_b)` per block.
+                let srcs = self.fold_chunk_srcs();
+                for (b, chunk) in srcs.iter().enumerate() {
+                    let pf = p[self.p_fold_first(b)].clone();
+                    for (k, &src) in chunk.iter().enumerate() {
+                        let ck = match src {
+                            Some(off) => cur[self.pw(self.pub_pi() + off)].clone(),
+                            None => AB::Expr::ZERO,
+                        };
+                        builder.assert_zero(pf.clone() * (cur[self.af_p(4 + k)].clone() - ck));
+                    }
+                    if b == 0 {
+                        builder.assert_zero(pf.clone() * (cur[self.af_p(0)].clone() - dom.clone()));
+                        for k in 1..4 {
+                            builder.assert_zero(pf.clone() * cur[self.af_p(k)].clone());
+                        }
+                    }
+                }
+                // s_k-chain internal link: block b output (last row lanes 0..4) → block b+1 rate-low (next row).
+                let plink = p[self.p_fold_sklink()].clone();
+                for k in 0..4 {
+                    builder.when_transition().assert_zero(plink.clone() * (nxt[self.af_p(k)].clone() - cur[self.af_p(k)].clone()));
+                }
+                // last s_k block output (= s_k) → ROOT block rate-high (lanes 4..8).
+                let pskl = p[self.p_fold_sklast()].clone();
+                for k in 0..4 {
+                    builder.when_transition().assert_zero(pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()));
+                }
             }
-            // SK block last row: s_k (output lanes 0..4) → ROOT block rate-high (next row lanes 4..8).
-            let pskl = p[self.p_fold_sklast()].clone();
-            for k in 0..4 {
-                builder.when_transition().assert_zero(pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()));
-            }
-            // ROOT block first row: rate-low == the running root column.
+            // ROOT block first row: rate-low == the running root column (both modes).
             let prin = p[self.p_fold_rootin()].clone();
             for k in 0..4 {
                 builder.assert_zero(prin.clone() * (cur[self.af_p(k)].clone() - cur[self.af_root(k)].clone()));

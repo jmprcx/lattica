@@ -79,7 +79,7 @@ fn monolith_air(is_zk: usize) -> crate::recursion::monolith::MonolithAir {
         inner_counter: false,
         column_window: false,
         k_instances: 1,
-        fold: false,
+        fold: false, fold_txstmt: false,
         constraints: vec![],
         w_inner_f: 1,
         n_pub_f: 1,
