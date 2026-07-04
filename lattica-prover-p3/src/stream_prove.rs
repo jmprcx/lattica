@@ -22,9 +22,11 @@
 use crate::config::{Challenge, ChallengeMmcs, Challenger, Dft, MyCompress, MyHash, Val, ValMmcs};
 use core::marker::PhantomData;
 use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
-use p3_commit::{BatchOpening, Mmcs};
+use p3_commit::{BatchOpening, Mmcs, OpenedValues};
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
-use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
+use p3_field::coset::TwoAdicMultiplicativeCoset;
+use p3_field::{batch_multiplicative_inverse, BasedVectorSpace, Field, PrimeCharacteristicRing};
+use p3_matrix::interpolation::{compute_adjusted_weights, Interpolate};
 use p3_fri::{
     compute_log_arity_for_round, CommitPhaseProofStep, FriFoldingStrategy, FriParameters, FriProof,
     ProverDataWithOpeningPoints, QueryProof, TwoAdicFriFolding, TwoAdicFriFoldingForMmcs,
@@ -362,20 +364,26 @@ type InputProverData = <ValMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>;
 /// p3's exact order, the folding reuses p3's own `TwoAdicFriFolding::fold_matrix` verbatim, and the
 /// `final_poly` iDFT + arity/PoW transcript steps are unchanged. `params.mmcs` is unused (its per-round
 /// salts come from `salt_rng`, which the caller seeds to match `params.mmcs`'s inner RNG); everything else
-/// in `params` is read exactly as p3 reads it. `open_input` is p3's verbatim (input opens stay resident).
+/// in `params` is read exactly as p3 reads it. `open_input_fn` supplies each query's input-batch openings
+/// (`index → Vec<BatchOpening>`, p3's `open_input`) — the caller injects either resident opens
+/// (`stream_open_input`) or, in the full streamed prove, disk-seeked opens (`stream_open_input_streamed`),
+/// both byte-identical to p3's `open_input`.
 ///
 /// Pinned by `stream_prove_fri_matches_p3`.
 #[allow(clippy::too_many_arguments)]
-pub fn stream_prove_fri<R: rand::Rng>(
+pub fn stream_prove_fri<R, OpenInput>(
     params: &FriParameters<ChallengeMmcs>,
     inputs: Vec<Vec<Challenge>>,
     challenger: &mut Challenger,
     log_global_max_height: usize,
-    input_data: &[ProverDataWithOpeningPoints<'_, Challenge, InputProverData>],
-    input_mmcs: &ValMmcs,
+    open_input_fn: OpenInput,
     salt_rng: &mut R,
     cap_height: usize,
-) -> std::io::Result<FriProof<Challenge, ChallengeMmcs, Val, Vec<BatchOpening<Val, ValMmcs>>>> {
+) -> std::io::Result<FriProof<Challenge, ChallengeMmcs, Val, Vec<BatchOpening<Val, ValMmcs>>>>
+where
+    R: rand::Rng,
+    OpenInput: Fn(usize) -> Vec<BatchOpening<Val, ValMmcs>>,
+{
     assert!(!inputs.is_empty());
     assert!(params.num_queries > 0, "num_queries must be at least 1 for FRI soundness");
     assert!(params.max_log_arity > 0, "max_log_arity must be at least 1 to guarantee folding progress");
@@ -447,7 +455,7 @@ pub fn stream_prove_fri<R: rand::Rng>(
     let extra_query_index_bits = FriFoldingStrategy::<Val, Challenge>::extra_query_index_bits(&folding);
     let query_proofs = core::iter::repeat_with(|| {
         let index = challenger.sample_bits(log_global_max_height + extra_query_index_bits);
-        let input_proof = stream_open_input(log_global_max_height, index, input_data, input_mmcs);
+        let input_proof = open_input_fn(index);
         let mut current_index = index >> extra_query_index_bits;
         let mut commit_phase_openings = Vec::with_capacity(datas.len());
         for (data, &log_arity) in datas.iter().zip(log_arities.iter()) {
@@ -469,10 +477,11 @@ pub fn stream_prove_fri<R: rand::Rng>(
     })
 }
 
-/// FRI `open_input`, verbatim from p3: open each input batch commitment at the query index, shifting the
-/// index down for matrices shorter than the global max height. The input opens stay resident in this
-/// increment (streaming them is the separate "batch open" step); byte-identical to p3's private `open_input`.
-fn stream_open_input(
+/// FRI `open_input` against RESIDENT input trees, verbatim from p3: open each input batch commitment at
+/// the query index, shifting the index down for matrices shorter than the global max height. Byte-identical
+/// to p3's private `open_input`. Used to build the `open_input_fn` closure when the inputs are resident
+/// (e.g. the standalone `stream_prove_fri` gate); the full streamed prove uses `stream_open_input_streamed`.
+pub fn stream_open_input(
     log_global_max_height: usize,
     index: usize,
     input_data: &[ProverDataWithOpeningPoints<'_, Challenge, InputProverData>],
@@ -487,6 +496,222 @@ fn stream_open_input(
             mmcs.open_batch(reduced_index, data)
         })
         .collect()
+}
+
+/// FRI `open_input` served from the STREAMED commits — the last resident piece of the FRI removed. Each
+/// round's opened row/salt/sibling-path comes from its on-disk `StreamCommitData` via `stream_open`
+/// (a single strided seek + the small resident salts/layers), shaped into the exact `BatchOpening` p3's
+/// hiding `Mmcs::open_batch` returns (`opened_values = [row]`, `opening_proof = ([salt], siblings)`).
+/// Byte-identical to `stream_open_input` (hence to p3's `open_input`) since `stream_open` is byte-identical
+/// to `open_batch` (`stream_open_matches_p3`). One matrix per `StreamCommitData` (the trace / opt-random
+/// rounds); the multi-matrix quotient round is served by `stream_open_input_batched` (I3).
+pub fn stream_open_input_streamed(
+    log_global_max_height: usize,
+    index: usize,
+    input_data: &[&StreamCommitData],
+) -> Vec<BatchOpening<Val, ValMmcs>> {
+    input_data
+        .iter()
+        .map(|data| {
+            let log_max_height = log2_strict_usize(data.store.height());
+            let bits_reduced = log_global_max_height - log_max_height;
+            let reduced_index = index >> bits_reduced;
+            let (row, salt, siblings) = stream_open(data, reduced_index);
+            BatchOpening::new(vec![row], (vec![salt], siblings))
+        })
+        .collect()
+}
+
+/// Materialize the low coset — the first `h = committed_height >> log_blowup` rows of the committed
+/// (bit-reversed) LDE — into a dense `RowMajorMatrix`. This is `mat.split_rows(h).0` in p3's `open`; it is
+/// trace-scale (the polynomial degree, not the blown-up LDE), so it is the ONE resident buffer of the
+/// streamed open (needed because barycentric `interpolate_coset_with_precomputation` wants a dense matrix;
+/// the RAM-heavy whole-LDE reduction stays on disk via `StoreMatrix`).
+fn materialize_low_coset(data: &StreamCommitData, h: usize) -> RowMajorMatrix<Val> {
+    let w = data.store.width();
+    let mut vals = vec![Val::default(); h * w];
+    data.store.fill_row_block(0, h, &mut vals);
+    RowMajorMatrix::new(vals, w)
+}
+
+/// Reimplementation of p3's PRIVATE `compute_inverse_denominators` (`two_adic_pcs.rs`): for each unique
+/// opening point `z`, find the largest committed height opened at `z` and return `1/(z - x)` for `x` over
+/// the size-`2^log_height` prefix of the bit-reversed coset. A small assoc list (few points) replaces
+/// p3's `LinearMap`; byte-identical values (`batch_multiplicative_inverse` over the same differences).
+fn compute_inverse_denominators_stream(
+    rounds: &[(&StreamCommitData, Vec<Challenge>)],
+    coset: &[Val],
+) -> Vec<(Challenge, Vec<Challenge>)> {
+    let mut max_log_height: Vec<(Challenge, usize)> = Vec::new();
+    for (data, points) in rounds {
+        let log_height = log2_strict_usize(data.store.height());
+        for &z in points {
+            match max_log_height.iter_mut().find(|(p, _)| *p == z) {
+                Some(e) => e.1 = e.1.max(log_height),
+                None => max_log_height.push((z, log_height)),
+            }
+        }
+    }
+    max_log_height
+        .into_iter()
+        .map(|(z, log_height)| {
+            let diffs: Vec<Challenge> = coset[..(1 << log_height)].iter().map(|&x| z - x).collect();
+            (z, batch_multiplicative_inverse(&diffs))
+        })
+        .collect()
+}
+
+/// Streaming, prove-only fork of the PRODUCTION `HidingFriPcs::open` → `TwoAdicFriPcs::open` (`two_adic_pcs.rs:414`,
+/// `hiding_pcs.rs:297`), specialized to `MyConfig`, for rounds each committing ONE matrix (the trace and the
+/// opt-randomization rounds; the multi-matrix quotient round is I3). Every committed LDE stays on disk: the
+/// whole-LDE reduction (`(f(ζ)-f(x))/(ζ-x)` accumulated into per-log-height `reduced_openings`) reads it via
+/// `StoreMatrix` row by row, and only the trace-sized low coset is materialized for the barycentric ζ-eval.
+///
+/// BYTE-IDENTICAL to `pcs.open`: the challenger observes the opened `ys` in p3's exact (round, matrix, point)
+/// order, `alpha`/`zeta` sampling is unchanged, the reduction is p3's `(f(ζ)-f(x))/(ζ-x)` (computed per-row —
+/// rows are independent and Goldilocks arithmetic is exact/order-free, so no `rowwise_packed_dot_product`
+/// SIMD dependency), `interpolate_coset_with_precomputation` / `compute_adjusted_weights` are p3's own, and
+/// the FRI is `stream_prove_fri` (its input opens seeked from these same stores). Returns the PUBLIC opened
+/// values, the split-off random-codeword opened values (the hiding proof's first half), and the `FriProof`.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_pcs_open(
+    rounds: &[(&StreamCommitData, Vec<Challenge>)],
+    challenger: &mut Challenger,
+    fri_params: &FriParameters<ChallengeMmcs>,
+    num_random_codewords: usize,
+    log_blowup: usize,
+    cap_height: usize,
+    fri_salt_rng: &mut impl rand::Rng,
+) -> std::io::Result<(
+    OpenedValues<Challenge>,
+    OpenedValues<Challenge>,
+    FriProof<Challenge, ChallengeMmcs, Val, Vec<BatchOpening<Val, ValMmcs>>>,
+)> {
+    let generator = <Val as Field>::GENERATOR;
+
+    // Global max height/width over the committed LDEs (one matrix per round).
+    let (global_max_height, global_max_width) = rounds
+        .iter()
+        .map(|(d, _)| (d.store.height(), d.store.width()))
+        .reduce(|(hm, wm), (h, w)| (hm.max(h), wm.max(w)))
+        .expect("no rounds supplied");
+    let log_global_max_height = log2_strict_usize(global_max_height);
+
+    // The coset `gK` of the largest subgroup, bit-reversed (so `coset[..2^i]` is `gK_i`). Exactly p3's.
+    let coset: Vec<Val> = {
+        let c = TwoAdicMultiplicativeCoset::new(generator, log_global_max_height).unwrap();
+        let mut pts: Vec<Val> = c.iter().collect();
+        reverse_slice_index_bits(&mut pts);
+        pts
+    };
+
+    // Per-point `1/(z - x)` and the adjusted barycentric weights `1/(z-x_i) - 1/z`.
+    let inv_denoms = compute_inverse_denominators_stream(rounds, &coset);
+    let adjusted_weights: Vec<(Challenge, Vec<Challenge>)> =
+        inv_denoms.iter().map(|(p, d)| (*p, compute_adjusted_weights(*p, d))).collect();
+    let find = |list: &[(Challenge, Vec<Challenge>)], z: Challenge| -> Vec<Challenge> {
+        list.iter().find(|(p, _)| *p == z).expect("point present").1.clone()
+    };
+
+    // Barycentric-evaluate each matrix's low coset at each of its points; observe the ys in p3's order.
+    let all_opened_values: OpenedValues<Challenge> = rounds
+        .iter()
+        .map(|(data, points)| {
+            let h = data.store.height() >> log_blowup;
+            let low_coset = materialize_low_coset(data, h);
+            let opened_for_mat: Vec<Vec<Challenge>> = points
+                .iter()
+                .map(|&point| {
+                    let adj_full = find(&adjusted_weights, point);
+                    let ys = low_coset.interpolate_coset_with_precomputation(generator, point, &adj_full[..h]);
+                    challenger.observe_algebra_slice(&ys);
+                    ys
+                })
+                .collect();
+            vec![opened_for_mat] // one matrix per round
+        })
+        .collect();
+
+    // Batch-combination challenge.
+    let alpha: Challenge = challenger.sample_algebra_element();
+
+    // Reduce `(f(ζ)-f(x))/(ζ-x)` into per-log-height accumulators. Reads the whole LDE off disk via
+    // `StoreMatrix`, one row at a time (sequential = byte-identical to p3's packed reduction: rows are
+    // independent and the intra-row sums are exact field ops).
+    let mut num_reduced = [0usize; 32];
+    let mut reduced_openings: [Option<Vec<Challenge>>; 32] = core::array::from_fn(|_| None);
+    for ((data, points), openings_for_round) in rounds.iter().zip(all_opened_values.iter()) {
+        let mat = StoreMatrix::new(&data.store);
+        let openings_for_mat = &openings_for_round[0];
+        let (mh, mw) = (mat.height(), mat.width());
+        let log_height = log2_strict_usize(mh);
+
+        // mat_compressed[r] = Σ_c alpha^c · mat[r][c].
+        let mut mat_compressed = vec![Challenge::ZERO; mh];
+        for (r, mc) in mat_compressed.iter_mut().enumerate() {
+            let row: Vec<Val> = mat.row(r).unwrap().into_iter().collect();
+            let (mut acc, mut ap) = (Challenge::ZERO, Challenge::ONE);
+            for &x in &row {
+                acc += ap * x;
+                ap *= alpha;
+            }
+            *mc = acc;
+        }
+
+        if reduced_openings[log_height].is_none() {
+            reduced_openings[log_height] = Some(vec![Challenge::ZERO; mh]);
+        }
+        for (&point, openings) in points.iter().zip(openings_for_mat.iter()) {
+            let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
+            let (mut reduced_opening, mut ap) = (Challenge::ZERO, Challenge::ONE);
+            for &y in openings {
+                reduced_opening += ap * y;
+                ap *= alpha;
+            }
+            let inv = find(&inv_denoms, point);
+            let ro = reduced_openings[log_height].as_mut().unwrap();
+            for (x, ro_x) in ro.iter_mut().enumerate() {
+                *ro_x += alpha_pow_offset * (reduced_opening - mat_compressed[x]) * inv[x];
+            }
+            num_reduced[log_height] += mw;
+        }
+    }
+
+    // FRI inputs: highest log-height first (`rev`), flattened.
+    let fri_input: Vec<Vec<Challenge>> = reduced_openings.into_iter().rev().flatten().collect();
+
+    let input_datas: Vec<&StreamCommitData> = rounds.iter().map(|(d, _)| *d).collect();
+    let fri_proof = stream_prove_fri(
+        fri_params,
+        fri_input,
+        challenger,
+        log_global_max_height,
+        |index| stream_open_input_streamed(log_global_max_height, index, &input_datas),
+        fri_salt_rng,
+        cap_height,
+    )?;
+
+    // Hiding split: drain the last `num_random_codewords` opened values per point into the random half.
+    let mut public_opened = all_opened_values;
+    let random_opened: OpenedValues<Challenge> = public_opened
+        .iter_mut()
+        .map(|round| {
+            round
+                .iter_mut()
+                .map(|mat| {
+                    mat.iter_mut()
+                        .map(|point| {
+                            let split = point.len() - num_random_codewords;
+                            point.drain(split..).collect()
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+
+    let _ = global_max_width; // (kept for parity with p3's `open`; unused in the sequential reduction)
+    Ok((public_opened, random_opened, fri_proof))
 }
 
 /// A file-backed (mmap'd) store for one `h × w` LDE matrix, held **COLUMN-MAJOR** (element `(row, col)`
@@ -952,8 +1177,12 @@ mod tests {
                 let p3 = prove_fri(&folding, &fri, inputs.clone(), &mut ch1, log_gmh, &input_data, &input_mmcs);
                 let mut ch2 = Challenger::new(perm.clone());
                 let mut salt_rng = ChaCha20Rng::seed_from_u64(seed);
-                let my = stream_prove_fri(&fri, inputs.clone(), &mut ch2, log_gmh, &input_data, &input_mmcs, &mut salt_rng, CAP_HEIGHT)
-                    .expect("stream_prove_fri");
+                let my = stream_prove_fri(
+                    &fri, inputs.clone(), &mut ch2, log_gmh,
+                    |index| stream_open_input(log_gmh, index, &input_data, &input_mmcs),
+                    &mut salt_rng, CAP_HEIGHT,
+                )
+                .expect("stream_prove_fri");
                 (p3, my)
             });
 
@@ -1062,6 +1291,65 @@ mod tests {
 
             let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
             assert_eq!(p3_cap, data.cap(), "streamed hiding trace commit != HidingFriPcs::commit at log_h={log_h} w={w}");
+        }
+    }
+
+    /// `stream_pcs_open` is byte-identical to the PRODUCTION `HidingFriPcs::open` for a trace round (one
+    /// hiding-committed matrix opened at [ζ, ζ_next]). Commits the SAME trace both ways (streamed via
+    /// `stream_hiding_commit`, resident via `pcs.commit`, matched rngs), opens both from identical fresh
+    /// challengers, and asserts the PUBLIC opened values, the random-codeword opened values, and the
+    /// `FriProof` all serialize byte-for-byte. Runs in a 1-thread pool (the FRI grind is nondeterministic).
+    /// This is I2 — the streamed open-at-ζ machinery (barycentric + whole-LDE reduction off disk + FRI +
+    /// hiding split), validated end-to-end against p3.
+    #[test]
+    fn stream_pcs_open_matches_pcs() {
+        use crate::config::{production_fri, MyPcs, ValMmcs, LOG_BLOWUP, NUM_RANDOM_CODEWORDS};
+        use p3_commit::{Pcs, PolynomialSpace};
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        let perm = default_goldilocks_poseidon2_8();
+        for &(log_h, w, cblk, s_mmcs, s_pcs) in &[(4usize, 5usize, 2usize, 7u64, 8u64), (6, 13, 4, 9, 10)] {
+            let h = 1usize << log_h;
+            let trace = RowMajorMatrix::<Val>::rand(&mut ChaCha20Rng::seed_from_u64(s_mmcs ^ 0xBEEF), h, w);
+
+            // Deterministic production PCS (both rngs seeded); commit the trace resident.
+            let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(s_mmcs));
+            let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+            let fri = production_fri(challenge_mmcs);
+            let pcs: MyPcs = MyPcs::new(Dft::default(), val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::seed_from_u64(s_pcs));
+            let ext_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 2 * h);
+            let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, h);
+            let (_commit, prover_data) = <MyPcs as Pcs<Challenge, Challenger>>::commit(&pcs, [(ext_domain, trace.clone())]);
+
+            // Streamed commit of the same trace (matched rngs); a throwaway FRI params (mmcs rng unused by open).
+            let mut pcs_rng = ChaCha20Rng::seed_from_u64(s_pcs);
+            let mut mmcs_rng = ChaCha20Rng::seed_from_u64(s_mmcs);
+            let data = stream_hiding_commit(trace, NUM_RANDOM_CODEWORDS, LOG_BLOWUP, <Val as Field>::GENERATOR, cblk, CAP_HEIGHT, &mut pcs_rng, &mut mmcs_rng).unwrap();
+            let fri_for_stream = production_fri(ChallengeMmcs::new(ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(999))));
+
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+            let (p3_opened, p3_random, p3_fri, my_public, my_random, my_fri) = pool.install(|| {
+                // p3: fresh challenger → sample ζ → open at [ζ, ζ_next].
+                let mut ch1 = Challenger::new(perm.clone());
+                let zeta: Challenge = ch1.sample_algebra_element();
+                let zeta_next = trace_domain.next_point(zeta).unwrap();
+                let (p3_opened, (p3_random, p3_fri)) =
+                    <MyPcs as Pcs<Challenge, Challenger>>::open(&pcs, vec![(&prover_data, vec![vec![zeta, zeta_next]])], &mut ch1);
+                // mine: identical fresh challenger → same ζ (FRI salts from a fresh S_mmcs rng, p3's clone semantics).
+                let mut ch2 = Challenger::new(perm.clone());
+                let zeta2: Challenge = ch2.sample_algebra_element();
+                let zeta2_next = trace_domain.next_point(zeta2).unwrap();
+                let mut fri_salt_rng = ChaCha20Rng::seed_from_u64(s_mmcs);
+                let (my_public, my_random, my_fri) = stream_pcs_open(
+                    &[(&data, vec![zeta2, zeta2_next])], &mut ch2, &fri_for_stream, NUM_RANDOM_CODEWORDS, LOG_BLOWUP, CAP_HEIGHT, &mut fri_salt_rng,
+                )
+                .unwrap();
+                (p3_opened, p3_random, p3_fri, my_public, my_random, my_fri)
+            });
+
+            assert_eq!(postcard::to_allocvec(&p3_opened).unwrap(), postcard::to_allocvec(&my_public).unwrap(), "public opened values differ (log_h={log_h} w={w})");
+            assert_eq!(postcard::to_allocvec(&p3_random).unwrap(), postcard::to_allocvec(&my_random).unwrap(), "random-codeword opened values differ (log_h={log_h} w={w})");
+            assert_eq!(postcard::to_allocvec(&p3_fri).unwrap(), postcard::to_allocvec(&my_fri).unwrap(), "FriProof differs (log_h={log_h} w={w})");
         }
     }
 
