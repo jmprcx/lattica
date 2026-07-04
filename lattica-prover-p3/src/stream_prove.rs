@@ -815,6 +815,11 @@ where
     let query_pow_witness = challenger.grind(params.query_proof_of_work_bits);
 
     // ── query phase (seek-backed) — sample each index, open the inputs (resident) + each round (disk). ─
+    // The commit phase wrote + Merkle-read each codeword store SEQUENTIALLY; the query phase now seeks them
+    // at sparse rows, so flip them to RANDOM (no readahead/drop-behind on the seeked rows).
+    for data in &datas {
+        data.store.advise(libc::MADV_RANDOM);
+    }
     let extra_query_index_bits = FriFoldingStrategy::<Val, Challenge>::extra_query_index_bits(&folding);
     let query_proofs = core::iter::repeat_with(|| {
         let index = challenger.sample_bits(log_global_max_height + extra_query_index_bits);
@@ -1074,6 +1079,13 @@ pub fn stream_pcs_open(
     let fri_input: Vec<Vec<Challenge>> = reduced_openings.into_iter().rev().flatten().collect();
 
     let round_refs: Vec<&RoundView> = rounds.iter().map(|(r, _)| r).collect();
+    // The FRI query phase now seeks these input stores at ~96 sparse rows — flip them to RANDOM so the
+    // SEQUENTIAL prefetch/drop-behind (which sped the reduction just above) doesn't evict the queried rows.
+    for round in &round_refs {
+        for s in &round.stores {
+            s.advise(libc::MADV_RANDOM);
+        }
+    }
     let fri_proof = stream_prove_fri(
         fri_params,
         fri_input,
@@ -1366,6 +1378,11 @@ impl MmapLdeStore {
                 libc::close(fd);
                 return Err(e);
             }
+            // Default hint: SEQUENTIAL. A store is written front-to-back and then read in streaming passes
+            // (Merkle / reduction / get_evals) for MOST of its life — aggressive readahead + drop-behind cut
+            // fault/reclaim churn under a cap. It flips to `MADV_RANDOM` (via `advise`) right before the FRI
+            // query phase's sparse row-seeks, where SEQUENTIAL's prefetch/drop-behind would hurt.
+            libc::madvise(m, bytes, libc::MADV_SEQUENTIAL);
             Ok(Self { map: m as *mut Val, n, h, w, fd })
         }
     }
@@ -1375,6 +1392,16 @@ impl MmapLdeStore {
     fn slice(&self) -> &[Val] {
         // SAFETY: `map` covers `n` initialized `Val` elements (zeroed at creation) for the store's lifetime.
         unsafe { std::slice::from_raw_parts(self.map, self.n) }
+    }
+
+    /// Re-hint the kernel about the coming access pattern — `MADV_SEQUENTIAL` for a streaming read pass,
+    /// `MADV_RANDOM` before the sparse FRI query seeks (no readahead / no drop-behind, so the queried rows
+    /// aren't evicted before they're read). Advice only — byte-transparent.
+    fn advise(&self, advice: libc::c_int) {
+        // SAFETY: `map`/`n` are the live mmap for this store's lifetime; madvise merely hints the kernel.
+        unsafe {
+            libc::madvise(self.map as *mut libc::c_void, self.n * size_of::<Val>(), advice);
+        }
     }
 
     /// Write a `h × cw` ROW-MAJOR LDE tile (columns `[c0, c0+cw)`, `tile[r*cw + c]`) into the COLUMN-MAJOR
