@@ -309,44 +309,32 @@ impl StreamCommitData {
     }
 }
 
-/// Frontier hiding Merkle over K SAME-height matrices: leaf row `i` is the hash of the concatenation, in
-/// matrix order, of each matrix's row `i` immediately followed by that matrix's salt row —
-/// `hash([m0[i] | salt0[i] | m1[i] | salt1[i] | … | mK[i] | saltK[i]])` — exactly p3's
+/// Frontier hiding Merkle over K SAME-height RESIDENT row-major matrices, hashed DIRECTLY (no store
+/// round-trip): leaf row `i` is `hash([m0[i] | salt0[i] | … | mK[i] | saltK[i]])` — exactly p3's
 /// `hash_iter(matrices.flat_map(|HP(m_j, salt_j)| row_i))` (`merkle_tree.rs:330`), then pairwise-compress
-/// to the cap. Reads each store in row-blocks (transposed-block, one streaming pass); only the block
-/// buffers + the digests reside.
-fn stream_merkle_layers_batch(stores: &[MmapLdeStore], salts: &[Vec<Val>], cap_height: usize) -> Vec<Vec<[Val; DIGEST]>> {
-    let h = stores[0].height();
+/// to the cap. The quotient chunks are already in RAM (`get_quotient_ldes`), so hashing them directly
+/// skips a full READ pass over the quotient LDE (byte-identical to reading the stores back — same leaves,
+/// same order). Fully parallel.
+fn stream_merkle_layers_batch(mats: &[RowMajorMatrix<Val>], salts: &[Vec<Val>], cap_height: usize) -> Vec<Vec<[Val; DIGEST]>> {
+    let h = mats[0].height();
     assert!(h.is_power_of_two(), "batch Merkle: height must be a power of two (got {h})");
     let perm = default_goldilocks_poseidon2_8();
     let hash = MyHash::new(perm.clone());
     let compress = MyCompress::new(perm);
 
-    const ROW_BLOCK: usize = 4096;
-    let bh = ROW_BLOCK.min(h);
-    // One transposed row-block buffer per store.
-    let mut blocks: Vec<Vec<Val>> = stores.iter().map(|s| vec![Val::default(); bh * s.width()]).collect();
-    let mut leaf: Vec<[Val; DIGEST]> = Vec::with_capacity(h);
-    let mut r0 = 0usize;
-    while r0 < h {
-        let nr = bh.min(h - r0);
-        for (j, s) in stores.iter().enumerate() {
-            s.fill_row_block(r0, nr, &mut blocks[j][..nr * s.width()]);
-        }
-        // Hash the block's rows in PARALLEL (each concatenated-salted row is an independent leaf).
-        leaf.par_extend((0..nr).into_par_iter().map(|i| {
-            let r = r0 + i;
-            let data = stores.iter().enumerate().flat_map(|(j, s)| {
-                let w = s.width();
-                blocks[j][i * w..(i + 1) * w]
+    let leaf: Vec<[Val; DIGEST]> = (0..h)
+        .into_par_iter()
+        .map(|i| {
+            let data = mats.iter().enumerate().flat_map(|(j, mat)| {
+                let w = mat.width();
+                mat.values[i * w..(i + 1) * w]
                     .iter()
                     .copied()
-                    .chain(salts[j][r * SALT_ELEMS..(r + 1) * SALT_ELEMS].iter().copied())
+                    .chain(salts[j][i * SALT_ELEMS..(i + 1) * SALT_ELEMS].iter().copied())
             });
             hash.hash_iter(data)
-        }));
-        r0 += nr;
-    }
+        })
+        .collect();
 
     let cap_len = (1usize << cap_height).min(leaf.len());
     let mut layers = vec![leaf];
@@ -394,7 +382,9 @@ pub fn stream_commit_batch<R: rand::Rng>(
     // Draw the salts PER MATRIX in order — p3's `inputs.map(|mat| rand(rng, h, SALT_ELEMS))`.
     let salts: Vec<Vec<Val>> = (0..mats.len()).map(|_| RowMajorMatrix::rand(rng, h, SALT_ELEMS).values).collect();
 
-    let layers = stream_merkle_layers_batch(&stores, &salts, cap_height);
+    // Hash the RESIDENT matrices (skips a read pass over the just-written quotient LDE); `mats` is dropped
+    // right after (the stores serve the query opens).
+    let layers = stream_merkle_layers_batch(&mats, &salts, cap_height);
     Ok(StreamBatchCommitData { stores, salts, layers })
 }
 
