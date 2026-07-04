@@ -41,6 +41,7 @@ ocl = { version = "0.19", optional = true }
 rayon = { version = "1", optional = true } # parallelize the GPU leaf-buffer marshalling
 libc = { version = "0.2", optional = true } # streaming: mmap/ftruncate/munmap for the spill allocator
 p3-util = { version = "0.6.1", optional = true } # streaming FRI fork: p3's exact log2_strict_usize / reverse_slice_index_bits
+p3-maybe-rayon = { version = "0.6.1", optional = true, features = ["parallel"] } # streaming open: SIMD-parallel off-disk reduction
 
 [dev-dependencies]
 rayon = "1" # streaming FRI test: pin a 1-thread pool so p3's `find_map_any` PoW grind is deterministic
@@ -59,7 +60,7 @@ recursion = []
 # peak RSS under a cgroup ceiling instead of holding the whole LDE in RAM. Additive + prove-only +
 # BYTE-IDENTICAL (only the backing store changes); OFF by default so the production staticlib and the
 # 10 frozen externs never install it. Run with `--features stream`. See `src/spill_alloc.rs`.
-stream = ["dep:libc", "dep:p3-util"]
+stream = ["dep:libc", "dep:p3-util", "dep:p3-maybe-rayon"]
 
 [profile.release]
 # Cross-crate inlining of p3's hot field-arithmetic / NTT / Poseidon2 loops (thin LTO + one codegen

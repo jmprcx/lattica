@@ -25,7 +25,7 @@ use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChalleng
 use p3_commit::{BatchOpening, Mmcs, OpenedValues, PolynomialSpace};
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
 use p3_field::coset::TwoAdicMultiplicativeCoset;
-use p3_field::{batch_multiplicative_inverse, BasedVectorSpace, Field, PrimeCharacteristicRing};
+use p3_field::{batch_multiplicative_inverse, BasedVectorSpace, ExtensionField, Field, PackedFieldExtension, PrimeCharacteristicRing};
 use p3_matrix::interpolation::{compute_adjusted_weights, Interpolate};
 use p3_fri::{
     compute_log_arity_for_round, CommitPhaseProofStep, FriFoldingStrategy, FriParameters, FriProof,
@@ -35,8 +35,9 @@ use p3_goldilocks::default_goldilocks_poseidon2_8;
 use p3_air::symbolic::{AirLayout, SymbolicAirBuilder};
 use p3_air::{Air, DebugConstraintBuilder};
 use p3_matrix::bitrev::BitReversibleMatrix;
-use p3_matrix::dense::RowMajorMatrix;
+use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView};
 use p3_matrix::Matrix;
+use p3_maybe_rayon::prelude::*;
 use p3_uni_stark::{
     get_log_num_quotient_chunks, quotient_values, Commitments, OpenedValues as StarkOpenedValues, Proof,
     ProverConstraintFolder, StarkGenericConfig,
@@ -148,18 +149,19 @@ fn stream_merkle_layers_inner<S: LeafSource>(src: &S, cap_height: usize, salts: 
     while r0 < h {
         let nr = bh.min(h - r0);
         src.fill_row_block(r0, nr, &mut block[..nr * w]);
-        for i in 0..nr {
+        // Hash the block's rows in PARALLEL — each row's digest is independent, so this is byte-identical
+        // to the scalar loop (and to p3's per-row `hash_iter`). This is the commit's hot loop.
+        leaf.par_extend((0..nr).into_par_iter().map(|i| {
             let data = block[i * w..(i + 1) * w].iter().copied();
-            let digest = match salts {
+            match salts {
                 // leaf = [row | salt], matching p3's `HorizontalPair::new(mat, salts)`
                 Some(s) => {
                     let r = r0 + i;
                     hash.hash_iter(data.chain(s[r * SALT_ELEMS..(r + 1) * SALT_ELEMS].iter().copied()))
                 }
                 None => hash.hash_iter(data),
-            };
-            leaf.push(digest);
-        }
+            }
+        }));
         r0 += nr;
     }
 
@@ -169,7 +171,7 @@ fn stream_merkle_layers_inner<S: LeafSource>(src: &S, cap_height: usize, salts: 
     let mut layers = vec![leaf];
     while layers.last().unwrap().len() > cap_len {
         let next: Vec<[Val; DIGEST]> =
-            layers.last().unwrap().chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
+            layers.last().unwrap().par_chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
         layers.push(next);
     }
     layers
@@ -331,7 +333,8 @@ fn stream_merkle_layers_batch(stores: &[MmapLdeStore], salts: &[Vec<Val>], cap_h
         for (j, s) in stores.iter().enumerate() {
             s.fill_row_block(r0, nr, &mut blocks[j][..nr * s.width()]);
         }
-        for i in 0..nr {
+        // Hash the block's rows in PARALLEL (each concatenated-salted row is an independent leaf).
+        leaf.par_extend((0..nr).into_par_iter().map(|i| {
             let r = r0 + i;
             let data = stores.iter().enumerate().flat_map(|(j, s)| {
                 let w = s.width();
@@ -340,8 +343,8 @@ fn stream_merkle_layers_batch(stores: &[MmapLdeStore], salts: &[Vec<Val>], cap_h
                     .copied()
                     .chain(salts[j][r * SALT_ELEMS..(r + 1) * SALT_ELEMS].iter().copied())
             });
-            leaf.push(hash.hash_iter(data));
-        }
+            hash.hash_iter(data)
+        }));
         r0 += nr;
     }
 
@@ -349,7 +352,7 @@ fn stream_merkle_layers_batch(stores: &[MmapLdeStore], salts: &[Vec<Val>], cap_h
     let mut layers = vec![leaf];
     while layers.last().unwrap().len() > cap_len {
         let next: Vec<[Val; DIGEST]> =
-            layers.last().unwrap().chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
+            layers.last().unwrap().par_chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
         layers.push(next);
     }
     layers
@@ -912,6 +915,7 @@ pub fn stream_pcs_open(
 
     // Barycentric-evaluate each matrix's low coset at each of its points; observe the ys in p3's
     // (round, matrix, point) order.
+    let mut _pt = std::time::Instant::now();
     let all_opened_values: OpenedValues<Challenge> = rounds
         .iter()
         .map(|(round, points_per_mat)| {
@@ -936,32 +940,42 @@ pub fn stream_pcs_open(
         })
         .collect();
 
+    prof("open.barycentric", _pt);
+    _pt = std::time::Instant::now();
+
     // Batch-combination challenge.
     let alpha: Challenge = challenger.sample_algebra_element();
 
-    // Reduce `(f(ζ)-f(x))/(ζ-x)` into per-log-height accumulators. Reads the whole LDE off disk via
-    // `StoreMatrix`, one row at a time (sequential = byte-identical to p3's packed reduction: rows are
-    // independent and the intra-row sums are exact field ops).
+    // Reduce `(f(ζ)-f(x))/(ζ-x)` into per-log-height accumulators. Reads the whole LDE off disk in
+    // ROW-BLOCKS (`fill_row_block` = `w` interleaved SEQUENTIAL column-segment streams — no strided per-row
+    // seeks, so it doesn't page-fault under a cap) and reduces each block with p3's SIMD-packed
+    // `rowwise_packed_dot_product`; the accumulate is parallel over rows. Byte-identical to the scalar
+    // reduction (P3.7a pinned `rowwise_packed_dot_product` disk-vs-resident; rows independent + Goldilocks
+    // exact) but ~an order of magnitude faster (sequential I/O + SIMD + rayon).
+    let global_max_width = rounds.iter().flat_map(|(r, _)| r.stores.iter().map(|s| s.width())).max().unwrap_or(0);
+    let packed_alpha_powers: Vec<_> =
+        <Challenge as ExtensionField<Val>>::ExtensionPacking::packed_ext_powers_capped(alpha, global_max_width).collect();
+    const RED_BLOCK: usize = 8192;
     let mut num_reduced = [0usize; 32];
     let mut reduced_openings: [Option<Vec<Challenge>>; 32] = core::array::from_fn(|_| None);
     for ((round, points_per_mat), openings_for_round) in rounds.iter().zip(all_opened_values.iter()) {
         for ((store, points), openings_for_mat) in
             round.stores.iter().zip(points_per_mat.iter()).zip(openings_for_round.iter())
         {
-            let mat = StoreMatrix::new(store);
-            let (mh, mw) = (mat.height(), mat.width());
+            let (mh, mw) = (store.height(), store.width());
             let log_height = log2_strict_usize(mh);
 
-            // mat_compressed[r] = Σ_c alpha^c · mat[r][c].
+            // mat_compressed[r] = Σ_c alpha^c · mat[r][c], via sequential row-block reads + SIMD packing.
             let mut mat_compressed = vec![Challenge::ZERO; mh];
-            for (r, mc) in mat_compressed.iter_mut().enumerate() {
-                let row: Vec<Val> = mat.row(r).unwrap().into_iter().collect();
-                let (mut acc, mut ap) = (Challenge::ZERO, Challenge::ONE);
-                for &x in &row {
-                    acc += ap * x;
-                    ap *= alpha;
-                }
-                *mc = acc;
+            let mut block = vec![Val::default(); RED_BLOCK.min(mh) * mw];
+            let mut r0 = 0usize;
+            while r0 < mh {
+                let nr = RED_BLOCK.min(mh - r0);
+                store.fill_row_block(r0, nr, &mut block[..nr * mw]);
+                let blk = RowMajorMatrixView::new(&block[..nr * mw], mw);
+                let mc: Vec<Challenge> = blk.rowwise_packed_dot_product::<Challenge>(&packed_alpha_powers).collect();
+                mat_compressed[r0..r0 + nr].copy_from_slice(&mc);
+                r0 += nr;
             }
 
             if reduced_openings[log_height].is_none() {
@@ -976,13 +990,20 @@ pub fn stream_pcs_open(
                 }
                 let inv = find(&inv_denoms, point);
                 let ro = reduced_openings[log_height].as_mut().unwrap();
-                for (x, ro_x) in ro.iter_mut().enumerate() {
-                    *ro_x += alpha_pow_offset * (reduced_opening - mat_compressed[x]) * inv[x];
-                }
+                // ro[x] += alpha_pow_offset · (reduced_opening − mat_compressed[x]) · inv[x], parallel over x.
+                ro.par_iter_mut()
+                    .zip(mat_compressed.par_iter())
+                    .zip(inv[..mh].par_iter())
+                    .for_each(|((ro_x, &mc_x), &inv_x)| {
+                        *ro_x += alpha_pow_offset * (reduced_opening - mc_x) * inv_x;
+                    });
                 num_reduced[log_height] += mw;
             }
         }
     }
+
+    prof("open.reduction", _pt);
+    _pt = std::time::Instant::now();
 
     // FRI inputs: highest log-height first (`rev`), flattened.
     let fri_input: Vec<Vec<Challenge>> = reduced_openings.into_iter().rev().flatten().collect();
@@ -997,6 +1018,7 @@ pub fn stream_pcs_open(
         fri_salt_rng,
         cap_height,
     )?;
+    prof("open.fri", _pt);
 
     // Hiding split: drain the last `num_random_codewords` opened values per point into the random half.
     let mut public_opened = all_opened_values;
@@ -1018,6 +1040,15 @@ pub fn stream_pcs_open(
         .collect();
 
     Ok((public_opened, random_opened, fri_proof))
+}
+
+/// Print `label` + elapsed since `t` to stderr when `LATTICA_STREAM_PROFILE` is set — a zero-cost
+/// phase profiler for the streamed prove (off unless the env var is present).
+#[inline]
+fn prof(label: &str, t: std::time::Instant) {
+    if std::env::var_os("LATTICA_STREAM_PROFILE").is_some() {
+        eprintln!("[stream_prove] {label:<22} {:.2}s", t.elapsed().as_secs_f64());
+    }
 }
 
 /// Streamed `get_evaluations_on_domain` for the trace on the quotient domain — the FAST path of
@@ -1098,9 +1129,12 @@ where
         <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree * (is_zk + 1));
 
     // ── trace commit (streamed) ──
+    let mut _t = std::time::Instant::now();
     let trace_data =
         stream_hiding_commit(trace, nrc, log_blowup, generator, c_block, CAP_HEIGHT, &mut pcs_rng, &mut mmcs_rng)?;
     let trace_commit = FriCommit::from(trace_data.cap().to_vec());
+    prof("trace_commit", _t);
+    _t = std::time::Instant::now();
 
     challenger.observe(Val::from_u8(log_ext_degree as u8));
     challenger.observe(Val::from_u8(log_degree as u8));
@@ -1122,6 +1156,8 @@ where
         pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
     );
     let quotient_flat = RowMajorMatrix::new_col(quotient).flatten_to_base();
+    prof("quotient_values", _t);
+    _t = std::time::Instant::now();
 
     // ── quotient commit (streamed) ──
     let quotient_data = stream_commit_quotient(
@@ -1129,12 +1165,16 @@ where
     )?;
     let quotient_commit = FriCommit::from(quotient_data.cap().to_vec());
     challenger.observe(quotient_commit.clone());
+    prof("quotient_commit", _t);
+    _t = std::time::Instant::now();
 
     // ── opt-randomization commit (ZK) ──
     let r_mat = RowMajorMatrix::<Val>::rand(&mut pcs_rng, ext_trace_domain.size(), nrc + 2);
     let r_data = stream_commit(r_mat, log_blowup, generator, c_block, CAP_HEIGHT, &mut mmcs_rng)?;
     let r_commit = FriCommit::from(r_data.cap().to_vec());
     challenger.observe(r_commit.clone());
+    prof("opt_r_commit", _t);
+    _t = std::time::Instant::now();
 
     let zeta: Challenge = challenger.sample_algebra_element();
     let zeta_next = trace_domain.next_point(zeta).expect("domain should support next_point");
@@ -1155,6 +1195,7 @@ where
     ];
     let (opened_values, random_opened, fri_proof) =
         stream_pcs_open(&rounds, &mut challenger, &fri_params, nrc, log_blowup, CAP_HEIGHT, &mut fri_salt_rng)?;
+    prof("open", _t);
 
     // ── assemble Proof (mirror prove_gpu:428-443) ──
     let (trace_idx, quotient_idx) = (1usize, 2usize);
@@ -1984,8 +2025,13 @@ mod tests {
     ///   stream: `systemd-run --scope -p MemoryMax=6G --user env LATTICA_BENCH_MODE=stream LATTICA_BATCH_N=64 \
     ///            LATTICA_SPILL_DIR=/home/access/scratch cargo test --release --features stream stream_prove_ram_bench -- --ignored --exact --nocapture`
     /// (`/dev/shm` or unset `LATTICA_SPILL_DIR` = tmpfs = RAM → NO win; needs a real nodatacow disk.)
+    ///
+    /// TUNING — the streamed commit/open are parallelized (SIMD Merkle + reduction). Under a TIGHT cap,
+    /// saturating all cores STARVES the kernel's mmap writeback/reclaim → thrash; set
+    /// `RAYON_NUM_THREADS ≈ cores/2` (measured sweet spot: 24-core box, N=16/2 GB cap → 98 s at 12 threads
+    /// vs 166 s sequential vs 274 s at 24). `LATTICA_STREAM_PROFILE=1` prints the per-phase breakdown.
     #[test]
-    #[ignore = "bench: full stream_prove RAM vs p3 (LATTICA_BENCH_MODE=stream|p3, LATTICA_BATCH_N, LATTICA_SPILL_DIR)"]
+    #[ignore = "bench: full stream_prove RAM vs p3 (LATTICA_BENCH_MODE=stream|p3, LATTICA_BATCH_N, LATTICA_SPILL_DIR, RAYON_NUM_THREADS≈cores/2)"]
     fn stream_prove_ram_bench() {
         use crate::batch_joinsplit_air::{batch_root, build_batch_trace, verify_batch_bytes, JoinSplitBatchAir};
         use crate::config::make_config;
