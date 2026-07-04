@@ -32,6 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Poseidon2 digest width (Goldilocks-8 sponge squeezes 4).
 pub const DIGEST: usize = 4;
 
+/// Salt columns appended to each leaf row in the production HIDING commit (`MerkleTreeHidingMmcs<…,4>`).
+pub const SALT_ELEMS: usize = 4;
+
 /// A source of `h` leaf rows of width `w`, addressable one row at a time — the seam the streaming store
 /// plugs into. `fill_row(i, buf)` writes row `i` (a `w`-wide slice) so the Merkle commit never holds the
 /// whole `h × w` leaf matrix; a later increment backs this by an mmap'd, column-tiled LDE store.
@@ -76,9 +79,32 @@ impl LeafSource for SliceLeaves<'_> {
 /// Returns the cap digests — byte-identical to `MerkleTreeMmcs::commit(vec![matrix]).0` under the same
 /// `MyHash`/`MyCompress`/`CAP_HEIGHT`. This is the frontier build that keeps the wide leaves off the heap.
 pub fn stream_merkle_cap<S: LeafSource>(src: &S, cap_height: usize) -> Vec<[Val; DIGEST]> {
+    stream_merkle_cap_inner(src, cap_height, None)
+}
+
+/// Streaming HIDING Merkle commitment — byte-identical to the PRODUCTION `MerkleTreeHidingMmcs::commit`.
+/// Draws the whole `h × SALT_ELEMS` salt matrix up-front from `rng` (exactly p3's `RowMajorMatrix::rand`,
+/// same row-major order — the byte-compat rule: draw all salts whole-matrix, up-front, in p3's order),
+/// then hashes each leaf as `[row | salt]` (p3's `HorizontalPair`) while streaming the wide rows from
+/// `src`. The salt matrix (`h × 4`) is small and resident; the leaves are not.
+pub fn stream_merkle_cap_hiding<S, R>(src: &S, cap_height: usize, rng: &mut R) -> Vec<[Val; DIGEST]>
+where
+    S: LeafSource,
+    R: rand::Rng,
+{
+    let salts = RowMajorMatrix::rand(rng, src.height(), SALT_ELEMS);
+    stream_merkle_cap_inner(src, cap_height, Some(&salts.values))
+}
+
+/// Shared frontier build. `salts`, when present, is the `h × SALT_ELEMS` matrix (row-major) whose row `r`
+/// is appended to leaf row `r` before hashing (the hiding variant); `None` is the plain commit.
+fn stream_merkle_cap_inner<S: LeafSource>(src: &S, cap_height: usize, salts: Option<&[Val]>) -> Vec<[Val; DIGEST]> {
     let h = src.height();
     let w = src.width();
     assert!(h.is_power_of_two(), "stream_merkle_cap: leaf height must be a power of two (got {h})");
+    if let Some(s) = salts {
+        assert_eq!(s.len(), h * SALT_ELEMS, "salt matrix must be h*SALT_ELEMS");
+    }
     let perm = default_goldilocks_poseidon2_8();
     let hash = MyHash::new(perm.clone());
     let compress = MyCompress::new(perm);
@@ -95,7 +121,16 @@ pub fn stream_merkle_cap<S: LeafSource>(src: &S, cap_height: usize) -> Vec<[Val;
         let nr = bh.min(h - r0);
         src.fill_row_block(r0, nr, &mut block[..nr * w]);
         for i in 0..nr {
-            layer.push(hash.hash_iter(block[i * w..(i + 1) * w].iter().copied()));
+            let data = block[i * w..(i + 1) * w].iter().copied();
+            let digest = match salts {
+                // leaf = [row | salt], matching p3's `HorizontalPair::new(mat, salts)`
+                Some(s) => {
+                    let r = r0 + i;
+                    hash.hash_iter(data.chain(s[r * SALT_ELEMS..(r + 1) * SALT_ELEMS].iter().copied()))
+                }
+                None => hash.hash_iter(data),
+            };
+            layer.push(digest);
         }
         r0 += nr;
     }
@@ -293,6 +328,32 @@ mod tests {
             // p3's commitment is the `MerkleCap` (AsRef<[digest]>) at CAP_HEIGHT
             let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
             assert_eq!(p3_cap, mine.as_slice(), "streaming Merkle cap != p3 at h=2^{log_h} w={w}");
+        }
+    }
+
+    /// The streaming HIDING Merkle cap is byte-identical to the PRODUCTION salted `MerkleTreeHidingMmcs`
+    /// commitment — same salts (a fresh rng of the same seed, drawn via p3's `RowMajorMatrix::rand` order)
+    /// and `[row | salt]` leaves. This matches the actual production commit (the non-hiding test above
+    /// validated the tree structure; production is hiding).
+    #[test]
+    fn stream_merkle_hiding_matches_p3() {
+        use p3_merkle_tree::MerkleTreeHidingMmcs;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        type HidingMmcs = MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, DIGEST, SALT_ELEMS>;
+        let perm = default_goldilocks_poseidon2_8();
+        for &(log_h, w, seed) in &[(3usize, 1usize, 1u64), (6, 5, 2), (10, 49, 3), (12, 53, 4), (13, 1291, 5)] {
+            let h = 1usize << log_h;
+            let vals: Vec<Val> = (0..h * w)
+                .map(|i| Val::new((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % 0xFFFF_FFFF_0000_0001))
+                .collect();
+            let mat = RowMajorMatrix::new(vals.clone(), w);
+            let mmcs = HidingMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(seed));
+            let (p3_commit, _) = mmcs.commit(vec![mat]);
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            let mine = stream_merkle_cap_hiding(&SliceLeaves { vals: &vals, h, w }, CAP_HEIGHT, &mut rng);
+            let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
+            assert_eq!(p3_cap, mine.as_slice(), "streaming HIDING Merkle cap != p3 at h=2^{log_h} w={w} seed={seed}");
         }
     }
 
