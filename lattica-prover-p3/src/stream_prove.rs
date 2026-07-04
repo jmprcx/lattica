@@ -201,6 +201,37 @@ pub fn stream_commit<R: rand::Rng>(
     Ok(StreamCommitData { store, salts, layers })
 }
 
+/// Streaming equivalent of the PRODUCTION `HidingFriPcs::commit` for one matrix: replicate p3's ZK
+/// randomization VERBATIM (`with_random_cols` — append `2*num_random_codewords` columns of `pcs_rng`
+/// draws, then reshape the width to `+num_random_codewords`, which interleaves random rows and DOUBLES the
+/// height — p3's `is_zk` masking), then stream the coset-LDE + committed-order hiding Merkle commit (salts
+/// from `mmcs_rng`). Reusing p3's own `with_random_cols` keeps the (small, trace-scale) randomization
+/// byte-identical by construction; only the RAM-heavy LDE + commit is streamed.
+///
+/// `cap()` is byte-identical to `HidingFriPcs::commit([(domain, trace)]).0` when `pcs_rng` matches the
+/// PCS's random-codeword rng, `mmcs_rng` matches its inner MMCS salt rng, `added_bits = log_blowup`, and
+/// `shift = Val::GENERATOR / domain.shift()` (the trace's `ext_trace_domain` is natural ⇒ `shift =
+/// GENERATOR`). The returned data opens byte-identically via `stream_open`.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_hiding_commit<R1: rand::Rng + Send + Sync, R2: rand::Rng>(
+    trace: RowMajorMatrix<Val>,
+    num_random_codewords: usize,
+    added_bits: usize,
+    shift: Val,
+    c_block: usize,
+    cap_height: usize,
+    pcs_rng: &mut R1,
+    mmcs_rng: &mut R2,
+) -> std::io::Result<StreamCommitData> {
+    let w = trace.width();
+    // p3's exact randomization: append `w + 2*nrc` columns (→ width `2w + 2*nrc`), then reshape to width
+    // `w + nrc` so the height doubles. `with_random_cols` draws `rng.random()` per appended element in
+    // row-major order — byte-identical to `HidingFriPcs::commit`'s draw.
+    let mut randomized = trace.with_random_cols(w + 2 * num_random_codewords, &mut *pcs_rng);
+    randomized.width = w + num_random_codewords;
+    stream_commit(randomized, added_bits, shift, c_block, cap_height, mmcs_rng)
+}
+
 /// Open the leaf at `index`: the (unsalted) row, its salt, and the binary Merkle sibling path up to the
 /// cap — byte-identical to production's hiding `Mmcs::open_batch` (which returns `opened_values = [row]`,
 /// `opening_proof = ([salt], siblings)`). The row is a single strided seek into the store; the salt and
@@ -994,6 +1025,43 @@ mod tests {
             let from_store: Vec<Challenge> = sm.rowwise_packed_dot_product::<Challenge>(&packed).collect();
             let from_mem: Vec<Challenge> = src.rowwise_packed_dot_product::<Challenge>(&packed).collect();
             assert_eq!(from_store, from_mem, "rowwise_packed_dot_product differs (h=2^{log_h} w={w})");
+        }
+    }
+
+    /// `stream_hiding_commit` is byte-identical to the PRODUCTION `HidingFriPcs::commit` — the full trace
+    /// commit path (ZK random-codeword columns + `is_zk` height-doubling + coset-LDE + committed-order
+    /// hiding Merkle), streamed. Builds a deterministic `MyPcs` (both the random-codeword rng and the inner
+    /// MMCS salt rng seeded) and asserts my `cap()` equals `pcs.commit([(ext_trace_domain, trace)]).0`.
+    /// This is I1 — the first end-to-end-faithful commit piece of the streamed `stream_prove`.
+    #[test]
+    fn stream_hiding_commit_matches_pcs() {
+        use crate::config::{production_fri, MyPcs, ValMmcs, LOG_BLOWUP, NUM_RANDOM_CODEWORDS};
+        use p3_commit::Pcs;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        let perm = default_goldilocks_poseidon2_8();
+        // (log_h, w, c_block, mmcs seed, pcs seed)
+        for &(log_h, w, cblk, s_mmcs, s_pcs) in &[(4usize, 5usize, 2usize, 11u64, 22u64), (8, 49, 8, 33, 44), (6, 53, 4, 55, 66)] {
+            let h = 1usize << log_h;
+            let trace = RowMajorMatrix::<Val>::rand(&mut ChaCha20Rng::seed_from_u64(s_mmcs ^ 0xABC), h, w);
+
+            // Deterministic production PCS: seed BOTH the random-codeword rng and the inner MMCS salt rng.
+            let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(s_mmcs));
+            let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+            let fri = production_fri(challenge_mmcs);
+            let pcs: MyPcs = MyPcs::new(Dft::default(), val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::seed_from_u64(s_pcs));
+            // The trace commits against `natural_domain_for_degree(2h)` (is_zk doubling); commit doubles it.
+            let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 2 * h);
+            let (p3_commit, _) = <MyPcs as Pcs<Challenge, Challenger>>::commit(&pcs, [(domain, trace.clone())]);
+
+            // Mine: the same two seeds, natural-domain shift (= GENERATOR).
+            let mut pcs_rng = ChaCha20Rng::seed_from_u64(s_pcs);
+            let mut mmcs_rng = ChaCha20Rng::seed_from_u64(s_mmcs);
+            let shift = <Val as Field>::GENERATOR;
+            let data = stream_hiding_commit(trace, NUM_RANDOM_CODEWORDS, LOG_BLOWUP, shift, cblk, CAP_HEIGHT, &mut pcs_rng, &mut mmcs_rng).unwrap();
+
+            let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
+            assert_eq!(p3_cap, data.cap(), "streamed hiding trace commit != HidingFriPcs::commit at log_h={log_h} w={w}");
         }
     }
 
