@@ -346,6 +346,50 @@ fn stream_merkle_layers_batch(mats: &[RowMajorMatrix<Val>], salts: &[Vec<Val>], 
     layers
 }
 
+/// Same as `stream_merkle_layers_batch` but reads the K matrices from their on-disk STORES in row-blocks
+/// (`fill_row_block` = sequential column-segment streams) — for the STREAMED quotient, whose chunk LDEs
+/// are tiled straight to disk (never all-K-resident), so there is no resident matrix to hash. Byte-identical.
+fn stream_merkle_layers_stores(stores: &[MmapLdeStore], salts: &[Vec<Val>], cap_height: usize) -> Vec<Vec<[Val; DIGEST]>> {
+    let h = stores[0].height();
+    assert!(h.is_power_of_two(), "batch Merkle: height must be a power of two (got {h})");
+    let perm = default_goldilocks_poseidon2_8();
+    let hash = MyHash::new(perm.clone());
+    let compress = MyCompress::new(perm);
+
+    const ROW_BLOCK: usize = 4096;
+    let bh = ROW_BLOCK.min(h);
+    let mut blocks: Vec<Vec<Val>> = stores.iter().map(|s| vec![Val::default(); bh * s.width()]).collect();
+    let mut leaf: Vec<[Val; DIGEST]> = Vec::with_capacity(h);
+    let mut r0 = 0usize;
+    while r0 < h {
+        let nr = bh.min(h - r0);
+        for (j, s) in stores.iter().enumerate() {
+            s.fill_row_block(r0, nr, &mut blocks[j][..nr * s.width()]);
+        }
+        leaf.par_extend((0..nr).into_par_iter().map(|i| {
+            let r = r0 + i;
+            let data = stores.iter().enumerate().flat_map(|(j, s)| {
+                let w = s.width();
+                blocks[j][i * w..(i + 1) * w]
+                    .iter()
+                    .copied()
+                    .chain(salts[j][r * SALT_ELEMS..(r + 1) * SALT_ELEMS].iter().copied())
+            });
+            hash.hash_iter(data)
+        }));
+        r0 += nr;
+    }
+
+    let cap_len = (1usize << cap_height).min(leaf.len());
+    let mut layers = vec![leaf];
+    while layers.last().unwrap().len() > cap_len {
+        let next: Vec<[Val; DIGEST]> =
+            layers.last().unwrap().par_chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
+        layers.push(next);
+    }
+    layers
+}
+
 /// Streaming BATCH hiding commit of K already-LDE'd SAME-height matrices (the quotient chunks, which
 /// `get_quotient_ldes` returns already in committed bit-reversed order) — byte-identical to
 /// `MerkleTreeHidingMmcs::commit(mats)` (= the production `commit_ldes` → `mmcs.commit`). Writes each
@@ -438,22 +482,25 @@ fn stream_get_zp_cis(domains: &[TwoAdicMultiplicativeCoset<Val>]) -> Vec<Val> {
 /// same rng + inputs; the domain/vanishing/DFT helpers are p3's own. Resident (quotient-scale) — the
 /// randomization is interleaved with the LDE, so this is the one buffer the streamed prove holds before
 /// batch-committing it out-of-core via `stream_commit_batch`.
-fn stream_get_quotient_ldes<R: rand::Rng + Send + Sync>(
+#[allow(clippy::too_many_arguments)]
+fn stream_get_quotient_ldes_to_stores<R: rand::Rng + Send + Sync>(
     domains: Vec<TwoAdicMultiplicativeCoset<Val>>,
     evaluations: Vec<RowMajorMatrix<Val>>,
     num_chunks: usize,
     log_blowup: usize,
     num_random_codewords: usize,
+    c_block: usize,
     pcs_rng: &mut R,
-) -> Vec<RowMajorMatrix<Val>> {
+) -> std::io::Result<Vec<MmapLdeStore>> {
     assert!(num_chunks > 1, "num_chunks must be > 1 to preserve hiding (got {num_chunks})");
     let cis = stream_get_zp_cis(&domains);
     let last_chunk = num_chunks - 1;
     let last_chunk_ci_inv = cis[last_chunk].inverse();
     let mul_coeffs: Vec<Val> = (0..last_chunk).map(|i| cis[i] * last_chunk_ci_inv).collect();
 
-    // Per chunk: append `nrc` random columns (pcs_rng). Then draw the `(K-1)·h·w` random values (pcs_rng),
-    // last chunk zeroed then set so Σ vanishes.
+    // Draw ALL the randomization UP FRONT (subdomain-scale — small), preserving p3's rng order: per chunk
+    // append `nrc` random columns (pcs_rng), then the `(K-1)·h·w` random values (pcs_rng), last chunk
+    // zeroed then set so Σ vanishes.
     let randomized_evaluations: Vec<RowMajorMatrix<Val>> =
         evaluations.into_iter().map(|mat| mat.with_random_cols(num_random_codewords, &mut *pcs_rng)).collect();
     let h = randomized_evaluations[0].height();
@@ -470,40 +517,57 @@ fn stream_get_quotient_ldes<R: rand::Rng + Send + Sync>(
         }
     }
 
+    // Compute each chunk's LDE ONE AT A TIME (identical to `get_quotient_ldes` per chunk), stream it to its
+    // own store, and DROP it — so only ONE chunk LDE is resident, not all K. This is what keeps the quotient
+    // commit from doubling the memory pressure (the whole-K-resident buffer was the capped floor).
     let dft = Dft::default();
     let g = <Val as Field>::GENERATOR;
-    domains
-        .into_iter()
-        .zip(randomized_evaluations)
-        .enumerate()
-        .map(|(i, (domain, evals))| {
-            let shift = g / domain.shift();
-            let random_values = &all_random_values[i * h * w..(i + 1) * h * w];
-            let mut lde_evals = dft.coset_lde_batch(evals, log_blowup + 1, shift).to_row_major_matrix();
+    let mut stores = Vec::with_capacity(num_chunks);
+    for (i, (domain, evals)) in domains.into_iter().zip(randomized_evaluations).enumerate() {
+        let shift = g / domain.shift();
+        let random_values = &all_random_values[i * h * w..(i + 1) * h * w];
+        let mut lde_evals = dft.coset_lde_batch(evals, log_blowup + 1, shift).to_row_major_matrix();
 
-            // v_H(X)·r(X) over the LDE (v_H = (g·X/domain.shift)^n - 1), added to the quotient chunk.
-            let mut vanishing_poly_coeffs = <Val as PrimeCharacteristicRing>::zero_vec((h * w) << (log_blowup + 1));
-            let p = shift.exp_u64(h as u64);
-            g.powers().take(h).enumerate().for_each(|(ii, p_i)| {
-                for jj in 0..w {
-                    let mul_coeff = p_i * random_values[ii * w + jj];
-                    vanishing_poly_coeffs[ii * w + jj] -= mul_coeff;
-                    vanishing_poly_coeffs[(h + ii) * w + jj] = p * mul_coeff;
-                }
-            });
-            let random_eval = dft.dft_batch(RowMajorMatrix::new(vanishing_poly_coeffs, w)).to_row_major_matrix();
-            for k in 0..h * w * (1 << (log_blowup + 1)) {
-                lde_evals.values[k] += random_eval.values[k];
+        // v_H(X)·r(X) over the LDE (v_H = (g·X/domain.shift)^n - 1), added to the quotient chunk.
+        let mut vanishing_poly_coeffs = <Val as PrimeCharacteristicRing>::zero_vec((h * w) << (log_blowup + 1));
+        let p = shift.exp_u64(h as u64);
+        g.powers().take(h).enumerate().for_each(|(ii, p_i)| {
+            for jj in 0..w {
+                let mul_coeff = p_i * random_values[ii * w + jj];
+                vanishing_poly_coeffs[ii * w + jj] -= mul_coeff;
+                vanishing_poly_coeffs[(h + ii) * w + jj] = p * mul_coeff;
             }
-            lde_evals.bit_reverse_rows().to_row_major_matrix()
-        })
-        .collect()
+        });
+        let random_eval = dft.dft_batch(RowMajorMatrix::new(vanishing_poly_coeffs, w)).to_row_major_matrix();
+        for k in 0..h * w * (1 << (log_blowup + 1)) {
+            lde_evals.values[k] += random_eval.values[k];
+        }
+        let chunk = lde_evals.bit_reverse_rows().to_row_major_matrix();
+
+        // Write the (row-major, committed-order) chunk into a COLUMN-MAJOR store, column-tiled, then drop it.
+        let (ch, cw_full) = (chunk.height(), chunk.width());
+        let store = MmapLdeStore::new(ch, cw_full)?;
+        let mut c0 = 0usize;
+        while c0 < cw_full {
+            let cw = c_block.min(cw_full - c0);
+            let mut tile = Vec::with_capacity(ch * cw);
+            for r in 0..ch {
+                tile.extend_from_slice(&chunk.values[r * cw_full + c0..r * cw_full + c0 + cw]);
+            }
+            store.write_col_tile(c0, cw, &tile);
+            c0 += cw;
+        }
+        drop(chunk);
+        stores.push(store);
+    }
+    Ok(stores)
 }
 
 /// The streamed equivalent of `commit_quotient`: split the quotient evaluations into `num_chunks`
-/// subdomains (p3's `split_evals`/`split_domains`), randomize + LDE them (`stream_get_quotient_ldes`,
-/// drawing from `pcs_rng`), and batch-commit the K chunk LDEs out-of-core (`stream_commit_batch`, salts
-/// from `mmcs_rng`). `cap()` is byte-identical to `pcs.commit_quotient(...).0`.
+/// subdomains (p3's `split_evals`/`split_domains`), randomize + LDE each chunk STRAIGHT TO ITS STORE one at
+/// a time (`stream_get_quotient_ldes_to_stores` — only one chunk LDE resident, drawing from `pcs_rng`), then
+/// draw the salts (`mmcs_rng`, per chunk in p3's order) and frontier-Merkle from the stores. `cap()` is
+/// byte-identical to `pcs.commit_quotient(...).0`; opens via `stream_open_batch`.
 #[allow(clippy::too_many_arguments)]
 pub fn stream_commit_quotient<R1: rand::Rng + Send + Sync, R2: rand::Rng>(
     quotient_domain: TwoAdicMultiplicativeCoset<Val>,
@@ -518,8 +582,13 @@ pub fn stream_commit_quotient<R1: rand::Rng + Send + Sync, R2: rand::Rng>(
 ) -> std::io::Result<StreamBatchCommitData> {
     let sub_evals = quotient_domain.split_evals(num_chunks, quotient_evaluations);
     let sub_domains = quotient_domain.split_domains(num_chunks);
-    let ldes = stream_get_quotient_ldes(sub_domains, sub_evals, num_chunks, log_blowup, num_random_codewords, pcs_rng);
-    stream_commit_batch(ldes, c_block, cap_height, mmcs_rng)
+    let stores =
+        stream_get_quotient_ldes_to_stores(sub_domains, sub_evals, num_chunks, log_blowup, num_random_codewords, c_block, pcs_rng)?;
+    let h = stores[0].height();
+    // Salts PER CHUNK in order — p3's `commit_ldes` → `mmcs.commit`'s `inputs.map(rand(rng, h, SALT_ELEMS))`.
+    let salts: Vec<Vec<Val>> = (0..stores.len()).map(|_| RowMajorMatrix::rand(mmcs_rng, h, SALT_ELEMS).values).collect();
+    let layers = stream_merkle_layers_stores(&stores, &salts, cap_height);
+    Ok(StreamBatchCommitData { stores, salts, layers })
 }
 
 /// Open the leaf at `index`: the (unsalted) row, its salt, and the binary Merkle sibling path up to the
