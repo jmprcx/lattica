@@ -30,6 +30,7 @@ use p3_fri::{
     ProverDataWithOpeningPoints, QueryProof, TwoAdicFriFolding, TwoAdicFriFoldingForMmcs,
 };
 use p3_goldilocks::default_goldilocks_poseidon2_8;
+use p3_matrix::bitrev::BitReversibleMatrix;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
 use p3_merkle_tree::MerkleCap;
@@ -582,9 +583,12 @@ impl LeafSource for MmapLdeStore {
 /// Compute the coset-LDE of `trace` a COLUMN-TILE at a time and write each tile into the COLUMN-MAJOR
 /// `store` (via `write_col_tile`), so only one `big × c_block` tile ever resides, never the whole
 /// `big × w` LDE, and the store is written FRONT-TO-BACK in ONE sequential pass (each column is a
-/// contiguous segment). Byte-identical to `Dft::coset_lde_batch(trace, added_bits, shift)` read
-/// row-major: columns are independent polynomials (a column subset yields identical per-column output)
-/// and the row bit-reversal is column-independent. `store` must be `big × w` (`big = h << added_bits`).
+/// contiguous segment). Byte-identical to what p3's `TwoAdicFriPcs::commit` COMMITS —
+/// `coset_lde_batch(trace, added_bits, shift).bit_reverse_rows().to_row_major_matrix()` (the extra
+/// `bit_reverse_rows` is the one p3 applies before the MMCS commit, so the stored order matches the
+/// committed matrix the open reads via `get_matrices`) — because columns are independent polynomials (a
+/// column subset yields identical per-column output) and the row bit-reversal is column-independent, so
+/// tiling and the reversal commute. `store` must be `big × w` (`big = h << added_bits`).
 ///
 /// Paired with the frontier Merkle's transposed-block read, the whole out-of-core commit is ~2
 /// sequential passes over the store, INDEPENDENT of `w` — so it is RAM-bounded AND fast, unlike the
@@ -604,8 +608,9 @@ pub fn stream_coset_lde_to_store(trace: &RowMajorMatrix<Val>, added_bits: usize,
         for r in 0..h {
             sub.extend_from_slice(&trace.values[r * w + c0..r * w + c0 + cw]);
         }
-        // coset-LDE the narrow tile -> big×cw, bit-reversed rows (p3's storage order), then discard it
-        let lde = dft.coset_lde_batch(RowMajorMatrix::new(sub, cw), added_bits, shift).to_row_major_matrix();
+        // coset-LDE the narrow tile -> big×cw, then bit-reverse rows into p3's COMMITTED order (the extra
+        // `.bit_reverse_rows()` p3's `TwoAdicFriPcs::commit` applies), then discard the tile.
+        let lde = dft.coset_lde_batch(RowMajorMatrix::new(sub, cw), added_bits, shift).bit_reverse_rows().to_row_major_matrix();
         store.write_col_tile(c0, cw, &lde.values);
         c0 += cw;
     }
@@ -715,8 +720,9 @@ mod tests {
         }
     }
 
-    /// Column-tiled LDE written into the mmap store is byte-identical to p3's whole `coset_lde_batch`
-    /// (the whole LDE never resides — only one `big × c_block` tile at a time).
+    /// Column-tiled LDE written into the mmap store is byte-identical to p3's COMMITTED LDE —
+    /// `coset_lde_batch(...).bit_reverse_rows().to_row_major_matrix()`, the exact matrix
+    /// `TwoAdicFriPcs::commit` commits — the whole LDE never residing (only one `big × c_block` tile).
     #[test]
     fn stream_lde_matches_p3() {
         let dft = Dft::default();
@@ -727,7 +733,7 @@ mod tests {
                 .map(|i| Val::new((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % 0xFFFF_FFFF_0000_0001))
                 .collect();
             let mat = RowMajorMatrix::new(vals, w);
-            let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).to_row_major_matrix();
+            let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).bit_reverse_rows().to_row_major_matrix();
             let big = h << added;
             let store = MmapLdeStore::new(big, w).unwrap();
             stream_coset_lde_to_store(&mat, added, shift, cblk, &store);
@@ -739,8 +745,9 @@ mod tests {
     }
 
     /// End-to-end out-of-core commit: column-tiled LDE into the mmap store + frontier Merkle equals p3's
-    /// `coset_lde_batch` + `MerkleTreeMmcs` commitment. Neither the whole LDE nor the whole leaf matrix
-    /// ever resides — this is the substrate that actually cuts the prover's RAM.
+    /// committed-order (`coset_lde_batch(...).bit_reverse_rows()`) + `MerkleTreeMmcs` commitment — i.e. the
+    /// commitment `TwoAdicFriPcs::commit` produces. Neither the whole LDE nor the whole leaf matrix ever
+    /// resides — this is the substrate that actually cuts the prover's RAM.
     #[test]
     fn stream_lde_merkle_matches_p3() {
         let dft = Dft::default();
@@ -754,7 +761,7 @@ mod tests {
                 .map(|i| Val::new((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % 0xFFFF_FFFF_0000_0001))
                 .collect();
             let mat = RowMajorMatrix::new(vals, w);
-            let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).to_row_major_matrix();
+            let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).bit_reverse_rows().to_row_major_matrix();
             let (p3_commit, _) = mmcs.commit(vec![p3_lde]);
             let store = MmapLdeStore::new(big, w).unwrap();
             stream_coset_lde_to_store(&mat, added, shift, cblk, &store);
@@ -784,7 +791,7 @@ mod tests {
                 .map(|i| Val::new((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % 0xFFFF_FFFF_0000_0001))
                 .collect();
             let mat = RowMajorMatrix::new(vals, w);
-            let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).to_row_major_matrix();
+            let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).bit_reverse_rows().to_row_major_matrix();
             let mmcs = HidingMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(seed));
             let (p3_commit, p3_data) = mmcs.commit(vec![p3_lde]);
             let mut rng = ChaCha20Rng::seed_from_u64(seed);
