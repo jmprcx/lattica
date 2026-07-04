@@ -232,6 +232,7 @@ dependencies = [
  "p3-poseidon2-air",
  "p3-symmetric",
  "p3-uni-stark",
+ "p3-util",
  "postcard",
  "rand",
  "rand_chacha",

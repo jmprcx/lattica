@@ -19,14 +19,22 @@
 //!
 //! Feature-gated (`stream`, off by default) — RESEARCH, not on any production path.
 
-use crate::config::{Challenge, ChallengeMmcs, Dft, MyCompress, MyHash, Val, CAP_HEIGHT};
-use p3_dft::TwoAdicSubgroupDft;
-use p3_field::BasedVectorSpace;
-use p3_fri::CommitPhaseProofStep;
+use crate::config::{Challenge, ChallengeMmcs, Challenger, Dft, MyCompress, MyHash, Val, ValMmcs};
+use core::marker::PhantomData;
+use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
+use p3_commit::{BatchOpening, Mmcs};
+use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
+use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
+use p3_fri::{
+    compute_log_arity_for_round, CommitPhaseProofStep, FriFoldingStrategy, FriParameters, FriProof,
+    ProverDataWithOpeningPoints, QueryProof, TwoAdicFriFolding, TwoAdicFriFoldingForMmcs,
+};
 use p3_goldilocks::default_goldilocks_poseidon2_8;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
+use p3_merkle_tree::MerkleCap;
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+use p3_util::{log2_strict_usize, reverse_slice_index_bits};
 use std::ffi::CString;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -302,6 +310,153 @@ pub fn stream_answer_query(
     (step, group_index)
 }
 
+/// The FRI commit-phase commitment type — the `ChallengeMmcs` (= its inner hiding `ValMmcs`) commitment,
+/// a `MerkleCap` of `DIGEST`-wide digests. `stream_commit_codeword(...).cap()` is exactly its `AsRef`.
+type FriCommit = MerkleCap<Val, [Val; DIGEST]>;
+
+/// The production input-commitment prover data (the trace / quotient LDE Merkle trees) that FRI's
+/// `open_input` reads at each query. Held resident here (this fork streams the FRI COMMIT phase; the
+/// input opens are the separate "batch open at ζ" increment) — `stream_prove_fri` opens them verbatim.
+type InputProverData = <ValMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>;
+
+/// Streaming, prove-only fork of `p3_fri::prover::prove_fri`, specialized to the production `MyConfig`
+/// types, that keeps the commit-phase residency bounded: instead of p3's `Vec<M::ProverData>` — which
+/// holds EVERY fold round's whole codeword-as-leaves AND its Merkle tree alive until the query phase —
+/// it keeps only the CURRENT round's codeword resident (needed to fold to the next), spills each round's
+/// leaves to disk via `stream_commit_codeword`, and retains just the digest layers + salts. The query
+/// phase then seeks each round's opened group from disk (`stream_answer_query`).
+///
+/// BYTE-IDENTICAL to `prove_fri`: every `challenger` observe/sample/grind and every salt draw happens in
+/// p3's exact order, the folding reuses p3's own `TwoAdicFriFolding::fold_matrix` verbatim, and the
+/// `final_poly` iDFT + arity/PoW transcript steps are unchanged. `params.mmcs` is unused (its per-round
+/// salts come from `salt_rng`, which the caller seeds to match `params.mmcs`'s inner RNG); everything else
+/// in `params` is read exactly as p3 reads it. `open_input` is p3's verbatim (input opens stay resident).
+///
+/// Pinned by `stream_prove_fri_matches_p3`.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_prove_fri<R: rand::Rng>(
+    params: &FriParameters<ChallengeMmcs>,
+    inputs: Vec<Vec<Challenge>>,
+    challenger: &mut Challenger,
+    log_global_max_height: usize,
+    input_data: &[ProverDataWithOpeningPoints<'_, Challenge, InputProverData>],
+    input_mmcs: &ValMmcs,
+    salt_rng: &mut R,
+    cap_height: usize,
+) -> std::io::Result<FriProof<Challenge, ChallengeMmcs, Val, Vec<BatchOpening<Val, ValMmcs>>>> {
+    assert!(!inputs.is_empty());
+    assert!(params.num_queries > 0, "num_queries must be at least 1 for FRI soundness");
+    assert!(params.max_log_arity > 0, "max_log_arity must be at least 1 to guarantee folding progress");
+    debug_assert_eq!(log_global_max_height, log2_strict_usize(inputs[0].len()));
+
+    // The folding strategy is stateless (PhantomData) — construct the SAME one p3's PCS `open` uses.
+    let folding: TwoAdicFriFoldingForMmcs<Val, ValMmcs> = TwoAdicFriFolding(PhantomData);
+
+    // ── commit phase (streamed) — mirrors p3's `commit_phase` exactly, per round: ─────────────────
+    //   stream-commit the codeword (draws salts) → observe cap → grind commit-PoW → sample beta →
+    //   fold → (if the next input matches the new height) mix it in with beta^arity.
+    let mut inputs_iter = inputs.into_iter().peekable();
+    let mut folded = inputs_iter.next().unwrap();
+    let mut commits: Vec<FriCommit> = vec![];
+    let mut datas: Vec<StreamCommitData> = vec![];
+    let mut log_arities: Vec<usize> = vec![];
+    let mut pow_witnesses: Vec<Val> = vec![];
+    let log_final_height = params.log_blowup + params.log_final_poly_len;
+
+    while folded.len() > params.blowup() * params.final_poly_len() {
+        let log_current_height = log2_strict_usize(folded.len());
+        let next_input_log_height = inputs_iter.peek().map(|v| log2_strict_usize(v.len()));
+        let log_arity =
+            compute_log_arity_for_round(log_current_height, next_input_log_height, log_final_height, params.max_log_arity);
+        let arity = 1usize << log_arity;
+        log_arities.push(log_arity);
+
+        // Stream-commit this round's codeword (spills the leaves to disk, keeps only digest layers).
+        let data = stream_commit_codeword(&folded, arity, cap_height, salt_rng)?;
+        let commit = FriCommit::from(data.cap().to_vec());
+        challenger.observe(commit.clone());
+        commits.push(commit);
+
+        let pow_witness = challenger.grind(params.commit_proof_of_work_bits);
+        pow_witnesses.push(pow_witness);
+
+        let beta: Challenge = challenger.sample_algebra_element();
+
+        // Reuse p3's folding math verbatim on the (still resident) current codeword. Fully-qualified so
+        // the base field `F = Val` is pinned (p3's `commit_phase` pins it via its `FriFoldingStrategy<Val,
+        // Challenge>` bound; here `TwoAdicFriFolding`'s blanket impl otherwise leaves `F` ambiguous).
+        let leaves = RowMajorMatrix::new(folded, arity);
+        folded = FriFoldingStrategy::<Val, Challenge>::fold_matrix(&folding, beta, log_arity, leaves.as_view());
+
+        datas.push(data);
+
+        // Mix in the next input polynomial once we have folded down to its height (p3's beta^arity factor).
+        if let Some(v) = inputs_iter.next_if(|v| v.len() == folded.len()) {
+            let beta_pow = beta.exp_power_of_2(log_arity);
+            folded.iter_mut().zip(v).for_each(|(c, x)| *c += beta_pow * x);
+        }
+    }
+
+    // Final polynomial: truncate, un-bit-reverse, iDFT — then observe all its coefficients. The iDFT is
+    // over the BASE-field FRI subgroup (`Challenge` coordinates DFT'd independently), so pin `F = Val`
+    // (`Challenge` is a `BasedVectorSpace` over both `Val` and itself, leaving `default()` ambiguous).
+    folded.truncate(params.final_poly_len());
+    reverse_slice_index_bits(&mut folded);
+    let final_poly = Radix2DFTSmallBatch::<Val>::default().idft_algebra(folded);
+    challenger.observe_algebra_slice(&final_poly);
+
+    // Bind the chosen folding arities into the transcript, then grind the query PoW.
+    for &log_arity in &log_arities {
+        challenger.observe(Val::from_usize(log_arity));
+    }
+    let query_pow_witness = challenger.grind(params.query_proof_of_work_bits);
+
+    // ── query phase (seek-backed) — sample each index, open the inputs (resident) + each round (disk). ─
+    let extra_query_index_bits = FriFoldingStrategy::<Val, Challenge>::extra_query_index_bits(&folding);
+    let query_proofs = core::iter::repeat_with(|| {
+        let index = challenger.sample_bits(log_global_max_height + extra_query_index_bits);
+        let input_proof = stream_open_input(log_global_max_height, index, input_data, input_mmcs);
+        let mut current_index = index >> extra_query_index_bits;
+        let mut commit_phase_openings = Vec::with_capacity(datas.len());
+        for (data, &log_arity) in datas.iter().zip(log_arities.iter()) {
+            let (step, group_index) = stream_answer_query(data, log_arity, current_index);
+            commit_phase_openings.push(step);
+            current_index = group_index;
+        }
+        QueryProof { input_proof, commit_phase_openings }
+    })
+    .take(params.num_queries)
+    .collect();
+
+    Ok(FriProof {
+        commit_phase_commits: commits,
+        commit_pow_witnesses: pow_witnesses,
+        query_proofs,
+        final_poly,
+        query_pow_witness,
+    })
+}
+
+/// FRI `open_input`, verbatim from p3: open each input batch commitment at the query index, shifting the
+/// index down for matrices shorter than the global max height. The input opens stay resident in this
+/// increment (streaming them is the separate "batch open" step); byte-identical to p3's private `open_input`.
+fn stream_open_input(
+    log_global_max_height: usize,
+    index: usize,
+    input_data: &[ProverDataWithOpeningPoints<'_, Challenge, InputProverData>],
+    mmcs: &ValMmcs,
+) -> Vec<BatchOpening<Val, ValMmcs>> {
+    input_data
+        .iter()
+        .map(|(data, _)| {
+            let log_max_height = log2_strict_usize(mmcs.get_max_height(data));
+            let bits_reduced = log_global_max_height - log_max_height;
+            let reduced_index = index >> bits_reduced;
+            mmcs.open_batch(reduced_index, data)
+        })
+        .collect()
+}
+
 /// A file-backed (mmap'd) store for one `h × w` LDE matrix, held **COLUMN-MAJOR** (element `(row, col)`
 /// at `map[col*h + row]`) — the out-of-core substrate that keeps the multi-GB LDE off the anonymous heap.
 /// Column-major is what makes both directions ONE sequential pass and dodges the transpose barrier:
@@ -459,6 +614,7 @@ pub fn stream_coset_lde_to_store(trace: &RowMajorMatrix<Val>, added_bits: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CAP_HEIGHT; // test-only: the production Merkle cap height
     use p3_commit::Mmcs;
     use p3_field::Field;
     use p3_matrix::dense::RowMajorMatrix;
@@ -652,6 +808,101 @@ mod tests {
                 let b = postcard::to_allocvec(&my_step).unwrap();
                 assert_eq!(a, b, "answer_query step != p3 at log_h={log_h} arity={arity} idx={current_index}");
             }
+        }
+    }
+
+    /// The full streaming FRI prover is byte-identical to p3's production `prove_fri`. Seed both salt
+    /// sources identically and drive both from a fresh (identical) challenger over the same inputs +
+    /// input commitments; the entire `FriProof` (commit-phase caps, per-round PoW witnesses, `final_poly`,
+    /// every query's input-open + commit-phase openings, query PoW) must serialize byte-for-byte. This is
+    /// the primary P3.6 gate — it exercises the streamed commit phase, the folding (reused verbatim), the
+    /// arity/final-poly/PoW transcript, and the seek-backed query phase all at once.
+    ///
+    /// Cases: a multi-input fold (three descending heights, arity-4 rounds, `open_input` at two commitment
+    /// heights so `bits_reduced ∈ {0, 2}`), and a single-input fold (one height → arity 16 then 2, the
+    /// no-next-input path). Production FRI parameters (`log_blowup=4`, cap 6, arity 4, 16-bit query PoW).
+    #[test]
+    fn stream_prove_fri_matches_p3() {
+        use crate::config::{production_fri, ValMmcs};
+        use p3_fri::prover::prove_fri;
+        use p3_fri::{TwoAdicFriFolding, TwoAdicFriFoldingForMmcs};
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        let perm = default_goldilocks_poseidon2_8();
+
+        // (FRI input log-heights [descending, distinct], input-commitment log-heights [for open_input]).
+        let cases: &[(&[usize], &[usize])] = &[(&[10, 8, 6], &[10, 8]), (&[9], &[9])];
+
+        for (ci, (in_heights, mmcs_heights)) in cases.iter().enumerate() {
+            let seed = 100 + ci as u64;
+            let log_gmh = in_heights[0];
+
+            // FRI inputs: one pseudo-random extension codeword per height (descending), p3's rand order.
+            let mut cw_rng = ChaCha20Rng::seed_from_u64(seed ^ 0xF71);
+            let inputs: Vec<Vec<Challenge>> = in_heights
+                .iter()
+                .map(|&lh| RowMajorMatrix::<Challenge>::rand(&mut cw_rng, 1usize << lh, 1).values)
+                .collect();
+
+            // Input commitments (for open_input): one hiding commit per height, sharing one ValMmcs.
+            // Built ONCE and shared, so both provers read identical stored rows/salts (open draws no rng).
+            let input_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(seed ^ 0x1157));
+            let mut mat_rng = ChaCha20Rng::seed_from_u64(seed ^ 0x9A7);
+            let in_datas: Vec<_> = mmcs_heights
+                .iter()
+                .map(|&lh| input_mmcs.commit_matrix(RowMajorMatrix::<Val>::rand(&mut mat_rng, 1usize << lh, 3)).1)
+                .collect();
+            let input_data: Vec<_> = in_datas.iter().map(|d| (d, Vec::<Vec<Challenge>>::new())).collect();
+
+            // Reference p3 `prove_fri` and my streaming fork, both driven from identical fresh challengers
+            // over the same inputs + input commitments + salt seed. The two prove calls run inside a
+            // SINGLE-THREAD rayon pool so p3's query-PoW grind (`find_map_any`, non-deterministic across
+            // threads — verified: p3-vs-p3 disagrees at higher arity) returns the same witness for both
+            // from their identical challenger state. Byte-identity is a property of the deterministic
+            // transcript→proof transform; the grind's thread-race is p3's and orthogonal to this fork.
+            let fri = production_fri(ChallengeMmcs::new(ValMmcs::new(
+                MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(seed),
+            )));
+            let folding: TwoAdicFriFoldingForMmcs<Val, ValMmcs> = TwoAdicFriFolding(PhantomData);
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+            let (p3_proof, my_proof) = pool.install(|| {
+                let mut ch1 = Challenger::new(perm.clone());
+                let p3 = prove_fri(&folding, &fri, inputs.clone(), &mut ch1, log_gmh, &input_data, &input_mmcs);
+                let mut ch2 = Challenger::new(perm.clone());
+                let mut salt_rng = ChaCha20Rng::seed_from_u64(seed);
+                let my = stream_prove_fri(&fri, inputs.clone(), &mut ch2, log_gmh, &input_data, &input_mmcs, &mut salt_rng, CAP_HEIGHT)
+                    .expect("stream_prove_fri");
+                (p3, my)
+            });
+
+            // Localize any divergence to a specific FriProof field before the full-bytes assert.
+            assert_eq!(
+                p3_proof.commit_phase_commits.iter().map(|c| c.as_ref().to_vec()).collect::<Vec<_>>(),
+                my_proof.commit_phase_commits.iter().map(|c| c.as_ref().to_vec()).collect::<Vec<_>>(),
+                "case {ci}: commit_phase_commits differ"
+            );
+            assert_eq!(p3_proof.commit_pow_witnesses, my_proof.commit_pow_witnesses, "case {ci}: commit_pow_witnesses differ");
+            assert_eq!(p3_proof.final_poly, my_proof.final_poly, "case {ci}: final_poly differ");
+            assert_eq!(p3_proof.query_pow_witness, my_proof.query_pow_witness, "case {ci}: query_pow_witness differ");
+            for (qi, (pq, mq)) in p3_proof.query_proofs.iter().zip(my_proof.query_proofs.iter()).enumerate() {
+                assert_eq!(
+                    postcard::to_allocvec(&pq.input_proof).unwrap(),
+                    postcard::to_allocvec(&mq.input_proof).unwrap(),
+                    "case {ci} query {qi}: input_proof differs"
+                );
+                for (ri, (ps, ms)) in pq.commit_phase_openings.iter().zip(mq.commit_phase_openings.iter()).enumerate() {
+                    assert_eq!(
+                        postcard::to_allocvec(ps).unwrap(),
+                        postcard::to_allocvec(ms).unwrap(),
+                        "case {ci} query {qi} round {ri}: commit_phase_opening differs (log_arity p3={} mine={})",
+                        ps.log_arity, ms.log_arity
+                    );
+                }
+                assert_eq!(pq.commit_phase_openings.len(), mq.commit_phase_openings.len(), "case {ci} query {qi}: round count differs");
+            }
+            let a = postcard::to_allocvec(&p3_proof).unwrap();
+            let b = postcard::to_allocvec(&my_proof).unwrap();
+            assert_eq!(a, b, "stream_prove_fri != p3 prove_fri at case {ci} in_heights={in_heights:?}");
         }
     }
 
