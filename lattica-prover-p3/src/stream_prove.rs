@@ -1175,6 +1175,34 @@ where
     Ok(Proof { commitments, opened_values, opening_proof: (random_opened, fri_proof), degree_bits: log_ext_degree })
 }
 
+/// `stream_prove` with a self-built deterministic config (fixed seeds). For benches / standalone runs
+/// where byte-identity to a *specific* p3 run isn't the point — the proof still VERIFIES under the
+/// production verifier (the hiding salts travel in the proof). NOT for production: fixed seeds ⇒
+/// predictable blinding (see `config::make_config`, which reseeds from OS entropy per proof).
+pub fn stream_prove_seeded<A>(
+    air: &A,
+    trace: RowMajorMatrix<Val>,
+    public_values: &[Val],
+    c_block: usize,
+) -> std::io::Result<Proof<MyConfig>>
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<ProverConstraintFolder<'a, MyConfig>>
+        + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+{
+    use crate::config::{production_fri, MyPcs, NUM_RANDOM_CODEWORDS};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+    let (pcs_seed, mmcs_seed) = (0x5EED_0001u64, 0x5EED_0002u64);
+    let perm = default_goldilocks_poseidon2_8();
+    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(mmcs_seed));
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    let fri = production_fri(challenge_mmcs);
+    let pcs = MyPcs::new(Dft::default(), val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::seed_from_u64(pcs_seed));
+    let config = MyConfig::new(pcs, Challenger::new(perm));
+    stream_prove(&config, air, trace, public_values, pcs_seed, mmcs_seed, c_block)
+}
+
 /// A file-backed (mmap'd) store for one `h × w` LDE matrix, held **COLUMN-MAJOR** (element `(row, col)`
 /// at `map[col*h + row]`) — the out-of-core substrate that keeps the multi-GB LDE off the anonymous heap.
 /// Column-major is what makes both directions ONE sequential pass and dodges the transpose barrier:
@@ -1946,6 +1974,46 @@ mod tests {
 
         let cfg = build_config();
         assert!(verify(&cfg, &JoinSplitAir, &my_proof, &pis).is_ok(), "streamed proof must verify under the production verifier");
+    }
+
+    /// RAM benchmark: the FULL `stream_prove` vs p3's `prove`, on the 2^k-row batch circuit, same
+    /// witnesses/trace for both (mode-selected). Prints peak RSS (VmHWM) + wall time; the proof verifies
+    /// under the production verifier. Run each mode in its OWN process (VmHWM is a process high-water mark),
+    /// stream mode under a cgroup cap on a nodatacow disk to force the mmap'd LDEs to writeback:
+    ///   p3:     `LATTICA_BATCH_N=64 cargo test --release --features stream stream_prove_ram_bench -- --ignored --exact --nocapture`
+    ///   stream: `systemd-run --scope -p MemoryMax=6G --user env LATTICA_BENCH_MODE=stream LATTICA_BATCH_N=64 \
+    ///            LATTICA_SPILL_DIR=/home/access/scratch cargo test --release --features stream stream_prove_ram_bench -- --ignored --exact --nocapture`
+    /// (`/dev/shm` or unset `LATTICA_SPILL_DIR` = tmpfs = RAM → NO win; needs a real nodatacow disk.)
+    #[test]
+    #[ignore = "bench: full stream_prove RAM vs p3 (LATTICA_BENCH_MODE=stream|p3, LATTICA_BATCH_N, LATTICA_SPILL_DIR)"]
+    fn stream_prove_ram_bench() {
+        use crate::batch_joinsplit_air::{batch_root, build_batch_trace, verify_batch_bytes, JoinSplitBatchAir};
+        use crate::config::make_config;
+        use crate::joinsplit_air::demo_witness;
+        use p3_uni_stark::prove;
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let n = env("LATTICA_BATCH_N", 8).max(1);
+        let cblk = env("LATTICA_BENCH_CBLK", 4).max(1);
+        let mode = std::env::var("LATTICA_BENCH_MODE").unwrap_or_else(|_| "p3".to_string());
+
+        let ws: Vec<_> = (0..n).map(|_| demo_witness()).collect();
+        let root = batch_root(&ws);
+        let trace = build_batch_trace(&ws);
+        let (rows, w) = (trace.height(), trace.width());
+
+        let t0 = std::time::Instant::now();
+        let bytes = if mode == "stream" {
+            postcard::to_allocvec(&stream_prove_seeded(&JoinSplitBatchAir, trace, &root, cblk).unwrap()).unwrap()
+        } else {
+            postcard::to_allocvec(&prove(&make_config(), &JoinSplitBatchAir, trace, &root)).unwrap()
+        };
+        let secs = t0.elapsed().as_secs_f64();
+        assert!(verify_batch_bytes(&bytes, &root), "bench proof (mode={mode}) must verify");
+        println!(
+            "STREAM-PROVE-BENCH mode={mode} n={n} rows={rows} w={w} cblk={cblk} peak_rss={}MiB prove={secs:.1}s proof={}KiB",
+            peak_rss_mib(),
+            bytes.len() / 1024,
+        );
     }
 
     /// Peak resident set (VmHWM) in MiB, from /proc/self/status.
