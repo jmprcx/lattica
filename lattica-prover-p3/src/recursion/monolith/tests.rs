@@ -1289,6 +1289,74 @@ where
 /// the block tx-root, matching `agg_root`/`batch_root` (so the node consensus seam is unchanged). Proves
 /// iff all K inners verify and their statements fold to the emitted root; rejects a corrupted instance and
 /// a wrong tx-root. Returns (log2 height, RSS).
+/// Build a K-instance aggregator (`MonolithAir`, wide trace, block tx-root) — the shared construction
+/// behind `run_aggregator` (which proves it under the recursion config) and the streamed-prover gate
+/// (`stream_prove_matches_p3_on_aggregator`, which proves the SAME instance under the production hiding
+/// config). The returned `(air, trace, txroot)` is a valid instance provable under ANY outer config.
+fn build_aggregator_trace(k: usize, n_queries: usize) -> (super::MonolithAir, p3_matrix::dense::RowMajorMatrix<Val>, Vec<Val>, MyConfig) {
+    use super::{MonolithAir, MAX_AGG_TILES};
+    use crate::joinsplit_air::merge;
+    use crate::poseidon2_air::{native_permute, native_steps};
+    use crate::recursion::native_fri::{agg_statement_digest, DOM_AGG};
+    use p3_matrix::dense::RowMajorMatrix;
+    assert!(k.is_power_of_two(), "K must be a power of two (no fold padding needed), matching batch_root");
+    assert!(k <= MAX_AGG_TILES, "K exceeds MAX_AGG_TILES ({MAX_AGG_TILES}); split into multiple aggregate proofs");
+    let config = make_config(1, n_queries);
+    let mut insts: Vec<Vec<Val>> = Vec::new();
+    let mut pvs0s: Vec<Val> = Vec::new();
+    let mut params: Option<(Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize)> = None;
+    for i in 0..k {
+        let (tr, counts, binds, ib, nt, pv0) = build_inner_window(&config, 42 + i as u64, n_queries);
+        insts.push(tr);
+        pvs0s.push(pv0);
+        if i == 0 {
+            params = Some((counts, binds, ib, nt));
+        }
+    }
+    let (counts, binds, index_binds, n_terms) = params.unwrap();
+    let air = MonolithAir { counts, binds, index_binds, n_queries, n_terms, inner_counter: false, column_window: true, k_instances: k, fold: true, fold_txstmt: false, constraints: vec![], w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6 };
+    let fw = air.fused_w();
+    let w = air.fold_w();
+    let inst_h = air.inst_h();
+    let hh = air.height();
+    let fb = air.fold_sk_block();
+    assert!(fb * BLOCK >= air.tr() + n_queries * air.m_period(), "fold blocks must land in the instance's tail slack");
+    let mut all = vec![Val::ZERO; hh * w];
+    let mut root = [Val::ZERO; 4]; // IV = 0
+    for i in 0..k {
+        let tr = &insts[i];
+        for r in 0..inst_h {
+            let dst = (i * inst_h + r) * w;
+            all[dst..dst + fw].copy_from_slice(&tr[r * fw..r * fw + fw]);
+            all[dst + air.af_root(0)..dst + air.af_root(0) + 4].copy_from_slice(&root);
+        }
+        let mut sk_in = [Val::ZERO; W];
+        sk_in[0] = Val::from_u64(DOM_AGG);
+        sk_in[4] = pvs0s[i];
+        let sk_rows = native_steps(sk_in);
+        for r in 0..BLOCK {
+            let base = (i * inst_h + fb * BLOCK + r) * w + air.af_p(0);
+            all[base..base + W].copy_from_slice(&sk_rows[r]);
+        }
+        let s_k: [Val; 4] = native_permute(sk_in)[..4].try_into().unwrap();
+        let mut rt_in = [Val::ZERO; W];
+        rt_in[..4].copy_from_slice(&root);
+        rt_in[4..].copy_from_slice(&s_k);
+        let rt_rows = native_steps(rt_in);
+        for r in 0..BLOCK {
+            let base = (i * inst_h + (fb + 1) * BLOCK + r) * w + air.af_p(0);
+            all[base..base + W].copy_from_slice(&rt_rows[r]);
+        }
+        root = native_permute(rt_in)[..4].try_into().unwrap();
+    }
+    let mut ref_root = [Val::ZERO; 4];
+    for &pv in &pvs0s {
+        ref_root = merge(ref_root, agg_statement_digest(pv));
+    }
+    assert_eq!(root, ref_root, "built tx-root == agg oracle root");
+    (air, RowMajorMatrix::new(all, w), root.to_vec(), config)
+}
+
 fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
     use super::{MonolithAir, MAX_AGG_TILES};
     use crate::joinsplit_air::merge;
@@ -1376,6 +1444,51 @@ fn run_aggregator(k: usize, n_queries: usize) -> (u32, u64) {
     let rss = peak_rss_bytes();
     println!("  -> peak RSS {} MiB", rss / (1 << 20));
     (hh.trailing_zeros(), rss)
+}
+
+/// GATE: `stream_prove` proves the REAL `MonolithAir` aggregator byte-identical to `p3_uni_stark::prove`,
+/// and the streamed proof verifies. This is the wide (~1291-col), tall aggregator AIR the whole streaming
+/// track targets (production peaks at 225-350 GB). A SMALL instance here (p3 must fit in RAM), proved under
+/// the PRODUCTION HIDING config (`crate::config::MyConfig` — what the block proof uses; `run_aggregator`'s
+/// own config is a non-hiding measurement config), in a 1-thread rayon pool (p3's FRI grind is
+/// nondeterministic). Run with `--features recursion,stream`.
+#[cfg(feature = "stream")]
+#[test]
+fn stream_prove_matches_p3_on_aggregator() {
+    use crate::config::{
+        production_fri, ChallengeMmcs as PChMmcs, Challenger as PChal, Dft as PDft, MyCompress as PComp,
+        MyConfig as PConfig, MyHash as PHash, MyPcs as PPcs, ValMmcs as PValMmcs, CAP_HEIGHT as PCAP,
+        NUM_RANDOM_CODEWORDS as PNRC,
+    };
+    use p3_goldilocks::default_goldilocks_poseidon2_8;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    let (k, n_queries, cblk) = (2usize, 4usize, 4usize);
+    let (air, trace, txroot, _rec_config) = build_aggregator_trace(k, n_queries);
+    println!("agg gate: width {} height 2^{}", trace.width, (trace.values.len() / trace.width).trailing_zeros());
+
+    let (pcs_seed, mmcs_seed) = (7u64, 9u64);
+    let perm = default_goldilocks_poseidon2_8();
+    let build = || {
+        let vm = PValMmcs::new(PHash::new(perm.clone()), PComp::new(perm.clone()), PCAP, ChaCha20Rng::seed_from_u64(mmcs_seed));
+        let pcs = PPcs::new(PDft::default(), vm.clone(), production_fri(PChMmcs::new(vm)), PNRC, ChaCha20Rng::seed_from_u64(pcs_seed));
+        PConfig::new(pcs, PChal::new(perm.clone()))
+    };
+
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let (p3_proof, my_proof) = pool.install(|| {
+        let p3 = prove(&build(), &air, trace.clone(), &txroot);
+        let my = crate::stream_prove::stream_prove(&build(), &air, trace.clone(), &txroot, pcs_seed, mmcs_seed, cblk)
+            .expect("stream_prove on the aggregator");
+        (p3, my)
+    });
+    assert_eq!(
+        postcard::to_allocvec(&p3_proof).unwrap(),
+        postcard::to_allocvec(&my_proof).unwrap(),
+        "stream_prove != p3_uni_stark::prove on the MonolithAir aggregator"
+    );
+    assert!(verify(&build(), &air, &my_proof, &txroot).is_ok(), "streamed aggregator proof must verify");
 }
 
 /// R4: the SYMBOLIC tiled aggregator — K column-window monolith instances, each verifying a REAL
