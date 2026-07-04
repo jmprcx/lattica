@@ -248,6 +248,56 @@ impl StreamBatchCommitData {
     pub fn cap(&self) -> &[[Val; DIGEST]] {
         self.layers.last().expect("at least the leaf layer")
     }
+    /// View this commit as a `RoundView` (K matrices) for the streamed open / FRI input opens.
+    pub fn round_view(&self) -> RoundView<'_> {
+        RoundView {
+            stores: self.stores.iter().collect(),
+            salts: self.salts.iter().map(|v| v.as_slice()).collect(),
+            layers: &self.layers,
+        }
+    }
+}
+
+/// A borrowed, K-matrix view of a committed round — unifies the single-matrix `StreamCommitData` (trace,
+/// opt-random) and the multi-matrix `StreamBatchCommitData` (quotient) for the streamed open, which loops
+/// over each round's matrices exactly as p3's `open` / `open_input` do. All matrices in a round share one
+/// height and one Merkle tree (its `layers`).
+pub struct RoundView<'a> {
+    pub stores: Vec<&'a MmapLdeStore>,
+    pub salts: Vec<&'a [Val]>,
+    pub layers: &'a [Vec<[Val; DIGEST]>],
+}
+
+impl RoundView<'_> {
+    /// Open leaf `index`: every matrix's row + salt, and the shared sibling path — the exact `BatchOpening`
+    /// p3's hiding `Mmcs::open_batch` returns for this round (single- or multi-matrix).
+    fn open(&self, index: usize) -> BatchOpening<Val, ValMmcs> {
+        let rows: Vec<Vec<Val>> = self
+            .stores
+            .iter()
+            .map(|s| {
+                let mut row = vec![Val::default(); s.width()];
+                s.fill_row(index, &mut row);
+                row
+            })
+            .collect();
+        let salts: Vec<Vec<Val>> =
+            self.salts.iter().map(|s| s[index * SALT_ELEMS..(index + 1) * SALT_ELEMS].to_vec()).collect();
+        let mut proof = Vec::with_capacity(self.layers.len().saturating_sub(1));
+        let mut idx = index;
+        for layer in &self.layers[..self.layers.len() - 1] {
+            proof.push(layer[idx ^ 1]);
+            idx >>= 1;
+        }
+        BatchOpening::new(rows, (salts, proof))
+    }
+}
+
+impl StreamCommitData {
+    /// View this single-matrix commit as a 1-matrix `RoundView`.
+    pub fn round_view(&self) -> RoundView<'_> {
+        RoundView { stores: vec![&self.store], salts: vec![self.salts.as_slice()], layers: &self.layers }
+    }
 }
 
 /// Frontier hiding Merkle over K SAME-height matrices: leaf row `i` is the hash of the concatenation, in
@@ -629,22 +679,22 @@ pub fn stream_open_input(
 /// round's opened row/salt/sibling-path comes from its on-disk `StreamCommitData` via `stream_open`
 /// (a single strided seek + the small resident salts/layers), shaped into the exact `BatchOpening` p3's
 /// hiding `Mmcs::open_batch` returns (`opened_values = [row]`, `opening_proof = ([salt], siblings)`).
-/// Byte-identical to `stream_open_input` (hence to p3's `open_input`) since `stream_open` is byte-identical
-/// to `open_batch` (`stream_open_matches_p3`). One matrix per `StreamCommitData` (the trace / opt-random
-/// rounds); the multi-matrix quotient round is served by `stream_open_input_batched` (I3).
+/// Byte-identical to `stream_open_input` (hence to p3's `open_input`) since `RoundView::open` is
+/// byte-identical to the hiding `Mmcs::open_batch` (`stream_open_matches_p3` / `stream_commit_batch_matches_p3`).
+/// Serves both single-matrix rounds (trace / opt-random) and the multi-matrix quotient round uniformly.
 pub fn stream_open_input_streamed(
     log_global_max_height: usize,
     index: usize,
-    input_data: &[&StreamCommitData],
+    rounds: &[&RoundView<'_>],
 ) -> Vec<BatchOpening<Val, ValMmcs>> {
-    input_data
+    rounds
         .iter()
-        .map(|data| {
-            let log_max_height = log2_strict_usize(data.store.height());
+        .map(|round| {
+            // All matrices in a round share one height.
+            let log_max_height = log2_strict_usize(round.stores[0].height());
             let bits_reduced = log_global_max_height - log_max_height;
             let reduced_index = index >> bits_reduced;
-            let (row, salt, siblings) = stream_open(data, reduced_index);
-            BatchOpening::new(vec![row], (vec![salt], siblings))
+            round.open(reduced_index)
         })
         .collect()
 }
@@ -654,10 +704,10 @@ pub fn stream_open_input_streamed(
 /// trace-scale (the polynomial degree, not the blown-up LDE), so it is the ONE resident buffer of the
 /// streamed open (needed because barycentric `interpolate_coset_with_precomputation` wants a dense matrix;
 /// the RAM-heavy whole-LDE reduction stays on disk via `StoreMatrix`).
-fn materialize_low_coset(data: &StreamCommitData, h: usize) -> RowMajorMatrix<Val> {
-    let w = data.store.width();
+fn materialize_low_coset(store: &MmapLdeStore, h: usize) -> RowMajorMatrix<Val> {
+    let w = store.width();
     let mut vals = vec![Val::default(); h * w];
-    data.store.fill_row_block(0, h, &mut vals);
+    store.fill_row_block(0, h, &mut vals);
     RowMajorMatrix::new(vals, w)
 }
 
@@ -666,13 +716,13 @@ fn materialize_low_coset(data: &StreamCommitData, h: usize) -> RowMajorMatrix<Va
 /// the size-`2^log_height` prefix of the bit-reversed coset. A small assoc list (few points) replaces
 /// p3's `LinearMap`; byte-identical values (`batch_multiplicative_inverse` over the same differences).
 fn compute_inverse_denominators_stream(
-    rounds: &[(&StreamCommitData, Vec<Challenge>)],
+    rounds: &[(RoundView<'_>, Vec<Vec<Challenge>>)],
     coset: &[Val],
 ) -> Vec<(Challenge, Vec<Challenge>)> {
     let mut max_log_height: Vec<(Challenge, usize)> = Vec::new();
-    for (data, points) in rounds {
-        let log_height = log2_strict_usize(data.store.height());
-        for &z in points {
+    for (round, points_per_mat) in rounds {
+        let log_height = log2_strict_usize(round.stores[0].height());
+        for &z in points_per_mat.iter().flatten() {
             match max_log_height.iter_mut().find(|(p, _)| *p == z) {
                 Some(e) => e.1 = e.1.max(log_height),
                 None => max_log_height.push((z, log_height)),
@@ -689,20 +739,22 @@ fn compute_inverse_denominators_stream(
 }
 
 /// Streaming, prove-only fork of the PRODUCTION `HidingFriPcs::open` → `TwoAdicFriPcs::open` (`two_adic_pcs.rs:414`,
-/// `hiding_pcs.rs:297`), specialized to `MyConfig`, for rounds each committing ONE matrix (the trace and the
-/// opt-randomization rounds; the multi-matrix quotient round is I3). Every committed LDE stays on disk: the
-/// whole-LDE reduction (`(f(ζ)-f(x))/(ζ-x)` accumulated into per-log-height `reduced_openings`) reads it via
-/// `StoreMatrix` row by row, and only the trace-sized low coset is materialized for the barycentric ζ-eval.
+/// `hiding_pcs.rs:297`), specialized to `MyConfig`. Rounds are `RoundView`s (K≥1 matrices each — one for the
+/// trace / opt-random rounds, `num_chunks` for the quotient round), with per-MATRIX opening points. Every
+/// committed LDE stays on disk: the whole-LDE reduction (`(f(ζ)-f(x))/(ζ-x)` accumulated into per-log-height
+/// `reduced_openings`) reads it via `StoreMatrix` row by row; only the trace-sized low coset is materialized
+/// for the barycentric ζ-eval.
 ///
 /// BYTE-IDENTICAL to `pcs.open`: the challenger observes the opened `ys` in p3's exact (round, matrix, point)
 /// order, `alpha`/`zeta` sampling is unchanged, the reduction is p3's `(f(ζ)-f(x))/(ζ-x)` (computed per-row —
 /// rows are independent and Goldilocks arithmetic is exact/order-free, so no `rowwise_packed_dot_product`
-/// SIMD dependency), `interpolate_coset_with_precomputation` / `compute_adjusted_weights` are p3's own, and
-/// the FRI is `stream_prove_fri` (its input opens seeked from these same stores). Returns the PUBLIC opened
-/// values, the split-off random-codeword opened values (the hiding proof's first half), and the `FriProof`.
+/// SIMD dependency; multiple matrices at one height accumulate with `alpha^{num_reduced}` offsets exactly as
+/// p3), `interpolate_coset_with_precomputation` / `compute_adjusted_weights` are p3's own, and the FRI is
+/// `stream_prove_fri` (its input opens seeked from these same stores). Returns the PUBLIC opened values, the
+/// split-off random-codeword opened values (the hiding proof's first half), and the `FriProof`.
 #[allow(clippy::too_many_arguments)]
 pub fn stream_pcs_open(
-    rounds: &[(&StreamCommitData, Vec<Challenge>)],
+    rounds: &[(RoundView<'_>, Vec<Vec<Challenge>>)],
     challenger: &mut Challenger,
     fri_params: &FriParameters<ChallengeMmcs>,
     num_random_codewords: usize,
@@ -716,11 +768,11 @@ pub fn stream_pcs_open(
 )> {
     let generator = <Val as Field>::GENERATOR;
 
-    // Global max height/width over the committed LDEs (one matrix per round).
-    let (global_max_height, global_max_width) = rounds
+    // Global max height over every committed LDE.
+    let global_max_height = rounds
         .iter()
-        .map(|(d, _)| (d.store.height(), d.store.width()))
-        .reduce(|(hm, wm), (h, w)| (hm.max(h), wm.max(w)))
+        .flat_map(|(r, _)| r.stores.iter().map(|s| s.height()))
+        .max()
         .expect("no rounds supplied");
     let log_global_max_height = log2_strict_usize(global_max_height);
 
@@ -740,22 +792,29 @@ pub fn stream_pcs_open(
         list.iter().find(|(p, _)| *p == z).expect("point present").1.clone()
     };
 
-    // Barycentric-evaluate each matrix's low coset at each of its points; observe the ys in p3's order.
+    // Barycentric-evaluate each matrix's low coset at each of its points; observe the ys in p3's
+    // (round, matrix, point) order.
     let all_opened_values: OpenedValues<Challenge> = rounds
         .iter()
-        .map(|(data, points)| {
-            let h = data.store.height() >> log_blowup;
-            let low_coset = materialize_low_coset(data, h);
-            let opened_for_mat: Vec<Vec<Challenge>> = points
+        .map(|(round, points_per_mat)| {
+            round
+                .stores
                 .iter()
-                .map(|&point| {
-                    let adj_full = find(&adjusted_weights, point);
-                    let ys = low_coset.interpolate_coset_with_precomputation(generator, point, &adj_full[..h]);
-                    challenger.observe_algebra_slice(&ys);
-                    ys
+                .zip(points_per_mat.iter())
+                .map(|(store, points)| {
+                    let h = store.height() >> log_blowup;
+                    let low_coset = materialize_low_coset(store, h);
+                    points
+                        .iter()
+                        .map(|&point| {
+                            let adj_full = find(&adjusted_weights, point);
+                            let ys = low_coset.interpolate_coset_with_precomputation(generator, point, &adj_full[..h]);
+                            challenger.observe_algebra_slice(&ys);
+                            ys
+                        })
+                        .collect()
                 })
-                .collect();
-            vec![opened_for_mat] // one matrix per round
+                .collect()
         })
         .collect();
 
@@ -767,53 +826,56 @@ pub fn stream_pcs_open(
     // independent and the intra-row sums are exact field ops).
     let mut num_reduced = [0usize; 32];
     let mut reduced_openings: [Option<Vec<Challenge>>; 32] = core::array::from_fn(|_| None);
-    for ((data, points), openings_for_round) in rounds.iter().zip(all_opened_values.iter()) {
-        let mat = StoreMatrix::new(&data.store);
-        let openings_for_mat = &openings_for_round[0];
-        let (mh, mw) = (mat.height(), mat.width());
-        let log_height = log2_strict_usize(mh);
+    for ((round, points_per_mat), openings_for_round) in rounds.iter().zip(all_opened_values.iter()) {
+        for ((store, points), openings_for_mat) in
+            round.stores.iter().zip(points_per_mat.iter()).zip(openings_for_round.iter())
+        {
+            let mat = StoreMatrix::new(store);
+            let (mh, mw) = (mat.height(), mat.width());
+            let log_height = log2_strict_usize(mh);
 
-        // mat_compressed[r] = Σ_c alpha^c · mat[r][c].
-        let mut mat_compressed = vec![Challenge::ZERO; mh];
-        for (r, mc) in mat_compressed.iter_mut().enumerate() {
-            let row: Vec<Val> = mat.row(r).unwrap().into_iter().collect();
-            let (mut acc, mut ap) = (Challenge::ZERO, Challenge::ONE);
-            for &x in &row {
-                acc += ap * x;
-                ap *= alpha;
+            // mat_compressed[r] = Σ_c alpha^c · mat[r][c].
+            let mut mat_compressed = vec![Challenge::ZERO; mh];
+            for (r, mc) in mat_compressed.iter_mut().enumerate() {
+                let row: Vec<Val> = mat.row(r).unwrap().into_iter().collect();
+                let (mut acc, mut ap) = (Challenge::ZERO, Challenge::ONE);
+                for &x in &row {
+                    acc += ap * x;
+                    ap *= alpha;
+                }
+                *mc = acc;
             }
-            *mc = acc;
-        }
 
-        if reduced_openings[log_height].is_none() {
-            reduced_openings[log_height] = Some(vec![Challenge::ZERO; mh]);
-        }
-        for (&point, openings) in points.iter().zip(openings_for_mat.iter()) {
-            let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
-            let (mut reduced_opening, mut ap) = (Challenge::ZERO, Challenge::ONE);
-            for &y in openings {
-                reduced_opening += ap * y;
-                ap *= alpha;
+            if reduced_openings[log_height].is_none() {
+                reduced_openings[log_height] = Some(vec![Challenge::ZERO; mh]);
             }
-            let inv = find(&inv_denoms, point);
-            let ro = reduced_openings[log_height].as_mut().unwrap();
-            for (x, ro_x) in ro.iter_mut().enumerate() {
-                *ro_x += alpha_pow_offset * (reduced_opening - mat_compressed[x]) * inv[x];
+            for (&point, openings) in points.iter().zip(openings_for_mat.iter()) {
+                let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
+                let (mut reduced_opening, mut ap) = (Challenge::ZERO, Challenge::ONE);
+                for &y in openings {
+                    reduced_opening += ap * y;
+                    ap *= alpha;
+                }
+                let inv = find(&inv_denoms, point);
+                let ro = reduced_openings[log_height].as_mut().unwrap();
+                for (x, ro_x) in ro.iter_mut().enumerate() {
+                    *ro_x += alpha_pow_offset * (reduced_opening - mat_compressed[x]) * inv[x];
+                }
+                num_reduced[log_height] += mw;
             }
-            num_reduced[log_height] += mw;
         }
     }
 
     // FRI inputs: highest log-height first (`rev`), flattened.
     let fri_input: Vec<Vec<Challenge>> = reduced_openings.into_iter().rev().flatten().collect();
 
-    let input_datas: Vec<&StreamCommitData> = rounds.iter().map(|(d, _)| *d).collect();
+    let round_refs: Vec<&RoundView> = rounds.iter().map(|(r, _)| r).collect();
     let fri_proof = stream_prove_fri(
         fri_params,
         fri_input,
         challenger,
         log_global_max_height,
-        |index| stream_open_input_streamed(log_global_max_height, index, &input_datas),
+        |index| stream_open_input_streamed(log_global_max_height, index, &round_refs),
         fri_salt_rng,
         cap_height,
     )?;
@@ -837,7 +899,6 @@ pub fn stream_pcs_open(
         })
         .collect();
 
-    let _ = global_max_width; // (kept for parity with p3's `open`; unused in the sequential reduction)
     Ok((public_opened, random_opened, fri_proof))
 }
 
@@ -1468,7 +1529,7 @@ mod tests {
                 let zeta2_next = trace_domain.next_point(zeta2).unwrap();
                 let mut fri_salt_rng = ChaCha20Rng::seed_from_u64(s_mmcs);
                 let (my_public, my_random, my_fri) = stream_pcs_open(
-                    &[(&data, vec![zeta2, zeta2_next])], &mut ch2, &fri_for_stream, NUM_RANDOM_CODEWORDS, LOG_BLOWUP, CAP_HEIGHT, &mut fri_salt_rng,
+                    &[(data.round_view(), vec![vec![zeta2, zeta2_next]])], &mut ch2, &fri_for_stream, NUM_RANDOM_CODEWORDS, LOG_BLOWUP, CAP_HEIGHT, &mut fri_salt_rng,
                 )
                 .unwrap();
                 (p3_opened, p3_random, p3_fri, my_public, my_random, my_fri)
