@@ -418,9 +418,9 @@ mod tests {
 
     /// Same block-size RAM/time bench, proven on the GPU (`config::gpu::make_config_hiding` = GpuHidingPcs:
     /// device-side LDE + Merkle + quotient randomization). Proof is BYTE-IDENTICAL to CPU and verifies under the
-    /// production verifier (asserted). Works while the LDE/NTT device buffer stays under this GPU's ~3.88 GB
-    /// CL_DEVICE_MAX_MEM_ALLOC_SIZE (≈ block ≤ 8 tx); larger blocks panic with CL_INVALID_BUFFER_SIZE until
-    /// `gpu.rs` sub-tiles that buffer.
+    /// production verifier (asserted). The LDE/NTT device buffers are column-tiled (`gpu.rs::col_block`) to stay
+    /// under this GPU's ~3.88 GB CL_DEVICE_MAX_MEM_ALLOC_SIZE, so a full 64-tx block proves on-device (the earlier
+    /// ≤ 8-tx CL_INVALID_BUFFER_SIZE ceiling is gone); only total device global memory now bounds the block size.
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "bench: batch RAM/time on the GPU (LATTICA_BATCH_N=<n>, one N per process)"]

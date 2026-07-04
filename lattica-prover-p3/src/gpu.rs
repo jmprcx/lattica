@@ -175,14 +175,16 @@ inline void perm8(ulong* s,__global const ulong* rci,__global const ulong* rcp,_
 }
 // leaf hash (PaddingFreeSponge<8,4,4>): one thread per row, sponge over `w` elems, out[row*4..].
 // Padding-free: overwrite state[0..4] with each block, permute after any absorbed block.
-__kernel void leaf_hash(__global const ulong* in,__global ulong* out,const uint h,const uint w,
+// Row-banded: `in` is a band of `band_h` rows (band-local), `out` is the full leaf-digest buffer;
+// thread g hashes band row g into digest `row0+g`. Row-independent, so banding is bit-transparent.
+__kernel void leaf_hash(__global const ulong* in,__global ulong* out,const uint row0,const uint band_h,const uint w,
                         __global const ulong* rci,__global const ulong* rcp,__global const ulong* rcf,__global const ulong* diag){
-  size_t row=get_global_id(0); if(row>=h) return;
+  size_t g=get_global_id(0); if(g>=band_h) return;
   ulong s[8]; for(int i=0;i<8;i++) s[i]=0UL;
-  __global const ulong* r=in+(size_t)row*w;
+  __global const ulong* r=in+(size_t)g*w;
   uint i=0;
   while(i<w){ for(uint k=0;k<4 && i<w;k++){ s[k]=r[i]; i++; } perm8(s,rci,rcp,rcf,diag); }
-  for(int k=0;k<4;k++) out[(size_t)row*4+k]=gl_canon(s[k]);
+  for(int k=0;k<4;k++) out[(size_t)(row0+g)*4+k]=gl_canon(s[k]);
 }
 // compress one tree layer (TruncatedPermutation<2,4,8>): out[j] = trunc(perm(in[2j] || in[2j+1])).
 __kernel void compress_layer(__global const ulong* in,__global ulong* out,const uint n_out,
@@ -258,6 +260,9 @@ struct GpuCtx {
     /// Stage-generator buffers keyed by `(log_h, inverse)` — tiny but rebuilt on every NTT call
     /// otherwise (~100 host-pointer buffer creations per proof).
     wlens: std::collections::HashMap<(usize, bool), ocl::Buffer<u64>>,
+    /// The device's per-allocation cap (`CL_DEVICE_MAX_MEM_ALLOC_SIZE`) in u64 elements, queried once.
+    /// Column-tiling keeps every `dev_buf` under it (see `col_block`).
+    max_alloc: Option<usize>,
 }
 
 thread_local! {
@@ -273,7 +278,7 @@ fn with_ctx<R>(f: impl FnOnce(&mut GpuCtx) -> R) -> R {
                 .dims(1)
                 .build()
                 .expect("GpuDft: OpenCL program build failed (is an OpenCL runtime + GPU present?)");
-            GpuCtx { pq, dev: [None, None, None], _staging_buf: None, staging_map: None, wlens: Default::default() }
+            GpuCtx { pq, dev: [None, None, None], _staging_buf: None, staging_map: None, wlens: Default::default(), max_alloc: None }
         });
         f(ctx)
     })
@@ -289,16 +294,79 @@ impl GpuCtx {
     /// calls (buffer churn is avoidable overhead on every NTT/commit).
     fn dev_buf(&mut self, slot: usize, n: usize) -> ocl::Buffer<u64> {
         if self.dev[slot].as_ref().is_none_or(|b| b.len() < n) {
+            // Round up to a power of two for geometric reuse, but never past the per-allocation cap: a
+            // column-tiled remainder block can be a non-power-of-two size whose `next_power_of_two`
+            // would exceed the cap even though its exact size fits (the tiled callers keep `n` legal).
+            let want = n.next_power_of_two();
+            let len = if want <= self.max_alloc_u64s() { want } else { n.max(1) };
             self.dev[slot] = Some(
                 ocl::Buffer::<u64>::builder()
                     .queue(self.pq.queue().clone())
                     .flags(ocl::flags::MEM_READ_WRITE)
-                    .len(n.next_power_of_two())
+                    .len(len)
                     .build()
                     .unwrap(),
             );
         }
         self.dev[slot].as_ref().unwrap().clone()
+    }
+
+    /// The device's per-allocation cap (`CL_DEVICE_MAX_MEM_ALLOC_SIZE`), in u64 elements — queried
+    /// once and cached. A single OpenCL buffer larger than this fails with `CL_INVALID_BUFFER_SIZE`,
+    /// regardless of free global memory; `col_block` uses it to bound every `dev_buf`.
+    fn max_alloc_u64s(&mut self) -> usize {
+        if let Some(m) = self.max_alloc {
+            return m;
+        }
+        let bytes = self
+            .pq
+            .queue()
+            .device()
+            .info(ocl::core::DeviceInfo::MaxMemAllocSize)
+            .ok()
+            .and_then(|r| match r {
+                ocl::core::DeviceInfoResult::MaxMemAllocSize(s) => Some(s as usize),
+                _ => None,
+            })
+            .filter(|&b| b >= (1 << 20))
+            .unwrap_or(1 << 30); // 1 GiB fallback if the driver won't report a sane cap
+        let m = bytes / 8;
+        self.max_alloc = Some(m);
+        m
+    }
+
+    /// Largest power-of-two column count `C` whose `big × C` u64 device buffer fits under ~7/8 of the
+    /// per-allocation cap, capped at `w`. Tiling every LDE/NTT into `C`-column blocks keeps each
+    /// `dev_buf` legal, so a wide trace (the batch at ≥16 tx, the aggregator at width ~1291) no longer
+    /// trips `CL_INVALID_BUFFER_SIZE`. The blocks are independent-column polynomials, so the stitched
+    /// output is bit-identical regardless of `C` — only the tile shape (`log_c`) changes, never the
+    /// butterfly values. `LATTICA_GPU_COL_BLOCK` caps `C` (forces multi-block tiling on small test inputs).
+    fn col_block(&mut self, big: usize, w: usize) -> usize {
+        let budget = self.max_alloc_u64s() / 8 * 7; // 7/8 headroom (fill/upload also touch the buffer)
+        let fit = (budget / big.max(1)).max(1);
+        // floor to a power of two so `big·C` is itself a power of two (no `dev_buf` next_pow2 inflation)
+        let mut c = 1usize << (usize::BITS - 1 - fit.leading_zeros());
+        if let Ok(v) = std::env::var("LATTICA_GPU_COL_BLOCK") {
+            if let Ok(cap) = v.parse::<usize>() {
+                c = c.min(cap.max(1));
+            }
+        }
+        c.min(w.max(1))
+    }
+
+    /// Rows per band such that a `rows × w` u64 leaf-input buffer fits under ~7/8 of the per-allocation
+    /// cap, capped at `h`. Row-banding the (wide) Merkle leaf input keeps its device buffer legal while
+    /// the per-row leaf hash is unchanged — each row maps to one digest, band-independent. `LATTICA_GPU_COL_BLOCK`
+    /// also caps the band (× w) so the tiling tests exercise multi-band leaf hashing.
+    fn row_block(&mut self, w: usize, h: usize) -> usize {
+        let budget = self.max_alloc_u64s() / 8 * 7;
+        let mut rows = (budget / w.max(1)).max(1);
+        if let Ok(v) = std::env::var("LATTICA_GPU_COL_BLOCK") {
+            if let Ok(cap) = v.parse::<usize>() {
+                rows = rows.min(cap.max(1));
+            }
+        }
+        rows.min(h.max(1))
     }
 
     /// The persistently mapped pinned staging window.
@@ -319,20 +387,6 @@ impl GpuCtx {
             self.staging_map = Some(map);
         }
         self.staging_map.as_mut().unwrap()
-    }
-
-    /// Blocking upload of `data` into `dst[0..data.len()]`, chunked through the pinned window.
-    /// The copy into the window is parallel — a single-threaded memcpy (and its page faults) costs
-    /// more than the PCIe DMA itself at these sizes.
-    fn upload(&mut self, dst: &ocl::Buffer<u64>, data: &[u64]) {
-        let map = self.staging();
-        for (ci, chunk) in data.chunks(STAGING_LEN).enumerate() {
-            map[..chunk.len()]
-                .par_chunks_mut(1 << 18)
-                .zip(chunk.par_chunks(1 << 18))
-                .for_each(|(d, s)| d.copy_from_slice(s));
-            dst.cmd().offset(ci * STAGING_LEN).write(&map[..chunk.len()]).enq().unwrap();
-        }
     }
 
     /// Blocking upload of `rows` logical rows (`row_w` u64s each) into `dst`, marshalling each row
@@ -386,6 +440,24 @@ impl GpuCtx {
             off += len;
         }
         out
+    }
+
+    /// Blocking download of a `rows × cw` device block (row-major, in the buffer's stored order) and
+    /// scatter into `out` (row-major `rows × out_w`) at column offset `c0` — the column-tiling
+    /// counterpart of `upload_rows`. Rows stream through the pinned window; the per-row scatter is parallel.
+    fn download_cols_into(&mut self, src: &ocl::Buffer<u64>, rows: usize, cw: usize, out: &mut [u64], out_w: usize, c0: usize) {
+        let rows_per_chunk = (STAGING_LEN / cw.max(1)).max(1);
+        let map = self.staging();
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let nr = rows_per_chunk.min(rows - r0);
+            src.cmd().offset(r0 * cw).read(&mut map[..nr * cw]).enq().unwrap();
+            out[r0 * out_w..(r0 + nr) * out_w]
+                .par_chunks_mut(out_w)
+                .zip(map[..nr * cw].par_chunks(cw))
+                .for_each(|(orow, blk)| orow[c0..c0 + cw].copy_from_slice(blk));
+            r0 += nr;
+        }
     }
 }
 
@@ -472,20 +544,29 @@ fn enqueue_tiled_ntt(
 /// p3's storage order, ready to wrap in `BitReversalPerm::new_view` with no CPU re-permutation.
 fn gpu_ntt(coeffs: &[u64], h: usize, w: usize, log_h: usize) -> Vec<u64> {
     let _t0 = std::time::Instant::now();
-    let n = h * w;
+    let mut out = vec![0u64; h * w];
     with_ctx(|ctx| {
-        let cb = ctx.dev_buf(0, n);
-        let ab = ctx.dev_buf(1, n);
-        ctx.upload(&cb, coeffs);
-        let in_dst = enqueue_tiled_ntt(ctx, &cb, &ab, h, w, log_h, false, 1, 1, true, true);
-        let out = ctx.download(if in_dst { &ab } else { &cb }, n);
-        if std::env::var_os("LATTICA_GPU_PROF").is_some() {
-            eprintln!("ntt h={h} w={w}: total {:.3}ms", _t0.elapsed().as_secs_f64() * 1e3);
+        // Column-tile so each `h × cw` device buffer stays under the per-allocation cap. Columns are
+        // independent transforms, so the stitched result is bit-identical to a single whole-width pass.
+        let c_block = ctx.col_block(h, w);
+        let mut c0 = 0usize;
+        while c0 < w {
+            let cw = c_block.min(w - c0);
+            let n = h * cw;
+            let cb = ctx.dev_buf(0, n);
+            let ab = ctx.dev_buf(1, n);
+            ctx.upload_rows(&cb, h, cw, |r, buf| buf.copy_from_slice(&coeffs[r * w + c0..r * w + c0 + cw]));
+            let in_dst = enqueue_tiled_ntt(ctx, &cb, &ab, h, cw, log_h, false, 1, 1, true, true);
+            ctx.download_cols_into(if in_dst { &ab } else { &cb }, h, cw, &mut out, w, c0);
+            c0 += cw;
         }
-        NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        NTT_CALLS.fetch_add(1, Ordering::Relaxed);
-        out
-    })
+    });
+    if std::env::var_os("LATTICA_GPU_PROF").is_some() {
+        eprintln!("ntt h={h} w={w}: total {:.3}ms", _t0.elapsed().as_secs_f64() * 1e3);
+    }
+    NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    NTT_CALLS.fetch_add(1, Ordering::Relaxed);
+    out
 }
 
 /// Full coset-LDE on the GPU, **device-side** (one upload + one download): iDFT → coset-scale +
@@ -499,43 +580,43 @@ fn gpu_coset_lde_bitrev(evals: &[u64], h: usize, w: usize, added_bits: usize, sh
     let log_h = h.trailing_zeros() as usize;
     let big = h << added_bits;
     let log_big = log_h + added_bits;
-    let n_big = big * w;
     let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
     let prof = std::env::var_os("LATTICA_GPU_PROF").is_some();
+    let mut out = vec![0u64; big * w];
     with_ctx(|ctx| {
-        let mut last_tick = std::time::Instant::now();
-        let a = ctx.dev_buf(0, n_big);
-        let b = ctx.dev_buf(1, n_big);
-        // Only `b` needs zeroing (rows h..big are the forward NTT's zero-pad, read at its fused
-        // bit-reversal): the first h·w elements of `a` are overwritten by the upload and the rest of
-        // `a` is never read before the forward NTT overwrites all of it.
-        b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
-        ctx.upload(&a, evals); // a[0..h·w] = input evals
-        if prof {
-            ctx.pq.queue().finish().unwrap();
-            eprintln!("lde h={h} w={w} big={big}: fill+upload {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
-            last_tick = std::time::Instant::now();
+        // Column-tile so each `big × cw` device buffer stays under the per-allocation cap: the columns
+        // are independent LDEs, so the stitched result is bit-identical to a single whole-width pass
+        // (only the tile shape `log_c` differs, never the butterfly values). This is what lets a wide
+        // trace (the batch at ≥16 tx, the aggregator at width ~1291) LDE on-device at all.
+        let c_block = ctx.col_block(big, w);
+        let mut c0 = 0usize;
+        while c0 < w {
+            let cw = c_block.min(w - c0);
+            let n_big = big * cw;
+            let a = ctx.dev_buf(0, n_big);
+            let b = ctx.dev_buf(1, n_big);
+            // Only `b` needs zeroing (rows h..big are the forward NTT's zero-pad, read at its fused
+            // bit-reversal); `a`'s first h·cw elements are overwritten by the upload below.
+            b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+            // gather this block's columns [c0, c0+cw) of the row-major h×w input into a[0..h·cw]
+            ctx.upload_rows(&a, h, cw, |r, buf| buf.copy_from_slice(&evals[r * w + c0..r * w + c0 + cw]));
+            // iDFT on the first h rows (a → b), the last group fusing scale-by-1/h + coset shift^row;
+            // rows ≥ h of `b` stay 0 (the zero-pad).
+            enqueue_tiled_ntt(ctx, &a, &b, h, cw, log_h, true, h_inv, shift, false, false);
+            // forward NTT of size `big` (b → a…, reading the zero-pad through the fused bit-reversal),
+            // canonicalized + stored bit-reversed by the last group (which bounces back into `b` when
+            // there are ≥ 2 groups).
+            let in_dst = enqueue_tiled_ntt(ctx, &b, &a, big, cw, log_big, false, 1, 1, true, true);
+            ctx.download_cols_into(if in_dst { &a } else { &b }, big, cw, &mut out, w, c0);
+            c0 += cw;
         }
-        // iDFT on the first h rows (a → b), the last group fusing scale-by-1/h + coset shift^row;
-        // rows ≥ h of `b` stay 0 (the zero-pad).
-        enqueue_tiled_ntt(ctx, &a, &b, h, w, log_h, true, h_inv, shift, false, false);
-        // forward NTT of size `big` (b → a…, reading the zero-pad through the fused bit-reversal),
-        // canonicalized + stored bit-reversed by the last group (which bounces back into `b` when
-        // there are ≥ 2 groups).
-        let in_dst = enqueue_tiled_ntt(ctx, &b, &a, big, w, log_big, false, 1, 1, true, true);
-        if prof {
-            ctx.pq.queue().finish().unwrap();
-            eprintln!("  kernels {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
-            last_tick = std::time::Instant::now();
-        }
-        let out = ctx.download(if in_dst { &a } else { &b }, n_big);
-        if prof {
-            eprintln!("  download {:.3}ms", last_tick.elapsed().as_secs_f64() * 1e3);
-        }
-        NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        NTT_CALLS.fetch_add(1, Ordering::Relaxed);
-        out
-    })
+    });
+    if prof {
+        eprintln!("lde h={h} w={w} big={big}: total {:.3}ms", _t0.elapsed().as_secs_f64() * 1e3);
+    }
+    NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    NTT_CALLS.fetch_add(1, Ordering::Relaxed);
+    out
 }
 
 /// One hiding-PCS quotient chunk, fully device-side (see `gpu_pcs::GpuHidingPcs::get_quotient_ldes`):
@@ -559,43 +640,52 @@ pub(crate) fn gpu_quotient_chunk_lde(
     let log_h = h.trailing_zeros() as usize;
     let big = h << added_bits;
     let log_big = log_h + added_bits;
-    let n_big = big * w;
     let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
+    let mut out = vec![0u64; big * w];
     with_ctx(|ctx| {
-        let a = ctx.dev_buf(0, n_big);
-        let b = ctx.dev_buf(1, n_big);
-        let c = ctx.dev_buf(2, n_big);
-        // coset-LDE of the chunk (as in gpu_coset_lde_bitrev, but NOT canonicalized — the final
-        // add_canon canonicalizes the sum).
-        b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
-        ctx.upload(&a, evals);
-        enqueue_tiled_ntt(ctx, &a, &b, h, w, log_h, true, h_inv, shift, false, false);
-        let in_dst = enqueue_tiled_ntt(ctx, &b, &a, big, w, log_big, false, 1, 1, false, true);
-        let (r, s) = if in_dst { (a, b) } else { (b, a) };
-        // v_H·r: zero-pad the freed scratch buffer, upload the 2h-row coefficient prefix, forward NTT.
-        // (The in-order queue sequences the fill after the LDE kernels that read `s`.)
-        s.cmd().fill(0u64, Some(n_big)).enq().unwrap();
-        ctx.upload(&s, van_prefix);
-        let v_in_dst = enqueue_tiled_ntt(ctx, &s, &c, big, w, log_big, false, 1, 1, false, true);
-        let v = if v_in_dst { c } else { s };
-        // sum + canonicalize, single download of the stored (bit-reversed) chunk LDE.
-        unsafe {
-            ctx.pq
-                .kernel_builder("add_canon")
-                .arg(&r)
-                .arg(&v)
-                .arg(n_big as u32)
-                .global_work_size(n_big)
-                .build()
-                .unwrap()
-                .enq()
-                .unwrap();
+        // Column-tile the chunk evals AND the vanishing-randomizer prefix in lockstep so each `big × cw`
+        // device buffer stays under the per-allocation cap; independent columns ⇒ bit-identical output.
+        let c_block = ctx.col_block(big, w);
+        let mut c0 = 0usize;
+        while c0 < w {
+            let cw = c_block.min(w - c0);
+            let n_big = big * cw;
+            let a = ctx.dev_buf(0, n_big);
+            let b = ctx.dev_buf(1, n_big);
+            let c = ctx.dev_buf(2, n_big);
+            // coset-LDE of the chunk (as in gpu_coset_lde_bitrev, but NOT canonicalized — the final
+            // add_canon canonicalizes the sum).
+            b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+            ctx.upload_rows(&a, h, cw, |r, buf| buf.copy_from_slice(&evals[r * w + c0..r * w + c0 + cw]));
+            enqueue_tiled_ntt(ctx, &a, &b, h, cw, log_h, true, h_inv, shift, false, false);
+            let in_dst = enqueue_tiled_ntt(ctx, &b, &a, big, cw, log_big, false, 1, 1, false, true);
+            let (r, s) = if in_dst { (a, b) } else { (b, a) };
+            // v_H·r: zero-pad the freed scratch buffer, upload this block's 2h-row prefix columns, forward NTT.
+            // (The in-order queue sequences the fill after the LDE kernels that read `s`.)
+            s.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+            ctx.upload_rows(&s, 2 * h, cw, |r2, buf| buf.copy_from_slice(&van_prefix[r2 * w + c0..r2 * w + c0 + cw]));
+            let v_in_dst = enqueue_tiled_ntt(ctx, &s, &c, big, cw, log_big, false, 1, 1, false, true);
+            let v = if v_in_dst { c } else { s };
+            // sum + canonicalize this block.
+            unsafe {
+                ctx.pq
+                    .kernel_builder("add_canon")
+                    .arg(&r)
+                    .arg(&v)
+                    .arg(n_big as u32)
+                    .global_work_size(n_big)
+                    .build()
+                    .unwrap()
+                    .enq()
+                    .unwrap();
+            }
+            ctx.download_cols_into(&r, big, cw, &mut out, w, c0);
+            c0 += cw;
         }
-        let out = ctx.download(&r, n_big);
-        NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        NTT_CALLS.fetch_add(1, Ordering::Relaxed);
-        out
-    })
+    });
+    NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    NTT_CALLS.fetch_add(1, Ordering::Relaxed);
+    out
 }
 
 /// Canonical-u64 conversion of a field slice — parallel above ~4 MiB (the per-matrix rayon overhead
@@ -671,8 +761,6 @@ fn gpu_merkle_layers_rows(h: usize, w: usize, fill: impl Fn(usize, &mut [u64]) +
     let _t0 = std::time::Instant::now();
     let (rci, rcp, rcf, diag) = poseidon2_consts();
     let out = with_ctx(|ctx| {
-        let inb = ctx.dev_buf(0, h * w);
-        ctx.upload_rows(&inb, h, w, fill);
         let q = ctx.pq.queue().clone();
         let ro = |data: &[u64]| {
             ocl::Buffer::<u64>::builder()
@@ -686,9 +774,34 @@ fn gpu_merkle_layers_rows(h: usize, w: usize, fill: impl Fn(usize, &mut [u64]) +
         let rw = |n: usize| ocl::Buffer::<u64>::builder().queue(q.clone()).flags(ocl::flags::MEM_READ_WRITE).len(n).build().unwrap();
         let (rci_b, rcp_b, rcf_b, diag_b) = (ro(&rci), ro(&rcp), ro(&rcf), ro(&diag));
         let leaves = rw(h * 4);
-        unsafe {
-            ctx.pq.kernel_builder("leaf_hash").arg(&inb).arg(&leaves).arg(h as u32).arg(w as u32)
-                .arg(&rci_b).arg(&rcp_b).arg(&rcf_b).arg(&diag_b).global_work_size(h).build().unwrap().enq().unwrap();
+        // Row-band the (wide) leaf input so its device buffer stays under the per-allocation cap; the
+        // per-row leaf hash is band-independent, so the digests match a single-shot hash bit-for-bit.
+        // The full leaf-digest buffer (h×4) and the compression layers below stay well under the cap.
+        let rb = ctx.row_block(w, h);
+        let mut r0 = 0usize;
+        while r0 < h {
+            let nr = rb.min(h - r0);
+            let inb = ctx.dev_buf(0, nr * w);
+            ctx.upload_rows(&inb, nr, w, |i, buf| fill(r0 + i, buf));
+            unsafe {
+                ctx.pq
+                    .kernel_builder("leaf_hash")
+                    .arg(&inb)
+                    .arg(&leaves)
+                    .arg(r0 as u32)
+                    .arg(nr as u32)
+                    .arg(w as u32)
+                    .arg(&rci_b)
+                    .arg(&rcp_b)
+                    .arg(&rcf_b)
+                    .arg(&diag_b)
+                    .global_work_size(nr)
+                    .build()
+                    .unwrap()
+                    .enq()
+                    .unwrap();
+            }
+            r0 += nr;
         }
         let to_digests = |raw: Vec<u64>| -> Vec<[Goldilocks; 4]> {
             raw.chunks_exact(4).map(|c| [Goldilocks::new(c[0]), Goldilocks::new(c[1]), Goldilocks::new(c[2]), Goldilocks::new(c[3])]).collect()
@@ -1072,7 +1185,8 @@ mod tests {
     fn gpu_coset_lde_matches_p3() {
         let mut rng = ChaCha20Rng::seed_from_u64(2);
         let shift = Goldilocks::GENERATOR;
-        for &(log_h, w, added) in &[(1usize, 1usize, 1usize), (4, 3, 2), (8, 5, 3), (12, 2, 4), (12, 19, 4)] {
+        // Include the batch (w=49) and aggregator-ish (w=53) widths so the column-tiling path is exercised.
+        for &(log_h, w, added) in &[(1usize, 1usize, 1usize), (4, 3, 2), (8, 5, 3), (12, 2, 4), (12, 19, 4), (12, 49, 4), (10, 53, 4)] {
             let h = 1 << log_h;
             let vals: Vec<Goldilocks> = (0..h * w).map(|_| Goldilocks::new(rng.random::<u64>() % 0xFFFF_FFFF_0000_0001)).collect();
             let mat = RowMajorMatrix::new(vals, w);
@@ -1080,6 +1194,30 @@ mod tests {
             let gpu = GpuDft.coset_lde_batch(mat, added, shift).to_row_major_matrix();
             assert_eq!(cpu.values, gpu.values, "GpuDft coset_lde != p3 at h=2^{log_h} w={w} added={added}");
         }
+    }
+
+    /// Column-tiling is transparent: with `LATTICA_GPU_COL_BLOCK` forcing multi-block tiling (C=1,2,3),
+    /// the stitched coset-LDE stays bit-identical to p3. This proves the sub-tiling that keeps each
+    /// device buffer under the per-allocation cap changes only the tile shape, never the output values —
+    /// the byte-compat guarantee that lets wide (batch ≥16 tx / aggregator) traces LDE on-device.
+    /// Run serially (the GPU context + the env var are process-global): `--test-threads=1`.
+    #[test]
+    #[ignore = "requires an OpenCL runtime + GPU; run with --test-threads=1"]
+    fn gpu_coset_lde_column_tiling_matches_p3() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
+        let shift = Goldilocks::GENERATOR;
+        for cb in [1usize, 2, 3] {
+            std::env::set_var("LATTICA_GPU_COL_BLOCK", cb.to_string());
+            for &(log_h, w, added) in &[(8usize, 7usize, 3usize), (10, 19, 4), (6, 49, 2)] {
+                let h = 1 << log_h;
+                let vals: Vec<Goldilocks> = (0..h * w).map(|_| Goldilocks::new(rng.random::<u64>() % 0xFFFF_FFFF_0000_0001)).collect();
+                let mat = RowMajorMatrix::new(vals, w);
+                let cpu = Radix2DitParallel::<Goldilocks>::default().coset_lde_batch(mat.clone(), added, shift).to_row_major_matrix();
+                let gpu = GpuDft.coset_lde_batch(mat, added, shift).to_row_major_matrix();
+                assert_eq!(cpu.values, gpu.values, "tiled GpuDft coset_lde != p3 at C={cb} h=2^{log_h} w={w} added={added}");
+            }
+        }
+        std::env::remove_var("LATTICA_GPU_COL_BLOCK");
     }
 
     /// END-TO-END: prove the REAL production join-split circuit with GPU-accelerated LDE, then assert
