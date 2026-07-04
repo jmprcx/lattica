@@ -22,7 +22,7 @@
 use crate::config::{Challenge, ChallengeMmcs, Challenger, Dft, MyCompress, MyHash, Val, ValMmcs};
 use core::marker::PhantomData;
 use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
-use p3_commit::{BatchOpening, Mmcs, OpenedValues};
+use p3_commit::{BatchOpening, Mmcs, OpenedValues, PolynomialSpace};
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
 use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::{batch_multiplicative_inverse, BasedVectorSpace, Field, PrimeCharacteristicRing};
@@ -38,6 +38,7 @@ use p3_matrix::Matrix;
 use p3_merkle_tree::MerkleCap;
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use p3_util::{log2_strict_usize, reverse_slice_index_bits};
+use rand::RngExt as _;
 use std::ffi::CString;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -409,6 +410,117 @@ pub fn stream_open_batch(data: &StreamBatchCommitData, index: usize) -> (Vec<Vec
         idx >>= 1;
     }
     (rows, salts, proof)
+}
+
+/// Reimplementation of p3's PRIVATE `get_zp_cis` (`hiding_pcs.rs:486`): the Lagrange normalization
+/// constant per quotient subdomain — `1 / Π_{j≠i} v_{H_j}(first_point(H_i))` (batch-inverted). Byte-identical.
+fn stream_get_zp_cis(domains: &[TwoAdicMultiplicativeCoset<Val>]) -> Vec<Val> {
+    let prods: Vec<Val> = domains
+        .iter()
+        .enumerate()
+        .map(|(i, domain)| {
+            domains
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, other)| other.vanishing_poly_at_point(domain.first_point()))
+                .product::<Val>()
+        })
+        .collect();
+    batch_multiplicative_inverse(&prods)
+}
+
+/// Reimplementation of the PRODUCTION `HidingFriPcs::get_quotient_ldes` (`hiding_pcs.rs:168`) drawing from
+/// an EXTERNAL `pcs_rng` (so the full prove can thread ONE random-codeword rng through trace → quotient →
+/// opt-random exactly as p3's internal `self.rng` does — p3 bundles that rng inside the PCS, which is why
+/// this is reimplemented rather than reused). Produces the num_chunks randomized quotient chunk LDEs
+/// (already in committed bit-reversed order): per chunk `q'_i = q_i + v_{H_i}·t_i` with random `t_i`,
+/// the last chunk's `t` set so the sum vanishes (the 2024/1037 masking). Byte-identical to p3 given the
+/// same rng + inputs; the domain/vanishing/DFT helpers are p3's own. Resident (quotient-scale) — the
+/// randomization is interleaved with the LDE, so this is the one buffer the streamed prove holds before
+/// batch-committing it out-of-core via `stream_commit_batch`.
+fn stream_get_quotient_ldes<R: rand::Rng + Send + Sync>(
+    domains: Vec<TwoAdicMultiplicativeCoset<Val>>,
+    evaluations: Vec<RowMajorMatrix<Val>>,
+    num_chunks: usize,
+    log_blowup: usize,
+    num_random_codewords: usize,
+    pcs_rng: &mut R,
+) -> Vec<RowMajorMatrix<Val>> {
+    assert!(num_chunks > 1, "num_chunks must be > 1 to preserve hiding (got {num_chunks})");
+    let cis = stream_get_zp_cis(&domains);
+    let last_chunk = num_chunks - 1;
+    let last_chunk_ci_inv = cis[last_chunk].inverse();
+    let mul_coeffs: Vec<Val> = (0..last_chunk).map(|i| cis[i] * last_chunk_ci_inv).collect();
+
+    // Per chunk: append `nrc` random columns (pcs_rng). Then draw the `(K-1)·h·w` random values (pcs_rng),
+    // last chunk zeroed then set so Σ vanishes.
+    let randomized_evaluations: Vec<RowMajorMatrix<Val>> =
+        evaluations.into_iter().map(|mat| mat.with_random_cols(num_random_codewords, &mut *pcs_rng)).collect();
+    let h = randomized_evaluations[0].height();
+    let w = randomized_evaluations[0].width();
+    let mut all_random_values: Vec<Val> = (0..(randomized_evaluations.len() - 1) * h * w)
+        .map(|_| pcs_rng.random())
+        .chain(core::iter::repeat_n(Val::ZERO, h * w))
+        .collect();
+    for j in 0..last_chunk {
+        let mul_coeff = mul_coeffs[j];
+        for k in 0..h * w {
+            let t = all_random_values[j * h * w + k] * mul_coeff;
+            all_random_values[last_chunk * h * w + k] -= t;
+        }
+    }
+
+    let dft = Dft::default();
+    let g = <Val as Field>::GENERATOR;
+    domains
+        .into_iter()
+        .zip(randomized_evaluations)
+        .enumerate()
+        .map(|(i, (domain, evals))| {
+            let shift = g / domain.shift();
+            let random_values = &all_random_values[i * h * w..(i + 1) * h * w];
+            let mut lde_evals = dft.coset_lde_batch(evals, log_blowup + 1, shift).to_row_major_matrix();
+
+            // v_H(X)·r(X) over the LDE (v_H = (g·X/domain.shift)^n - 1), added to the quotient chunk.
+            let mut vanishing_poly_coeffs = <Val as PrimeCharacteristicRing>::zero_vec((h * w) << (log_blowup + 1));
+            let p = shift.exp_u64(h as u64);
+            g.powers().take(h).enumerate().for_each(|(ii, p_i)| {
+                for jj in 0..w {
+                    let mul_coeff = p_i * random_values[ii * w + jj];
+                    vanishing_poly_coeffs[ii * w + jj] -= mul_coeff;
+                    vanishing_poly_coeffs[(h + ii) * w + jj] = p * mul_coeff;
+                }
+            });
+            let random_eval = dft.dft_batch(RowMajorMatrix::new(vanishing_poly_coeffs, w)).to_row_major_matrix();
+            for k in 0..h * w * (1 << (log_blowup + 1)) {
+                lde_evals.values[k] += random_eval.values[k];
+            }
+            lde_evals.bit_reverse_rows().to_row_major_matrix()
+        })
+        .collect()
+}
+
+/// The streamed equivalent of `commit_quotient`: split the quotient evaluations into `num_chunks`
+/// subdomains (p3's `split_evals`/`split_domains`), randomize + LDE them (`stream_get_quotient_ldes`,
+/// drawing from `pcs_rng`), and batch-commit the K chunk LDEs out-of-core (`stream_commit_batch`, salts
+/// from `mmcs_rng`). `cap()` is byte-identical to `pcs.commit_quotient(...).0`.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_commit_quotient<R1: rand::Rng + Send + Sync, R2: rand::Rng>(
+    quotient_domain: TwoAdicMultiplicativeCoset<Val>,
+    quotient_evaluations: RowMajorMatrix<Val>,
+    num_chunks: usize,
+    log_blowup: usize,
+    num_random_codewords: usize,
+    c_block: usize,
+    cap_height: usize,
+    pcs_rng: &mut R1,
+    mmcs_rng: &mut R2,
+) -> std::io::Result<StreamBatchCommitData> {
+    let sub_evals = quotient_domain.split_evals(num_chunks, quotient_evaluations);
+    let sub_domains = quotient_domain.split_domains(num_chunks);
+    let ldes = stream_get_quotient_ldes(sub_domains, sub_evals, num_chunks, log_blowup, num_random_codewords, pcs_rng);
+    stream_commit_batch(ldes, c_block, cap_height, mmcs_rng)
 }
 
 /// Open the leaf at `index`: the (unsalted) row, its salt, and the binary Merkle sibling path up to the
@@ -1584,6 +1696,41 @@ mod tests {
                 assert_eq!(p3_salts, salts, "batch salts != p3 at idx {idx}");
                 assert_eq!(p3_sibs, sibs, "batch sibling path != p3 at idx {idx}");
             }
+        }
+    }
+
+    /// `stream_commit_quotient` is byte-identical to the PRODUCTION `pcs.commit_quotient` — the full
+    /// quotient path (split into chunks + `get_quotient_ldes` vanishing-poly randomization drawn from
+    /// pcs_rng + batch hiding commit). Builds a deterministic `MyPcs`, a random quotient evaluation vector
+    /// over a disjoint quotient domain (non-unit shift, exercising `g/domain.shift()`), and asserts my
+    /// `cap()` == `pcs.commit_quotient(...).0` across chunk counts 2 and 4. This is I3c.
+    #[test]
+    fn stream_commit_quotient_matches_pcs() {
+        use crate::config::{production_fri, MyPcs, ValMmcs, LOG_BLOWUP, NUM_RANDOM_CODEWORDS};
+        use p3_commit::Pcs;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        let perm = default_goldilocks_poseidon2_8();
+        for &(log_ext, log_nc, cblk, s_mmcs, s_pcs) in &[(4usize, 1usize, 2usize, 1u64, 2u64), (6, 2, 4, 3, 4)] {
+            let num_chunks = 1usize << log_nc;
+            let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(s_mmcs));
+            let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+            let fri = production_fri(challenge_mmcs);
+            let pcs: MyPcs = MyPcs::new(Dft::default(), val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::seed_from_u64(s_pcs));
+            let ext_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 1 << log_ext);
+            let quotient_domain = ext_domain.create_disjoint_domain(1 << (log_ext + log_nc));
+            let qsize = quotient_domain.size();
+            let quotient_flat = RowMajorMatrix::<Val>::rand(&mut ChaCha20Rng::seed_from_u64(s_pcs ^ 0xEE), qsize, 2);
+
+            let (p3_commit, _) =
+                <MyPcs as Pcs<Challenge, Challenger>>::commit_quotient(&pcs, quotient_domain, quotient_flat.clone(), num_chunks);
+
+            let mut pcs_rng = ChaCha20Rng::seed_from_u64(s_pcs);
+            let mut mmcs_rng = ChaCha20Rng::seed_from_u64(s_mmcs);
+            let data = stream_commit_quotient(quotient_domain, quotient_flat, num_chunks, LOG_BLOWUP, NUM_RANDOM_CODEWORDS, cblk, CAP_HEIGHT, &mut pcs_rng, &mut mmcs_rng).unwrap();
+
+            let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
+            assert_eq!(p3_cap, data.cap(), "streamed quotient commit != pcs.commit_quotient at log_ext={log_ext} chunks={num_chunks}");
         }
     }
 
