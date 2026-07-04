@@ -96,12 +96,20 @@ where
     stream_merkle_cap_inner(src, cap_height, Some(&salts.values))
 }
 
-/// Shared frontier build. `salts`, when present, is the `h × SALT_ELEMS` matrix (row-major) whose row `r`
-/// is appended to leaf row `r` before hashing (the hiding variant); `None` is the plain commit.
 fn stream_merkle_cap_inner<S: LeafSource>(src: &S, cap_height: usize, salts: Option<&[Val]>) -> Vec<[Val; DIGEST]> {
+    let mut layers = stream_merkle_layers_inner(src, cap_height, salts);
+    layers.pop().expect("at least the leaf layer")
+}
+
+/// Shared frontier build returning EVERY digest layer (layer 0 = leaves, last = the `cap_height` cap) —
+/// what `stream_open` needs for sibling paths. `salts`, when present, is the `h × SALT_ELEMS` matrix
+/// (row-major) whose row `r` is appended to leaf row `r` before hashing (the hiding variant); `None` is
+/// the plain commit. The layers are small (≈ `h × DIGEST` total); the wide leaves are streamed, never
+/// fully resident.
+fn stream_merkle_layers_inner<S: LeafSource>(src: &S, cap_height: usize, salts: Option<&[Val]>) -> Vec<Vec<[Val; DIGEST]>> {
     let h = src.height();
     let w = src.width();
-    assert!(h.is_power_of_two(), "stream_merkle_cap: leaf height must be a power of two (got {h})");
+    assert!(h.is_power_of_two(), "stream_merkle: leaf height must be a power of two (got {h})");
     if let Some(s) = salts {
         assert_eq!(s.len(), h * SALT_ELEMS, "salt matrix must be h*SALT_ELEMS");
     }
@@ -115,7 +123,7 @@ fn stream_merkle_cap_inner<S: LeafSource>(src: &S, cap_height: usize, salts: Opt
     const ROW_BLOCK: usize = 4096;
     let bh = ROW_BLOCK.min(h);
     let mut block = vec![Val::default(); bh * w];
-    let mut layer: Vec<[Val; DIGEST]> = Vec::with_capacity(h);
+    let mut leaf: Vec<[Val; DIGEST]> = Vec::with_capacity(h);
     let mut r0 = 0usize;
     while r0 < h {
         let nr = bh.min(h - r0);
@@ -130,18 +138,75 @@ fn stream_merkle_cap_inner<S: LeafSource>(src: &S, cap_height: usize, salts: Opt
                 }
                 None => hash.hash_iter(data),
             };
-            layer.push(digest);
+            leaf.push(digest);
         }
         r0 += nr;
     }
 
-    // Compress pairwise (arity 2) up to the cap. `h` is a power of two, so every layer length is even
-    // until it reaches the cap; a tree shorter than the cap clamps to the leaf layer (p3's effective cap).
-    let cap_len = (1usize << cap_height).min(layer.len());
-    while layer.len() > cap_len {
-        layer = layer.chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
+    // Compress pairwise (arity 2) up to the cap, keeping every layer. `h` is a power of two, so every
+    // layer length is even until it reaches the cap; a tree shorter than the cap is just the leaf layer.
+    let cap_len = (1usize << cap_height).min(leaf.len());
+    let mut layers = vec![leaf];
+    while layers.last().unwrap().len() > cap_len {
+        let next: Vec<[Val; DIGEST]> =
+            layers.last().unwrap().chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
+        layers.push(next);
     }
-    layer
+    layers
+}
+
+/// Prover data for the streaming commit: the LDE on disk, the hiding salts, and the digest layers
+/// (leaves..cap — small). Everything `stream_open` needs to open a query index. `cap()` is the commitment.
+pub struct StreamCommitData {
+    pub store: MmapLdeStore,
+    pub salts: Vec<Val>,
+    pub layers: Vec<Vec<[Val; DIGEST]>>,
+}
+
+impl StreamCommitData {
+    /// The commitment cap (the top digest layer) — byte-identical to the production commitment.
+    pub fn cap(&self) -> &[[Val; DIGEST]] {
+        self.layers.last().expect("at least the leaf layer")
+    }
+}
+
+/// The out-of-core equivalent of p3's hiding `Pcs::commit` for one matrix: stream the coset-LDE of
+/// `trace` to disk, draw the hiding salts (p3's order), and build the salted Merkle layers. `cap()` is
+/// byte-identical to the production commitment; the data opens byte-identically via `stream_open`.
+pub fn stream_commit<R: rand::Rng>(
+    trace: RowMajorMatrix<Val>,
+    added_bits: usize,
+    shift: Val,
+    c_block: usize,
+    cap_height: usize,
+    rng: &mut R,
+) -> std::io::Result<StreamCommitData> {
+    let (h, w) = (trace.height(), trace.width());
+    let big = h << added_bits;
+    let store = MmapLdeStore::new(big, w)?;
+    stream_coset_lde_to_store(&trace, added_bits, shift, c_block, &store);
+    let salts = RowMajorMatrix::rand(rng, big, SALT_ELEMS).values;
+    let layers = stream_merkle_layers_inner(&store, cap_height, Some(&salts));
+    Ok(StreamCommitData { store, salts, layers })
+}
+
+/// Open the leaf at `index`: the (unsalted) row, its salt, and the binary Merkle sibling path up to the
+/// cap — byte-identical to production's hiding `Mmcs::open_batch` (which returns `opened_values = [row]`,
+/// `opening_proof = ([salt], siblings)`). The row is a single strided seek into the store; the salt and
+/// the log-length path come from the small resident salts/layers — negligible I/O at 96 queries.
+pub fn stream_open(data: &StreamCommitData, index: usize) -> (Vec<Val>, Vec<Val>, Vec<[Val; DIGEST]>) {
+    let w = data.store.width();
+    let mut row = vec![Val::default(); w];
+    data.store.fill_row(index, &mut row);
+    let salt = data.salts[index * SALT_ELEMS..(index + 1) * SALT_ELEMS].to_vec();
+    // one sibling per binary level, leaf up to (not including) the cap layer
+    let mut proof = Vec::with_capacity(data.layers.len().saturating_sub(1));
+    let mut idx = index;
+    for layer in &data.layers[..data.layers.len() - 1] {
+        proof.push(layer[idx ^ 1]);
+        idx >>= 1;
+    }
+    (row, salt, proof)
 }
 
 /// A file-backed (mmap'd) store for one `h × w` LDE matrix, held **COLUMN-MAJOR** (element `(row, col)`
@@ -403,6 +468,42 @@ mod tests {
             let mine = stream_merkle_cap(&store, CAP_HEIGHT);
             let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
             assert_eq!(p3_cap, mine.as_slice(), "streamed LDE+Merkle != p3 at h=2^{log_h} w={w} cblk={cblk}");
+        }
+    }
+
+    /// `stream_commit` + `stream_open` open a query index byte-identical to production's HIDING
+    /// `Mmcs::commit` + `open_batch`: same opened row, same salt, same Merkle sibling path — the full
+    /// out-of-core commit/open MMCS primitive that the streamed FRI open will drive.
+    #[test]
+    fn stream_open_matches_p3() {
+        use p3_commit::Mmcs;
+        use p3_merkle_tree::MerkleTreeHidingMmcs;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        type HidingMmcs = MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, DIGEST, SALT_ELEMS>;
+        let dft = Dft::default();
+        let shift = <Val as Field>::GENERATOR;
+        let perm = default_goldilocks_poseidon2_8();
+        for &(log_h, w, added, cblk, seed) in &[(6usize, 5usize, 3usize, 2usize, 1u64), (10, 49, 4, 8, 2), (12, 53, 4, 16, 3)] {
+            let h = 1usize << log_h;
+            let big = h << added;
+            let vals: Vec<Val> = (0..h * w)
+                .map(|i| Val::new((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % 0xFFFF_FFFF_0000_0001))
+                .collect();
+            let mat = RowMajorMatrix::new(vals, w);
+            let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).to_row_major_matrix();
+            let mmcs = HidingMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(seed));
+            let (p3_commit, p3_data) = mmcs.commit(vec![p3_lde]);
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            let data = stream_commit(mat, added, shift, cblk, CAP_HEIGHT, &mut rng).unwrap();
+            assert_eq!(p3_commit.as_ref(), data.cap(), "commit cap != p3 at h=2^{log_h} w={w}");
+            for &idx in &[0usize, 1, big / 3, big / 2, big - 1] {
+                let (p3_openings, (p3_salts, p3_sibs)) = mmcs.open_batch(idx, &p3_data).unpack();
+                let (row, salt, sibs) = stream_open(&data, idx);
+                assert_eq!(p3_openings[0], row, "opened row != p3 at idx {idx} (h=2^{log_h} w={w})");
+                assert_eq!(p3_salts[0], salt, "salt != p3 at idx {idx}");
+                assert_eq!(p3_sibs, sibs, "sibling path != p3 at idx {idx}");
+            }
         }
     }
 
