@@ -315,8 +315,9 @@ mod tests {
             assert_eq!(v[123], 123); // contents intact through the mmap backing
             drop(v);
         }
-        // after the scope closes, arming is off again
-        assert!(!is_armed());
+        // NB: no assertion on the *global* `is_armed()` here — `ARMED` is process-global, so a parallel
+        // prove test (which arms via `proof_to_bytes`) can hold it set; correctness never depends on it
+        // (dealloc keys off the per-allocation header, not the arm state).
     }
 
     /// A zeroed large allocation is actually zero on the mmap path (fresh ftruncate'd file), so

@@ -26,6 +26,9 @@ pub mod quotient_gpu; // opt-in GPU quotient offload (fork of p3 prove; --featur
 pub mod spill_alloc; // opt-in out-of-core allocator: spills large LDE/quotient/Merkle buffers to an
                      // mmap'd file (bounds peak RSS). Additive, prove-only, byte-identical; --features stream.
 #[cfg(feature = "stream")]
+pub mod stream_prove; // opt-in streaming (out-of-core) prove fork: frontier Merkle commit that never
+                      // holds the whole leaf matrix. Prove-only, byte-identical; --features stream.
+#[cfg(feature = "stream")]
 #[global_allocator]
 static SPILL_ALLOC: spill_alloc::SpillAlloc = spill_alloc::SpillAlloc;
 #[cfg(test)]
