@@ -611,6 +611,50 @@ pub fn stream_coset_lde_to_store(trace: &RowMajorMatrix<Val>, added_bits: usize,
     }
 }
 
+/// A read-only `Matrix<Val>` VIEW over a committed-LDE `MmapLdeStore` — the disk-backed matrix that p3's
+/// `open`-at-ζ reduction reads verbatim. The heavy step of the open, `rowwise_packed_dot_product` over the
+/// WHOLE blown-up LDE (`two_adic_pcs.rs`), is `Matrix`-generic, so running it on this view keeps the LDE on
+/// disk and streams it row by row while producing the byte-identical `reduced_openings` the FRI consumes.
+/// (The barycentric low-coset eval needs a dense `RowMajorMatrix`, but it reads only the first
+/// `height >> log_blowup` rows — trace-sized — so that slice is materialized resident separately.)
+///
+/// A row is a stride-`h` gather across the column-major store (`map[c*h + r]`); the reduction's sequential
+/// row walk therefore reads each column-segment in order — the same streaming access pattern as the commit.
+pub struct StoreMatrix<'a> {
+    store: &'a MmapLdeStore,
+}
+
+impl<'a> StoreMatrix<'a> {
+    pub fn new(store: &'a MmapLdeStore) -> Self {
+        Self { store }
+    }
+}
+
+impl Matrix<Val> for StoreMatrix<'_> {
+    #[inline]
+    fn width(&self) -> usize {
+        self.store.w
+    }
+    #[inline]
+    fn height(&self) -> usize {
+        self.store.h
+    }
+    #[inline]
+    unsafe fn row_subseq_unchecked(
+        &self,
+        r: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = Val, IntoIter = impl Iterator<Item = Val> + Send + Sync> {
+        // Column-major store: element (r, c) is at `map[c*h + r]`, so a row is a stride-`h` gather. This is
+        // the one required accessor (the trait derives `row`/`row_slice`/`get` from it); bounds are the
+        // caller's `unsafe` contract (`r < height`, `start <= end <= width`) → every index is `< n`.
+        let s = self.store.slice();
+        let h = self.store.h;
+        (start..end).map(move |c| s[c * h + r])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +947,46 @@ mod tests {
             let a = postcard::to_allocvec(&p3_proof).unwrap();
             let b = postcard::to_allocvec(&my_proof).unwrap();
             assert_eq!(a, b, "stream_prove_fri != p3 prove_fri at case {ci} in_heights={in_heights:?}");
+        }
+    }
+
+    /// `StoreMatrix` (the disk-backed `Matrix<Val>` view) reproduces its store byte-for-byte AND drives
+    /// p3's whole-LDE open reduction identically to a resident `RowMajorMatrix`. This is the keystone for
+    /// the streamed open-at-ζ: (a) exhaustive per-row equality proves the strided column-major reads are
+    /// faithful; (b) `rowwise_packed_dot_product` — the exact `Matrix`-generic op p3's `open` runs over the
+    /// whole blown-up LDE to build `reduced_openings` — yields identical `Challenge` outputs whether the
+    /// matrix is on disk or in RAM (so the reduction can stream the LDE off the heap, byte-identically).
+    #[test]
+    fn store_matrix_reads_like_p3_reduction() {
+        use p3_field::{ExtensionField, PackedFieldExtension};
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        use rayon::prelude::*;
+        for &(log_h, w, seed) in &[(6usize, 5usize, 1u64), (10, 49, 2), (8, 53, 3), (7, 1291, 4)] {
+            let h = 1usize << log_h;
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            let src = RowMajorMatrix::<Val>::rand(&mut rng, h, w);
+            // Write the resident matrix into a column-major store (each column a contiguous segment).
+            let store = MmapLdeStore::new(h, w).unwrap();
+            for c in 0..w {
+                let col: Vec<Val> = (0..h).map(|r| src.values[r * w + c]).collect();
+                store.write_col_tile(c, 1, &col);
+            }
+            let sm = StoreMatrix::new(&store);
+            assert_eq!((sm.width(), sm.height()), (w, h));
+
+            // (a) exhaustive row equality — the disk-backed view reproduces every source row.
+            for r in 0..h {
+                let got: Vec<Val> = sm.row(r).unwrap().into_iter().collect();
+                assert_eq!(got.as_slice(), &src.values[r * w..(r + 1) * w], "row {r} differs (h=2^{log_h} w={w})");
+            }
+
+            // (b) the exact op p3's `open` runs over the whole LDE — byte-identical disk-view vs resident.
+            let alpha: Challenge = RowMajorMatrix::<Challenge>::rand(&mut rng, 1, 1).values[0];
+            let packed: Vec<_> = <Challenge as ExtensionField<Val>>::ExtensionPacking::packed_ext_powers_capped(alpha, w).collect();
+            let from_store: Vec<Challenge> = sm.rowwise_packed_dot_product::<Challenge>(&packed).collect();
+            let from_mem: Vec<Challenge> = src.rowwise_packed_dot_product::<Challenge>(&packed).collect();
+            assert_eq!(from_store, from_mem, "rowwise_packed_dot_product differs (h=2^{log_h} w={w})");
         }
     }
 
