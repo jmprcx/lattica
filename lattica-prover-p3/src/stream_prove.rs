@@ -19,8 +19,10 @@
 //!
 //! Feature-gated (`stream`, off by default) — RESEARCH, not on any production path.
 
-use crate::config::{Dft, MyCompress, MyHash, Val, CAP_HEIGHT};
+use crate::config::{Challenge, ChallengeMmcs, Dft, MyCompress, MyHash, Val, CAP_HEIGHT};
 use p3_dft::TwoAdicSubgroupDft;
+use p3_field::BasedVectorSpace;
+use p3_fri::CommitPhaseProofStep;
 use p3_goldilocks::default_goldilocks_poseidon2_8;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
@@ -207,6 +209,97 @@ pub fn stream_open(data: &StreamCommitData, index: usize) -> (Vec<Val>, Vec<Val>
         idx >>= 1;
     }
     (row, salt, proof)
+}
+
+// ── Streaming FRI (P3.6) ────────────────────────────────────────────────────────────────────────
+// The commit/open MMCS substrate above is over the BASE field. The FRI commit phase instead commits
+// each round's codeword over the EXTENSION field through p3's `ChallengeMmcs = ExtensionMmcs<Val,
+// Challenge, ValMmcs>`, which base-flattens each `Challenge` element into its `EXT_D` coordinates
+// (element-major, exactly `FlatMatrixView`) and then hides via the SAME production `ValMmcs`. So a FRI
+// round commit is just the streaming hiding commit applied to the base-flattened codeword — and a FRI
+// query open is `stream_open` + `reconstitute_from_base`. These two functions are the extension-field
+// bridge; `stream_prove_fri` (below) drives them round-by-round.
+
+/// Base coordinates per `Challenge` element (`Challenge`'s degree over `Val`). `ExtensionMmcs` flattens
+/// each committed extension element into this many consecutive base columns, element-major.
+const EXT_D: usize = <Challenge as BasedVectorSpace<Val>>::DIMENSION;
+
+/// Streaming HIDING commit of one FRI-round codeword, byte-identical to p3's per-round
+/// `params.mmcs.commit_matrix(RowMajorMatrix::new(folded, arity))` where `params.mmcs` is the production
+/// `ExtensionMmcs<Val, Challenge, ValMmcs>`. `folded` is the round's evaluation vector over `Challenge`
+/// in the bit-reversed order p3 keeps; reshaped to width `arity` it is the round's leaf matrix.
+///
+/// The out-of-core reproduction: base-flatten the codeword element-major (matching `FlatMatrixView`) and
+/// store it COLUMN-MAJOR on disk (each base column written from `folded` with only `h/arity` `Val`s
+/// transient — never the whole base matrix), so the query phase can seek any group by index; draw the
+/// `h/arity × SALT_ELEMS` salts in p3's exact `RowMajorMatrix::rand` order; frontier-Merkle the salted
+/// leaves keeping only the digest layers + salts resident. Unlike p3 — which keeps EVERY round's whole
+/// codeword-as-leaves AND its Merkle tree alive until the query phase — only the current round's store
+/// (on disk) and its small digest layers persist.
+///
+/// `cap()` of the result equals `ExtensionMmcs::commit_matrix(leaves).0` byte-for-byte; `stream_answer_query`
+/// opens it byte-identically to p3's `answer_query`.
+pub fn stream_commit_codeword<R: rand::Rng>(
+    folded: &[Challenge],
+    arity: usize,
+    cap_height: usize,
+    rng: &mut R,
+) -> std::io::Result<StreamCommitData> {
+    let n = folded.len();
+    assert!(arity >= 1 && n % arity == 0, "codeword length {n} must be a multiple of arity {arity}");
+    let h_leaf = n / arity;
+    let bw = arity * EXT_D; // base-flattened leaf width
+    let store = MmapLdeStore::new(h_leaf, bw)?;
+    // Write the base-flattened codeword COLUMN-MAJOR, one base column at a time (only `h_leaf` `Val`s
+    // transient). Base column `bc` is coordinate `bc % EXT_D` of extension column `bc / EXT_D`, read
+    // down the groups — the element-major flatten `FlatMatrixView` (and `flatten_to_base`) produce.
+    let mut col = vec![Val::default(); h_leaf];
+    for bc in 0..bw {
+        let (ec, co) = (bc / EXT_D, bc % EXT_D);
+        for (g, c) in col.iter_mut().enumerate() {
+            *c = folded[g * arity + ec].as_basis_coefficients_slice()[co];
+        }
+        store.write_col_tile(bc, 1, &col);
+    }
+    let salts = RowMajorMatrix::rand(rng, h_leaf, SALT_ELEMS).values;
+    let layers = stream_merkle_layers_inner(&store, cap_height, Some(&salts));
+    Ok(StreamCommitData { store, salts, layers })
+}
+
+/// One FRI query's opening of one commit-phase round — byte-identical to a single step of p3's
+/// `answer_query`. Given the round's streamed commit and the query's `current_index` into the round's
+/// codeword, seek the containing group (a strided row read from the on-disk store), reconstitute it to
+/// the extension field (p3's `reconstitute_from_base`, the inverse of the commit's base-flatten), drop
+/// the queried element to leave the `arity-1` sibling values, and package the salt + Merkle path as the
+/// `ExtensionMmcs` opening proof (which is the inner hiding proof unchanged). Returns the step and the
+/// parent `group_index` — the next round's `current_index`, exactly as p3 threads it.
+pub fn stream_answer_query(
+    data: &StreamCommitData,
+    log_arity: usize,
+    current_index: usize,
+) -> (CommitPhaseProofStep<Challenge, ChallengeMmcs>, usize) {
+    let arity = 1usize << log_arity;
+    let index_in_group = current_index % arity;
+    let group_index = current_index >> log_arity;
+    // Seek the base-flattened group row (`arity * EXT_D` `Val`s), its salt, and the sibling path.
+    let (base_row, salt, siblings) = stream_open(data, group_index);
+    debug_assert_eq!(base_row.len(), arity * EXT_D);
+    let opened_row = <Challenge as BasedVectorSpace<Val>>::reconstitute_from_base(base_row);
+    debug_assert_eq!(opened_row.len(), arity);
+    // Siblings = every group element except the queried one (p3's `filter(|(j, _)| *j != index_in_group)`).
+    let sibling_values: Vec<Challenge> = opened_row
+        .into_iter()
+        .enumerate()
+        .filter(|(j, _)| *j != index_in_group)
+        .map(|(_, v)| v)
+        .collect();
+    let step = CommitPhaseProofStep {
+        log_arity: log_arity as u8,
+        sibling_values,
+        // ExtensionMmcs::Proof == inner hiding Proof == (salts: Vec<Vec<Val>>, siblings: Vec<[Val; DIGEST]>).
+        opening_proof: (vec![salt], siblings),
+    };
+    (step, group_index)
 }
 
 /// A file-backed (mmap'd) store for one `h × w` LDE matrix, held **COLUMN-MAJOR** (element `(row, col)`
@@ -503,6 +596,61 @@ mod tests {
                 assert_eq!(p3_openings[0], row, "opened row != p3 at idx {idx} (h=2^{log_h} w={w})");
                 assert_eq!(p3_salts[0], salt, "salt != p3 at idx {idx}");
                 assert_eq!(p3_sibs, sibs, "sibling path != p3 at idx {idx}");
+            }
+        }
+    }
+
+    /// The streaming FRI-round commit + open (over the EXTENSION field) is byte-identical to p3's
+    /// production `ExtensionMmcs<Val, Challenge, ValMmcs>::commit_matrix` + a single `answer_query` step.
+    /// This retires the extension-flatten (`FlatMatrixView`) / reconstitution + hiding-over-extension
+    /// risk standalone — the two primitives `stream_prove_fri` drives round-by-round. Covers binary and
+    /// higher-arity folds (`log_arity` 1..3), which change only the leaf width (`arity * EXT_D`).
+    #[test]
+    fn stream_fri_commit_open_matches_p3() {
+        use crate::config::ValMmcs;
+        use p3_fri::CommitPhaseProofStep;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        let perm = default_goldilocks_poseidon2_8();
+        // (log_h, log_arity, seed): a height-2^log_h extension codeword folded into groups of 2^log_arity.
+        for &(log_h, log_arity, seed) in &[(4usize, 1usize, 10u64), (8, 1, 11), (8, 2, 12), (10, 3, 13), (6, 2, 14)] {
+            let h = 1usize << log_h;
+            let arity = 1usize << log_arity;
+            // Deterministic pseudo-random extension codeword (p3's StandardUniform draw order).
+            let folded: Vec<Challenge> =
+                RowMajorMatrix::<Challenge>::rand(&mut ChaCha20Rng::seed_from_u64(seed ^ 0xC0DE), h, 1).values;
+            let leaves = RowMajorMatrix::new(folded.clone(), arity); // (h/arity) × arity, extension
+
+            // Reference: the production ExtensionMmcs over the hiding ValMmcs, salts seeded.
+            let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(seed));
+            let challenge_mmcs = ChallengeMmcs::new(val_mmcs);
+            let (ref_commit, ref_data) = challenge_mmcs.commit_matrix(leaves);
+
+            // Mine: the same salt stream (a freshly seeded ChaCha20Rng), streamed out-of-core.
+            let data = stream_commit_codeword(&folded, arity, CAP_HEIGHT, &mut ChaCha20Rng::seed_from_u64(seed)).unwrap();
+
+            let ref_cap: &[[Val; DIGEST]] = ref_commit.as_ref();
+            assert_eq!(ref_cap, data.cap(), "FRI round commit cap != p3 at log_h={log_h} arity={arity}");
+
+            // Open several indices; compare the full CommitPhaseProofStep bytes (postcard = wire).
+            for &current_index in &[0usize, 1, arity, h / 3, h / 2, h - 1] {
+                let index_in_group = current_index % arity;
+                let group_index = current_index >> log_arity;
+                // Reference: p3's answer_query for one round (open the group, drop the queried element).
+                let (mut ref_rows, ref_proof) = challenge_mmcs.open_batch(group_index, &ref_data).unpack();
+                let ref_row = ref_rows.pop().unwrap();
+                let ref_sibs: Vec<Challenge> =
+                    ref_row.into_iter().enumerate().filter(|(j, _)| *j != index_in_group).map(|(_, v)| v).collect();
+                let ref_step = CommitPhaseProofStep::<Challenge, ChallengeMmcs> {
+                    log_arity: log_arity as u8,
+                    sibling_values: ref_sibs,
+                    opening_proof: ref_proof,
+                };
+                let (my_step, my_group) = stream_answer_query(&data, log_arity, current_index);
+                assert_eq!(my_group, group_index, "parent group_index != p3 at idx={current_index}");
+                let a = postcard::to_allocvec(&ref_step).unwrap();
+                let b = postcard::to_allocvec(&my_step).unwrap();
+                assert_eq!(a, b, "answer_query step != p3 at log_h={log_h} arity={arity} idx={current_index}");
             }
         }
     }
