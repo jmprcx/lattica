@@ -19,7 +19,7 @@
 //!
 //! Feature-gated (`stream`, off by default) — RESEARCH, not on any production path.
 
-use crate::config::{Challenge, ChallengeMmcs, Challenger, Dft, MyCompress, MyHash, Val, ValMmcs};
+use crate::config::{Challenge, ChallengeMmcs, Challenger, Dft, MyCompress, MyConfig, MyHash, Val, ValMmcs, CAP_HEIGHT};
 use core::marker::PhantomData;
 use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
 use p3_commit::{BatchOpening, Mmcs, OpenedValues, PolynomialSpace};
@@ -32,9 +32,15 @@ use p3_fri::{
     ProverDataWithOpeningPoints, QueryProof, TwoAdicFriFolding, TwoAdicFriFoldingForMmcs,
 };
 use p3_goldilocks::default_goldilocks_poseidon2_8;
+use p3_air::symbolic::{AirLayout, SymbolicAirBuilder};
+use p3_air::{Air, DebugConstraintBuilder};
 use p3_matrix::bitrev::BitReversibleMatrix;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
+use p3_uni_stark::{
+    get_log_num_quotient_chunks, quotient_values, Commitments, OpenedValues as StarkOpenedValues, Proof,
+    ProverConstraintFolder, StarkGenericConfig,
+};
 use p3_merkle_tree::MerkleCap;
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use p3_util::{log2_strict_usize, reverse_slice_index_bits};
@@ -1014,6 +1020,161 @@ pub fn stream_pcs_open(
     Ok((public_opened, random_opened, fri_proof))
 }
 
+/// Streamed `get_evaluations_on_domain` for the trace on the quotient domain — the FAST path of
+/// `TwoAdicFriPcs::get_evaluations_on_domain` (when the quotient domain is a `GENERATOR`-coset the committed
+/// LDE covers): the first `qsize` rows of the committed (bit-reversed) trace LDE, un-bit-reversed, then the
+/// `nrc` hiding-random columns truncated off (p3's `HidingFriPcs` `HorizontallyTruncated`). Reads only the
+/// row-prefix off the store (quotient-scale resident); feeds p3's `quotient_values`.
+fn stream_trace_on_quotient_domain(store: &MmapLdeStore, qsize: usize, keep_width: usize) -> RowMajorMatrix<Val> {
+    let full_w = store.width();
+    let mut vals = vec![Val::default(); qsize * full_w];
+    store.fill_row_block(0, qsize, &mut vals);
+    let bitrev = RowMajorMatrix::new(vals, full_w).bit_reverse_rows().to_row_major_matrix();
+    let mut out = Vec::with_capacity(qsize * keep_width);
+    for r in 0..qsize {
+        out.extend_from_slice(&bitrev.values[r * full_w..r * full_w + keep_width]);
+    }
+    RowMajorMatrix::new(out, keep_width)
+}
+
+/// The full streaming prover — an in-crate, prove-only fork of `p3_uni_stark::prove` (production `MyConfig`,
+/// `is_zk = 1`, no preprocessed) that keeps the trace/quotient LDEs off the heap: every commit is streamed
+/// out-of-core (trace via `stream_hiding_commit`, quotient via `stream_commit_quotient`, opt-random via
+/// `stream_commit`) and the open reads them back from disk (`stream_pcs_open`). The one RAM-heavy step
+/// still reused verbatim is p3's `quotient_values` (fed a quotient-scale row-prefix of the trace LDE).
+///
+/// BYTE-IDENTICAL to `p3_uni_stark::prove` on a config seeded with `(pcs_seed, mmcs_seed)`: the three
+/// ChaCha20 streams are threaded in p3's exact order — `pcs_rng` (trace random cols → quotient masking →
+/// opt-random matrix), `mmcs_rng` (trace → quotient → opt-random commit salts), `fri_salt_rng` (FRI round
+/// salts) — and every challenger observe/sample/grind matches. `config` supplies only the (rng-free)
+/// domains, periodic table, and challenger init; its internal rngs are unused (this fork draws from the
+/// explicit seeds). NB: p3's FRI grind is nondeterministic (`find_map_any`) — the differential gate runs
+/// both provers in a 1-thread rayon pool.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_prove<A>(
+    config: &MyConfig,
+    air: &A,
+    trace: RowMajorMatrix<Val>,
+    public_values: &[Val],
+    pcs_seed: u64,
+    mmcs_seed: u64,
+    c_block: usize,
+) -> std::io::Result<Proof<MyConfig>>
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<ProverConstraintFolder<'a, MyConfig>>
+        + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+{
+    use crate::config::{production_fri, MyPcs, LOG_BLOWUP, NUM_RANDOM_CODEWORDS};
+    use p3_commit::Pcs;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    let (nrc, log_blowup, is_zk) = (NUM_RANDOM_CODEWORDS, LOG_BLOWUP, 1usize);
+    let generator = <Val as Field>::GENERATOR;
+    let mut pcs_rng = ChaCha20Rng::seed_from_u64(pcs_seed);
+    let mut mmcs_rng = ChaCha20Rng::seed_from_u64(mmcs_seed);
+    let mut fri_salt_rng = ChaCha20Rng::seed_from_u64(mmcs_seed);
+
+    let degree = trace.height();
+    let log_degree = degree.trailing_zeros() as usize;
+    let log_ext_degree = log_degree + is_zk;
+    let preprocessed_width = 0usize;
+    assert_eq!(air.preprocessed_width(), 0, "stream_prove: preprocessed columns unsupported");
+    let layout = AirLayout {
+        preprocessed_width,
+        main_width: air.width(),
+        num_public_values: air.num_public_values(),
+        num_periodic_columns: air.num_periodic_columns(),
+        ..Default::default()
+    };
+    let log_num_quotient_chunks = get_log_num_quotient_chunks::<Val, A>(air, layout, is_zk);
+    let num_quotient_chunks = 1 << (log_num_quotient_chunks + is_zk);
+
+    let pcs = config.pcs();
+    let mut challenger = config.initialise_challenger();
+    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let ext_trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree * (is_zk + 1));
+
+    // ── trace commit (streamed) ──
+    let trace_data =
+        stream_hiding_commit(trace, nrc, log_blowup, generator, c_block, CAP_HEIGHT, &mut pcs_rng, &mut mmcs_rng)?;
+    let trace_commit = FriCommit::from(trace_data.cap().to_vec());
+
+    challenger.observe(Val::from_u8(log_ext_degree as u8));
+    challenger.observe(Val::from_u8(log_degree as u8));
+    challenger.observe(Val::from_usize(preprocessed_width));
+    challenger.observe(trace_commit.clone());
+    challenger.observe_slice(public_values);
+
+    let alpha: Challenge = challenger.sample_algebra_element();
+
+    // ── quotient (p3's quotient_values on a streamed trace-on-quotient-domain) ──
+    let quotient_domain = ext_trace_domain.create_disjoint_domain(1 << (log_ext_degree + log_num_quotient_chunks));
+    let qsize = quotient_domain.size();
+    assert!(
+        quotient_domain.shift() == generator && trace_data.store.height() >= qsize,
+        "streamed get_evaluations_on_domain fast path not applicable (shift/height)"
+    );
+    let trace_on_quotient_domain = stream_trace_on_quotient_domain(&trace_data.store, qsize, air.width());
+    let quotient = quotient_values::<MyConfig, A, _>(
+        pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
+    );
+    let quotient_flat = RowMajorMatrix::new_col(quotient).flatten_to_base();
+
+    // ── quotient commit (streamed) ──
+    let quotient_data = stream_commit_quotient(
+        quotient_domain, quotient_flat, num_quotient_chunks, log_blowup, nrc, c_block, CAP_HEIGHT, &mut pcs_rng, &mut mmcs_rng,
+    )?;
+    let quotient_commit = FriCommit::from(quotient_data.cap().to_vec());
+    challenger.observe(quotient_commit.clone());
+
+    // ── opt-randomization commit (ZK) ──
+    let r_mat = RowMajorMatrix::<Val>::rand(&mut pcs_rng, ext_trace_domain.size(), nrc + 2);
+    let r_data = stream_commit(r_mat, log_blowup, generator, c_block, CAP_HEIGHT, &mut mmcs_rng)?;
+    let r_commit = FriCommit::from(r_data.cap().to_vec());
+    challenger.observe(r_commit.clone());
+
+    let zeta: Challenge = challenger.sample_algebra_element();
+    let zeta_next = trace_domain.next_point(zeta).expect("domain should support next_point");
+    let main_next = !air.main_next_row_columns().is_empty();
+    let round1_points = if main_next { vec![zeta, zeta_next] } else { vec![zeta] };
+
+    // ── open at ζ (streamed): rounds are [opt-random, trace, quotient] (ZK ⇒ TRACE_IDX=1, QUOTIENT_IDX=2). ──
+    let fri_params = production_fri(ChallengeMmcs::new(ValMmcs::new(
+        MyHash::new(default_goldilocks_poseidon2_8()),
+        MyCompress::new(default_goldilocks_poseidon2_8()),
+        CAP_HEIGHT,
+        ChaCha20Rng::seed_from_u64(0),
+    )));
+    let rounds = vec![
+        (r_data.round_view(), vec![vec![zeta]]),
+        (trace_data.round_view(), vec![round1_points]),
+        (quotient_data.round_view(), vec![vec![zeta]; num_quotient_chunks]),
+    ];
+    let (opened_values, random_opened, fri_proof) =
+        stream_pcs_open(&rounds, &mut challenger, &fri_params, nrc, log_blowup, CAP_HEIGHT, &mut fri_salt_rng)?;
+
+    // ── assemble Proof (mirror prove_gpu:428-443) ──
+    let (trace_idx, quotient_idx) = (1usize, 2usize);
+    let trace_local = opened_values[trace_idx][0][0].clone();
+    let trace_next = if main_next { Some(opened_values[trace_idx][0][1].clone()) } else { None };
+    let quotient_chunks = opened_values[quotient_idx].iter().map(|v| v[0].clone()).collect();
+    let random = Some(opened_values[0][0][0].clone());
+
+    let opened_values = StarkOpenedValues {
+        trace_local,
+        trace_next,
+        preprocessed_local: None,
+        preprocessed_next: None,
+        quotient_chunks,
+        random,
+    };
+    let commitments = Commitments { trace: trace_commit, quotient_chunks: quotient_commit, random: Some(r_commit) };
+    Ok(Proof { commitments, opened_values, opening_proof: (random_opened, fri_proof), degree_bits: log_ext_degree })
+}
+
 /// A file-backed (mmap'd) store for one `h × w` LDE matrix, held **COLUMN-MAJOR** (element `(row, col)`
 /// at `map[col*h + row]`) — the out-of-core substrate that keeps the multi-GB LDE off the anonymous heap.
 /// Column-major is what makes both directions ONE sequential pass and dodges the transpose barrier:
@@ -1219,7 +1380,6 @@ impl Matrix<Val> for StoreMatrix<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CAP_HEIGHT; // test-only: the production Merkle cap height
     use p3_commit::Mmcs;
     use p3_field::Field;
     use p3_matrix::dense::RowMajorMatrix;
@@ -1732,6 +1892,60 @@ mod tests {
             let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
             assert_eq!(p3_cap, data.cap(), "streamed quotient commit != pcs.commit_quotient at log_ext={log_ext} chunks={num_chunks}");
         }
+    }
+
+    /// THE END-TO-END GATE: the full `stream_prove` is byte-identical to `p3_uni_stark::prove` and its
+    /// proof verifies. Builds a deterministic `MyConfig` (all three rngs seeded), runs both provers on the
+    /// real `JoinSplitAir` inside a 1-thread pool (FRI grind determinism), and asserts the whole `Proof`
+    /// serializes byte-for-byte (with commitments/opened-values localizers) — then verifies the streamed
+    /// proof under the production verifier. This is I3: trace + quotient + opt-random commits streamed
+    /// out-of-core, quotient reused, open streamed, all byte-exact.
+    #[test]
+    fn stream_prove_matches_p3() {
+        use crate::config::{production_fri, MyConfig, MyPcs, ValMmcs, NUM_RANDOM_CODEWORDS};
+        use crate::joinsplit_air::{self, JoinSplitAir};
+        use p3_uni_stark::{prove, verify};
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        let perm = default_goldilocks_poseidon2_8();
+        let (pcs_seed, mmcs_seed, cblk) = (1u64, 2u64, 4usize);
+        let build_config = || {
+            let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(mmcs_seed));
+            let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+            let fri = production_fri(challenge_mmcs);
+            let pcs = MyPcs::new(Dft::default(), val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::seed_from_u64(pcs_seed));
+            MyConfig::new(pcs, Challenger::new(perm.clone()))
+        };
+        let w = joinsplit_air::demo_witness();
+        let pis = joinsplit_air::public_values(&w);
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let (p3_proof, my_proof) = pool.install(|| {
+            let cfg1 = build_config();
+            let p3 = prove(&cfg1, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
+            let cfg2 = build_config();
+            let my = stream_prove(&cfg2, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis, pcs_seed, mmcs_seed, cblk).unwrap();
+            (p3, my)
+        });
+
+        assert_eq!(
+            postcard::to_allocvec(&p3_proof.commitments).unwrap(),
+            postcard::to_allocvec(&my_proof.commitments).unwrap(),
+            "commitments differ"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&p3_proof.opened_values).unwrap(),
+            postcard::to_allocvec(&my_proof.opened_values).unwrap(),
+            "opened_values differ"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&p3_proof).unwrap(),
+            postcard::to_allocvec(&my_proof).unwrap(),
+            "stream_prove != p3_uni_stark::prove"
+        );
+
+        let cfg = build_config();
+        assert!(verify(&cfg, &JoinSplitAir, &my_proof, &pis).is_ok(), "streamed proof must verify under the production verifier");
     }
 
     /// Peak resident set (VmHWM) in MiB, from /proc/self/status.
