@@ -526,38 +526,44 @@ fn stream_get_quotient_ldes_to_stores<R: rand::Rng + Send + Sync>(
     for (i, (domain, evals)) in domains.into_iter().zip(randomized_evaluations).enumerate() {
         let shift = g / domain.shift();
         let random_values = &all_random_values[i * h * w..(i + 1) * h * w];
-        let mut lde_evals = dft.coset_lde_batch(evals, log_blowup + 1, shift).to_row_major_matrix();
-
-        // v_H(X)·r(X) over the LDE (v_H = (g·X/domain.shift)^n - 1), added to the quotient chunk.
-        let mut vanishing_poly_coeffs = <Val as PrimeCharacteristicRing>::zero_vec((h * w) << (log_blowup + 1));
         let p = shift.exp_u64(h as u64);
-        g.powers().take(h).enumerate().for_each(|(ii, p_i)| {
-            for jj in 0..w {
-                let mul_coeff = p_i * random_values[ii * w + jj];
-                vanishing_poly_coeffs[ii * w + jj] -= mul_coeff;
-                vanishing_poly_coeffs[(h + ii) * w + jj] = p * mul_coeff;
-            }
-        });
-        let random_eval = dft.dft_batch(RowMajorMatrix::new(vanishing_poly_coeffs, w)).to_row_major_matrix();
-        for k in 0..h * w * (1 << (log_blowup + 1)) {
-            lde_evals.values[k] += random_eval.values[k];
-        }
-        let chunk = lde_evals.bit_reverse_rows().to_row_major_matrix();
+        let big = h << (log_blowup + 1); // chunk LDE height
+        let store = MmapLdeStore::new(big, w)?;
 
-        // Write the (row-major, committed-order) chunk into a COLUMN-MAJOR store, column-tiled, then drop it.
-        let (ch, cw_full) = (chunk.height(), chunk.width());
-        let store = MmapLdeStore::new(ch, cw_full)?;
+        // Compute the chunk's LDE a COLUMN-TILE at a time and write each tile to the store — coset-LDE (each
+        // column an independent poly), the vanishing-poly masking (each column depends only on its own
+        // random_values column), the DFT, and the row bit-reversal are ALL column-separable, so a `big ×
+        // c_block` tile is byte-identical to the corresponding columns of the whole-chunk computation. Only
+        // that tile ever resides (never the whole chunk), so the quotient commit's RAM floor is `big·c_block`
+        // instead of `big·w`.
         let mut c0 = 0usize;
-        while c0 < cw_full {
-            let cw = c_block.min(cw_full - c0);
-            let mut tile = Vec::with_capacity(ch * cw);
-            for r in 0..ch {
-                tile.extend_from_slice(&chunk.values[r * cw_full + c0..r * cw_full + c0 + cw]);
+        while c0 < w {
+            let cw = c_block.min(w - c0);
+            // Gather the tile's input columns [c0, c0+cw) from the (resident, subdomain-scale) chunk evals.
+            let mut evals_tile = Vec::with_capacity(h * cw);
+            for r in 0..h {
+                evals_tile.extend_from_slice(&evals.values[r * w + c0..r * w + c0 + cw]);
             }
-            store.write_col_tile(c0, cw, &tile);
+            let mut lde_tile =
+                dft.coset_lde_batch(RowMajorMatrix::new(evals_tile, cw), log_blowup + 1, shift).to_row_major_matrix();
+
+            // v_H(X)·r(X) for exactly these columns.
+            let mut vanishing_tile = <Val as PrimeCharacteristicRing>::zero_vec((h * cw) << (log_blowup + 1));
+            g.powers().take(h).enumerate().for_each(|(ii, p_i)| {
+                for jj in 0..cw {
+                    let mul_coeff = p_i * random_values[ii * w + c0 + jj];
+                    vanishing_tile[ii * cw + jj] -= mul_coeff;
+                    vanishing_tile[(h + ii) * cw + jj] = p * mul_coeff;
+                }
+            });
+            let random_eval_tile = dft.dft_batch(RowMajorMatrix::new(vanishing_tile, cw)).to_row_major_matrix();
+            for k in 0..h * cw * (1 << (log_blowup + 1)) {
+                lde_tile.values[k] += random_eval_tile.values[k];
+            }
+            let chunk_tile = lde_tile.bit_reverse_rows().to_row_major_matrix();
+            store.write_col_tile(c0, cw, &chunk_tile.values);
             c0 += cw;
         }
-        drop(chunk);
         stores.push(store);
     }
     Ok(stores)
