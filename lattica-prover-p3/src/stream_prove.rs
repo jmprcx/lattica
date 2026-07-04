@@ -39,6 +39,16 @@ pub trait LeafSource: Sync {
     fn height(&self) -> usize;
     fn width(&self) -> usize;
     fn fill_row(&self, row: usize, out: &mut [Val]);
+    /// Fill `nr` consecutive rows starting at `r0` into `out` (row-major `nr × width`). The frontier
+    /// Merkle reads through THIS (in row-blocks), so a COLUMN-MAJOR store can override it to read `width`
+    /// contiguous column-segments — `width` interleaved sequential streams, ~one pass — instead of the
+    /// strided per-row gather. The default is the row-major per-row fill.
+    fn fill_row_block(&self, r0: usize, nr: usize, out: &mut [Val]) {
+        let w = self.width();
+        for i in 0..nr {
+            self.fill_row(r0 + i, &mut out[i * w..(i + 1) * w]);
+        }
+    }
 }
 
 /// A `LeafSource` over an already-materialized row-major matrix — the Vec-backed store used to pin the
@@ -73,16 +83,22 @@ pub fn stream_merkle_cap<S: LeafSource>(src: &S, cap_height: usize) -> Vec<[Val;
     let hash = MyHash::new(perm.clone());
     let compress = MyCompress::new(perm);
 
-    // Leaf digest layer: hash each row from the source, discarding the row (only the digests survive).
-    let mut layer: Vec<[Val; DIGEST]> = {
-        let mut row = vec![Val::default(); w];
-        (0..h)
-            .map(|i| {
-                src.fill_row(i, &mut row);
-                hash.hash_iter(row.iter().copied())
-            })
-            .collect()
-    };
+    // Leaf digest layer: hash rows in blocks (so a column-major store reads `w` contiguous
+    // column-segments per block — one streaming pass — rather than a strided per-row gather). Only the
+    // block buffer (ROW_BLOCK × w) and the digests ever reside; the wide leaves are never fully held.
+    const ROW_BLOCK: usize = 4096;
+    let bh = ROW_BLOCK.min(h);
+    let mut block = vec![Val::default(); bh * w];
+    let mut layer: Vec<[Val; DIGEST]> = Vec::with_capacity(h);
+    let mut r0 = 0usize;
+    while r0 < h {
+        let nr = bh.min(h - r0);
+        src.fill_row_block(r0, nr, &mut block[..nr * w]);
+        for i in 0..nr {
+            layer.push(hash.hash_iter(block[i * w..(i + 1) * w].iter().copied()));
+        }
+        r0 += nr;
+    }
 
     // Compress pairwise (arity 2) up to the cap. `h` is a power of two, so every layer length is even
     // until it reaches the cap; a tree shorter than the cap clamps to the leaf layer (p3's effective cap).
@@ -93,11 +109,17 @@ pub fn stream_merkle_cap<S: LeafSource>(src: &S, cap_height: usize) -> Vec<[Val;
     layer
 }
 
-/// A file-backed (mmap'd) store for one `h × w` LDE matrix — the out-of-core substrate that keeps the
-/// multi-GB LDE off the anonymous heap. Written a column-tile at a time (sequential) and read row-by-row
-/// for the frontier Merkle (sequential); later, by query index for FRI opening (sparse seeks). The
-/// difference from the Phase 2 allocator: access here is EXPLICIT and sequential, so the OS streams it
-/// (evicts behind the read head) instead of thrashing on p3's blind whole-buffer re-touch.
+/// A file-backed (mmap'd) store for one `h × w` LDE matrix, held **COLUMN-MAJOR** (element `(row, col)`
+/// at `map[col*h + row]`) — the out-of-core substrate that keeps the multi-GB LDE off the anonymous heap.
+/// Column-major is what makes both directions ONE sequential pass and dodges the transpose barrier:
+/// - **write** a column-tile → each column is a contiguous segment `[(c0+c)*h, (c0+c+1)*h)`, so the whole
+///   LDE is written in one forward pass as `c0` advances (independent of the tile width);
+/// - **read** for the frontier Merkle → `fill_row_block` reads `w` contiguous column-segments per row-block
+///   (w interleaved sequential streams), one pass over the store.
+///
+/// Access is EXPLICIT and sequential, so the OS streams it (evicts behind the read head) instead of
+/// thrashing on p3's blind whole-buffer re-touch (the Phase 2 allocator's failure). Later, FRI opening
+/// reads individual rows by `fill_row` (sparse strided seeks — cheap at 96 queries).
 pub struct MmapLdeStore {
     map: *mut Val,
     n: usize,
@@ -155,15 +177,19 @@ impl MmapLdeStore {
         unsafe { std::slice::from_raw_parts(self.map, self.n) }
     }
 
-    /// Write `vals` — a fragment of `row` starting at column `c0`. Disjoint (row, c0) ranges may be
-    /// written from different threads; the caller writes each tile before any read of it.
-    #[inline]
-    pub fn write_cols(&self, row: usize, c0: usize, vals: &[Val]) {
-        let off = row * self.w + c0;
-        debug_assert!(off + vals.len() <= self.n, "store write out of bounds");
-        // SAFETY: `[off, off+len)` is in-bounds and, per the type invariant, not concurrently read.
-        unsafe {
-            std::ptr::copy_nonoverlapping(vals.as_ptr(), self.map.add(off), vals.len());
+    /// Write a `h × cw` ROW-MAJOR LDE tile (columns `[c0, c0+cw)`, `tile[r*cw + c]`) into the COLUMN-MAJOR
+    /// store: column `c0+c` fills the contiguous segment `[(c0+c)*h, (c0+c+1)*h)`. As `c0` advances across
+    /// tiles this writes the whole store front-to-back in one sequential pass. The per-column transpose of
+    /// the (small, resident) tile is in-RAM; the disk write is sequential.
+    pub fn write_col_tile(&self, c0: usize, cw: usize, tile: &[Val]) {
+        debug_assert_eq!(tile.len(), self.h * cw, "tile must be h*cw");
+        debug_assert!((c0 + cw) * self.h <= self.n, "column tile out of bounds");
+        for c in 0..cw {
+            // SAFETY: `[(c0+c)*h, +h)` is in-bounds; distinct columns are disjoint; written before any read.
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.map.add((c0 + c) * self.h), self.h) };
+            for (r, d) in dst.iter_mut().enumerate() {
+                *d = tile[r * cw + c];
+            }
         }
     }
 }
@@ -185,25 +211,36 @@ impl LeafSource for MmapLdeStore {
     fn width(&self) -> usize {
         self.w
     }
+    /// One row by strided gather across the `w` column-segments — for sparse FRI-query reads.
     fn fill_row(&self, row: usize, out: &mut [Val]) {
-        out.copy_from_slice(&self.slice()[row * self.w..(row + 1) * self.w]);
+        let s = self.slice();
+        for (c, o) in out.iter_mut().enumerate() {
+            *o = s[c * self.h + row];
+        }
+    }
+    /// A block of `nr` rows, read as `w` contiguous column-segments `[c*h + r0, +nr)` (w interleaved
+    /// sequential streams over the store) transposed into `out` (row-major `nr × w`) — one streaming pass.
+    fn fill_row_block(&self, r0: usize, nr: usize, out: &mut [Val]) {
+        let s = self.slice();
+        for c in 0..self.w {
+            let seg = &s[c * self.h + r0..c * self.h + r0 + nr];
+            for i in 0..nr {
+                out[i * self.w + c] = seg[i];
+            }
+        }
     }
 }
 
-/// Compute the coset-LDE of `trace` a COLUMN-TILE at a time and write it (bit-reversed row order —
-/// p3's storage order) into `store`, so only one `big × c_block` tile ever resides, never the whole
-/// `big × w` LDE. Byte-identical to `Dft::coset_lde_batch(trace, added_bits, shift)`: columns are
-/// independent polynomials (a column subset yields identical per-column output) and the row
-/// bit-reversal is column-independent. `store` must be sized `big × w` (`big = h << added_bits`).
+/// Compute the coset-LDE of `trace` a COLUMN-TILE at a time and write each tile into the COLUMN-MAJOR
+/// `store` (via `write_col_tile`), so only one `big × c_block` tile ever resides, never the whole
+/// `big × w` LDE, and the store is written FRONT-TO-BACK in ONE sequential pass (each column is a
+/// contiguous segment). Byte-identical to `Dft::coset_lde_batch(trace, added_bits, shift)` read
+/// row-major: columns are independent polynomials (a column subset yields identical per-column output)
+/// and the row bit-reversal is column-independent. `store` must be `big × w` (`big = h << added_bits`).
 ///
-/// MEASURED (the transpose barrier): a 1.66 GiB LDE (batch h=2^18, w=53) streams to disk + frontier
-/// Merkles under a 1 GB hard cgroup cap (peak RSS 1018 MiB) and COMPLETES — where the Phase 2 allocator
-/// thrashed to death at gentler caps. So the RAM bound is real (explicit sequential access streams;
-/// no random re-touch). BUT it is I/O-heavy: writing column-tiles into a ROW-MAJOR store makes
-/// `w/c_block` forward passes over the file (~13 for the batch), each doing full disk I/O under a tight
-/// cap → ~4 min vs ~2 s in-RAM, and `w/c_block` scales badly for the wide aggregator (w=1291). The next
-/// increment fixes this with a COLUMN-MAJOR store (one sequential write pass) + a transposed-block
-/// Merkle read (~2 passes total, independent of `w`).
+/// Paired with the frontier Merkle's transposed-block read, the whole out-of-core commit is ~2
+/// sequential passes over the store, INDEPENDENT of `w` — so it is RAM-bounded AND fast, unlike the
+/// row-major-store predecessor (`w/c_block` passes) and the Phase 2 allocator (thrashed under pressure).
 pub fn stream_coset_lde_to_store(trace: &RowMajorMatrix<Val>, added_bits: usize, shift: Val, c_block: usize, store: &MmapLdeStore) {
     let (h, w) = (trace.height(), trace.width());
     let big = h << added_bits;
@@ -221,9 +258,7 @@ pub fn stream_coset_lde_to_store(trace: &RowMajorMatrix<Val>, added_bits: usize,
         }
         // coset-LDE the narrow tile -> big×cw, bit-reversed rows (p3's storage order), then discard it
         let lde = dft.coset_lde_batch(RowMajorMatrix::new(sub, cw), added_bits, shift).to_row_major_matrix();
-        for r in 0..big {
-            store.write_cols(r, c0, &lde.values[r * cw..(r + 1) * cw]);
-        }
+        store.write_col_tile(c0, cw, &lde.values);
         c0 += cw;
     }
 }
@@ -274,9 +309,13 @@ mod tests {
                 .collect();
             let mat = RowMajorMatrix::new(vals, w);
             let p3_lde = dft.coset_lde_batch(mat.clone(), added, shift).to_row_major_matrix();
-            let store = MmapLdeStore::new(h << added, w).unwrap();
+            let big = h << added;
+            let store = MmapLdeStore::new(big, w).unwrap();
             stream_coset_lde_to_store(&mat, added, shift, cblk, &store);
-            assert_eq!(store.slice(), p3_lde.values.as_slice(), "streamed LDE store != p3 at h=2^{log_h} w={w} cblk={cblk}");
+            // reconstruct the row-major matrix from the COLUMN-MAJOR store and compare to p3's whole LDE
+            let mut got = vec![Val::default(); big * w];
+            store.fill_row_block(0, big, &mut got);
+            assert_eq!(got, p3_lde.values, "streamed LDE store (row-major view) != p3 at h=2^{log_h} w={w} cblk={cblk}");
         }
     }
 
@@ -316,12 +355,15 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// RAM bench: stream a large trace's LDE (blowup 16) into the mmap store and frontier-Merkle it,
-    /// entirely out-of-core. The commit's LDE (the multi-GB buffer) lives on disk; access is EXPLICIT and
-    /// sequential (column-tile write passes + one row-wise Merkle read), so under a cgroup cap it completes
-    /// with BOUNDED RSS — where the Phase 2 allocator thrashed on p3's blind whole-buffer re-touch. Run it
-    /// under `systemd-run --user --scope -p MemoryMax=<cap>` on a nodatacow scratch. Tunables:
-    /// LATTICA_STREAM_LOGH (default 18), LATTICA_STREAM_W (53), LATTICA_STREAM_CBLK (4).
+    /// RAM bench: stream a large trace's LDE (blowup 16) into the column-major mmap store and
+    /// frontier-Merkle it, entirely out-of-core. The commit's LDE (the multi-GB buffer) lives on disk;
+    /// access is EXPLICIT and sequential (one column-major write pass + one transposed-block Merkle read),
+    /// so under a cgroup cap it completes with BOUNDED RSS — where the Phase 2 allocator thrashed on p3's
+    /// blind whole-buffer re-touch. Run under `systemd-run --user --scope -p MemoryMax=<cap>` on a
+    /// nodatacow scratch. Tunables: LATTICA_STREAM_LOGH (18), LATTICA_STREAM_W (53), LATTICA_STREAM_CBLK (4).
+    ///
+    /// MEASURED: 1.66 GiB LDE (h=2^18, w=53) under a 1 GB HARD cap → RSS 1013 MiB, 41 s — vs 233 s for the
+    /// row-major-store predecessor at the same RAM bound (5.6x; ~2 sequential passes, w-independent).
     #[test]
     #[ignore = "bench: out-of-core LDE+Merkle RAM (LATTICA_STREAM_LOGH=<n>, LATTICA_SPILL_DIR=<disk>)"]
     fn stream_commit_ram_bench() {
