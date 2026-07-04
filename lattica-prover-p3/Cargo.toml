@@ -39,6 +39,7 @@ serde = { version = "1", default-features = false, features = ["alloc", "derive"
 # GPU-accelerated proving (opt-in): OpenCL DFT/LDE. Default build never pulls these.
 ocl = { version = "0.19", optional = true }
 rayon = { version = "1", optional = true } # parallelize the GPU leaf-buffer marshalling
+libc = { version = "0.2", optional = true } # streaming: mmap/ftruncate/munmap for the spill allocator
 
 [features]
 # Enable GPU (OpenCL) acceleration of the LDE. Additive + prove-only: the default CPU proving path,
@@ -49,6 +50,12 @@ gpu = ["dep:ocl", "dep:rayon"]
 # gating it out keeps the default staticlib to the frozen node seam. Its ~80 `#[ignore]` tests + the 2 monolith
 # constraint-fingerprint pins compile only under this feature. Run with `--features recursion`.
 recursion = []
+# Enable the RESEARCH out-of-core (streaming) prover: a `#[global_allocator]` that spills large
+# allocations (the trace/quotient/Merkle LDE) to a memory-mapped file on NVMe, bounding the prover's
+# peak RSS under a cgroup ceiling instead of holding the whole LDE in RAM. Additive + prove-only +
+# BYTE-IDENTICAL (only the backing store changes); OFF by default so the production staticlib and the
+# 10 frozen externs never install it. Run with `--features stream`. See `src/spill_alloc.rs`.
+stream = ["dep:libc"]
 
 [profile.release]
 # Cross-crate inlining of p3's hot field-arithmetic / NTT / Poseidon2 loops (thin LTO + one codegen

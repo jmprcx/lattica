@@ -114,6 +114,11 @@ where
         + for<'a> Air<ProverConstraintFolder<'a, MyConfig>>
         + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
 {
+    // Streaming builds (`--features stream`) spill the LDE/quotient/Merkle buffers to an mmap'd file for
+    // the duration of this prove — bounding peak RSS. No-op (and zero cost) in the default build. Prove
+    // is the only path armed; the verifier + the 10 frozen externs never spill. Byte-transparent.
+    #[cfg(feature = "stream")]
+    let _spill = crate::spill_alloc::SpillScope::arm();
     let proof = prove(&make_config(), air, trace, pis);
     postcard::to_allocvec(&proof).expect("proof serialization is infallible")
 }

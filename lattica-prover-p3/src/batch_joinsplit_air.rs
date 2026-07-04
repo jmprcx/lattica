@@ -445,6 +445,42 @@ mod tests {
         );
     }
 
+    /// Same block-size RAM/time bench under the OUT-OF-CORE allocator (`--features stream`): the trace,
+    /// quotient, and Merkle-leaf LDE buffers spill to an mmap'd file, so peak RSS is bounded by
+    /// page-cache pressure (set a cgroup `memory.high`) instead of the whole LDE living in RAM. The proof
+    /// VERIFIES under the production verifier — spilling is byte-transparent (mmap-backed memory holds
+    /// identical bytes; the mechanics are pinned byte-exact by `spill_alloc::tests`). Reports peak RSS and
+    /// the spill high-water mark. Point `LATTICA_SPILL_DIR` at a disk-backed (ideally `chattr +C`) scratch.
+    #[cfg(feature = "stream")]
+    #[test]
+    #[ignore = "bench: batch RAM/time under the spill allocator (LATTICA_BATCH_N=<n>, LATTICA_SPILL_DIR=<disk>)"]
+    fn batch_ram_bench_stream() {
+        use p3_matrix::Matrix;
+        let n: usize = std::env::var("LATTICA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(64).max(1);
+        let ws: Vec<Witness> = (0..n).map(|i| variant_asset(1000 + i as u64)).collect();
+        let root = batch_root(&ws);
+        let trace = build_batch_trace(&ws);
+        let (rows, w) = (trace.height(), trace.width());
+        crate::spill_alloc::reset_spill_peak();
+        let t0 = std::time::Instant::now();
+        let bytes = {
+            let _g = crate::spill_alloc::SpillScope::arm();
+            let proof = prove(&make_config(), &JoinSplitBatchAir, trace, &root);
+            postcard::to_allocvec(&proof).unwrap()
+        };
+        let prove_s = t0.elapsed().as_secs_f64();
+        let spill_peak = crate::spill_alloc::spill_peak_bytes();
+        assert!(verify_batch_bytes(&bytes, &root), "batch of {n} verifies (spill-proven)");
+        assert!(spill_peak > 0, "the LDE must spill to mmap while armed (n={n}); needs a block whose LDE exceeds the 64 MiB threshold + a writable LATTICA_SPILL_DIR");
+        println!(
+            "BATCH-BENCH-STREAM n={n} padded_tiles={} rows={rows} width={w} peak_rss={}MiB spill_peak={}MiB prove={prove_s:.1}s proof={}KiB",
+            padded_tiles(n),
+            peak_rss_mib(),
+            spill_peak / (1 << 20),
+            bytes.len() / 1024
+        );
+    }
+
     #[test]
     fn batch_root_folds_in_order_with_iv_and_padding() {
         let ws = [variant(1), variant(2), variant(3)];

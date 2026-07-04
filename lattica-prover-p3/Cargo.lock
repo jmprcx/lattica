@@ -216,6 +216,7 @@ dependencies = [
 name = "lattica-prover-p3"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ocl",
  "p3-air",
  "p3-baby-bear",
