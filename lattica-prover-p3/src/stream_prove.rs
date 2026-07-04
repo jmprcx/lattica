@@ -234,6 +234,133 @@ pub fn stream_hiding_commit<R1: rand::Rng + Send + Sync, R2: rand::Rng>(
     stream_commit(randomized, added_bits, shift, c_block, cap_height, mmcs_rng)
 }
 
+/// Prover data for a BATCH hiding commit of K SAME-height matrices in ONE Merkle tree — the quotient's
+/// multi-chunk commit (`num_chunks` LDEs committed together, one root). Each matrix has its own on-disk
+/// store + salt column-block; the digest layers are shared. `cap()` is the (single) commitment.
+pub struct StreamBatchCommitData {
+    pub stores: Vec<MmapLdeStore>,
+    pub salts: Vec<Vec<Val>>,
+    pub layers: Vec<Vec<[Val; DIGEST]>>,
+}
+
+impl StreamBatchCommitData {
+    /// The commitment cap — byte-identical to `MerkleTreeHidingMmcs::commit(mats).0`.
+    pub fn cap(&self) -> &[[Val; DIGEST]] {
+        self.layers.last().expect("at least the leaf layer")
+    }
+}
+
+/// Frontier hiding Merkle over K SAME-height matrices: leaf row `i` is the hash of the concatenation, in
+/// matrix order, of each matrix's row `i` immediately followed by that matrix's salt row —
+/// `hash([m0[i] | salt0[i] | m1[i] | salt1[i] | … | mK[i] | saltK[i]])` — exactly p3's
+/// `hash_iter(matrices.flat_map(|HP(m_j, salt_j)| row_i))` (`merkle_tree.rs:330`), then pairwise-compress
+/// to the cap. Reads each store in row-blocks (transposed-block, one streaming pass); only the block
+/// buffers + the digests reside.
+fn stream_merkle_layers_batch(stores: &[MmapLdeStore], salts: &[Vec<Val>], cap_height: usize) -> Vec<Vec<[Val; DIGEST]>> {
+    let h = stores[0].height();
+    assert!(h.is_power_of_two(), "batch Merkle: height must be a power of two (got {h})");
+    let perm = default_goldilocks_poseidon2_8();
+    let hash = MyHash::new(perm.clone());
+    let compress = MyCompress::new(perm);
+
+    const ROW_BLOCK: usize = 4096;
+    let bh = ROW_BLOCK.min(h);
+    // One transposed row-block buffer per store.
+    let mut blocks: Vec<Vec<Val>> = stores.iter().map(|s| vec![Val::default(); bh * s.width()]).collect();
+    let mut leaf: Vec<[Val; DIGEST]> = Vec::with_capacity(h);
+    let mut r0 = 0usize;
+    while r0 < h {
+        let nr = bh.min(h - r0);
+        for (j, s) in stores.iter().enumerate() {
+            s.fill_row_block(r0, nr, &mut blocks[j][..nr * s.width()]);
+        }
+        for i in 0..nr {
+            let r = r0 + i;
+            let data = stores.iter().enumerate().flat_map(|(j, s)| {
+                let w = s.width();
+                blocks[j][i * w..(i + 1) * w]
+                    .iter()
+                    .copied()
+                    .chain(salts[j][r * SALT_ELEMS..(r + 1) * SALT_ELEMS].iter().copied())
+            });
+            leaf.push(hash.hash_iter(data));
+        }
+        r0 += nr;
+    }
+
+    let cap_len = (1usize << cap_height).min(leaf.len());
+    let mut layers = vec![leaf];
+    while layers.last().unwrap().len() > cap_len {
+        let next: Vec<[Val; DIGEST]> =
+            layers.last().unwrap().chunks_exact(2).map(|c| compress.compress([c[0], c[1]])).collect();
+        layers.push(next);
+    }
+    layers
+}
+
+/// Streaming BATCH hiding commit of K already-LDE'd SAME-height matrices (the quotient chunks, which
+/// `get_quotient_ldes` returns already in committed bit-reversed order) — byte-identical to
+/// `MerkleTreeHidingMmcs::commit(mats)` (= the production `commit_ldes` → `mmcs.commit`). Writes each
+/// matrix to its own column-major store, draws the `h × SALT_ELEMS` salts PER MATRIX in order (p3's map
+/// order over the batch), then frontier-Merkles the concatenated salted rows. Opens byte-identically via
+/// `stream_open_batch`.
+pub fn stream_commit_batch<R: rand::Rng>(
+    mats: Vec<RowMajorMatrix<Val>>,
+    c_block: usize,
+    cap_height: usize,
+    rng: &mut R,
+) -> std::io::Result<StreamBatchCommitData> {
+    assert!(!mats.is_empty(), "batch commit needs at least one matrix");
+    let h = mats[0].height();
+    assert!(mats.iter().all(|m| m.height() == h), "batch matrices must share one height");
+
+    // Write each matrix to its own column-major store (no LDE — the inputs are already LDEs).
+    let mut stores = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let w = mat.width();
+        let store = MmapLdeStore::new(h, w)?;
+        let mut c0 = 0usize;
+        while c0 < w {
+            let cw = c_block.min(w - c0);
+            let mut tile = Vec::with_capacity(h * cw);
+            for r in 0..h {
+                tile.extend_from_slice(&mat.values[r * w + c0..r * w + c0 + cw]);
+            }
+            store.write_col_tile(c0, cw, &tile);
+            c0 += cw;
+        }
+        stores.push(store);
+    }
+    // Draw the salts PER MATRIX in order — p3's `inputs.map(|mat| rand(rng, h, SALT_ELEMS))`.
+    let salts: Vec<Vec<Val>> = (0..mats.len()).map(|_| RowMajorMatrix::rand(rng, h, SALT_ELEMS).values).collect();
+
+    let layers = stream_merkle_layers_batch(&stores, &salts, cap_height);
+    Ok(StreamBatchCommitData { stores, salts, layers })
+}
+
+/// Open leaf `index` of a BATCH commit: each matrix's (unsalted) row, each matrix's salt, and the SHARED
+/// Merkle sibling path — byte-identical to production hiding `Mmcs::open_batch` on a multi-matrix commit
+/// (`opened_values = [m0_row, …, mK_row]`, `opening_proof = ([salt0, …, saltK], siblings)`).
+pub fn stream_open_batch(data: &StreamBatchCommitData, index: usize) -> (Vec<Vec<Val>>, Vec<Vec<Val>>, Vec<[Val; DIGEST]>) {
+    let rows: Vec<Vec<Val>> = data
+        .stores
+        .iter()
+        .map(|s| {
+            let mut row = vec![Val::default(); s.width()];
+            s.fill_row(index, &mut row);
+            row
+        })
+        .collect();
+    let salts: Vec<Vec<Val>> = data.salts.iter().map(|s| s[index * SALT_ELEMS..(index + 1) * SALT_ELEMS].to_vec()).collect();
+    let mut proof = Vec::with_capacity(data.layers.len().saturating_sub(1));
+    let mut idx = index;
+    for layer in &data.layers[..data.layers.len() - 1] {
+        proof.push(layer[idx ^ 1]);
+        idx >>= 1;
+    }
+    (rows, salts, proof)
+}
+
 /// Open the leaf at `index`: the (unsalted) row, its salt, and the binary Merkle sibling path up to the
 /// cap — byte-identical to production's hiding `Mmcs::open_batch` (which returns `opened_values = [row]`,
 /// `opening_proof = ([salt], siblings)`). The row is a single strided seek into the store; the salt and
@@ -1350,6 +1477,52 @@ mod tests {
             assert_eq!(postcard::to_allocvec(&p3_opened).unwrap(), postcard::to_allocvec(&my_public).unwrap(), "public opened values differ (log_h={log_h} w={w})");
             assert_eq!(postcard::to_allocvec(&p3_random).unwrap(), postcard::to_allocvec(&my_random).unwrap(), "random-codeword opened values differ (log_h={log_h} w={w})");
             assert_eq!(postcard::to_allocvec(&p3_fri).unwrap(), postcard::to_allocvec(&my_fri).unwrap(), "FriProof differs (log_h={log_h} w={w})");
+        }
+    }
+
+    /// `stream_commit_batch` + `stream_open_batch` are byte-identical to the production hiding MMCS on a
+    /// MULTI-matrix commit — the quotient's `num_chunks` same-height chunks committed in ONE tree. Asserts
+    /// the cap == `MerkleTreeHidingMmcs::commit(mats).0` and each opened index's (rows, salts, sibling-path)
+    /// == `open_batch(idx)` (`.unpack()`), across chunk counts 2..4 and widths, seeded. This is I3a — the
+    /// batch commit/open substrate the streamed quotient round needs.
+    #[test]
+    fn stream_commit_batch_matches_p3() {
+        use p3_commit::Mmcs;
+        use p3_merkle_tree::MerkleTreeHidingMmcs;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+        type HidingMmcs = MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, DIGEST, SALT_ELEMS>;
+        let perm = default_goldilocks_poseidon2_8();
+        let cases: &[(usize, &[usize], usize, u64)] =
+            &[(6, &[3, 3, 3], 2, 1), (8, &[5, 7], 4, 2), (10, &[2, 2, 2, 2], 8, 3), (7, &[49, 49], 16, 4)];
+        for &(log_h, widths, cblk, seed) in cases {
+            let h = 1usize << log_h;
+            let mats: Vec<RowMajorMatrix<Val>> = widths
+                .iter()
+                .enumerate()
+                .map(|(k, &w)| {
+                    let vals: Vec<Val> = (0..h * w)
+                        .map(|i| Val::new(((i as u64 + (k as u64) * 7919).wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 0xFFFF_FFFF_0000_0001))
+                        .collect();
+                    RowMajorMatrix::new(vals, w)
+                })
+                .collect();
+
+            let mmcs = HidingMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(seed));
+            let (p3_commit, p3_data) = mmcs.commit(mats.clone());
+
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            let data = stream_commit_batch(mats, cblk, CAP_HEIGHT, &mut rng).unwrap();
+            let p3_cap: &[[Val; DIGEST]] = p3_commit.as_ref();
+            assert_eq!(p3_cap, data.cap(), "batch commit cap != p3 at log_h={log_h} widths={widths:?}");
+
+            for &idx in &[0usize, 1, h / 2, h - 1] {
+                let (p3_rows, (p3_salts, p3_sibs)) = mmcs.open_batch(idx, &p3_data).unpack();
+                let (rows, salts, sibs) = stream_open_batch(&data, idx);
+                assert_eq!(p3_rows, rows, "batch opened rows != p3 at idx {idx}");
+                assert_eq!(p3_salts, salts, "batch salts != p3 at idx {idx}");
+                assert_eq!(p3_sibs, sibs, "batch sibling path != p3 at idx {idx}");
+            }
         }
     }
 
