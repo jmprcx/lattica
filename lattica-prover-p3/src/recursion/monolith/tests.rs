@@ -1491,6 +1491,38 @@ fn stream_prove_matches_p3_on_aggregator() {
     assert!(verify(&build(), &air, &my_proof, &txroot).is_ok(), "streamed aggregator proof must verify");
 }
 
+/// RAM bench: prove a big `MonolithAir` aggregator under the PRODUCTION config, `stream_prove` vs p3 (same
+/// AIR/trace, mode-selected). The point: `stream_prove` completes a big aggregator inside a cgroup cap that
+/// p3 needs the whole LDE resident for. Both proofs verify. Run each mode in its own process; stream under a
+/// cap on a nodatacow disk with `RAYON_NUM_THREADS≈cores/2`:
+///   p3:     `LATTICA_AGG_K=2 LATTICA_AGG_Q=32 LATTICA_AGG_MODE=p3 cargo test --release --features recursion,stream stream_prove_aggregator_ram_bench -- --ignored --nocapture`
+///   stream: `systemd-run --user --scope -p MemoryMax=8G env RAYON_NUM_THREADS=12 LATTICA_AGG_MODE=stream LATTICA_AGG_K=2 LATTICA_AGG_Q=32 LATTICA_SPILL_DIR=/home/access/scratch cargo test --release --features recursion,stream stream_prove_aggregator_ram_bench -- --ignored --nocapture`
+#[cfg(feature = "stream")]
+#[test]
+#[ignore = "bench: aggregator RAM stream_prove vs p3 (LATTICA_AGG_K, LATTICA_AGG_Q, LATTICA_AGG_MODE=stream|p3, LATTICA_SPILL_DIR)"]
+fn stream_prove_aggregator_ram_bench() {
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let (kk, qq, cblk) = (env("LATTICA_AGG_K", 2), env("LATTICA_AGG_Q", 8), env("LATTICA_AGG_CBLK", 4));
+    let mode = std::env::var("LATTICA_AGG_MODE").unwrap_or_else(|_| "stream".into());
+    let (air, trace, txroot, _) = build_aggregator_trace(kk, qq);
+    let (w, rows) = (trace.width, trace.values.len() / trace.width);
+    let t0 = std::time::Instant::now();
+    let proof = if mode == "stream" {
+        crate::stream_prove::stream_prove_seeded(&air, trace, &txroot, cblk).expect("stream_prove")
+    } else {
+        prove(&crate::config::make_config(), &air, trace, &txroot)
+    };
+    let secs = t0.elapsed().as_secs_f64();
+    assert!(verify(&crate::config::make_config(), &air, &proof, &txroot).is_ok(), "aggregator proof (mode={mode}) must verify");
+    let bytes = postcard::to_allocvec(&proof).unwrap();
+    println!(
+        "AGG-RAM-BENCH mode={mode} k={kk} q={qq} width={w} rows=2^{} peak_rss={}MiB prove={secs:.1}s proof={}KiB",
+        rows.trailing_zeros(),
+        peak_rss_bytes() / (1 << 20),
+        bytes.len() / 1024,
+    );
+}
+
 /// R4: the SYMBOLIC tiled aggregator — K column-window monolith instances, each verifying a REAL
 /// join-split proof (accept-iff-p3::verify via the symbolic epilogue) AND folding its verified `pvs[0]`
 /// into the block tx-root, fused in ONE AIR. The symbolic twin of `run_aggregator` (which did ConstAir
