@@ -326,7 +326,7 @@ pub fn proven_security_bits(n: usize) -> usize {
 
 /// Verify an HTLC batch proof against the block tx-root.
 pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
-    crate::config::verify_proof_bytes(&HtlcBatchAir, DIGEST, proof_bytes, root)
+    crate::config::verify_proof_bytes(&HtlcBatchAir, DIGEST, crate::batch_common::MAX_BATCH_TILES * TILE_HEIGHT, proof_bytes, root)
 }
 
 #[cfg(test)]
@@ -381,6 +381,22 @@ mod tests {
         a.current_height = 50;
         b.current_height = 51;
         assert_ne!(tx_statement_digest(&public_values(&a)), tx_statement_digest(&public_values(&b)));
+    }
+
+    #[test]
+    fn htlc_batch_dummy_padding_fold_matches_oracle() {
+        // OBS-2 (audit): the FAST trace-vs-oracle cross-check the join-split batch has
+        // (`batch_dummy_padding_fold_matches_oracle`), now mirrored for HTLC — 3 real tiles → padded to 4;
+        // the in-circuit fold's final output (the trace's last-row root-block output, cols 0..4) must equal
+        // the native `batch_root` (which folds `dummy_sk`), so an HTLC fold-geometry/arg regression is caught
+        // in the fast suite instead of only the #[ignore] slow prove.
+        let ws = [variant(1), variant(2), variant(3)];
+        let trace = build_batch_trace(&ws);
+        let root = batch_root(&ws);
+        let h = trace.values.len() / BATCH_WIDTH;
+        for k in 0..DIGEST {
+            assert_eq!(trace.values[(h - 1) * BATCH_WIDTH + k], root[k], "htlc fold limb {k} != oracle root");
+        }
     }
 
     // ---- circuit: distinct HTLC tiles bound to the tx-root (real prover) ----

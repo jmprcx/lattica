@@ -19,8 +19,10 @@ row-offset `t·4096` (`batch_joinsplit_air.rs:301-341`), so **K scales rows, not
 
 **Padding to a power of two.** `padded_tiles(n) = n.max(1).next_power_of_two()`
 (`batch_common.rs:37-39`), capped at `MAX_BATCH_TILES = 64` (`batch_common.rs:34`) — the ≥100-bit
-proven-soundness floor, enforced in both provers (`batch_joinsplit_air.rs:346-349`) **and** both ABI
-entry points (`lib.rs:594-596, 660-662`). A **dummy/padding tile is a REAL balanced 0-value spend**
+proven-soundness floor, enforced on the **prove** path (`batch_joinsplit_air.rs:346-349`; the ABI prove
+entries reject `n_tx > MAX_BATCH_TILES` first, overflow-safe) **and on the verify** path (a trace-height
+bound in `config::verify_proof_bytes` rejects a proof whose `degree_bits` implies K > 64, so an oversize
+below-floor batch cannot verify even if a caller forgets to pre-cap — v3-batch internal audit F1/F2). A **dummy/padding tile is a REAL balanced 0-value spend**
 (`dummy_witness`, `batch_joinsplit_air.rs:79-99`: `nk=0`, `value=0`, `rho=rcm=0`, all-zero
 membership), *not* a zeroed row-block — so it satisfies every per-tile constraint like a real tile and
 needs no special-case gating (`batch_joinsplit_air.rs:75-78`). Its statement digest `dummy_sk` is a

@@ -124,10 +124,16 @@ where
 }
 
 /// Deserialize a `postcard(Proof<MyConfig>)` and verify it against `pis` under the production config.
-/// **Fail-closed**: a public-input count ≠ `n_expected_pis`, malformed proof bytes, or a verify error
-/// all return `false`. The ONE audited deserialize-bound verify gate behind the circuits'
-/// `verify_bytes` / `verify_batch_bytes` shims.
-pub fn verify_proof_bytes<A>(air: &A, n_expected_pis: usize, proof_bytes: &[u8], pis: &[Val]) -> bool
+/// **Fail-closed**: a public-input count ≠ `n_expected_pis`, a trace height above `max_trace_height`,
+/// malformed proof bytes, or a verify error all return `false`. The ONE audited deserialize-bound verify
+/// gate behind the circuits' `verify_bytes` / `verify_batch_bytes` shims.
+///
+/// `max_trace_height` (a power of two) bounds the accepted trace: the p3 verifier otherwise caps the
+/// proof's `degree_bits` only by `Val::TWO_ADICITY` (= 32), so a proof for a trace far above the
+/// circuit's size — e.g. a batch of K ≫ `MAX_BATCH_TILES`, *below* the ≥100-bit proven-soundness floor —
+/// would verify. Making the height cap intrinsic here means the ≥100-bit floor is a property of the
+/// verify seam, not a caller obligation (v3-batch internal audit F1).
+pub fn verify_proof_bytes<A>(air: &A, n_expected_pis: usize, max_trace_height: usize, proof_bytes: &[u8], pis: &[Val]) -> bool
 where
     A: Air<SymbolicAirBuilder<Val>> + for<'a> Air<VerifierConstraintFolder<'a, MyConfig>>,
 {
@@ -138,6 +144,10 @@ where
         Ok(p) => p,
         Err(_) => return false,
     };
+    // The hiding PCS commits at 2× the trace (is_zk randomization), so `degree_bits = log2(height) + 1`.
+    if proof.degree_bits > (max_trace_height.trailing_zeros() as usize) + 1 {
+        return false;
+    }
     verify(&make_config(), air, &proof, pis).is_ok()
 }
 

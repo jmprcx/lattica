@@ -1073,8 +1073,14 @@ pub fn prove_verify_with(w: &Witness, pis: &[Val]) -> Result<(), String> {
     let config = make_config();
     let air = HtlcAir;
     let trace = build_trace(w);
-    let proof = prove(&config, &air, trace, pis);
-    verify(&config, &air, &proof, pis).map_err(|e| format!("{e:?}"))
+    // Catch the debug-only `check_constraints` panic on mismatched pis so the `*_rejected` soundness tests
+    // reject cleanly in both debug and release; a valid witness+pis never panics. (audit OBS-1) See the
+    // join-split twin for the rationale.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let proof = prove(&config, &air, trace, pis);
+        verify(&config, &air, &proof, pis).map_err(|e| format!("{e:?}"))
+    }))
+    .unwrap_or_else(|_| Err("prove rejected (debug check_constraints)".to_string()))
 }
 
 pub fn prove_verify(w: &Witness) -> Result<(), String> {
@@ -1089,7 +1095,7 @@ pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {
 
 /// Verify canonical proof bytes against public inputs. **Fail-closed** on any error.
 pub fn verify_bytes(proof_bytes: &[u8], pis: &[Val]) -> bool {
-    crate::config::verify_proof_bytes(&HtlcAir, N_PUBLIC, proof_bytes, pis)
+    crate::config::verify_proof_bytes(&HtlcAir, N_PUBLIC, HEIGHT, proof_bytes, pis)
 }
 
 /// A representative valid join-split witness (2 inputs at tree positions 0,1; balanced).

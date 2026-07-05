@@ -363,7 +363,7 @@ pub fn proven_security_bits(n: usize) -> usize {
 
 /// Verify a batch proof against the block tx-root (4 Goldilocks).
 pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
-    crate::config::verify_proof_bytes(&JoinSplitBatchAir, DIGEST, proof_bytes, root)
+    crate::config::verify_proof_bytes(&JoinSplitBatchAir, DIGEST, MAX_BATCH_TILES * TILE_HEIGHT, proof_bytes, root)
 }
 
 #[cfg(test)]
@@ -632,6 +632,24 @@ mod tests {
         let ws = [variant(1), variant(2), variant(3)];
         let root = batch_root(&ws);
         assert!(verify_batch_bytes(&prove_batch_to_bytes(&ws), &root));
+    }
+
+    #[test]
+    #[ignore = "slow: proves a 2-tile batch to exercise the verify-side height cap (audit F1)"]
+    fn batch_verify_rejects_above_tile_cap() {
+        // A valid 2-tile batch verifies; tampering its degree_bits above the 64-tile ceiling (19) makes
+        // verify_batch_bytes reject via the height cap BEFORE the expensive verify — so an oversize,
+        // below-100-bit-floor batch cannot verify even if a caller forgot to pre-cap. (v3-batch audit F1)
+        use crate::config::MyConfig;
+        use p3_uni_stark::Proof;
+        let ws = [variant(1), variant(2)];
+        let root = batch_root(&ws);
+        let bytes = prove_batch_to_bytes(&ws);
+        assert!(verify_batch_bytes(&bytes, &root), "the honest 2-tile batch must verify");
+        let mut proof: Proof<MyConfig> = postcard::from_bytes(&bytes).unwrap();
+        proof.degree_bits = (MAX_BATCH_TILES * TILE_HEIGHT).trailing_zeros() as usize + 2; // one above the cap
+        let tampered = postcard::to_allocvec(&proof).unwrap();
+        assert!(!verify_batch_bytes(&tampered, &root), "a proof above the 64-tile height cap must reject");
     }
 
     #[test]

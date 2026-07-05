@@ -588,11 +588,15 @@ pub unsafe extern "C" fn lattica_batch_prove(
     if witness_ptr.is_null() || proof_out.is_null() || root_out.is_null() || proof_len.is_null() || root_len.is_null() {
         return 1; // fail-closed on any null pointer (audit M-01)
     }
-    if n_tx == 0 || witness_len != n_tx.checked_mul(JS_WITNESS_LEN).unwrap_or(usize::MAX) {
-        return 1; // exactly n_tx concatenated join-split witness records
+    // Reject empty or beyond the proven-soundness floor FIRST. `padded_tiles(n) ≤ 64 ⟺ n ≤ 64`, so this
+    // is the equivalent cap AND it prevents the `padded_tiles` next_power_of_two overflow (an n_tx near
+    // 2^64 wraps to 0 and would bypass a `padded_tiles(n_tx) > 64` check), keeping the size math and
+    // `from_raw_parts` below on a bounded n_tx (v3-batch internal audit F2).
+    if n_tx == 0 || n_tx > batch_common::MAX_BATCH_TILES {
+        return 1;
     }
-    if batch_common::padded_tiles(n_tx) > batch_common::MAX_BATCH_TILES {
-        return 1; // beyond the proven-soundness floor — split into multiple batch proofs
+    if witness_len != n_tx.checked_mul(JS_WITNESS_LEN).unwrap_or(usize::MAX) {
+        return 1; // exactly n_tx concatenated join-split witness records
     }
     let wb = slice::from_raw_parts(witness_ptr, witness_len);
     let mut ws = Vec::with_capacity(n_tx);
@@ -654,10 +658,11 @@ pub unsafe extern "C" fn lattica_htlc_batch_prove(
     if witness_ptr.is_null() || proof_out.is_null() || root_out.is_null() || proof_len.is_null() || root_len.is_null() {
         return 1;
     }
-    if n_tx == 0 || witness_len != n_tx.checked_mul(HTLC_WITNESS_LEN).unwrap_or(usize::MAX) {
+    // See lattica_batch_prove — cap n_tx first (overflow-safe; audit F2).
+    if n_tx == 0 || n_tx > batch_common::MAX_BATCH_TILES {
         return 1;
     }
-    if batch_common::padded_tiles(n_tx) > batch_common::MAX_BATCH_TILES {
+    if witness_len != n_tx.checked_mul(HTLC_WITNESS_LEN).unwrap_or(usize::MAX) {
         return 1;
     }
     let wb = slice::from_raw_parts(witness_ptr, witness_len);
@@ -1202,6 +1207,13 @@ mod tests {
             unsafe { lattica_batch_prove(big.as_ptr(), big.len(), 65, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
             1
         );
+        // F2 (audit): n_tx in the `padded_tiles` next_power_of_two overflow window (near 2^64) must reject
+        // — NOT wrap to 0, bypass the cap, and hit `from_raw_parts(usize::MAX)` UB / a with_capacity panic.
+        // The early `n_tx > MAX_BATCH_TILES` cap catches it before any size math or `from_raw_parts`.
+        assert_eq!(
+            unsafe { lattica_batch_prove(big.as_ptr(), usize::MAX, usize::MAX, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            1
+        );
         // oversize proof_len on verify ⇒ rejected before deref (M-08)
         assert_ne!(unsafe { lattica_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) }, 0);
         // wrong root length ⇒ reject
@@ -1244,6 +1256,11 @@ mod tests {
         let wb = vec![0u8; HTLC_WITNESS_LEN + 1];
         assert_eq!(
             unsafe { lattica_htlc_batch_prove(wb.as_ptr(), wb.len(), 1, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            1
+        );
+        // F2 (audit): n_tx overflow window rejects (see batch_abi_fail_closed).
+        assert_eq!(
+            unsafe { lattica_htlc_batch_prove(wb.as_ptr(), usize::MAX, usize::MAX, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
             1
         );
         assert_ne!(unsafe { lattica_htlc_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) }, 0);
