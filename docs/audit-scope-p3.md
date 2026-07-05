@@ -3,7 +3,8 @@
 Auditor handoff for the **production** proving stack (`lattica-prover-p3/`). It defines what is in
 scope, the trust/threat model, the frozen parameters, known limitations, and the pre-audit readiness
 checklist. Companion docs: `docs/soundness-budget.md` (C-04), `docs/plonky3-port-plan.md` (how the
-circuit was built), `docs/remediation-status.md` (audit-finding tracker), `docs/audit-scope.md` (the
+circuit was built), `docs/remediation-status.md` (audit-finding tracker), `docs/audit-readiness-status.md`
+(current post-`v3-audit` state + the remaining audit-prep roadmap), `docs/audit-scope.md` (the
 older *Winterfell* reviewer guide — reference only; superseded by this for production).
 
 > **Status: ready for external review; one deliberate-parameter sign-off remains (not a bug).** The
@@ -74,6 +75,12 @@ older *Winterfell* reviewer guide — reference only; superseded by this for pro
   production; the consolidated status + review/improvement surface is
   `docs/recursion-aggregation-status.md` (with `docs/recursion-design.md` §10,
   `docs/recursion-verifier-audit.md`, and `docs/recursion-aggregation-params.md`).
+- **GPU + streaming provers (`src/gpu*.rs`, `src/quotient_gpu.rs`, `src/stream_prove.rs`,
+  `src/spill_alloc.rs`) — RESEARCH, NOT PRODUCTION, out of this round.** Opt-in accelerators
+  (`--features gpu` / `stream`), **prove-only + byte-compatible**: a GPU or streamed proof deserializes
+  and verifies under the standard production verifier unchanged, and neither is in the default staticlib
+  (`lattica-prover-p3/scripts/check-abi-symbols.sh`) or the C-ABI. Not audited. See
+  `docs/gpu-acceleration.md` and `docs/audit-readiness-status.md`.
 - The live consensus node (`rubble-node-zig`) beyond the verify seam; networking; mempool; P2P; the
   heartbeat block-production design (`docs/block-production-consensus.md`, host-chain scope).
 - The wallet/prover key management and note-discovery.
@@ -190,7 +197,9 @@ Tracked in detail in `docs/remediation-status.md`. The soundness-relevant ones:
   swap is protocol-wide (touches note encryption/wallet) it lands with the **M6 node cutover**; the
   end-to-end FFI test (below) demonstrates the protocol-side `poseidon2.zig` hashes equal the
   circuit's via a real proof verifying.
-- Single-asset; no memo field; coinbase/mint/burn not yet modeled.
+- Single-asset; no memo field. **Mint / coinbase issuance ARE modeled** (see the §7 checklist —
+  `Σin + mint = Σout + fee`, range-checked; `Chain.applyCoinbase` requires `mint == 0` on the normal
+  path); the single-hidden-asset substrate is the deliberate v1 scope (`docs/protocol-v1-decisions.md`).
 
 ### A4 — nullifier-derivation argument
 The nullifier is `nf = H(DOM_NF ‖ nk ‖ rho ‖ pos)` with `H` = Poseidon2-Goldilocks (vetted constants),
@@ -240,9 +249,9 @@ pads to the fixed 2-in/2-out shape with zero-value notes (a dummy input is a zer
 spender owns; balance and range are unaffected). Tested (`dummy_notes_pad_smaller_transactions`). A
 variable-shape circuit is only needed if more than 2-in/2-out is required.
 
-**Remaining for the audited artifact:** only the **C-03 protocol note-model swap** (migrate the
-`Note` model + Merkle tree off SHA3 onto `poseidon2.zig` — protocol-wide, lands with the M6 node
-cutover; §5). Everything else is done: join-split **C ABI + byte layout**
+**Remaining for the audited artifact:** none — the **C-03 protocol note-model swap** (migrate the
+`Note` model + Merkle tree off SHA3 onto `poseidon2.zig`) landed with the **M6 cutover, now complete**
+(`docs/remediation-status.md`; §5). Everything is done: join-split **C ABI + byte layout**
 (`lattica_joinsplit_verify`, round-trip tested), the **shared KATs** + Zig hash match
 (`poseidon2.zig`), the **end-to-end FFI test** (`tests/ffi_integration.c`: prove→verify→tamper→
 double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-constraint-audit.md`).
@@ -263,11 +272,11 @@ double-spend, verified), and the **constraint self-audit** (`docs/joinsplit-cons
 | **B — join-split (N-in/M-out) circuit** | ✅ (`joinsplit_air`, fixed 2-in/2-out, 12/12) |
 | **Join-split C ABI + byte layout** | ✅ (`lattica_joinsplit_verify` + `ffi.zig::JoinSplitPublicInputs`) |
 | **C-03 hash match: Zig Poseidon2 == circuit + KATs** | ✅ (`src/poseidon2.zig`) |
-| **C-03 protocol note-model swap (tx/tree off SHA3)** | ⏳ M6 cutover (protocol-wide) |
+| **C-03 protocol note-model swap (tx/tree off SHA3)** | ✅ (M6 cutover complete — `tx`/`tree` on `poseidon2.zig`; `docs/remediation-status.md`) |
 | **End-to-end FFI integration test** (prove→verify→tamper→double-spend) | ✅ (`tests/ffi_integration.c`, verified; Zig `test-ffi` ready) |
 | **Constraint-accounting self-audit** (every column/constraint, no vacuous binding) | ✅ (`docs/joinsplit-constraint-audit.md`) |
 | **Variable (N,M) via dummy notes** | ✅ (tested) |
-| ABI fuzz / adversarial tests (beyond fail-closed) | ❌ |
+| ABI fuzz / adversarial tests (beyond fail-closed) | 🟡 HTLC done (`tests/fuzz_htlc.rs`); **batch fuzz open** (W2 — `docs/audit-readiness-status.md`) |
 | Threat model + scope + frozen params (this doc) | ✅ |
 | ZK blinding from a CSPRNG, fresh per proof | ✅ (`ChaCha20Rng`; re-randomization tested) |
 | Remove pre-Plonky3 / one-input production surfaces | ✅ join-split + HTLC only; legacy spend surface removed |

@@ -1,7 +1,11 @@
 # Lattica — Production-Readiness Assessment
 
-> **⚠ Historical / reference-only — not the v1 audit artifact.** Pre-cutover assessment. Start at
-> [`AUDITORS.md`](AUDITORS.md); current state is `remediation-status.md` and `lattica-implementation-audit.md`.
+> **⚠ SUPERSEDED — historical, do NOT read as current.** This assesses the **pre-Plonky3** stack (the
+> Winterfell → Zig FRI-STARK PoC: ~50-bit, 64-bit field, a placeholder `x³+C`-style relation, "not yet
+> zero-knowledge"). The current production stack is the **Plonky3 `lattica-prover-p3` crate — ~103-bit
+> *proven* soundness, a hiding (ZK) FRI PCS, and the real join-split + shielded-HTLC circuits**, none of
+> which is described below. Start at [`AUDITORS.md`](AUDITORS.md); current state is
+> `docs/audit-readiness-status.md`, `docs/remediation-status.md`, and `docs/lattica-implementation-audit.md`.
 
 **Audience:** CTO / technical diligence · **Subject:** Lattica quantum-safe shielded payment protocol (PoC)
 **Version assessed:** 0.1 (2026-06) · **Assessment date:** 2026-06-25

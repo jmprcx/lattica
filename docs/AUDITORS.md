@@ -73,10 +73,11 @@ here) for the cross-language link.
 
 ```sh
 # 1. Circuit + ABI tests (incl. adversarial corrupted-trace soundness tests, the htlc_air redeem/
-#    refund + negative tests, and the htlc prove/verify C-ABI round-trips). v3-audit: 82 passed, 3 ignored.
+#    refund + negative tests, and the htlc prove/verify C-ABI round-trips).
+#    v3-audit tag: 82 passed, 3 ignored. Current tip (636741f): 101 passed, 17 ignored.
 cd lattica-prover-p3 && cargo test --release
 
-# 1b. Slower ignored audit tests (exhaustive/fuzz-style HTLC checks). v3-audit: 3 passed.
+# 1b. Slower ignored audit tests (exhaustive/fuzz-style HTLC checks). v3-audit: 3 passed; current tip: 17 passed.
 cd lattica-prover-p3 && cargo test --release -- --ignored
 
 # 2. The Zig protocol suite — incl. the Poseidon2 KATs that pin on-chain == circuit byte-for-byte.
@@ -132,7 +133,9 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
 4. **`docs/protocol-v1-decisions.md`** — the deliberate v1 parameter decisions + limitations
    (single-asset, key model, note randomness, issuance, the deterministic-encryption interaction).
 
-Also current: `docs/lattica-implementation-audit.md` (the implementation audit + remediation log) and
+Also current: `docs/audit-readiness-status.md` (audit-readiness status + the post-`v3-audit` roadmap —
+read this for what remains before an external audit of the current tip),
+`docs/lattica-implementation-audit.md` (the implementation audit + remediation log) and
 `docs/remediation-status.md` (live status). `docs/full-node-security-integration.md` is the production
 full-node checklist (host-chain scope). **Everything else in `docs/` is historical / reference-only**
 (each carries a banner pointing back here) — `audit-scope.md`, `soundness.md`,
@@ -203,7 +206,7 @@ gate.** The in-circuit recursive STARK verifier ("the monolith", `MonolithAir`) 
 (R1–R5)**: one AIR that accepts iff `p3::verify(inner)` accepts (a real `JoinSplitAir` inner, non-hiding
 and hiding), plus an aggregator that verifies K inner join-split proofs and folds them into a block
 tx-root **byte-identical to `batch_joinsplit_air::batch_root`**. It is feature-gated behind
-`--features recursion` (zero recursion symbols in the default staticlib — `scripts/check-abi-symbols.sh`),
+`--features recursion` (zero recursion symbols in the default staticlib — `lattica-prover-p3/scripts/check-abi-symbols.sh`),
 on no production path, not externally audited, and the deeper self-recursion tree is deferred behind a
 wrap. It is **not part of this audit gate**; the consolidated status + the review/improvement surface is
 **`docs/recursion-aggregation-status.md`** (with `docs/recursion-design.md` §10,
