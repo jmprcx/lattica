@@ -1507,14 +1507,24 @@ fn stream_prove_aggregator_ram_bench() {
     let (air, trace, txroot, _) = build_aggregator_trace(kk, qq);
     let (w, rows) = (trace.width, trace.values.len() / trace.width);
     let t0 = std::time::Instant::now();
-    let proof = if mode == "stream" {
-        crate::stream_prove::stream_prove_seeded(&air, trace, &txroot, cblk).expect("stream_prove")
+    let bytes = if mode == "stream" {
+        postcard::to_allocvec(&crate::stream_prove::stream_prove_seeded(&air, trace, &txroot, cblk).expect("stream_prove")).unwrap()
+    } else if mode == "gpu" {
+        // GPU hiding prove (GpuHidingPcs) of the recursive aggregator — same production config, verified below.
+        #[cfg(feature = "gpu")]
+        {
+            crate::config::gpu::proof_to_bytes_hiding(&air, trace, &txroot)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            unreachable!("mode=gpu requires --features gpu")
+        }
     } else {
-        prove(&crate::config::make_config(), &air, trace, &txroot)
+        postcard::to_allocvec(&prove(&crate::config::make_config(), &air, trace, &txroot)).unwrap()
     };
     let secs = t0.elapsed().as_secs_f64();
+    let proof: Proof<crate::config::MyConfig> = postcard::from_bytes(&bytes).expect("aggregator proof deser");
     assert!(verify(&crate::config::make_config(), &air, &proof, &txroot).is_ok(), "aggregator proof (mode={mode}) must verify");
-    let bytes = postcard::to_allocvec(&proof).unwrap();
     println!(
         "AGG-RAM-BENCH mode={mode} k={kk} q={qq} width={w} rows=2^{} peak_rss={}MiB prove={secs:.1}s proof={}KiB",
         rows.trailing_zeros(),
