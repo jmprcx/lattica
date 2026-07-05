@@ -688,6 +688,71 @@ pub(crate) fn gpu_quotient_chunk_lde(
     out
 }
 
+/// ONE column-tile `[c0, c0+cw)` of a hiding-PCS quotient chunk LDE, computed fully device-side — the
+/// per-tile core of `gpu_quotient_chunk_lde`, exposed so the STREAMING prover can compute a chunk one
+/// `big × cw` tile at a time and spill each straight to its on-disk store, never holding the whole
+/// `big × w` chunk resident (that whole-chunk buffer is the aggregator's quotient RAM floor, which the
+/// CPU streaming path already tiles away — this keeps the property when the compute moves to the GPU).
+/// `evals` (h×w) and `van_prefix` (2h×w) are the FULL chunk inputs; only columns `[c0, c0+cw)` are read.
+/// Output is `big × cw` in p3's bit-reversed row order, canonical u64 — bit-identical to the same columns
+/// of `gpu_quotient_chunk_lde` (independent-column polynomials; only the tile `log_c` differs). The caller's
+/// `cw` must keep `big·cw` under the device per-allocation cap (the streaming `c_block` guarantees it).
+#[cfg(feature = "stream")] // only the streaming quotient path calls this; avoids dead-code under `gpu`-only
+pub(crate) fn gpu_quotient_chunk_lde_tile(
+    evals: &[u64],
+    van_prefix: &[u64],
+    h: usize,
+    w: usize,
+    c0: usize,
+    cw: usize,
+    added_bits: usize,
+    shift: u64,
+) -> Vec<u64> {
+    let _t0 = std::time::Instant::now();
+    assert!(h >= 2 && h.is_power_of_two(), "quotient chunk height must be a power of two ≥ 2");
+    assert_eq!(van_prefix.len(), 2 * h * w, "vanishing randomizer prefix is 2h rows");
+    let log_h = h.trailing_zeros() as usize;
+    let big = h << added_bits;
+    let log_big = log_h + added_bits;
+    let h_inv = Goldilocks::from_u64(h as u64).inverse().as_canonical_u64();
+    let mut out = vec![0u64; big * cw];
+    with_ctx(|ctx| {
+        let n_big = big * cw;
+        let a = ctx.dev_buf(0, n_big);
+        let b = ctx.dev_buf(1, n_big);
+        let c = ctx.dev_buf(2, n_big);
+        // coset-LDE of the chunk (not canonicalized — the final add_canon canonicalizes the sum).
+        b.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+        ctx.upload_rows(&a, h, cw, |r, buf| buf.copy_from_slice(&evals[r * w + c0..r * w + c0 + cw]));
+        enqueue_tiled_ntt(ctx, &a, &b, h, cw, log_h, true, h_inv, shift, false, false);
+        let in_dst = enqueue_tiled_ntt(ctx, &b, &a, big, cw, log_big, false, 1, 1, false, true);
+        let (r, s) = if in_dst { (a, b) } else { (b, a) };
+        // v_H·r: zero-pad the freed scratch, upload this tile's 2h-row prefix columns, forward NTT.
+        s.cmd().fill(0u64, Some(n_big)).enq().unwrap();
+        ctx.upload_rows(&s, 2 * h, cw, |r2, buf| buf.copy_from_slice(&van_prefix[r2 * w + c0..r2 * w + c0 + cw]));
+        let v_in_dst = enqueue_tiled_ntt(ctx, &s, &c, big, cw, log_big, false, 1, 1, false, true);
+        let v = if v_in_dst { c } else { s };
+        // sum + canonicalize this tile.
+        unsafe {
+            ctx.pq
+                .kernel_builder("add_canon")
+                .arg(&r)
+                .arg(&v)
+                .arg(n_big as u32)
+                .global_work_size(n_big)
+                .build()
+                .unwrap()
+                .enq()
+                .unwrap();
+        }
+        // the tile IS the whole output here (out is `big × cw`, out_w = cw, c0 = 0).
+        ctx.download_cols_into(&r, big, cw, &mut out, cw, 0);
+    });
+    NTT_NANOS.fetch_add(_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    NTT_CALLS.fetch_add(1, Ordering::Relaxed);
+    out
+}
+
 /// Canonical-u64 conversion of a field slice — parallel above ~4 MiB (the per-matrix rayon overhead
 /// loses on the many small quotient-chunk/FRI-layer matrices, but the full-size randomization
 /// matrices the hiding PCS feeds `dft_batch` are 6+ MiB of mostly-cold pages).

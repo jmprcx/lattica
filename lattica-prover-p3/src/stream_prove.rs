@@ -26,6 +26,8 @@ use p3_commit::{BatchOpening, Mmcs, OpenedValues, PolynomialSpace};
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
 use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::{batch_multiplicative_inverse, BasedVectorSpace, ExtensionField, Field, PackedFieldExtension, PrimeCharacteristicRing};
+#[cfg(feature = "gpu")] // GPU-per-tile quotient: `as_canonical_u64` to marshal chunk evals / vanishing prefix to the device
+use p3_field::PrimeField64;
 use p3_matrix::interpolation::{compute_adjusted_weights, Interpolate};
 use p3_fri::{
     compute_log_arity_for_round, CommitPhaseProofStep, FriFoldingStrategy, FriParameters, FriProof,
@@ -520,6 +522,7 @@ fn stream_get_quotient_ldes_to_stores<R: rand::Rng + Send + Sync>(
     // Compute each chunk's LDE ONE AT A TIME (identical to `get_quotient_ldes` per chunk), stream it to its
     // own store, and DROP it — so only ONE chunk LDE is resident, not all K. This is what keeps the quotient
     // commit from doubling the memory pressure (the whole-K-resident buffer was the capped floor).
+    #[cfg(not(feature = "gpu"))]
     let dft = Dft::default();
     let g = <Val as Field>::GENERATOR;
     let mut stores = Vec::with_capacity(num_chunks);
@@ -530,6 +533,29 @@ fn stream_get_quotient_ldes_to_stores<R: rand::Rng + Send + Sync>(
         let big = h << (log_blowup + 1); // chunk LDE height
         let store = MmapLdeStore::new(big, w)?;
 
+        // GPU-per-tile: when the `gpu` feature is on, build the two subdomain-scale chunk inputs ONCE — the
+        // randomized evals as canonical u64, and the 2h-row vanishing-randomizer prefix `v_H·r` (byte-identical
+        // to the CPU `vanishing_tile` construction below, just built for the full width) — then compute each
+        // `big × cw` tile on the device (`gpu_quotient_chunk_lde_tile`). Still only ONE tile is host-resident,
+        // so the aggregator scaling floor is preserved while the coset-LDE + DFT run off the CPU; under a
+        // cgroup cap that frees the cores that were contending with the kernel's mmap writeback.
+        #[cfg(feature = "gpu")]
+        let evals_u64: Vec<u64> = evals.values.iter().map(|f| f.as_canonical_u64()).collect();
+        #[cfg(feature = "gpu")]
+        let van_prefix: Vec<u64> = {
+            let mut vp = vec![0u64; 2 * h * w];
+            g.powers().take(h).enumerate().for_each(|(r, p_r)| {
+                for j in 0..w {
+                    let mul_coeff = p_r * random_values[r * w + j];
+                    vp[r * w + j] = (-mul_coeff).as_canonical_u64();
+                    vp[(h + r) * w + j] = (p * mul_coeff).as_canonical_u64();
+                }
+            });
+            vp
+        };
+        #[cfg(feature = "gpu")]
+        let shift_u64 = shift.as_canonical_u64();
+
         // Compute the chunk's LDE a COLUMN-TILE at a time and write each tile to the store — coset-LDE (each
         // column an independent poly), the vanishing-poly masking (each column depends only on its own
         // random_values column), the DFT, and the row bit-reversal are ALL column-separable, so a `big ×
@@ -539,29 +565,46 @@ fn stream_get_quotient_ldes_to_stores<R: rand::Rng + Send + Sync>(
         let mut c0 = 0usize;
         while c0 < w {
             let cw = c_block.min(w - c0);
-            // Gather the tile's input columns [c0, c0+cw) from the (resident, subdomain-scale) chunk evals.
-            let mut evals_tile = Vec::with_capacity(h * cw);
-            for r in 0..h {
-                evals_tile.extend_from_slice(&evals.values[r * w + c0..r * w + c0 + cw]);
-            }
-            let mut lde_tile =
-                dft.coset_lde_batch(RowMajorMatrix::new(evals_tile, cw), log_blowup + 1, shift).to_row_major_matrix();
-
-            // v_H(X)·r(X) for exactly these columns.
-            let mut vanishing_tile = <Val as PrimeCharacteristicRing>::zero_vec((h * cw) << (log_blowup + 1));
-            g.powers().take(h).enumerate().for_each(|(ii, p_i)| {
-                for jj in 0..cw {
-                    let mul_coeff = p_i * random_values[ii * w + c0 + jj];
-                    vanishing_tile[ii * cw + jj] -= mul_coeff;
-                    vanishing_tile[(h + ii) * cw + jj] = p * mul_coeff;
+            #[cfg(feature = "gpu")]
+            let tile_values: Vec<Val> = crate::gpu::gpu_quotient_chunk_lde_tile(
+                &evals_u64,
+                &van_prefix,
+                h,
+                w,
+                c0,
+                cw,
+                log_blowup + 1,
+                shift_u64,
+            )
+            .into_iter()
+            .map(Val::new)
+            .collect();
+            #[cfg(not(feature = "gpu"))]
+            let tile_values: Vec<Val> = {
+                // Gather the tile's input columns [c0, c0+cw) from the (resident, subdomain-scale) chunk evals.
+                let mut evals_tile = Vec::with_capacity(h * cw);
+                for r in 0..h {
+                    evals_tile.extend_from_slice(&evals.values[r * w + c0..r * w + c0 + cw]);
                 }
-            });
-            let random_eval_tile = dft.dft_batch(RowMajorMatrix::new(vanishing_tile, cw)).to_row_major_matrix();
-            for k in 0..h * cw * (1 << (log_blowup + 1)) {
-                lde_tile.values[k] += random_eval_tile.values[k];
-            }
-            let chunk_tile = lde_tile.bit_reverse_rows().to_row_major_matrix();
-            store.write_col_tile(c0, cw, &chunk_tile.values);
+                let mut lde_tile =
+                    dft.coset_lde_batch(RowMajorMatrix::new(evals_tile, cw), log_blowup + 1, shift).to_row_major_matrix();
+
+                // v_H(X)·r(X) for exactly these columns.
+                let mut vanishing_tile = <Val as PrimeCharacteristicRing>::zero_vec((h * cw) << (log_blowup + 1));
+                g.powers().take(h).enumerate().for_each(|(ii, p_i)| {
+                    for jj in 0..cw {
+                        let mul_coeff = p_i * random_values[ii * w + c0 + jj];
+                        vanishing_tile[ii * cw + jj] -= mul_coeff;
+                        vanishing_tile[(h + ii) * cw + jj] = p * mul_coeff;
+                    }
+                });
+                let random_eval_tile = dft.dft_batch(RowMajorMatrix::new(vanishing_tile, cw)).to_row_major_matrix();
+                for k in 0..h * cw * (1 << (log_blowup + 1)) {
+                    lde_tile.values[k] += random_eval_tile.values[k];
+                }
+                lde_tile.bit_reverse_rows().to_row_major_matrix().values
+            };
+            store.write_col_tile(c0, cw, &tile_values);
             c0 += cw;
         }
         stores.push(store);
