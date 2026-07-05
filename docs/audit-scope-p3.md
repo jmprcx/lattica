@@ -65,13 +65,15 @@ older *Winterfell* reviewer guide — reference only; superseded by this for pro
   entry + reviewer guide in the In-scope list above.
 
 **Out of scope (this round):**
-- **Recursion (`lattica-prover-p3/src/recursion/`) — RESEARCH, NOT PRODUCTION, NOT SOUND, NOT a circuit
-  yet.** It contains validated in-circuit *primitives* (FRI Merkle openings, the Fiat–Shamir transcript,
-  the F_p² fold — each differential-tested against the real p3 functions) and a *native* re-verifier
-  (`native_verify.rs`) that re-implements `p3-uni-stark::verify`'s orchestration and agrees with
-  `p3::verify`. **The in-circuit recursive verifier itself is NOT built** — these are feasibility spikes +
-  a porting blueprint, multi-week from a production artifact. Do **not** audit as production; status in
-  `docs/recursion-design.md` §10 + `docs/recursion-verifier-audit.md`.
+- **Recursion (`lattica-prover-p3/src/recursion/`) — RESEARCH, NOT PRODUCTION, NOT audited, out of this
+  round.** The in-circuit recursive verifier ("the monolith", `MonolithAir`) **is built + validated
+  (R1–R5)** — one AIR that accepts iff `p3::verify(inner)` accepts (a real `JoinSplitAir` inner, non-hiding
+  and hiding), plus an aggregator whose block tx-root is byte-identical to `batch_joinsplit_air::batch_root`.
+  It is feature-gated (`--features recursion`; zero recursion symbols in the default staticlib), on no
+  production path, and the deep self-recursion tree is deferred behind a wrap. Do **not** audit as
+  production; the consolidated status + review/improvement surface is
+  `docs/recursion-aggregation-status.md` (with `docs/recursion-design.md` §10,
+  `docs/recursion-verifier-audit.md`, and `docs/recursion-aggregation-params.md`).
 - The live consensus node (`rubble-node-zig`) beyond the verify seam; networking; mempool; P2P; the
   heartbeat block-production design (`docs/block-production-consensus.md`, host-chain scope).
 - The wallet/prover key management and note-discovery.

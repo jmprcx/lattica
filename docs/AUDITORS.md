@@ -198,11 +198,15 @@ P2P swap protocol/versioning that drive a rubble↔BTC swap over `htlc_air`) and
 (exchange integration, issuance/bridging beyond the single-hidden-asset substrate) is also future
 design. The v3 audit gate covers the lattica side: `htlc_air` + `ShieldedHtlcTx` + their seam.
 
-**Recursion (`lattica-prover-p3/src/recursion/`) is RESEARCH — NOT production, NOT sound, NOT audited.**
-It holds validated in-circuit *primitives* (FRI Merkle openings, the Fiat–Shamir transcript, the F_p²
-fold — each differential-tested against the real Plonky3 functions) plus a *native* re-verifier
-(`native_verify.rs`) that re-implements `p3-uni-stark::verify`'s orchestration and agrees with
-`p3::verify`. **The in-circuit recursive verifier is NOT built** — these are feasibility spikes + a
-porting blueprint (`docs/recursion-design.md` §10, `docs/recursion-verifier-audit.md`), multi-week from a
-production artifact. **Batch aggregation, by contrast, IS production + validated** (`batch_joinsplit_air`/
+**Recursion (`lattica-prover-p3/src/recursion/`) is RESEARCH — NOT production, NOT audited, out of this
+gate.** The in-circuit recursive STARK verifier ("the monolith", `MonolithAir`) **is built + validated
+(R1–R5)**: one AIR that accepts iff `p3::verify(inner)` accepts (a real `JoinSplitAir` inner, non-hiding
+and hiding), plus an aggregator that verifies K inner join-split proofs and folds them into a block
+tx-root **byte-identical to `batch_joinsplit_air::batch_root`**. It is feature-gated behind
+`--features recursion` (zero recursion symbols in the default staticlib — `scripts/check-abi-symbols.sh`),
+on no production path, not externally audited, and the deeper self-recursion tree is deferred behind a
+wrap. It is **not part of this audit gate**; the consolidated status + the review/improvement surface is
+**`docs/recursion-aggregation-status.md`** (with `docs/recursion-design.md` §10,
+`docs/recursion-verifier-audit.md`, and `docs/recursion-aggregation-params.md`).
+**Batch aggregation, by contrast, IS production + validated** (`batch_joinsplit_air`/
 `batch_htlc_air` + the node `applyBatch` path); include it in scope if this round covers the batch path.
