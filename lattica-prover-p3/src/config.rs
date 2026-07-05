@@ -125,8 +125,8 @@ where
 
 /// Deserialize a `postcard(Proof<MyConfig>)` and verify it against `pis` under the production config.
 /// **Fail-closed**: a public-input count ≠ `n_expected_pis`, a trace height above `max_trace_height`,
-/// malformed proof bytes, or a verify error all return `false`. The ONE audited deserialize-bound verify
-/// gate behind the circuits' `verify_bytes` / `verify_batch_bytes` shims.
+/// malformed OR non-canonical (trailing-byte) proof bytes, or a verify error all return `false`. The ONE
+/// audited deserialize-bound verify gate behind the circuits' `verify_bytes` / `verify_batch_bytes` shims.
 ///
 /// `max_trace_height` (a power of two) bounds the accepted trace: the p3 verifier otherwise caps the
 /// proof's `degree_bits` only by `Val::TWO_ADICITY` (= 32), so a proof for a trace far above the
@@ -140,10 +140,17 @@ where
     if pis.len() != n_expected_pis {
         return false;
     }
-    let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
-        Ok(p) => p,
+    // Deserialize AND reject trailing bytes: `postcard::from_bytes` does not check the input was fully
+    // consumed, so `postcard(Proof) ‖ arbitrary` would otherwise verify — a non-canonical accept at the
+    // untrusted-network boundary (proof malleability; external audit M-EXT-1). The wire format is exactly
+    // `postcard(Proof<MyConfig>)`, so an honest proof leaves no remainder.
+    let (proof, rest): (Proof<MyConfig>, &[u8]) = match postcard::take_from_bytes(proof_bytes) {
+        Ok(pr) => pr,
         Err(_) => return false,
     };
+    if !rest.is_empty() {
+        return false;
+    }
     // The hiding PCS commits at 2× the trace (is_zk randomization), so `degree_bits = log2(height) + 1`.
     if proof.degree_bits > (max_trace_height.trailing_zeros() as usize) + 1 {
         return false;

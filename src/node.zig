@@ -74,6 +74,7 @@ pub const TxError = error{
     OversizeProof,
     OversizeOutput,
     OversizeFee, // fee ≥ 2^RANGE_BITS (defense-in-depth with the circuit's fee range check)
+    OversizeMint, // mint ≥ 2^RANGE_BITS (parity with fee: keep the u128 supply counters in-field)
     OversizeHeight, // current_height ≥ 2^RANGE_BITS (would let the HTLC timeout compare wrap)
     HeightMismatch, // tx's current_height ≠ the consensus height the node is validating at
     NonCanonicalField, // a public 32-byte field has a limb ≥ p (non-canonical encoding)
@@ -971,6 +972,10 @@ pub const Chain = struct {
     fn statelessTxChecks(t: anytype) TxError!void {
         for (t.outputs) |o| if (o.ciphertext.len > MAX_NOTE_CIPHERTEXT_LEN) return TxError.OversizeOutput;
         if (t.fee >= MAX_RANGE_VALUE) return TxError.OversizeFee;
+        // Parity with fee (external audit L-node): mint is an issuance quantity fed both to the verifier
+        // (as a field element, mod p) and to the u128 supply counters — bound it in-field so the two can't
+        // diverge on a wrap. Normal txs mint 0; coinbase mint == reward (pinned in applyChecked).
+        if (t.mint >= MAX_RANGE_VALUE) return TxError.OversizeMint;
         return canonicalTxFieldChecks(t);
     }
 

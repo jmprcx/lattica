@@ -1007,6 +1007,22 @@ mod tests {
         matches!(outcome, Ok(false) | Err(_))
     }
 
+    #[test]
+    #[ignore = "slow: proves a join-split to exercise the non-canonical-proof (trailing-byte) rejection"]
+    fn proof_with_trailing_bytes_is_rejected() {
+        // External audit M-EXT-1 (proof malleability): the wire format is exactly postcard(Proof), and the
+        // verify gate now rejects any trailing bytes — so `postcard(Proof) ‖ junk` must NOT verify.
+        let w = demo_witness();
+        let pis = public_values(&w);
+        let proof = prove_to_bytes(&w);
+        assert!(verify_bytes(&proof, &pis), "the honest proof must verify");
+        for extra in [vec![0xAAu8], vec![0u8; 64], vec![7u8; 4096]] {
+            let mut mauled = proof.clone();
+            mauled.extend_from_slice(&extra);
+            assert!(!verify_bytes(&mauled, &pis), "proof + {} trailing bytes must be rejected", extra.len());
+        }
+    }
+
     /// For each persistent key/randomness limb fed to BOTH the commitment/ownership AND the nullifier,
     /// forge a trace that uses a different value in the nullifier (publishing the matching forged nf),
     /// so ONLY that limb's persistence constraint is violated. Each must be unprovable — this is the
