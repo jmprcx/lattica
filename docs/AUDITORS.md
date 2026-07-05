@@ -133,8 +133,9 @@ system `cc`. On a host whose linker handles the crt, the real backends install d
 4. **`docs/protocol-v1-decisions.md`** — the deliberate v1 parameter decisions + limitations
    (single-asset, key model, note randomness, issuance, the deterministic-encryption interaction).
 
-Also current: `docs/audit-readiness-status.md` (audit-readiness status + the post-`v3-audit` roadmap —
-read this for what remains before an external audit of the current tip),
+Also current: **`docs/v3-batch-audit-handoff.md`** (the handoff for the post-`v3-audit` batch tip — start
+here for the batch-aggregation delta: its constraint audit, C-ABI fuzz, and internal adversarial round),
+`docs/audit-readiness-status.md` (audit-readiness status + roadmap),
 `docs/lattica-implementation-audit.md` (the implementation audit + remediation log) and
 `docs/remediation-status.md` (live status). `docs/full-node-security-integration.md` is the production
 full-node checklist (host-chain scope). **Everything else in `docs/` is historical / reference-only**

@@ -1,6 +1,6 @@
 # Lattica — audit-readiness status & roadmap
 
-**Status (2026-07-05): the production CPU path is audit-ready in principle, but the frozen audit artifact (`v3-audit`, 2026-06-28) is ~222 commits stale — the batch-aggregation delta that is now production is uncovered by any audit round, and the batch-delta audit-prep track (W1–W10) is ~10% done (only W1).** This doc is the live map: it answers "is it ready?", "are CPU/GPU production-ready?", and "is it refactored for auditability?", and lists the concrete work to reach a re-frozen `v3-batch-audit` artifact. Entry point for the external audit remains `docs/AUDITORS.md`; closed findings are in `docs/remediation-status.md`.
+**Status (2026-07-05): the batch-delta audit-prep is COMPLETE — W1–W9 done.** Batch aggregation now has a constraint-by-constraint audit (`batch-constraint-audit.md`), C-ABI verifier fuzz (`tests/fuzz_batch.rs`), a four-lens internal adversarial round + remediation (`v3-batch-internal-audit.md` — no critical/high break; two seam fixes F1/F2 landed), an evidence pass, and a fresh handoff (`v3-batch-audit-handoff.md`). **The only remaining step is W10: the maintainer tags `v3-batch-audit` at the RC commit (`8be9b17`) to freeze the artifact (a human action).** The production CPU path is audit-ready; recursion/GPU/streaming stay research/out-of-gate. This doc is the live map (answers "is it ready?", "are CPU/GPU production-ready?", "is it refactored?"). Entry points: `docs/AUDITORS.md` + `docs/v3-batch-audit-handoff.md`; closed findings in `docs/remediation-status.md`.
 
 ## 1. Assessment — the three questions
 
@@ -19,24 +19,25 @@
 
 There is **no `v3-batch-audit` tag yet.** An auditor handed the current tip would be reviewing 222 commits of unfrozen delta against a handoff (`AUDITORS.md`) written for the tag.
 
-*Green ≠ audited.* At `636741f` the current tip passes all gates — the default suite is **101 passed / 17 ignored** (`--ignored`: 17 passed), the ABI-symbol gate confirms the frozen 10-extern surface (zero recursion symbols), and `scripts/run-real-integration.sh` passes end-to-end **including the batch path** (real prove → verify → tamper-reject → double-spend-reject; the Zig node's tx-root equals the Rust circuit's). Passing gates is necessary but not sufficient: **no adversarial round has covered the batch delta** (that is W5).
+*Green ≠ audited.* At RC `8be9b17` the tip passes all gates — the default suite is **102 passed / 20 ignored** (`--ignored`: 20 passed), the ABI-symbol gate confirms the frozen 10-extern surface (zero recursion symbols), constraint fingerprints are unchanged, and `scripts/run-real-integration.sh` passes end-to-end **including the batch path** (real prove → verify → tamper-reject → double-spend-reject; the Zig node's tx-root equals the Rust circuit's). Passing gates was necessary but not sufficient — so the batch delta has now had a **four-lens internal adversarial round + remediation** (W5/W6, `docs/v3-batch-internal-audit.md`): no critical/high soundness break, two seam-robustness fixes (F1 verify-side height cap, F2 prove-side overflow) landed with tests.
 
 ## 3. Roadmap — the batch-delta audit-readiness track (W1–W10)
 
 | WS | What | Status | Artifact |
 |---|---|---|---|
-| **W1** | Feature-gate research (recursion/gpu/stream) out of the production staticlib + an ABI-symbol gate | ✅ **done** | `lattica-prover-p3/scripts/check-abi-symbols.sh` (green) |
-| **W2** | Batch C-ABI fuzz / adversarial tests (the HTLC precedent is `tests/fuzz_htlc.rs`) | ❌ | `lattica-prover-p3/tests/fuzz_batch.rs` (absent) |
-| **W3** | Batch constraint-by-constraint self-audit (the join-split precedent is `joinsplit-constraint-audit.md`) | ❌ | `docs/batch-constraint-audit.md` (absent) |
-| **W4** | Audit-doc truth pass — stale claims / scope / repro numbers | 🟡 **this pass** | `AUDITORS.md`, `audit-scope-p3.md`, `production-readiness.md` |
-| **W5** | Internal adversarial round on the batch delta | ❌ | `docs/v3-batch-internal-audit.md` (absent) |
-| **W6** | Fix wave from W5 | ⬜ blocked on W5 | — |
-| **W7** | Full gate-run evidence pass at the RC commit | ⬜ | (re-run the §"Build/test" gates) |
-| **W8** | New external handoff for the batch tip | ❌ | `docs/v3-batch-audit-handoff.md` (absent) |
-| **W9** | Final consistency sweep + freeze | ⬜ | — |
-| **W10** | **USER** tags `v3-batch-audit` (never autonomous) | ❌ | tag (still `v3-audit`) |
+| **W1** | Feature-gate research (recursion/gpu/stream) out of the production staticlib + an ABI-symbol gate | ✅ | `lattica-prover-p3/scripts/check-abi-symbols.sh` (green) |
+| **W2** | Batch C-ABI fuzz / adversarial tests | ✅ | `lattica-prover-p3/tests/fuzz_batch.rs` (`772dffb`) |
+| **W3** | Batch constraint-by-constraint self-audit | ✅ | `docs/batch-constraint-audit.md` (`b87fe4f`) |
+| **W4** | Audit-doc truth pass — stale claims / scope / repro numbers | ✅ | `AUDITORS.md`, `audit-scope-p3.md`, `production-readiness.md` (`d97c1f1`) |
+| **W5** | Internal adversarial round on the batch delta (4 lenses) | ✅ | `docs/v3-batch-internal-audit.md` (`8be9b17`) |
+| **W6** | Fix wave (F1 verify-cap, F2 overflow, OBS-1 debug-panic, OBS-2 oracle) | ✅ | `8be9b17` (validated green) |
+| **W7** | Full gate-run evidence pass at the RC commit | ✅ | RC `8be9b17`: 102/20, `--ignored` 20, ABI gate + real integration green |
+| **W8** | New external handoff for the batch tip | ✅ | `docs/v3-batch-audit-handoff.md` |
+| **W9** | Final consistency sweep | ✅ | this doc |
+| **W10** | **Maintainer** tags `v3-batch-audit` at the RC commit (never autonomous) | ⏳ | tag (still `v3-audit`; RC is `8be9b17`) |
 
-The substantive lifts are **W2 (batch fuzz), W3 (batch constraint audit), W5 (internal adversarial round)**; W7–W10 are evidence/handoff/freeze. Scope of the track is the **production-surface delta only** — recursion/GPU/streaming research are explicitly out.
+The batch-delta track is **complete through W9**; only **W10 (the human tag)** remains. Scope was the
+**production-surface delta only** — recursion/GPU/streaming research are explicitly out.
 
 ## 4. Standing auditor sign-off items
 
@@ -52,8 +53,12 @@ The substantive lifts are **W2 (batch fuzz), W3 (batch constraint audit), W5 (in
 - **GPU / streaming / recursion** — research, feature-gated, verified under the prod verifier (§1.2).
 - **Wallet / prover key management + note discovery.**
 
-## 6. Doc hygiene (refreshed in this pass) + see also
+## 6. Doc hygiene + batch-delta artifacts + see also
 
-This pass corrected stale claims that would mislead an auditor: the reproduction test counts in `AUDITORS.md` §3, the "coinbase/mint/burn not yet modeled" line and the C-03 checklist row in `audit-scope-p3.md` (both since resolved), the ABI-fuzz status (HTLC done, batch open), an explicit out-of-scope listing for GPU + streaming, a hardened historical banner on `production-readiness.md`, and the crate-relative path to `check-abi-symbols.sh`.
+The doc-truth pass (W4) corrected stale claims that would mislead an auditor: the reproduction test counts in `AUDITORS.md` §3, the "coinbase/mint/burn not yet modeled" line and the C-03 checklist row in `audit-scope-p3.md`, an explicit out-of-scope listing for GPU + streaming, a hardened historical banner on `production-readiness.md`, and the crate-relative path to `check-abi-symbols.sh`.
+
+**Batch-delta audit artifacts (W2–W8):** `docs/v3-batch-audit-handoff.md` (the handoff — start here for the delta), `docs/batch-constraint-audit.md` (constraint-by-constraint audit), `docs/v3-batch-internal-audit.md` (the four-lens adversarial round + F1/F2 remediation), `lattica-prover-p3/tests/fuzz_batch.rs` (C-ABI verifier fuzz).
+
+**See also:** `docs/AUDITORS.md` · `docs/audit-scope-p3.md` · `docs/remediation-status.md` · `docs/soundness-budget.md` · `docs/full-node-security-integration.md` · `docs/gpu-acceleration.md` · `docs/recursion-aggregation-status.md`.
 
 **See also:** `docs/AUDITORS.md` (handoff) · `docs/audit-scope-p3.md` (scope/threat model/frozen params) · `docs/remediation-status.md` (closed findings) · `docs/soundness-budget.md` (the proven floor) · `docs/full-node-security-integration.md` (host-chain gates) · `docs/gpu-acceleration.md` · `docs/recursion-aggregation-status.md`.
