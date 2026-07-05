@@ -1523,6 +1523,70 @@ fn stream_prove_aggregator_ram_bench() {
     );
 }
 
+/// PERF bench: CPU vs GPU HIDING prove across circuit scales (join-split → batch → aggregator), all under
+/// the PRODUCTION hiding config and all verifying under the production verifier. CPU = `prove(make_config())`
+/// (Radix2 LDE + CPU Merkle); GPU = `config::gpu::proof_to_bytes_hiding` (`GpuHidingPcs`: GPU LDE + GPU
+/// Merkle, CPU quotient). Best-of-`LATTICA_BENCH_RUNS` (default 3) wall-clock; the trace is built once and
+/// cloned per run so only the prove is timed (the first GPU run also pays the one-time OpenCL program build,
+/// which best-of discards). Run:
+///   `cargo test --release --features recursion,gpu cpu_vs_gpu_prove_benchmark -- --ignored --nocapture`
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "bench: CPU vs GPU hiding prove across scales (--features recursion,gpu, LATTICA_BENCH_RUNS)"]
+fn cpu_vs_gpu_prove_benchmark() {
+    use crate::batch_joinsplit_air::{batch_root, build_batch_trace, JoinSplitBatchAir};
+    use crate::joinsplit_air::{self, JoinSplitAir};
+    use p3_matrix::dense::RowMajorMatrix;
+
+    let runs: usize =
+        std::env::var("LATTICA_BENCH_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3).max(1);
+    println!("\nCPU vs GPU hiding prove (best of {runs}), production config, both verify under production verifier:");
+    println!("{:<20} {:>11} {:>10} {:>10} {:>9}", "circuit", "rows x w", "CPU ms", "GPU ms", "speedup");
+
+    // Build the trace ONCE; verify both backends under the production verifier; then best-of-`runs` each,
+    // cloning the trace per run so `prove` (not the trace build) is what's timed. Concrete-air calls, so no
+    // explicit trait bounds are needed (macro, not a generic fn — the GPU hiding config type stays private).
+    macro_rules! bench {
+        ($name:expr, $air:expr, $trace:expr, $pis:expr) => {{
+            let name = $name;
+            let air = $air;
+            let trace: RowMajorMatrix<crate::config::Val> = $trace;
+            let pis = $pis;
+            let (rows, w) = (trace.values.len() / trace.width, trace.width);
+            let cpu_p = prove(&crate::config::make_config(), &air, trace.clone(), &pis);
+            assert!(verify(&crate::config::make_config(), &air, &cpu_p, &pis).is_ok(), "{} CPU verify", name);
+            let gpu_b = crate::config::gpu::proof_to_bytes_hiding(&air, trace.clone(), &pis);
+            let gpu_p: Proof<crate::config::MyConfig> = postcard::from_bytes(&gpu_b).expect("gpu proof deser");
+            assert!(verify(&crate::config::make_config(), &air, &gpu_p, &pis).is_ok(), "{} GPU verify", name);
+            let (mut cpu_ms, mut gpu_ms) = (f64::MAX, f64::MAX);
+            for _ in 0..runs {
+                let tr = trace.clone();
+                let t = std::time::Instant::now();
+                let _ = prove(&crate::config::make_config(), &air, tr, &pis);
+                cpu_ms = cpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                let tr = trace.clone();
+                let t = std::time::Instant::now();
+                let _ = crate::config::gpu::proof_to_bytes_hiding(&air, tr, &pis);
+                gpu_ms = gpu_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let dims = format!("{rows}x{w}");
+            println!("{:<20} {:>11} {:>10.1} {:>10.1} {:>8.2}x", name, dims, cpu_ms, gpu_ms, cpu_ms / gpu_ms);
+        }};
+    }
+
+    let w = joinsplit_air::demo_witness();
+    bench!("join-split", JoinSplitAir, joinsplit_air::build_trace(&w), joinsplit_air::public_values(&w));
+    for n in [16usize, 64] {
+        let ws: Vec<_> = (0..n).map(|_| joinsplit_air::demo_witness()).collect();
+        let root = batch_root(&ws);
+        bench!(format!("batch N={n}"), JoinSplitBatchAir, build_batch_trace(&ws), root);
+    }
+    for q in [8usize, 32] {
+        let (air, trace, txroot, _) = build_aggregator_trace(2, q);
+        bench!(format!("aggregator q={q}"), air, trace, txroot);
+    }
+}
+
 /// R4: the SYMBOLIC tiled aggregator — K column-window monolith instances, each verifying a REAL
 /// join-split proof (accept-iff-p3::verify via the symbolic epilogue) AND folding its verified `pvs[0]`
 /// into the block tx-root, fused in ONE AIR. The symbolic twin of `run_aggregator` (which did ConstAir
