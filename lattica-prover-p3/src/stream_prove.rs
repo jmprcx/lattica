@@ -2185,6 +2185,18 @@ mod tests {
         let t0 = std::time::Instant::now();
         let bytes = if mode == "stream" {
             postcard::to_allocvec(&stream_prove_seeded(&JoinSplitBatchAir, trace, &root, cblk).unwrap()).unwrap()
+        } else if mode == "gpu" {
+            // GPU hiding prove (GpuHidingPcs: GPU LDE + GPU Merkle, CPU quotient) — like `p3` it holds the
+            // whole LDE in host RAM (GPU offloads to VRAM, not host), so it shares p3's RAM floor; here to
+            // measure its speed/RAM curve against the out-of-core `stream`.
+            #[cfg(feature = "gpu")]
+            {
+                crate::config::gpu::proof_to_bytes_hiding(&JoinSplitBatchAir, trace, &root)
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                unreachable!("mode=gpu requires --features gpu")
+            }
         } else {
             postcard::to_allocvec(&prove(&make_config(), &JoinSplitBatchAir, trace, &root)).unwrap()
         };
