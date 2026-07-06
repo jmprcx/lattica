@@ -1,6 +1,6 @@
 # Lattica — audit-readiness status & roadmap
 
-**Status (2026-07-05): the batch-delta audit-prep is COMPLETE — W1–W9 done.** Batch aggregation now has a constraint-by-constraint audit (`batch-constraint-audit.md`), C-ABI verifier fuzz (`tests/fuzz_batch.rs`), a four-lens internal adversarial round + remediation (`v3-batch-internal-audit.md` — no critical/high break; two seam fixes F1/F2 landed), an evidence pass, and a fresh handoff (`v3-batch-audit-handoff.md`). **The only remaining step is W10: the maintainer tags `v3-batch-audit` at the RC commit (`8be9b17`) to freeze the artifact (a human action).** The production CPU path is audit-ready; recursion/GPU/streaming stay research/out-of-gate. This doc is the live map (answers "is it ready?", "are CPU/GPU production-ready?", "is it refactored?"). Entry points: `docs/AUDITORS.md` + `docs/v3-batch-audit-handoff.md`; closed findings in `docs/remediation-status.md`.
+**Status (2026-07-06): COMPLETE — W1–W10 done; artifact frozen at the `v3-batch-audit` tag.** Batch aggregation has a constraint-by-constraint audit (`batch-constraint-audit.md`), C-ABI verifier fuzz (`tests/fuzz_batch.rs`), a four-lens internal adversarial round + remediation (`v3-batch-internal-audit.md` — no critical/high break; F1/F2 fixes), an evidence pass, and a handoff (`v3-batch-audit-handoff.md`). The tagged tip **additionally carries the full external-scope security audit** (`v3-external-audit-report.md` — five adversarial lenses over the join-split + HTLC circuits, the C-ABI/verify boundary, the Zig node, and crypto/ZK: no critical/high) **and its M-EXT-1 (proof malleability) + L-node (mint parity) remediations**, all re-validated (Rust 102 passed / 0 failed, `zig build test` green). The production CPU path is audit-ready; recursion/GPU/streaming stay research/out-of-gate. Entry points: `docs/AUDITORS.md` + `docs/v3-batch-audit-handoff.md` + `docs/v3-external-audit-report.md`; closed findings in `docs/remediation-status.md`.
 
 ## 1. Assessment — the three questions
 
@@ -34,10 +34,11 @@ There is **no `v3-batch-audit` tag yet.** An auditor handed the current tip woul
 | **W7** | Full gate-run evidence pass at the RC commit | ✅ | RC `8be9b17`: 102/20, `--ignored` 20, ABI gate + real integration green |
 | **W8** | New external handoff for the batch tip | ✅ | `docs/v3-batch-audit-handoff.md` |
 | **W9** | Final consistency sweep | ✅ | this doc |
-| **W10** | **Maintainer** tags `v3-batch-audit` at the RC commit (never autonomous) | ⏳ | tag (still `v3-audit`; RC is `8be9b17`) |
+| **W10** | Maintainer tags `v3-batch-audit` (freeze the artifact) | ✅ | tagged `v3-batch-audit` (this commit) |
 
-The batch-delta track is **complete through W9**; only **W10 (the human tag)** remains. Scope was the
-**production-surface delta only** — recursion/GPU/streaming research are explicitly out.
+The batch-delta track is **complete (W1–W10)** and the artifact is frozen at the `v3-batch-audit` tag,
+which also carries the full external-scope audit + its remediations. Scope was the **production-surface
+delta only** — recursion/GPU/streaming research are explicitly out.
 
 ## 4. Standing auditor sign-off items
 
