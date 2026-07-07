@@ -47,6 +47,23 @@ type Dom = <MyPcs as Pcs<Challenge, Cha>>::Domain;
 /// The batched FRI opening proof type of the production PCS.
 type PcsProof = <MyPcs as Pcs<Challenge, Cha>>::Proof;
 
+/// The AIR capabilities the lookup prover needs: a base AIR (width), symbolic evaluation (for the combined
+/// constraint layout + lookup extraction), and folding through the lookup-aware verifier folder (shared by
+/// the quotient and the ζ-check). Any interaction AIR generic over its builder satisfies this via the blanket
+/// impl below. (Not yet threaded: public values + periodic columns — see `batched_constraints_at_point`.)
+pub trait LookupAir:
+    BaseAir<Val>
+    + Air<InteractionSymbolicBuilder<Val, Challenge>>
+    + for<'a> Air<VerifierConstraintFolderWithLookups<'a, MyConfig>>
+{
+}
+impl<A> LookupAir for A where
+    A: BaseAir<Val>
+        + Air<InteractionSymbolicBuilder<Val, Challenge>>
+        + for<'a> Air<VerifierConstraintFolderWithLookups<'a, MyConfig>>
+{
+}
+
 /// The public artifact of the two-round lookup prover (a proof *skeleton* — no quotient/opening yet).
 pub struct LookupRoundProof {
     pub trace_commit: Com,
@@ -187,8 +204,8 @@ pub fn aux_fraction_wellformed(
 /// p3's `get_log_num_quotient_chunks` runs only `air.eval` and so misses the lookup constraints — using it
 /// would make the alpha-power layout and the quotient domain too small. The forked quotient (W1.2) must use
 /// THIS layout + degree. Emission order is `air.eval` then `gadget.eval_all` (matched by prover + verifier).
-pub fn combined_constraint_layout(
-    air: &RangeCheckAir,
+pub fn combined_constraint_layout<A: LookupAir>(
+    air: &A,
     lookups: &Lookups<Val>,
     is_zk: usize,
 ) -> (ConstraintLayout, usize) {
@@ -224,8 +241,8 @@ pub fn combined_constraint_layout(
 /// is automatic — no `decompose_alpha` / packed-aux reconstruction, and no risk of the two sides folding
 /// constraints differently (the classic FRI-fork bug). Values are in the extension field.
 #[allow(clippy::too_many_arguments)]
-pub fn batched_constraints_at_point(
-    air: &RangeCheckAir,
+pub fn batched_constraints_at_point<A: LookupAir>(
+    air: &A,
     lookups: &Lookups<Val>,
     trace_local: &[Challenge],
     trace_next: &[Challenge],
@@ -267,7 +284,7 @@ pub fn batched_constraints_at_point(
         permutation_challenges: lookup_challenges,
         permutation_values,
     };
-    air.eval(&mut folder); // base constraints (RangeCheckAir: none; drains the interaction)
+    air.eval(&mut folder); // base AIR constraints + drains the interaction into the lookup folder
     LogUpGadget::new().eval_all(&mut folder, lookups); // the LogUp fraction/accumulator constraints
     folder.inner.accumulator
 }
@@ -299,8 +316,8 @@ pub struct LookupQuotientProof {
 /// fold constraints identically. The extension-field aux trace is reconstructed from its `flatten_to_base`
 /// layout: Challenge column `c` ← base columns `c*D .. c*D+D`.
 #[allow(clippy::too_many_arguments)]
-pub fn lookup_quotient_values<Mt, Ma>(
-    air: &RangeCheckAir,
+pub fn lookup_quotient_values<A: LookupAir, Mt, Ma>(
+    air: &A,
     lookups: &Lookups<Val>,
     trace_domain: Dom,
     quotient_domain: Dom,
@@ -361,8 +378,8 @@ where
 /// `prove_lookup_rounds` (the two-round skeleton) with the quotient commit — the half of the FRI tail that
 /// binds the trace + aux to the constraints. What remains is only the ζ-opening (trace + aux + quotient FRI
 /// openings and the OOD identity), a mechanical extension of p3's `open`.
-pub fn prove_lookup_with_quotient(
-    air: &RangeCheckAir,
+pub fn prove_lookup_with_quotient<A: LookupAir>(
+    air: &A,
     main: RowMajorMatrix<Val>,
     pis: &[Val],
 ) -> LookupQuotientProof {
@@ -498,14 +515,14 @@ pub enum LookupVerifyError {
 /// W1.3 — the complete lookup prover: `prove_lookup_with_quotient`'s three rounds followed by the **ζ-opening**
 /// of trace + aux + quotient (one batched FRI proof). Completes the W1 milestone (`prove` → `verify` end to
 /// end); see `verify_lookup` for the matching verifier.
-pub fn prove_lookup(air: &RangeCheckAir, main: RowMajorMatrix<Val>, pis: &[Val]) -> LookupProof {
+pub fn prove_lookup<A: LookupAir>(air: &A, main: RowMajorMatrix<Val>, pis: &[Val]) -> LookupProof {
     prove_lookup_inner(air, main, pis, false)
 }
 
 /// The prover core. `forge_aux` (test-only) corrupts one committed aux fraction so the batched constraints no
 /// longer vanish on `H`, driving the verifier's OOD rejection path.
-fn prove_lookup_inner(
-    air: &RangeCheckAir,
+fn prove_lookup_inner<A: LookupAir>(
+    air: &A,
     main: RowMajorMatrix<Val>,
     pis: &[Val],
     forge_aux: bool,
@@ -605,8 +622,8 @@ fn prove_lookup_inner(
 /// batched FRI opening of trace + aux + quotient at ζ, then check the two soundness relations — the OOD
 /// constraint identity `folded(ζ)·Z_H(ζ)^{-1} = Q(ζ)` (base AIR + LogUp constraints via the *same*
 /// `batched_constraints_at_point` the prover's quotient used) and the LogUp terminal sum.
-pub fn verify_lookup(
-    air: &RangeCheckAir,
+pub fn verify_lookup<A: LookupAir>(
+    air: &A,
     proof: &LookupProof,
     pis: &[Val],
 ) -> Result<(), LookupVerifyError> {
@@ -1007,6 +1024,69 @@ mod tests {
         assert!(
             matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
             "a forged aux must fail the OOD constraint identity"
+        );
+    }
+
+    /// A second interaction AIR (distinct from `RangeCheckAir`) exercising the generalized prover: a boolean
+    /// column `b` (base constraint `b·(b−1)=0`, degree 2 — which `RangeCheckAir` has none of) plus one LogUp
+    /// range-check of `b` against a table. Columns: `[b, table, mult]`.
+    struct BooleanAir;
+    impl<F: p3_field::Field> BaseAir<F> for BooleanAir {
+        fn width(&self) -> usize {
+            3
+        }
+    }
+    impl<AB> Air<AB> for BooleanAir
+    where
+        AB: AirBuilder<F = Val> + InteractionBuilder,
+    {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let local = main.current_slice();
+            let (b, table, mult) = (local[0], local[1], local[2]);
+            builder.assert_zero(b.into() * (b.into() - AB::Expr::ONE)); // b ∈ {0,1}
+            builder.push_local_interaction(vec![
+                (vec![b.into()], AB::Expr::ONE),
+                (vec![table.into()], -(mult.into())),
+            ]);
+        }
+    }
+
+    /// A balanced boolean trace: `b = i mod 2`, provided in the table with multiplicity 1 (the lookup balances
+    /// and every `b` is boolean).
+    fn boolean_main(height: usize) -> RowMajorMatrix<Val> {
+        let mut flat = Vec::with_capacity(height * 3);
+        for i in 0..height {
+            let b = Val::from_u64((i as u64) & 1);
+            flat.push(b);
+            flat.push(b);
+            flat.push(Val::ONE);
+        }
+        RowMajorMatrix::new(flat, 3)
+    }
+
+    /// W2 groundwork — the generalized prover proves + verifies a DIFFERENT interaction AIR (boolean + lookup,
+    /// with a real base constraint) end to end, not just `RangeCheckAir`.
+    #[test]
+    fn boolean_air_prove_verify_round_trips() {
+        let air = BooleanAir;
+        let proof = prove_lookup(&air, boolean_main(1 << 5), &[]);
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "the boolean+lookup AIR must verify end to end");
+    }
+
+    /// A non-boolean `b` (base constraint violated), kept lookup-balanced so the terminal stays zero, is caught
+    /// by the OOD constraint identity — proving base constraints are folded on the generalized path (the
+    /// terminal alone would not catch it).
+    #[test]
+    fn boolean_air_verify_rejects_broken_base_constraint() {
+        let air = BooleanAir;
+        let mut main = boolean_main(1 << 5);
+        main.values[3 * 4] = Val::from_u64(2); // row 4: b = 2 (not boolean)
+        main.values[3 * 4 + 1] = Val::from_u64(2); // table = 2 keeps the lookup balanced (terminal stays 0)
+        let proof = prove_lookup(&air, main, &[]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
+            "a non-boolean b must fail the OOD constraint identity (base constraint)"
         );
     }
 }
