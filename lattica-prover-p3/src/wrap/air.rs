@@ -1052,6 +1052,17 @@ mod tests {
             wrap_w - outer_w,
             wrap.n_mul
         );
+        // W3 target (the first size lever): the narrow-tall op-table lays the {n_mul} Mul products as trace
+        // ROWS at CONSTANT width (the `ChainEvalAir` form — degree down the rows) instead of 2·n_mul = {}
+        // COLUMNS, so the wrap contracts from {wrap_w} back to ≈ the inline monolith ({outer_w}) — no longer
+        // WIDER than inline. Then canonicalize (fix w_inner/nqc/cap_height) makes it inner-independent, and
+        // Tip5 (~4.6× fewer hash rows) shrinks the hash-dominated fused_w toward the W5 fixed point (W_out≤W_in).
+        println!(
+            "W3 target: narrow-tall op-table ⇒ wrap width ~{outer_w} (the {} witnessed COLUMNS become {} slack \
+             ROWS at constant width); then canonicalize + Tip5 → the W5 size fixed point.",
+            wrap_w - outer_w,
+            wrap.n_mul
+        );
         assert!(inline_nqc > LOG_BLOWUP, "the inline monolith must EXPLODE on a monolith-as-inner (the R5 bug)");
         assert!(wrap_nqc <= LOG_BLOWUP, "the wrap must FIX it — witnessed epilogue stays within budget");
     }
