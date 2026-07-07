@@ -217,10 +217,6 @@ pub fn combined_constraint_layout<A: LookupAir>(
         num_permutation_values: 1,            // the committed terminal
         ..AirLayout::from_air(air)
     };
-    assert_eq!(
-        layout.num_periodic_columns, 0,
-        "periodic columns are not yet threaded through the lookup fold"
-    );
     let mut isb = InteractionSymbolicBuilder::<Val, Challenge>::new(layout);
     air.eval(&mut isb);
     LogUpGadget::new().eval_all(&mut isb, lookups);
@@ -258,6 +254,7 @@ pub fn batched_constraints_at_point<A: LookupAir>(
     lookup_challenges: &[Challenge], // [α_L, β]
     permutation_values: &[Challenge], // [terminal]
     public_values: &[Val],
+    periodic_values: &[Challenge],
 ) -> Challenge {
     let empty: &[Challenge] = &[];
     let main = VerticalPair::new(
@@ -270,7 +267,7 @@ pub fn batched_constraints_at_point<A: LookupAir>(
         main,
         preprocessed,
         preprocessed_window,
-        periodic_values: empty,
+        periodic_values,
         public_values,
         is_first_row,
         is_last_row,
@@ -331,6 +328,7 @@ pub fn lookup_quotient_values<A: LookupAir, Mt, Ma>(
     lookup_challenges: &[Challenge],
     permutation_values: &[Challenge],
     public_values: &[Val],
+    pcs: &MyPcs,
 ) -> Vec<Challenge>
 where
     Mt: Matrix<Val>,
@@ -340,6 +338,17 @@ where
     let sels = trace_domain.selectors_on_coset(quotient_domain);
     let next_step = quotient_size / trace_domain.size();
     let d = <Challenge as BasedVectorSpace<Val>>::DIMENSION;
+
+    // The periodic-column LDE on the quotient domain (None for AIRs with no periodic columns).
+    let periodic_cols = air.periodic_columns();
+    let periodic_table = (!periodic_cols.is_empty()).then(|| {
+        <MyPcs as Pcs<Challenge, Cha>>::build_periodic_lde_table(
+            pcs,
+            &periodic_cols,
+            trace_domain,
+            quotient_domain,
+        )
+    });
 
     // Lift a base trace row to the extension field.
     let trace_row = |i: usize| -> Vec<Challenge> {
@@ -356,6 +365,10 @@ where
     (0..quotient_size)
         .map(|i| {
             let inext = (i + next_step) % quotient_size;
+            let periodic: Vec<Challenge> = periodic_table
+                .as_ref()
+                .map(|t| (0..t.width()).map(|c| Challenge::from(*t.get(i, c))).collect())
+                .unwrap_or_default();
             let folded = batched_constraints_at_point(
                 air,
                 lookups,
@@ -370,6 +383,7 @@ where
                 lookup_challenges,
                 permutation_values,
                 public_values,
+                &periodic,
             );
             // quotient(x) = C(x) / Z_H(x) = folded · inv_vanishing(x).
             folded * Challenge::from(sels.inv_vanishing[i])
@@ -449,6 +463,7 @@ pub fn prove_lookup_with_quotient<A: LookupAir>(
         &lookup_challenges,
         &[terminal.0],
         pis,
+        pcs,
     );
     let quotient_flat = RowMajorMatrix::new_col(quotient_values.clone()).flatten_to_base();
     let (quotient_commit, _quotient_data) = <MyPcs as Pcs<Challenge, Cha>>::commit_quotient(
@@ -583,7 +598,7 @@ fn prove_lookup_inner<A: LookupAir>(
         <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &aux_data, 0, quotient_domain);
     let quotient_values = lookup_quotient_values(
         air, &lookups, trace_domain, quotient_domain, &trace_on_qd, &aux_on_qd, aux_width, alpha,
-        &lookup_challenges, &[terminal.0], pis,
+        &lookup_challenges, &[terminal.0], pis, pcs,
     );
     let quotient_flat = RowMajorMatrix::new_col(quotient_values).flatten_to_base();
     let (quotient_commit, quotient_data) = <MyPcs as Pcs<Challenge, Cha>>::commit_quotient(
@@ -740,6 +755,11 @@ pub fn verify_lookup<A: LookupAir>(
 
     // The OOD constraint identity — folded (base + lookup) via the SAME folder the prover's quotient used.
     let sels = init_trace_domain.selectors_at_point(zeta);
+    let periodic_at_zeta: Vec<Challenge> = air
+        .periodic_columns()
+        .iter()
+        .map(|col| init_trace_domain.evaluate_periodic_column_at(col, zeta))
+        .collect();
     let folded = batched_constraints_at_point(
         air,
         &lookups,
@@ -754,6 +774,7 @@ pub fn verify_lookup<A: LookupAir>(
         &lookup_challenges,
         &[proof.terminal.0],
         pis,
+        &periodic_at_zeta,
     );
     if folded * sels.inv_vanishing != quotient_at_zeta {
         return Err(LookupVerifyError::OodMismatch);
@@ -801,7 +822,7 @@ mod tests {
         let is_first = if r == 0 { one } else { zero };
         let is_last = if r == n - 1 { one } else { zero };
         let is_trans = if r == n - 1 { zero } else { one };
-        batched_constraints_at_point(air, lookups, &tl, &tn, &al, &an, is_first, is_last, is_trans, alpha, lc, pv, &[])
+        batched_constraints_at_point(air, lookups, &tl, &tn, &al, &an, is_first, is_last, is_trans, alpha, lc, pv, &[], &[])
     }
 
     /// W1.2 core — the batched (base + lookup) constraints **vanish on every trace-domain row** for a valid
@@ -1212,5 +1233,72 @@ mod tests {
         let proof = prove_lookup(&air, two_lookup_main(1 << 5), &[]);
         assert_eq!(proof.aux_width, 3, "two lookups ⇒ aux width = 1 accumulator + 2 fractions");
         assert!(verify_lookup(&air, &proof, &[]).is_ok(), "the two-lookup AIR must verify end to end");
+    }
+
+    /// A periodic-column AIR: `[val, table, mult]` with a period-2 selector `[1,0]` gating a base constraint
+    /// (`val == 0` on even rows) plus one LogUp range-check. Exercises periodic-column threading — the
+    /// quotient-domain periodic LDE (prover) and `evaluate_periodic_column_at` (verifier).
+    struct PeriodicAir;
+    impl<F: p3_field::Field> BaseAir<F> for PeriodicAir {
+        fn width(&self) -> usize {
+            3
+        }
+        fn num_periodic_columns(&self) -> usize {
+            1
+        }
+        fn periodic_columns(&self) -> Vec<Vec<F>> {
+            vec![vec![F::ONE, F::ZERO]] // period-2 selector: 1 on even rows, 0 on odd
+        }
+    }
+    impl<AB> Air<AB> for PeriodicAir
+    where
+        AB: AirBuilder<F = Val> + InteractionBuilder,
+    {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let local = main.current_slice();
+            let (val, table, mult) = (local[0], local[1], local[2]);
+            let sel: AB::Expr = builder.periodic_values()[0].into();
+            builder.assert_zero(sel * val.into()); // on even rows (sel = 1): val must be 0
+            builder.push_local_interaction(vec![
+                (vec![val.into()], AB::Expr::ONE),
+                (vec![table.into()], -(mult.into())),
+            ]);
+        }
+    }
+
+    /// A balanced trace with `val = table = 0` everywhere (satisfies the even-row constraint and the lookup).
+    fn periodic_main(height: usize) -> RowMajorMatrix<Val> {
+        let mut flat = Vec::with_capacity(height * 3);
+        for _ in 0..height {
+            flat.push(Val::ZERO); // val
+            flat.push(Val::ZERO); // table
+            flat.push(Val::ONE); // mult
+        }
+        RowMajorMatrix::new(flat, 3)
+    }
+
+    /// Step 1 (periodic columns) — the fold now threads periodic columns (quotient-domain LDE in the prover,
+    /// `evaluate_periodic_column_at` in the verifier): prove + verify end to end.
+    #[test]
+    fn periodic_air_round_trips() {
+        let air = PeriodicAir;
+        let proof = prove_lookup(&air, periodic_main(1 << 5), &[]);
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "the periodic-selector AIR must verify end to end");
+    }
+
+    /// Breaking an EVEN row's value (kept lookup-balanced) violates the periodic-gated base constraint ⇒ OOD
+    /// mismatch — confirming periodic columns are folded consistently in the prover's quotient and the ζ-check.
+    #[test]
+    fn periodic_air_rejects_violated_even_row() {
+        let air = PeriodicAir;
+        let mut main = periodic_main(1 << 5);
+        main.values[3 * 2] = Val::from_u64(5); // row 2 (even, sel = 1): val = 5 ≠ 0
+        main.values[3 * 2 + 1] = Val::from_u64(5); // table = 5 keeps the lookup balanced
+        let proof = prove_lookup(&air, main, &[]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
+            "a violated even-row periodic constraint must fail the OOD identity"
+        );
     }
 }
