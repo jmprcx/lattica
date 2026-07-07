@@ -27,17 +27,18 @@ block-DAG where each block wraps K parents (the existing flat aggregator is alre
   AIR+lookup layout, the shared single-point constraint folder, quotient-over-domain, and the batched
   ζ-opening of trace + aux + quotient. A range-check lookup AIR round-trips; imbalance → `NonZeroTerminal`,
   tamper → `Pcs`/`OodMismatch`, forged aux → `OodMismatch`. 16/16 lookup tests.
-- **W2 — IN PROGRESS; the DEGREE crux is measured GO, the full assembly remains.** The prover is generalized
+- **W2 — COMPLETE (degree gate closed + the assembled wrap proven + the self-recursion fix demonstrated).** The prover is generalized
   to arbitrary interaction AIRs (public values, multi-arity, periodic), and the three high-degree constructs
   **B / C / I** are each built + measured in `src/wrap/mod.rs`. The `log_nqc ≤ 4` degree crux (vs the
   monolith's 7) is measured **three independent ways** — synthetic 384-constraint models, the **real
   81-constraint `JoinSplitAir`** epilogue, and the accessible-region rollup (composed 3). **W2-super** then
   folded the reused `--features recursion` super-tile tiles into the rollup and measured them (D/E/F = 2/3/3),
   so classes A/D/E/F sit ≤ budget too; G/H/J are already ≤ 4 via the monolith's own degree guards, and the
-  prover-readiness for the composed AIR is validated (`CompositeAir`). **W2-assemble.1** (the novel B/C/I
-  regions) is now fused + proven end-to-end (`WrapArithAir`, `src/wrap/air.rs`); **remaining = W2-assemble.2**
-  (fold in the reused super-tile regions over a real inner — trace-construction, one `sim_full` blocker) +
-  **W2-measure** (the whole-construction gate).
+  prover-readiness for the composed AIR is validated (`CompositeAir`). **W2-assemble** then built the actual
+  `WrapAir` (the `MonolithBci` refactor — the monolith's whole constraint system via `eval_bci` with a
+  witnessed epilogue, `InlineBci` byte-identical): it **composes ≤ 4, proves over a real inner, and fixes the
+  self-recursion explosion** (`wrap_fixes_self_recursion`: inline `log_nqc 7` → witnessed `3`). **W2 done;
+  the remaining phases (W3–W7) are the SIZE program (Tip5 + the fixed point + the tree).**
 
 ## The load-bearing insight (from the grounded conversion map)
 
@@ -160,9 +161,12 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
     fused_w 773 + 2·214 witnessed `c_k` cols) — the assembled wrap composes within budget. **And it PROVES:**
     `wrap_air_proves` (`--release --ignored`, ~32s) fills the witnessed `c_k` columns (`native_witnessed`, the
     native mirror of the `Witnesser`) at each arith head and **proves + verifies + tamper-rejects** the full
-    `WrapAir` over a real inner — so the assembled wrap is **sound**, not just degree-≤4. *Remaining follow-up
-    (deferred):* the high-degree demonstration (inline explodes / witnessed ≤4 on a monolith-as-inner — the
-    R5/W5-adjacent case, where the degree *win* actually shows).
+    `WrapAir` over a real inner — so the assembled wrap is **sound**, not just degree-≤4. **And the degree WIN
+    is demonstrated** (`wrap_fixes_self_recursion`, `--release --ignored`): building the OUTER monolith
+    verifying an INNER ConstAir monolith (the R5 self-recursion case, 384 inner constraints) and measuring it
+    two ways over the same inner — **inline `MonolithAir` `log_nqc = 7` (EXPLODES) vs witnessed `WrapAir`
+    `log_nqc = 3` (FIXED)**. So the wrap fixes the self-recursion explosion it was built for (on a join-split,
+    maxdeg 8, both are ≤4 — the win only shows on a high-degree inner). **Brick 2 / W2 complete.**
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
   prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the
