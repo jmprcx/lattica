@@ -1037,6 +1037,30 @@ pub(crate) trait MonolithBci<AB: AirBuilder<F = Goldilocks>> {
         tf: &AB::Expr,
         openings: &[(usize, usize, usize, usize)],
     );
+
+    /// **B/C (OOD epilogue fold):** α-Horner-fold the inner constraints (`c_k = eval_symbolic_circuit(...)`,
+    /// chunked via `fold_acc` in column-window mode) and check `folded·inv_van == quot(ζ)`, gated by `tf`.
+    /// The `local/next/pubs/periodic` openings + `is_first/is_last/is_trans` selectors are verifier-derived
+    /// (the reused H region); only the fold + check (the degree crux) vary by strategy.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_epilogue(
+        &self,
+        builder: &mut AB,
+        air: &MonolithAir,
+        cur: &[AB::Expr],
+        tf: &AB::Expr,
+        w: &AB::Expr,
+        local: &[(AB::Expr, AB::Expr)],
+        next: &[(AB::Expr, AB::Expr)],
+        pubs: &[(AB::Expr, AB::Expr)],
+        periodic: &[(AB::Expr, AB::Expr)],
+        is_first: &(AB::Expr, AB::Expr),
+        is_last: &(AB::Expr, AB::Expr),
+        is_trans: &(AB::Expr, AB::Expr),
+        alpha_stark: &(AB::Expr, AB::Expr),
+        inv_van: &(AB::Expr, AB::Expr),
+        quot: &(AB::Expr, AB::Expr),
+    );
 }
 
 /// The monolith's inline B/C/I — the cap-mux as a degree-`bits` product-mux (the current behavior, kept
@@ -1068,6 +1092,53 @@ impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for InlineBci {
                 builder.assert_zero(tf.clone() * (cur[air.cap_c(cg_off + k)].clone() - acc));
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_epilogue(
+        &self,
+        builder: &mut AB,
+        air: &MonolithAir,
+        cur: &[AB::Expr],
+        tf: &AB::Expr,
+        w: &AB::Expr,
+        local: &[(AB::Expr, AB::Expr)],
+        next: &[(AB::Expr, AB::Expr)],
+        pubs: &[(AB::Expr, AB::Expr)],
+        periodic: &[(AB::Expr, AB::Expr)],
+        is_first: &(AB::Expr, AB::Expr),
+        is_last: &(AB::Expr, AB::Expr),
+        is_trans: &(AB::Expr, AB::Expr),
+        alpha_stark: &(AB::Expr, AB::Expr),
+        inv_van: &(AB::Expr, AB::Expr),
+        quot: &(AB::Expr, AB::Expr),
+    ) {
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let chunked = air.column_window;
+        let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
+        let mut acc_i = 0usize;
+        let n_c = air.constraints.len();
+        for (k, c) in air.constraints.iter().enumerate() {
+            let ci = eval_symbolic_circuit::<AB>(c, local, next, pubs, periodic, is_first, is_last, is_trans, w);
+            let fa = emul(folded.clone(), alpha_stark.clone());
+            folded = (fa.0 + ci.0, fa.1 + ci.1);
+            if chunked && (k + 1) % MonolithAir::FOLD_CHUNK == 0 && k + 1 < n_c {
+                let a = gg(air.fold_acc(acc_i)); // bind the witnessed partial fold, then Horner on from it
+                builder.assert_zero(tf.clone() * (a.0.clone() - folded.0.clone()));
+                builder.assert_zero(tf.clone() * (a.1.clone() - folded.1.clone()));
+                folded = a;
+                acc_i += 1;
+            }
+        }
+        let chk = emul(folded, inv_van.clone());
+        builder.assert_zero(tf.clone() * (chk.0 - quot.0.clone()));
+        builder.assert_zero(tf.clone() * (chk.1 - quot.1.clone()));
     }
 }
 
@@ -1368,28 +1439,13 @@ impl MonolithAir {
                 let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub()).map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO)).collect();
                 // periodic column values at ζ (verifier-computed publics in the periodic pis region).
                 let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic()).map(|i| (pis[self.periodic_base() + 2 * i].clone(), pis[self.periodic_base() + 2 * i + 1].clone())).collect();
-                // α-Horner fold of the inner constraints, CHUNKED in column-window mode (α_stark degree-1):
-                // witness the running fold every FOLD_CHUNK constraints and continue from that degree-1 column,
-                // so this stays ≈ base+FOLD_CHUNK instead of base+C_inner. pis-mode (α degree-0) folds inline.
-                let chunked = self.column_window;
-                let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
-                let mut acc_i = 0usize;
-                let n_c = self.constraints.len();
-                for (k, c) in self.constraints.iter().enumerate() {
-                    let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w);
-                    let fa = emul(folded.clone(), alpha_stark.clone());
-                    folded = (fa.0 + ci.0, fa.1 + ci.1);
-                    if chunked && (k + 1) % Self::FOLD_CHUNK == 0 && k + 1 < n_c {
-                        let a = gg(self.fold_acc(acc_i)); // bind the witnessed partial fold, then Horner on from it
-                        builder.assert_zero(tf.clone() * (a.0.clone() - folded.0.clone()));
-                        builder.assert_zero(tf.clone() * (a.1.clone() - folded.1.clone()));
-                        folded = a;
-                        acc_i += 1;
-                    }
-                }
-                let chk = emul(folded, inv_van);
-                builder.assert_zero(tf.clone() * (chk.0 - quot.0));
-                builder.assert_zero(tf.clone() * (chk.1 - quot.1));
+                // B/C (OOD epilogue fold) — routed through the strategy so the wrap can replace the inline
+                // eval_symbolic_circuit + α-Horner with lookups (byte-identical under InlineBci; the reused
+                // selector binds + openings above stay inline).
+                bci.emit_epilogue(
+                    builder, self, &cur, &tf, &w, &local, &next, &pubs, &periodic, &is_first, &is_last,
+                    &is_trans, &alpha_stark, &inv_van, &quot,
+                );
             } else {
                 // 1-COLUMN ConstAir/CounterAir: the 2-constraint form (1 first-row + 1 transition):
                 //   z_h·α·(local−pub) + is_trans·(ζ−1)·(next−local[−1]) == z_h·(ζ−1)·(c0+c1·X).
