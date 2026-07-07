@@ -209,15 +209,18 @@ pub fn combined_constraint_layout<A: LookupAir>(
     lookups: &Lookups<Val>,
     is_zk: usize,
 ) -> (ConstraintLayout, usize) {
+    // Base layout (preprocessed/main widths + public-value/periodic counts) from the AIR; override only the
+    // permutation (LogUp aux) fields.
     let layout = AirLayout {
-        preprocessed_width: 0,
-        main_width: BaseAir::<Val>::width(air),
-        num_public_values: 0,
         permutation_width: lookups.len() + 1, // accumulator + one fraction column per lookup
-        num_permutation_challenges: 2,        // LogUp (α_L, β)
+        num_permutation_challenges: 2 * lookups.len(), // LogUp: (α_L, β) per lookup
         num_permutation_values: 1,            // the committed terminal
-        num_periodic_columns: 0,
+        ..AirLayout::from_air(air)
     };
+    assert_eq!(
+        layout.num_periodic_columns, 0,
+        "periodic columns are not yet threaded through the lookup fold"
+    );
     let mut isb = InteractionSymbolicBuilder::<Val, Challenge>::new(layout);
     air.eval(&mut isb);
     LogUpGadget::new().eval_all(&mut isb, lookups);
@@ -254,6 +257,7 @@ pub fn batched_constraints_at_point<A: LookupAir>(
     alpha: Challenge,
     lookup_challenges: &[Challenge], // [α_L, β]
     permutation_values: &[Challenge], // [terminal]
+    public_values: &[Val],
 ) -> Challenge {
     let empty: &[Challenge] = &[];
     let main = VerticalPair::new(
@@ -267,7 +271,7 @@ pub fn batched_constraints_at_point<A: LookupAir>(
         preprocessed,
         preprocessed_window,
         periodic_values: empty,
-        public_values: &[],
+        public_values,
         is_first_row,
         is_last_row,
         is_transition,
@@ -299,8 +303,7 @@ pub struct LookupQuotientProof {
     pub aux_commit: Com,
     pub quotient_commit: Com,
     pub terminal: LookupTerminal<Challenge>,
-    pub lookup_alpha: Challenge,
-    pub lookup_beta: Challenge,
+    pub lookup_challenges: Vec<Challenge>,
     pub alpha: Challenge,
     pub zeta: Challenge,
     pub log_num_quotient_chunks: usize,
@@ -327,6 +330,7 @@ pub fn lookup_quotient_values<A: LookupAir, Mt, Ma>(
     alpha: Challenge,
     lookup_challenges: &[Challenge],
     permutation_values: &[Challenge],
+    public_values: &[Val],
 ) -> Vec<Challenge>
 where
     Mt: Matrix<Val>,
@@ -365,6 +369,7 @@ where
                 alpha,
                 lookup_challenges,
                 permutation_values,
+                public_values,
             );
             // quotient(x) = C(x) / Z_H(x) = folded · inv_vanishing(x).
             folded * Challenge::from(sels.inv_vanishing[i])
@@ -407,13 +412,14 @@ pub fn prove_lookup_with_quotient<A: LookupAir>(
         <MyPcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, main.clone())]);
     challenger.observe(trace_commit.clone());
     challenger.observe_slice(pis);
-    let lookup_alpha: Challenge = challenger.sample_algebra_element();
-    let lookup_beta: Challenge = challenger.sample_algebra_element();
+    // LogUp draws `num_challenges = 2` (denominator α_L + tuple-combine β) PER lookup.
+    let lookup_challenges: Vec<Challenge> =
+        (0..2 * lookups.len()).map(|_| challenger.sample_algebra_element()).collect();
 
     // Round 2 — generate + commit the LogUp aux (permutation) trace.
     let gadget = LogUpGadget::new();
     let (aux, terminal) =
-        gadget.generate_permutation::<MyConfig>(&main, &None, pis, &lookups, &[lookup_alpha, lookup_beta]);
+        gadget.generate_permutation::<MyConfig>(&main, &None, pis, &lookups, &lookup_challenges);
     let terminal = terminal.expect("an AIR with a lookup commits a terminal");
     let aux_width = aux.width();
     let aux_base = aux.flatten_to_base();
@@ -440,8 +446,9 @@ pub fn prove_lookup_with_quotient<A: LookupAir>(
         &aux_on_qd,
         aux_width,
         alpha,
-        &[lookup_alpha, lookup_beta],
+        &lookup_challenges,
         &[terminal.0],
+        pis,
     );
     let quotient_flat = RowMajorMatrix::new_col(quotient_values.clone()).flatten_to_base();
     let (quotient_commit, _quotient_data) = <MyPcs as Pcs<Challenge, Cha>>::commit_quotient(
@@ -460,8 +467,7 @@ pub fn prove_lookup_with_quotient<A: LookupAir>(
         aux_commit,
         quotient_commit,
         terminal,
-        lookup_alpha,
-        lookup_beta,
+        lookup_challenges,
         alpha,
         zeta,
         log_num_quotient_chunks,
@@ -549,13 +555,14 @@ fn prove_lookup_inner<A: LookupAir>(
         <MyPcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, main.clone())]);
     challenger.observe(trace_commit.clone());
     challenger.observe_slice(pis);
-    let lookup_alpha: Challenge = challenger.sample_algebra_element();
-    let lookup_beta: Challenge = challenger.sample_algebra_element();
+    // LogUp draws `num_challenges = 2` (denominator α_L + tuple-combine β) PER lookup.
+    let lookup_challenges: Vec<Challenge> =
+        (0..2 * lookups.len()).map(|_| challenger.sample_algebra_element()).collect();
 
     // Round 2 — LogUp aux trace.
     let gadget = LogUpGadget::new();
     let (mut aux, terminal) =
-        gadget.generate_permutation::<MyConfig>(&main, &None, pis, &lookups, &[lookup_alpha, lookup_beta]);
+        gadget.generate_permutation::<MyConfig>(&main, &None, pis, &lookups, &lookup_challenges);
     let terminal = terminal.expect("an AIR with a lookup commits a terminal");
     if forge_aux {
         aux.values[1] += Challenge::ONE; // break one fraction ⇒ constraints no longer vanish on H
@@ -576,7 +583,7 @@ fn prove_lookup_inner<A: LookupAir>(
         <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &aux_data, 0, quotient_domain);
     let quotient_values = lookup_quotient_values(
         air, &lookups, trace_domain, quotient_domain, &trace_on_qd, &aux_on_qd, aux_width, alpha,
-        &[lookup_alpha, lookup_beta], &[terminal.0],
+        &lookup_challenges, &[terminal.0], pis,
     );
     let quotient_flat = RowMajorMatrix::new_col(quotient_values).flatten_to_base();
     let (quotient_commit, quotient_data) = <MyPcs as Pcs<Challenge, Cha>>::commit_quotient(
@@ -671,8 +678,9 @@ pub fn verify_lookup<A: LookupAir>(
     let mut challenger = config.initialise_challenger();
     challenger.observe(proof.trace_commit.clone());
     challenger.observe_slice(pis);
-    let lookup_alpha: Challenge = challenger.sample_algebra_element();
-    let lookup_beta: Challenge = challenger.sample_algebra_element();
+    // LogUp draws `num_challenges = 2` (denominator α_L + tuple-combine β) PER lookup.
+    let lookup_challenges: Vec<Challenge> =
+        (0..2 * lookups.len()).map(|_| challenger.sample_algebra_element()).collect();
     challenger.observe(proof.aux_commit.clone());
     let alpha: Challenge = challenger.sample_algebra_element();
     challenger.observe(proof.quotient_commit.clone());
@@ -743,8 +751,9 @@ pub fn verify_lookup<A: LookupAir>(
         sels.is_last_row,
         sels.is_transition,
         alpha,
-        &[lookup_alpha, lookup_beta],
+        &lookup_challenges,
         &[proof.terminal.0],
+        pis,
     );
     if folded * sels.inv_vanishing != quotient_at_zeta {
         return Err(LookupVerifyError::OodMismatch);
@@ -792,7 +801,7 @@ mod tests {
         let is_first = if r == 0 { one } else { zero };
         let is_last = if r == n - 1 { one } else { zero };
         let is_trans = if r == n - 1 { zero } else { one };
-        batched_constraints_at_point(air, lookups, &tl, &tn, &al, &an, is_first, is_last, is_trans, alpha, lc, pv)
+        batched_constraints_at_point(air, lookups, &tl, &tn, &al, &an, is_first, is_last, is_trans, alpha, lc, pv, &[])
     }
 
     /// W1.2 core — the batched (base + lookup) constraints **vanish on every trace-domain row** for a valid
@@ -1088,5 +1097,120 @@ mod tests {
             matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
             "a non-boolean b must fail the OOD constraint identity (base constraint)"
         );
+    }
+
+    /// A public-values AIR: `[val, table, mult]` with `num_public_values = 1` and a base constraint pinning
+    /// the first row's `val` to `public[0]`, plus one LogUp range-check. Exercises public-value threading
+    /// through the fold (both folders delegate `public_values()`).
+    struct PinnedAir;
+    impl<F: p3_field::Field> BaseAir<F> for PinnedAir {
+        fn width(&self) -> usize {
+            3
+        }
+        fn num_public_values(&self) -> usize {
+            1
+        }
+    }
+    impl<AB> Air<AB> for PinnedAir
+    where
+        AB: AirBuilder<F = Val> + InteractionBuilder,
+    {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let local = main.current_slice();
+            let (val, table, mult) = (local[0], local[1], local[2]);
+            let pin: AB::Expr = builder.public_values()[0].into();
+            builder.when_first_row().assert_eq(val, pin); // row 0: val == public[0]
+            builder.push_local_interaction(vec![
+                (vec![val.into()], AB::Expr::ONE),
+                (vec![table.into()], -(mult.into())),
+            ]);
+        }
+    }
+
+    /// A balanced trace whose first row's value is `pin` (matching the public input).
+    fn pinned_main(height: usize, pin: Val) -> RowMajorMatrix<Val> {
+        let mut flat = Vec::with_capacity(height * 3);
+        for i in 0..height {
+            let v = if i == 0 { pin } else { Val::from_u64((i as u64 * 2654435761) & 0xffff) };
+            flat.push(v);
+            flat.push(v);
+            flat.push(Val::ONE);
+        }
+        RowMajorMatrix::new(flat, 3)
+    }
+
+    /// Step 1 (public values) — the fold now threads public inputs: a trace whose first row matches the public
+    /// value proves + verifies end to end.
+    #[test]
+    fn pinned_air_round_trips_with_public_values() {
+        let air = PinnedAir;
+        let pin = Val::from_u64(0x1234);
+        let proof = prove_lookup(&air, pinned_main(1 << 5, pin), &[pin]);
+        assert!(verify_lookup(&air, &proof, &[pin]).is_ok(), "the pinned public value must verify");
+    }
+
+    /// A committed trace whose first row ≠ the public input (kept lookup-balanced) fails the base constraint,
+    /// so the OOD identity rejects it — confirming public values are folded into the OOD check.
+    #[test]
+    fn pinned_air_rejects_unpinned_trace() {
+        let air = PinnedAir;
+        let pin = Val::from_u64(0x1234);
+        let main = pinned_main(1 << 5, Val::from_u64(0x9999)); // row 0 val = 0x9999 ≠ pin, still balanced
+        let proof = prove_lookup(&air, main, &[pin]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[pin]), Err(LookupVerifyError::OodMismatch)),
+            "a trace whose first row ≠ public[0] must fail the OOD identity"
+        );
+    }
+
+    /// A two-lookup AIR: `[a, b, table, mult]` declaring TWO LogUp range-checks (a and b against the shared
+    /// table). aux width = 1 accumulator + 2 fraction columns = 3, a different layout than `RangeCheckAir`.
+    struct TwoLookupAir;
+    impl<F: p3_field::Field> BaseAir<F> for TwoLookupAir {
+        fn width(&self) -> usize {
+            4
+        }
+    }
+    impl<AB> Air<AB> for TwoLookupAir
+    where
+        AB: AirBuilder<F = Val> + InteractionBuilder,
+    {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let local = main.current_slice();
+            let (a, b, table, mult) = (local[0], local[1], local[2], local[3]);
+            builder.push_local_interaction(vec![
+                (vec![a.into()], AB::Expr::ONE),
+                (vec![table.into()], -(mult.into())),
+            ]);
+            builder.push_local_interaction(vec![
+                (vec![b.into()], AB::Expr::ONE),
+                (vec![table.into()], -(mult.into())),
+            ]);
+        }
+    }
+
+    /// A balanced two-lookup trace: `a = b = table`, multiplicity 1 (each lookup cancels per row).
+    fn two_lookup_main(height: usize) -> RowMajorMatrix<Val> {
+        let mut flat = Vec::with_capacity(height * 4);
+        for i in 0..height {
+            let v = Val::from_u64((i as u64 * 2654435761) & 0xffff);
+            flat.push(v); // a
+            flat.push(v); // b
+            flat.push(v); // table
+            flat.push(Val::ONE); // mult
+        }
+        RowMajorMatrix::new(flat, 4)
+    }
+
+    /// Step 1 (multi-arity) — the generalized prover handles an AIR with MULTIPLE lookups (aux width 3):
+    /// prove + verify end to end.
+    #[test]
+    fn two_lookup_air_round_trips() {
+        let air = TwoLookupAir;
+        let proof = prove_lookup(&air, two_lookup_main(1 << 5), &[]);
+        assert_eq!(proof.aux_width, 3, "two lookups ⇒ aux width = 1 accumulator + 2 fractions");
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "the two-lookup AIR must verify end to end");
     }
 }
