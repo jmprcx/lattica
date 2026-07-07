@@ -16,6 +16,8 @@
 //! lookup soundly detects imbalance. It reuses lattica's production `MyConfig` (Goldilocks + F_p²) as the
 //! `SC` type parameter, proving the argument is field-compatible with the real proof system.
 
+pub mod prover; // P2b — the two-round lookup prover skeleton (real challenger + PCS)
+
 #[cfg(test)]
 mod tests {
     use crate::config::{Challenge, MyConfig, Val};
