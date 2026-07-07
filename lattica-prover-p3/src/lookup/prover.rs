@@ -24,9 +24,12 @@ use p3_field::{Field, PrimeCharacteristicRing};
 use p3_lookup::{
     InteractionBuilder, InteractionSymbolicBuilder, LogUpGadget, LookupProtocol, LookupTerminal, Lookups,
 };
-use p3_matrix::dense::RowMajorMatrix;
+use p3_air::RowWindow;
+use p3_lookup::folder::VerifierConstraintFolderWithLookups;
+use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView};
+use p3_matrix::stack::VerticalPair;
 use p3_matrix::Matrix;
-use p3_uni_stark::StarkGenericConfig;
+use p3_uni_stark::{StarkGenericConfig, VerifierConstraintFolder};
 
 /// The production config's PCS + Challenger (pinned so the generic `Pcs` methods resolve).
 type Cha = <MyConfig as StarkGenericConfig>::Challenger;
@@ -205,10 +208,123 @@ pub fn combined_constraint_layout(
     (clayout, log_nqc)
 }
 
+/// W1.2 core — evaluate the batched (base AIR + LogUp lookup) constraints at a single point via the **real**
+/// `VerifierConstraintFolderWithLookups` (Horner batching by `alpha`). The forked quotient (per
+/// quotient-domain point, `÷ Z_H`) and the verifier's ζ-check both call this, so prover/verifier consistency
+/// is automatic — no `decompose_alpha` / packed-aux reconstruction, and no risk of the two sides folding
+/// constraints differently (the classic FRI-fork bug). Values are in the extension field.
+#[allow(clippy::too_many_arguments)]
+pub fn batched_constraints_at_point(
+    air: &RangeCheckAir,
+    lookups: &Lookups<Val>,
+    trace_local: &[Challenge],
+    trace_next: &[Challenge],
+    aux_local: &[Challenge],
+    aux_next: &[Challenge],
+    is_first_row: Challenge,
+    is_last_row: Challenge,
+    is_transition: Challenge,
+    alpha: Challenge,
+    lookup_challenges: &[Challenge], // [α_L, β]
+    permutation_values: &[Challenge], // [terminal]
+) -> Challenge {
+    let empty: &[Challenge] = &[];
+    let main = VerticalPair::new(
+        RowMajorMatrixView::new_row(trace_local),
+        RowMajorMatrixView::new_row(trace_next),
+    );
+    let preprocessed = VerticalPair::new(RowMajorMatrixView::new(empty, 0), RowMajorMatrixView::new(empty, 0));
+    let preprocessed_window = RowWindow::from_two_rows(empty, empty);
+    let inner = VerifierConstraintFolder::<MyConfig> {
+        main,
+        preprocessed,
+        preprocessed_window,
+        periodic_values: empty,
+        public_values: &[],
+        is_first_row,
+        is_last_row,
+        is_transition,
+        alpha,
+        accumulator: Challenge::ZERO,
+    };
+    let permutation = VerticalPair::new(
+        RowMajorMatrixView::new_row(aux_local),
+        RowMajorMatrixView::new_row(aux_next),
+    );
+    let mut folder = VerifierConstraintFolderWithLookups {
+        inner,
+        permutation,
+        permutation_challenges: lookup_challenges,
+        permutation_values,
+    };
+    air.eval(&mut folder); // base constraints (RangeCheckAir: none; drains the interaction)
+    LogUpGadget::new().eval_all(&mut folder, lookups); // the LogUp fraction/accumulator constraints
+    folder.inner.accumulator
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use p3_lookup::{LogUpGadget, LookupProtocol, Lookups};
+
+    /// Lift a base-field trace row into the extension field (the folder evaluates over F_p²).
+    fn lift(row: &[Val]) -> Vec<Challenge> {
+        row.iter().map(|&v| Challenge::from(v)).collect()
+    }
+
+    /// Evaluate the batched constraints at trace-domain row `r` (selectors from the row position; the
+    /// last-row `next` wraps to row 0, masked by `is_transition=0`).
+    #[allow(clippy::too_many_arguments)]
+    fn batched_at_row(
+        air: &RangeCheckAir,
+        lookups: &Lookups<Val>,
+        main: &RowMajorMatrix<Val>,
+        aux: &RowMajorMatrix<Challenge>,
+        r: usize,
+        n: usize,
+        alpha: Challenge,
+        lc: &[Challenge],
+        pv: &[Challenge],
+    ) -> Challenge {
+        let nr = (r + 1) % n;
+        let (tl, tn) = (lift(&main.row_slice(r).unwrap()), lift(&main.row_slice(nr).unwrap()));
+        let (al, an) = (aux.row_slice(r).unwrap().to_vec(), aux.row_slice(nr).unwrap().to_vec());
+        let one = Challenge::ONE;
+        let zero = Challenge::ZERO;
+        let is_first = if r == 0 { one } else { zero };
+        let is_last = if r == n - 1 { one } else { zero };
+        let is_trans = if r == n - 1 { zero } else { one };
+        batched_constraints_at_point(air, lookups, &tl, &tn, &al, &an, is_first, is_last, is_trans, alpha, lc, pv)
+    }
+
+    /// W1.2 core — the batched (base + lookup) constraints **vanish on every trace-domain row** for a valid
+    /// trace (the constraints hold ⇒ the quotient is well-defined), and a forged aux violates them. This is
+    /// the exact folder the verifier's ζ-check uses, so a valid quotient is now computable per-point.
+    #[test]
+    fn batched_constraints_vanish_on_trace_domain() {
+        let air = RangeCheckAir;
+        let main = balanced_main(1 << 4);
+        let n = main.height();
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (alpha_l, beta) = (Challenge::from_u32(7), Challenge::from_u32(11));
+        let (aux, terminal) =
+            LogUpGadget::new().generate_permutation::<MyConfig>(&main, &None, &[], &lookups, &[alpha_l, beta]);
+        let terminal = terminal.expect("terminal").0;
+        let alpha = Challenge::from_u32(13); // the constraint-fold challenge (distinct from α_L)
+
+        // valid: constraints vanish on every row
+        for r in 0..n {
+            let acc = batched_at_row(&air, &lookups, &main, &aux, r, n, alpha, &[alpha_l, beta], &[terminal]);
+            assert_eq!(acc, Challenge::ZERO, "constraints must vanish at row {r} for a valid trace");
+        }
+
+        // forged aux: some row's constraints do not vanish
+        let mut bad = aux.clone();
+        bad.values[1] += Challenge::ONE;
+        let any_nonzero = (0..n)
+            .any(|r| batched_at_row(&air, &lookups, &main, &bad, r, n, alpha, &[alpha_l, beta], &[terminal]) != Challenge::ZERO);
+        assert!(any_nonzero, "a forged aux must violate the batched constraints");
+    }
 
     /// W1.1 — the combined layout counts the base + lookup constraints, and their degree gives a small
     /// `log_nqc` (the number the forked quotient domain + alpha-powers must be sized against).
