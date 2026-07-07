@@ -466,6 +466,138 @@ mod tests {
         println!("REAL epilogue INLINE (monolith, deg {max_deg}): log_nqc = {}", wrap_log_nqc(&inline));
     }
 
+    /// **W3 (size) — profile the epilogue DAG to choose the op-table canonicalization.** The witnessed epilogue
+    /// (W2) pays `2·n_mul` COLUMNS (each F_p² `Mul` → a degree-1 column pair, filled only at the `n_queries`
+    /// arith heads, wasted on every other row); W3 trades those for narrow-tall op-table ROWS at constant width
+    /// (overlaid on slack rows). Two canonical forms are possible, and the REAL DAG shape decides between them:
+    /// - **(A) FLATTEN** every op (Add/Sub/Neg/Mul) to its own row, wired by a permutation/LogUp bus — each row
+    ///   reads exactly **2** operands by address and writes 1 output, so the width is a small CONSTANT and the
+    ///   fan-in is trivially bounded; the cost is `n_ops` rows (all node types, not just `Mul`).
+    /// - **(B) HYBRID** — keep the linear folding of Add/Sub/Neg and put one row per `Mul` (`n_mul` rows), but
+    ///   then each `Mul` operand is a linear combination of terminals (opening leaves + child-`Mul` outputs)
+    ///   needing **bounded bus fan-in** — viable only if the max operand fan-in is small.
+    ///
+    /// This measures the deciding data on the real inner: the node-type census over the shared DAG (Arc-dedup)
+    /// and the per-`Mul` operand linear fan-in (distinct terminals reachable through Add/Sub/Neg without
+    /// crossing another `Mul`). Reported, not asserted — it documents the op-table design input (like W2-real's
+    /// "81 constraints, 214 Muls"), so the next brick builds the right canonical form.
+    #[test]
+    fn joinsplit_epilogue_dag_shape() {
+        use p3_uni_stark::BaseLeaf;
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+
+        // (1) Node-type census over the shared DAG (dedup at Arc boundaries, like `count_mul_nodes`; the 81
+        // constraint ROOTS are owned, counted directly — sharing lives in their Arc children).
+        #[derive(Default)]
+        struct Census {
+            leaf_var: usize,  // opening values (Main/Public/Periodic) — bus terminals
+            leaf_sel: usize,  // is_first/is_last/is_trans selectors — witnessed at ζ, also terminals
+            leaf_const: usize, // pure constants — affine constant term, not a bus read
+            add: usize,
+            sub: usize,
+            neg: usize,
+            mul: usize,
+        }
+        // Collect each unique Mul's operand arcs (for the fan-in pass) alongside the census.
+        type Arcs = Vec<(Arc<SymbolicExpression<Val>>, Arc<SymbolicExpression<Val>>)>;
+        fn census_node(e: &SymbolicExpression<Val>, seen: &mut HashSet<usize>, c: &mut Census, ops: &mut Arcs) {
+            match e {
+                SymbolicExpr::Leaf(l) => match l {
+                    BaseLeaf::Constant(_) => c.leaf_const += 1,
+                    BaseLeaf::Variable(_) => c.leaf_var += 1,
+                    _ => c.leaf_sel += 1,
+                },
+                SymbolicExpr::Add { x, y, .. } => {
+                    c.add += 1;
+                    census_arc(x, seen, c, ops);
+                    census_arc(y, seen, c, ops);
+                }
+                SymbolicExpr::Sub { x, y, .. } => {
+                    c.sub += 1;
+                    census_arc(x, seen, c, ops);
+                    census_arc(y, seen, c, ops);
+                }
+                SymbolicExpr::Neg { x, .. } => {
+                    c.neg += 1;
+                    census_arc(x, seen, c, ops);
+                }
+                SymbolicExpr::Mul { x, y, .. } => {
+                    c.mul += 1;
+                    ops.push((x.clone(), y.clone()));
+                    census_arc(x, seen, c, ops);
+                    census_arc(y, seen, c, ops);
+                }
+            }
+        }
+        fn census_arc(arc: &Arc<SymbolicExpression<Val>>, seen: &mut HashSet<usize>, c: &mut Census, ops: &mut Arcs) {
+            if seen.insert(Arc::as_ptr(arc) as usize) {
+                census_node(arc.as_ref(), seen, c, ops);
+            }
+        }
+        let (mut seen, mut cen, mut mul_ops) = (HashSet::new(), Census::default(), Arcs::new());
+        for root in &constraints {
+            census_node(root, &mut seen, &mut cen, &mut mul_ops);
+        }
+        let n_ops = cen.add + cen.sub + cen.neg + cen.mul;
+        assert_eq!(cen.mul, mul_ops.len(), "one operand pair recorded per unique Mul node");
+
+        // (2) Per-Mul operand linear fan-in: distinct terminals (non-constant leaf OR child-Mul cut point)
+        // reachable through Add/Sub/Neg. This is the bus-read count a HYBRID (one-row-per-Mul) design needs
+        // per operand — the number that decides whether B is viable vs. the always-2 FLATTEN form.
+        fn terminals(arc: &Arc<SymbolicExpression<Val>>, set: &mut HashSet<usize>) {
+            match arc.as_ref() {
+                SymbolicExpr::Leaf(BaseLeaf::Constant(_)) => {} // constant term, not a bus read
+                SymbolicExpr::Leaf(_) | SymbolicExpr::Mul { .. } => {
+                    set.insert(Arc::as_ptr(arc) as usize); // opening terminal / Mul cut point
+                }
+                SymbolicExpr::Neg { x, .. } => terminals(x, set),
+                SymbolicExpr::Add { x, y, .. } | SymbolicExpr::Sub { x, y, .. } => {
+                    terminals(x, set);
+                    terminals(y, set);
+                }
+            }
+        }
+        let mut fanins: Vec<usize> = Vec::with_capacity(2 * mul_ops.len());
+        for (x, y) in &mul_ops {
+            for operand in [x, y] {
+                let mut set = HashSet::new();
+                terminals(operand, &mut set);
+                fanins.push(set.len());
+            }
+        }
+        let max_fanin = fanins.iter().copied().max().unwrap_or(0);
+        let sum_fanin: usize = fanins.iter().sum();
+        let mean_fanin = sum_fanin as f64 / fanins.len().max(1) as f64;
+        // Histogram over the fan-in buckets that matter for a fixed-width hybrid row.
+        let buckets = [(1usize, 2usize), (3, 4), (5, 8), (9, 16), (17, usize::MAX)];
+        let hist: Vec<(String, usize)> = buckets
+            .iter()
+            .map(|&(lo, hi)| {
+                let label = if hi == usize::MAX { format!("{lo}+") } else { format!("{lo}-{hi}") };
+                (label, fanins.iter().filter(|&&f| f >= lo && f <= hi).count())
+            })
+            .collect();
+
+        println!(
+            "W3 DAG shape (real JoinSplitAir epilogue): {} constraints ⇒ unique nodes: {} leaf-var (openings), \
+             {} leaf-sel, {} const, {} add, {} sub, {} neg, {} MUL",
+            constraints.len(), cen.leaf_var, cen.leaf_sel, cen.leaf_const, cen.add, cen.sub, cen.neg, cen.mul,
+        );
+        println!(
+            "  op count n_ops = {n_ops} (add+sub+neg+mul); Mul operand fan-in: max {max_fanin}, mean {mean_fanin:.2}, \
+             histogram {hist:?}",
+        );
+        // The size trade-off the number decides. Witnessed (W2) = 2·n_mul dedicated COLUMNS (all rows).
+        // FLATTEN op-table = a small const width W_op over n_ops slack ROWS (fan-in exactly 2). HYBRID =
+        // const width over n_mul ROWS but only if max_fanin is small enough to bound the per-row bus reads.
+        println!(
+            "  ⇒ witnessed W2 = {} COLUMNS; FLATTEN op-table = const-width × {n_ops} ROWS (fan-in 2); \
+             HYBRID = const-width × {} ROWS (needs fan-in ≤ K, max here {max_fanin})",
+            2 * cen.mul, cen.mul,
+        );
+    }
+
     /// **Wrap degree-budget rollup (W2-super).** `log_nqc` composes as the MAX over regions (it is monotonic
     /// in the max constraint degree), so the whole wrap's budget is the max of its regions' log_nqc. Roll up
     /// the real regions and confirm they compose within budget: the OOD epilogue (B, over the real inner's 81
