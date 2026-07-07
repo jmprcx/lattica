@@ -10,17 +10,20 @@
 //!
 //! What this validates: the real PCS commits both rounds, the challenger sequencing is sound (prover and
 //! verifier derive identical `α,β,ζ` from the public commitments), and the lookup terminal distinguishes a
-//! balanced trace from a tampered one. What it deliberately leaves out — the **isolated remaining FRI
-//! tail** — is the quotient that *enforces* aux-trace well-formedness (via `ProverConstraintFolderWithLookups`)
-//! and the FRI opening of trace+aux+quotient at `ζ`; those are mechanical extensions of p3's existing
-//! `quotient_values` + `open`, not new cryptographic structure.
+//! balanced trace from a tampered one.
+//!
+//! **W1.2** extends the skeleton with the constraint **quotient**: `prove_lookup_with_quotient` folds the
+//! batched (base AIR + LogUp) constraints across the quotient domain, divides by `Z_H`, and commits the
+//! quotient (`lookup_quotient_values` + `commit_quotient`) — the half of the FRI tail that *enforces*
+//! aux-trace well-formedness. The single remaining piece is the ζ-opening of trace + aux + quotient (a
+//! mechanical extension of p3's `open`), not new cryptographic structure.
 
 use crate::config::{make_config, Challenge, MyConfig, Val};
 use p3_air::symbolic::{AirLayout, ConstraintLayout};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::{CanObserve, FieldChallenger};
-use p3_commit::Pcs;
-use p3_field::{Field, PrimeCharacteristicRing};
+use p3_commit::{Pcs, PolynomialSpace};
+use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing};
 use p3_lookup::{
     InteractionBuilder, InteractionSymbolicBuilder, LogUpGadget, LookupProtocol, LookupTerminal, Lookups,
 };
@@ -36,6 +39,8 @@ type Cha = <MyConfig as StarkGenericConfig>::Challenger;
 type MyPcs = <MyConfig as StarkGenericConfig>::Pcs;
 /// The PCS commitment type of the production config.
 type Com = <MyPcs as Pcs<Challenge, Cha>>::Commitment;
+/// The PCS polynomial domain of the production config (a two-adic multiplicative coset).
+type Dom = <MyPcs as Pcs<Challenge, Cha>>::Domain;
 
 /// The public artifact of the two-round lookup prover (a proof *skeleton* — no quotient/opening yet).
 pub struct LookupRoundProof {
@@ -262,9 +267,191 @@ pub fn batched_constraints_at_point(
     folder.inner.accumulator
 }
 
+/// The public artifact of the **W1.2 lookup prover** — the two-round skeleton **plus** a committed
+/// constraint quotient. Compared with `LookupRoundProof` this adds `quotient_commit` and the constraint-fold
+/// challenge `alpha` (sampled after the aux commit). `quotient_values` is the raw quotient evaluation vector,
+/// exposed so the `÷ Z_H` / low-degree gate can be checked directly; a real succinct proof carries only the
+/// commitment plus the ζ-openings (the remaining FRI tail), not these values.
+pub struct LookupQuotientProof {
+    pub trace_commit: Com,
+    pub aux_commit: Com,
+    pub quotient_commit: Com,
+    pub terminal: LookupTerminal<Challenge>,
+    pub lookup_alpha: Challenge,
+    pub lookup_beta: Challenge,
+    pub alpha: Challenge,
+    pub zeta: Challenge,
+    pub log_num_quotient_chunks: usize,
+    pub quotient_values: Vec<Challenge>,
+}
+
+/// W1.2-rest — the lookup **quotient**: fold the batched (base AIR + LogUp) constraints across the whole
+/// quotient domain, divide by the trace domain's vanishing polynomial `Z_H`, and return the quotient
+/// evaluations ready for `commit_quotient`. This is the lookup analogue of `p3_uni_stark::quotient_values`
+/// (mirrored by `quotient_gpu::cpu_quotient_values`): the selector / `inv_vanishing` / `next_step` setup is
+/// identical, but the per-point fold runs through `batched_constraints_at_point` — the *exact* same
+/// `VerifierConstraintFolderWithLookups` the verifier's ζ-check calls (W1.2-core), so prover and verifier
+/// fold constraints identically. The extension-field aux trace is reconstructed from its `flatten_to_base`
+/// layout: Challenge column `c` ← base columns `c*D .. c*D+D`.
+#[allow(clippy::too_many_arguments)]
+pub fn lookup_quotient_values<Mt, Ma>(
+    air: &RangeCheckAir,
+    lookups: &Lookups<Val>,
+    trace_domain: Dom,
+    quotient_domain: Dom,
+    trace_on_quotient_domain: &Mt,
+    aux_on_quotient_domain: &Ma,
+    aux_width: usize,
+    alpha: Challenge,
+    lookup_challenges: &[Challenge],
+    permutation_values: &[Challenge],
+) -> Vec<Challenge>
+where
+    Mt: Matrix<Val>,
+    Ma: Matrix<Val>,
+{
+    let quotient_size = quotient_domain.size();
+    let sels = trace_domain.selectors_on_coset(quotient_domain);
+    let next_step = quotient_size / trace_domain.size();
+    let d = <Challenge as BasedVectorSpace<Val>>::DIMENSION;
+
+    // Lift a base trace row to the extension field.
+    let trace_row = |i: usize| -> Vec<Challenge> {
+        trace_on_quotient_domain.row(i).unwrap().into_iter().map(Challenge::from).collect()
+    };
+    // Reconstruct a Challenge aux row from the `flatten_to_base` layout (col `c*D + dd`).
+    let aux_row = |i: usize| -> Vec<Challenge> {
+        let base: Vec<Val> = aux_on_quotient_domain.row(i).unwrap().into_iter().collect();
+        (0..aux_width)
+            .map(|c| Challenge::from_basis_coefficients_fn(|dd| base[c * d + dd]))
+            .collect()
+    };
+
+    (0..quotient_size)
+        .map(|i| {
+            let inext = (i + next_step) % quotient_size;
+            let folded = batched_constraints_at_point(
+                air,
+                lookups,
+                &trace_row(i),
+                &trace_row(inext),
+                &aux_row(i),
+                &aux_row(inext),
+                Challenge::from(sels.is_first_row[i]),
+                Challenge::from(sels.is_last_row[i]),
+                Challenge::from(sels.is_transition[i]),
+                alpha,
+                lookup_challenges,
+                permutation_values,
+            );
+            // quotient(x) = C(x) / Z_H(x) = folded · inv_vanishing(x).
+            folded * Challenge::from(sels.inv_vanishing[i])
+        })
+        .collect()
+}
+
+/// W1.2-rest — the **three-round** lookup prover: commit the main trace → sample `(α_L, β)` → generate +
+/// commit the LogUp aux trace → sample the constraint-fold `α` → **fold the batched constraints over the
+/// quotient domain, ÷ `Z_H`, and `commit_quotient`** → sample the opening point `ζ`. This extends
+/// `prove_lookup_rounds` (the two-round skeleton) with the quotient commit — the half of the FRI tail that
+/// binds the trace + aux to the constraints. What remains is only the ζ-opening (trace + aux + quotient FRI
+/// openings and the OOD identity), a mechanical extension of p3's `open`.
+pub fn prove_lookup_with_quotient(
+    air: &RangeCheckAir,
+    main: RowMajorMatrix<Val>,
+    pis: &[Val],
+) -> LookupQuotientProof {
+    let config = make_config();
+    let pcs = config.pcs();
+    let mut challenger = config.initialise_challenger();
+
+    let degree = main.height();
+    let log_degree = degree.trailing_zeros() as usize;
+    let is_zk = config.is_zk();
+    let log_ext_degree = log_degree + is_zk;
+
+    // W1.1 — size the quotient over the FULL (base + lookup) constraint set; p3's own helper runs only
+    // `air.eval` and would miss the lookup constraints, making the quotient domain too small.
+    let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(air);
+    let (_layout, log_num_quotient_chunks) = combined_constraint_layout(air, &lookups, is_zk);
+    let num_quotient_chunks = 1 << (log_num_quotient_chunks + is_zk);
+
+    let trace_domain = <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree);
+    let ext_trace_domain =
+        <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree * (is_zk + 1));
+
+    // Round 1 — commit the main trace, observe it + the public values, then sample the lookup challenges.
+    let (trace_commit, trace_data) =
+        <MyPcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, main.clone())]);
+    challenger.observe(trace_commit.clone());
+    challenger.observe_slice(pis);
+    let lookup_alpha: Challenge = challenger.sample_algebra_element();
+    let lookup_beta: Challenge = challenger.sample_algebra_element();
+
+    // Round 2 — generate + commit the LogUp aux (permutation) trace.
+    let gadget = LogUpGadget::new();
+    let (aux, terminal) =
+        gadget.generate_permutation::<MyConfig>(&main, &None, pis, &lookups, &[lookup_alpha, lookup_beta]);
+    let terminal = terminal.expect("an AIR with a lookup commits a terminal");
+    let aux_width = aux.width();
+    let aux_base = aux.flatten_to_base();
+    let (aux_commit, aux_data) =
+        <MyPcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, aux_base)]);
+    challenger.observe(aux_commit.clone());
+
+    // The constraint-fold challenge α — sampled AFTER the aux commit so the quotient may bind the aux trace.
+    let alpha: Challenge = challenger.sample_algebra_element();
+
+    // Round 3 — the quotient: batched constraints over the quotient domain ÷ Z_H, then commit.
+    let quotient_domain =
+        ext_trace_domain.create_disjoint_domain(1 << (log_ext_degree + log_num_quotient_chunks));
+    let trace_on_qd =
+        <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &trace_data, 0, quotient_domain);
+    let aux_on_qd =
+        <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &aux_data, 0, quotient_domain);
+    let quotient_values = lookup_quotient_values(
+        air,
+        &lookups,
+        trace_domain,
+        quotient_domain,
+        &trace_on_qd,
+        &aux_on_qd,
+        aux_width,
+        alpha,
+        &[lookup_alpha, lookup_beta],
+        &[terminal.0],
+    );
+    let quotient_flat = RowMajorMatrix::new_col(quotient_values.clone()).flatten_to_base();
+    let (quotient_commit, _quotient_data) = <MyPcs as Pcs<Challenge, Cha>>::commit_quotient(
+        pcs,
+        quotient_domain,
+        quotient_flat,
+        num_quotient_chunks,
+    );
+    challenger.observe(quotient_commit.clone());
+
+    // The opening point ζ (the remaining FRI tail — openings of trace + aux + quotient at ζ — is deferred).
+    let zeta: Challenge = challenger.sample_algebra_element();
+
+    LookupQuotientProof {
+        trace_commit,
+        aux_commit,
+        quotient_commit,
+        terminal,
+        lookup_alpha,
+        lookup_beta,
+        alpha,
+        zeta,
+        log_num_quotient_chunks,
+        quotient_values,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Dft;
+    use p3_dft::TwoAdicSubgroupDft;
     use p3_lookup::{LogUpGadget, LookupProtocol, Lookups};
 
     /// Lift a base-field trace row into the extension field (the folder evaluates over F_p²).
@@ -406,5 +593,77 @@ mod tests {
         // swap in the trace commitment for the aux commitment ⇒ ζ no longer matches.
         proof.aux_commit = proof.trace_commit.clone();
         assert!(verify_lookup_rounds(&pis, &proof).is_err(), "a tampered aux commitment must be caught");
+    }
+
+    /// Rebuild the quotient domain for a `degree`-row trace at `log_nqc` (as `prove_lookup_with_quotient`).
+    fn quotient_domain_for(degree: usize, log_nqc: usize) -> Dom {
+        let config = make_config();
+        let is_zk = config.is_zk();
+        let log_ext_degree = degree.trailing_zeros() as usize + is_zk;
+        let ext =
+            <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(config.pcs(), degree * (is_zk + 1));
+        ext.create_disjoint_domain(1 << (log_ext_degree + log_nqc))
+    }
+
+    /// Interpolate the quotient evaluations (coset iDFT over the quotient coset) into coefficient rows.
+    fn quotient_coeff_rows(quotient_values: &[Challenge], quotient_domain: Dom) -> RowMajorMatrix<Val> {
+        let flat = RowMajorMatrix::new_col(quotient_values.to_vec()).flatten_to_base();
+        Dft::default().coset_idft_batch(flat, quotient_domain.first_point())
+    }
+
+    /// Are all coefficients in the top `n` degrees zero (across every base column)?
+    fn top_coeffs_all_zero(coeffs: &RowMajorMatrix<Val>, n: usize) -> bool {
+        let h = coeffs.height();
+        (h - n..h).all(|r| coeffs.row_slice(r).unwrap().iter().all(|&v| v == Val::ZERO))
+    }
+
+    /// W1.2-rest — the committed quotient is a genuine polynomial of degree `< quotient_size − |H|` (the
+    /// `÷ Z_H` is exact, i.e. the batched base+lookup constraints vanish on `H`): its top `|H|` interpolated
+    /// coefficients are zero. Tampering a single quotient value makes it a non-polynomial and breaks that —
+    /// exactly the low-degree property the deferred FRI opening enforces succinctly at `ζ`.
+    #[test]
+    fn lookup_quotient_is_low_degree_and_commits() {
+        let air = RangeCheckAir;
+        let degree = 1 << 5;
+        let proof = prove_lookup_with_quotient(&air, balanced_main(degree), &[]);
+
+        let qd = quotient_domain_for(degree, proof.log_num_quotient_chunks);
+        assert_eq!(proof.quotient_values.len(), qd.size(), "one quotient value per quotient-domain point");
+
+        let coeffs = quotient_coeff_rows(&proof.quotient_values, qd);
+        assert!(
+            top_coeffs_all_zero(&coeffs, degree),
+            "an honest quotient C/Z_H has degree < quotient_size − |H| ⇒ its top |H| coefficients vanish"
+        );
+
+        let mut tampered = proof.quotient_values.clone();
+        tampered[3] += Challenge::ONE;
+        assert!(
+            !top_coeffs_all_zero(&quotient_coeff_rows(&tampered, qd), degree),
+            "a tampered quotient value must break the low-degree property"
+        );
+    }
+
+    /// The two soundness mechanisms are distinct: the **quotient** enforces aux-trace well-formedness (it is
+    /// low-degree for any honestly-generated aux, balanced or not), while the committed **terminal** enforces
+    /// multiset balance. An imbalanced trace therefore keeps a well-formed quotient but a non-zero terminal.
+    #[test]
+    fn quotient_wellformed_while_terminal_catches_imbalance() {
+        let air = RangeCheckAir;
+        let degree = 1 << 5;
+
+        let bal = prove_lookup_with_quotient(&air, balanced_main(degree), &[]);
+        let qd = quotient_domain_for(degree, bal.log_num_quotient_chunks);
+        assert_eq!(bal.terminal.0, Challenge::ZERO, "balanced ⇒ zero terminal");
+        assert!(top_coeffs_all_zero(&quotient_coeff_rows(&bal.quotient_values, qd), degree));
+
+        let mut m = balanced_main(degree);
+        m.values[3 * 4 + 1] = Val::from_u64(0xBADD); // break row 4's table value ⇒ multiset imbalance
+        let imb = prove_lookup_with_quotient(&air, m, &[]);
+        assert_ne!(imb.terminal.0, Challenge::ZERO, "imbalanced ⇒ non-zero terminal");
+        assert!(
+            top_coeffs_all_zero(&quotient_coeff_rows(&imb.quotient_values, qd), degree),
+            "the honestly-generated aux stays well-formed, so the quotient remains a valid polynomial"
+        );
     }
 }
