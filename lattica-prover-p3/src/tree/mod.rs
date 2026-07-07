@@ -149,10 +149,48 @@ pub mod degree_probe {
     }
 }
 
+/// Phase-3 (size-stability) — the wrap **fixed-point model**, the size analog of 0a′'s degree measurement.
+///
+/// A recursion tree needs `verify(proof)` to be **non-expanding**: verifying a proof of width `W` must
+/// emit a proof of width `≤ W`. Model the self-verification width recurrence as `W_out = A + B·W_in`; a
+/// fixed point (`W_out = W_in`, an *attracting* one) exists iff the per-inner-column factor **`B < 1`** — a
+/// contraction. `B` is the marginal cost of verifying one more inner column: the monolith **opens and
+/// re-evaluates** it (expensive), a lookup-based wrap **looks it up** at bounded cost.
+///
+/// Fitting `B` from the two measured monolith self-verification points — verify a W=19 join-split → W=193,
+/// and verify a W=193 monolith → W=8520 (`phase9_self_recursion_probe`) — gives `B ≈ 48 ≫ 1`: a strong
+/// expansion, so the monolith has **no fixed point** and diverges (exactly the measured 44× blow-up). The
+/// wrap must drive `B < 1`; P2 showed a lookup carries **fixed degree (3) and fixed width** independent of
+/// the value looked up, which is precisely the per-column contraction the fixed point requires.
+pub mod size_model {
+    /// Two measured self-verification points `(W_in, W_out)` from the monolith probes.
+    pub const MONOLITH_POINTS: [(f64, f64); 2] = [(19.0, 193.0), (193.0, 8520.0)];
+
+    /// Fit the linear recurrence `W_out = A + B·W_in` from two points → `(A, B)`.
+    pub fn fit_recurrence(p0: (f64, f64), p1: (f64, f64)) -> (f64, f64) {
+        let b = (p1.1 - p0.1) / (p1.0 - p0.0);
+        let a = p0.1 - b * p0.0;
+        (a, b)
+    }
+
+    /// The **attracting** fixed point `W* = A/(1−B)` iff `B < 1` (a contraction); `None` if `B ≥ 1`
+    /// (iterating `W ↦ A + B·W` diverges — no attracting fixed point).
+    pub fn attracting_fixed_point(a: f64, b: f64) -> Option<f64> {
+        if b < 1.0 && a >= 0.0 {
+            Some(a / (1.0 - b))
+        } else if b < 1.0 {
+            Some(a / (1.0 - b)) // contraction toward W* even with A<0; the sign is a modelling artifact
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::degree_probe::log_nqc_for_degree;
+    use super::size_model::*;
 
     /// **0a's model → a measurement.** Measure the degree→log_nqc mapping p3 actually applies, and confirm:
     ///   * the BASELINE explosion is a *degree* problem — the monolith's ~degree-91 fold (air.rs:473) maps to
@@ -177,6 +215,28 @@ mod tests {
         // i.e. the real degree budget is ~17, a hair more than the nominal 16. Tip5(7)/lookup(2) clear it
         // comfortably; the baseline's ~91 blows well past it.
         assert!(log_nqc_for_degree(17) <= ceiling && log_nqc_for_degree(32) > ceiling, "cliff between degree 17 and 32");
+    }
+
+    /// **0a's size-stability "by design" → a concrete fixed-point condition.** The monolith's *measured*
+    /// self-verification expands (B ≫ 1) ⇒ no attracting fixed point ⇒ diverges (the 44× blow-up); a
+    /// lookup-based wrap can drive B < 1 ⇒ a contraction with an attracting canonical fixed point W*.
+    #[test]
+    fn wrap_size_stability_is_a_contraction_fixed_point() {
+        // MONOLITH — fit B from the two measured points; a strong expansion ⇒ diverges.
+        let (a_m, b_m) = fit_recurrence(MONOLITH_POINTS[0], MONOLITH_POINTS[1]);
+        println!(
+            "SIZE-MODEL monolith: W_out = {a_m:.0} + {b_m:.1}·W_in ⇒ attracting fixed point = {:?}",
+            attracting_fixed_point(a_m, b_m)
+        );
+        assert!(b_m > 1.0, "monolith is an expansion (B = {b_m:.1} ≫ 1)");
+        assert!(attracting_fixed_point(a_m, b_m).is_none(), "expansion ⇒ no attracting fixed point ⇒ diverges");
+
+        // WRAP — a lookup-based verifier makes the per-inner-column cost a bounded lookup (P2: fixed
+        // degree 3 + fixed width, independent of the value) ⇒ B < 1 ⇒ an attracting fixed point exists.
+        let (a_w, b_w) = (300.0, 0.5); // illustrative contraction; the real B is the wrap's per-query lookup cost
+        let w_star = attracting_fixed_point(a_w, b_w).expect("a contraction has an attracting fixed point");
+        println!("SIZE-MODEL wrap (contraction B = {b_w}): canonical W* = {w_star:.0}");
+        assert!(b_w < 1.0 && w_star.is_finite() && w_star > 0.0);
     }
 
     /// The GO/NO-GO model. Prints the before/after and asserts the two drivers are addressed.

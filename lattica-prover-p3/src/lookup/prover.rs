@@ -18,7 +18,7 @@
 use crate::config::{make_config, Challenge, MyConfig, Val};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::{CanObserve, FieldChallenger};
-use p3_commit::{Pcs, PolynomialSpace};
+use p3_commit::Pcs;
 use p3_field::{Field, PrimeCharacteristicRing};
 use p3_lookup::{InteractionBuilder, LogUpGadget, LookupProtocol, LookupTerminal, Lookups};
 use p3_matrix::dense::RowMajorMatrix;
