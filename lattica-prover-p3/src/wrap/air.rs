@@ -1033,6 +1033,7 @@ mod tests {
         let olayout = AirLayout::from_air::<Val>(&outer);
         let inline_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
         let (inner_w, outer_w) = (inner.fused_w(), outer.fused_w());
+        let (o_inst_h, o_used) = (outer.inst_h(), outer.tr() + outer.n_queries * outer.m_period());
         let wrap = WrapAir::new(outer);
         let wlayout = AirLayout::from_air::<Val>(&wrap);
         let wrap_nqc = get_log_num_quotient_chunks::<Val, WrapAir>(&wrap, wlayout, 0);
@@ -1052,17 +1053,29 @@ mod tests {
             wrap_w - outer_w,
             wrap.n_mul
         );
-        // W3 target (the first size lever): the narrow-tall op-table lays the {n_mul} Mul products as trace
-        // ROWS at CONSTANT width (the `ChainEvalAir` form — degree down the rows) instead of 2·n_mul = {}
-        // COLUMNS, so the wrap contracts from {wrap_w} back to ≈ the inline monolith ({outer_w}) — no longer
-        // WIDER than inline. Then canonicalize (fix w_inner/nqc/cap_height) makes it inner-independent, and
-        // Tip5 (~4.6× fewer hash rows) shrinks the hash-dominated fused_w toward the W5 fixed point (W_out≤W_in).
+        // W3 op-table projection (MEASURED, not just targeted — bricks 1–4 built the op-table): build the
+        // FLATTEN op-table for THIS R5 inner's constraint DAG and measure its geometry. The op-table lays the
+        // c_k evaluation + the α-fold as ROWS at a CONSTANT width (13) that OVERLAY the outer's wide fused_w
+        // columns on slack rows, so the 2·n_mul witnessed COLUMNS become slack ROWS and the wrap width
+        // contracts to ≈ fused_w (the inline monolith) — only the folded value is an O(1) net-new binding at
+        // the arith head. Height grows to fit the op rows (a proving-time cost, not a width cost).
+        let (optab, _r, _f) =
+            crate::wrap::op_table_f2_trace(&inner_cs, |_| Challenge::ONE, Some(Challenge::ONE));
+        let op_rows = optab.values.len() / 13;
+        let slack = o_inst_h.saturating_sub(o_used);
+        let fits = op_rows <= slack;
+        let op_height = if fits { o_inst_h } else { (o_used + op_rows).next_power_of_two() };
         println!(
-            "W3 target: narrow-tall op-table ⇒ wrap width ~{outer_w} (the {} witnessed COLUMNS become {} slack \
-             ROWS at constant width); then canonicalize + Tip5 → the W5 size fixed point.",
+            "W3 op-table PROJECTION (R5 inner, {} constraints): FLATTEN op-table = {op_rows} ROWS × 13 cols \
+             (overlaid on fused_w={outer_w}); outer slack = {slack} rows (used {o_used}/{o_inst_h}), \
+             fits_in_slack={fits} ⇒ op height {op_height}. ⇒ projected WRAP width = fused_w + O(1) ≈ {outer_w} \
+             (vs witnessed {wrap_w} = fused_w + 2·n_mul) — the {}-col c_k overhead becomes {op_rows} slack ROWS. \
+             WIDTH CONTRACTS to ≈ the inline monolith; the residual is the brick-5 integration (bus composition \
+             through the W1 lookup prover + region gating), NOT a width question.",
+            inner_cs.len(),
             wrap_w - outer_w,
-            wrap.n_mul
         );
+        assert!(op_rows > 0 && 13 <= outer_w, "the op-table has rows and its width overlays fused_w (ample room)");
         assert!(inline_nqc > LOG_BLOWUP, "the inline monolith must EXPLODE on a monolith-as-inner (the R5 bug)");
         assert!(wrap_nqc <= LOG_BLOWUP, "the wrap must FIX it — witnessed epilogue stays within budget");
     }
