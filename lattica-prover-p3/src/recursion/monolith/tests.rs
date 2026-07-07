@@ -68,7 +68,7 @@ impl Sim {
 /// (per-block input states, counts, ext-bind block per challenge, ext challenge values,
 /// index binds = (block, lane) per query, index felts).
 #[allow(clippy::type_complexity)]
-fn sim_full(
+pub(crate) fn sim_full( // W2-assemble (research): exposed to the wrap as the inner-proof witness-extraction seam
     config: &MyConfig,
     proof: &Proof<MyConfig>,
     pvs: &[Val],

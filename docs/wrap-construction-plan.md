@@ -132,12 +132,15 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
   — the build is not monolithically coupled after all; the novel regions stand alone.
 - **W2-assemble.2 — fold in the reused super-tile regions over a real inner** (the coupled part): add the
   transcript (F) + super-tile (A/D/E/G/H) + tx-root (J) regions. Their degrees are already established
-  (W2-super + the monolith's hiding degree guard), so this is **trace-construction, not a degree question** —
-  and it hits the one blocker: the wrap trace needs the inner-proof witness extraction (`sim_full`, a private
-  `#[cfg(test)]` helper in the do-not-touch `monolith/tests.rs`). `MonolithAir` / `monolith_build_trace` /
-  `multicol_query_terms` / `make_config` are `pub(crate)` and reusable; only the extraction is walled off.
-  **Decision:** expose the extraction (surgical, additive) vs re-derive it wrap-local. Then **W2-measure** on
-  the built wrap (`log_nqc ≤ 4` + prove/verify/tamper-reject over a real join-split inner).
+  (W2-super + the monolith's hiding degree guard), so this is **trace-construction, not a degree question**.
+  - **The witness seam is OPEN** (`wrap_witness_seam_real_inner`, `--features lookup,recursion`): `sim_full`
+    is exposed `pub(crate)` (alongside the already-reusable `MonolithAir` / `monolith_build_trace` /
+    `multicol_query_terms` / `make_config`), so the wrap now extracts a REAL join-split inner's witness and
+    confirms the reused regions (A–J) compose `log_nqc ≤ 4` on the real inner — from the wrap side.
+  - **Remaining:** the wrap-specific **trace builder** (lay the extracted witness into the wrap's column
+    layout) + **fusing the reused gadget constraints** (`SpongeAir` / `FriFoldAir` / `FriMerkleAir` are
+    `#[cfg(test)]` — needs the same exposure treatment or re-authoring). Then **W2-measure** on the built wrap
+    (`log_nqc ≤ 4` + prove/verify/tamper-reject over a real join-split inner) = the GATE.
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
   prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the

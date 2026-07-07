@@ -241,4 +241,53 @@ mod tests {
         println!("WrapArithAir (n=81, chunk=7, deg=8): log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
         assert!(log_nqc <= LOG_BLOWUP, "the fused arith region must stay within the degree budget");
     }
+
+    /// **W2-assemble.2 — the witness seam (`--features lookup,recursion`).** With `sim_full` exposed, the wrap
+    /// can obtain a REAL join-split inner's witness (challenge counts/binds, query index binds) and construct
+    /// the real reused-region AIR (`MonolithAir` = the super-tile classes A/D/E/F/G/H/J), confirming (a) the
+    /// witness-extraction seam is open from the wrap side and (b) those reused regions compose `log_nqc ≤ 4`
+    /// on the real inner — the foundation the wrap trace builder (the remaining W2-assemble.2) builds on.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn wrap_witness_seam_real_inner() {
+        use crate::joinsplit_air::{
+            build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
+        };
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        // The seam: extract the real inner's transcript witness + query index binds.
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+        };
+        let layout = AirLayout::from_air::<Val>(&air);
+        let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
+        println!("WRAP witness seam: real join-split MonolithAir (reused regions A–J) log_nqc = {log_nqc}");
+        assert!(log_nqc <= LOG_BLOWUP, "the reused super-tile regions must compose ≤ log_blowup on the real inner");
+    }
 }
