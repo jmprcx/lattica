@@ -149,10 +149,17 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
     **proves + verifies** end-to-end (`wrap_reused_trace_proves`, `--release --ignored`) + rejects a tampered
     inner pub; the cheap always-on `wrap_reused_ood_identity` pins the symbolic OOD fold == quotient(ζ). So
     the reused-region columns are correct — the foundation the B/C/I swap builds on.
-  - **Brick 2 — re-author the reused-region constraints** into the wrap AIR with **B/C/I as lookups** (reading
-    `monolith/air.rs` + the gadget AIRs as reference; the B/C/I lookup columns replace the inline forms in the
-    trace). Then **W2-measure** on the built wrap (`log_nqc ≤ 4` + prove/verify/tamper over a real inner) = the
-    GATE.
+  - **Brick 2 — DONE (core): the `MonolithBci` refactor + `WrapAir`.** Rather than duplicate the ~750-line
+    soundness surface, `MonolithAir::eval` was refactored into `eval_bci<AB, S: MonolithBci<AB>>` parameterized
+    over the B/C/I emission strategy — `Air::eval` uses `InlineBci` (BYTE-IDENTICAL, guarded by the
+    constraint-fingerprint pins + a `--release` join-split prove), the wrap uses `WrapBci`. `WrapBci` witnesses
+    each epilogue `c_k` in a degree-1 column (the real-DAG version of the C fix — the `Witnesser` walker binds
+    every F_p² `Mul` to a witnessed column pair) so the fold degree is capped independent of the inner; the
+    cap-mux (I) stays inline (degree `cap_height`, not the crux). **`WrapAir` (= `eval_bci` + `WrapBci`) over a
+    real join-split inner measures `log_nqc 4 ≤ 4` at is_zk = 1** (`wrap_air_within_budget`; width 1201 =
+    fused_w 773 + 2·214 witnessed `c_k` cols) — the assembled wrap composes within budget. *Follow-ups:* the
+    high-degree demonstration (inline explodes / witnessed ≤4 on a monolith-as-inner — the R5/W5-adjacent
+    case), and a full prove of the wrap (fill the witnessed columns + `p3::prove`, vs the symbolic measure).
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
   prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the
