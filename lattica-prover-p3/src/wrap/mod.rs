@@ -474,6 +474,208 @@ pub fn op_table_trace(constraints: &[p3_air::symbolic::SymbolicExpression<Val>])
     RowMajorMatrix::new(flat, w)
 }
 
+/// **W3 op-table brick 2 — the F_p² lift.** The real epilogue evaluates each `c_k` over F_p² (the OOD point ζ
+/// and every opening live in the degree-2 extension), so the faithful op-table carries **2-felt** values and
+/// multiplies via `emul` (`X² = 7`, the monolith's `MRO_W_EXT`) instead of scalar `Val`. Same FLATTEN shape as
+/// [`OpTableAir`] (one op per row, operands routed by a LogUp wiring bus), but the bus tuple is `(addr, v0,
+/// v1)` and the `mul` relation is the two-component `emul`. Native `Challenge` multiplication equals `emul(7)`
+/// (this is what the W2 `Witnesser`'s native mirror relies on), so a `Challenge`-valued trace satisfies the
+/// AIR by construction.
+///
+/// Columns (width 13): `[is_mul, is_add, is_sub, out_addr, out0, out1, a_addr, a0, a1, b_addr, b0, b1,
+/// out_mult]`. Degree 3 (`is_mul · a0 · b0`). The leaf-seed is a closure, so the SAME builder serves both the
+/// pseudo-value validation here and the real-ζ-opening seed (brick 3) — only the closure changes.
+pub struct OpTableF2Air;
+
+impl<F: p3_field::Field> BaseAir<F> for OpTableF2Air {
+    fn width(&self) -> usize {
+        13
+    }
+}
+
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for OpTableF2Air {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let r = main.current_slice().to_vec();
+        let (is_mul, is_add, is_sub) = (r[0], r[1], r[2]);
+        let (out_addr, o0, o1) = (r[3], r[4], r[5]);
+        let (a_addr, a0, a1) = (r[6], r[7], r[8]);
+        let (b_addr, b0, b1) = (r[9], r[10], r[11]);
+        let out_mult = r[12];
+        let w = AB::Expr::from(Val::from_u64(7)); // F_p² : X² = 7 (= MRO_W_EXT)
+
+        for s in [is_mul, is_add, is_sub] {
+            builder.assert_zero(s.into() * (s.into() - AB::Expr::ONE));
+        }
+        let is_op: AB::Expr = is_mul.into() + is_add.into() + is_sub.into();
+        builder.assert_zero(is_op.clone() * (is_op.clone() - AB::Expr::ONE));
+
+        // The gated op relation over F_p²: mul = emul (X²=7), add/sub componentwise.
+        builder.assert_zero(is_mul.into() * (o0.into() - (a0.into() * b0.into() + w * a1.into() * b1.into())));
+        builder.assert_zero(is_mul.into() * (o1.into() - (a0.into() * b1.into() + a1.into() * b0.into())));
+        builder.assert_zero(is_add.into() * (o0.into() - (a0.into() + b0.into())));
+        builder.assert_zero(is_add.into() * (o1.into() - (a1.into() + b1.into())));
+        builder.assert_zero(is_sub.into() * (o0.into() - (a0.into() - b0.into())));
+        builder.assert_zero(is_sub.into() * (o1.into() - (a1.into() - b1.into())));
+
+        // The wiring bus (one LogUp channel) — the 3-felt tuple `(addr, v0, v1)`.
+        builder.push_local_interaction(vec![
+            (vec![a_addr.into(), a0.into(), a1.into()], is_op.clone()),
+            (vec![b_addr.into(), b0.into(), b1.into()], is_op.clone()),
+            (vec![out_addr.into(), o0.into(), o1.into()], out_mult.into()),
+        ]);
+    }
+}
+
+/// Build an [`OpTableF2Air`] trace evaluating a constraint DAG over F_p² (`Challenge`). `leaf_val` supplies
+/// each leaf's `Challenge` value (constants keep their actual value; the closure maps Variables/selectors —
+/// pseudo values here, real ζ-openings in brick 3). Ops compute `out = a ∘ b` in `Challenge` (native mul =
+/// `emul(7)`). Returns the trace and the constraint ROOT values (each the native `c_k` — the hook the fold /
+/// faithfulness check reads). Same wiring/fanout/padding as [`op_table_trace`].
+pub fn op_table_f2_trace(
+    constraints: &[p3_air::symbolic::SymbolicExpression<Val>],
+    leaf_val: impl FnMut(&p3_uni_stark::BaseLeaf<Val>) -> crate::config::Challenge,
+) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>) {
+    use crate::config::Challenge;
+    use p3_air::symbolic::SymbolicExpr;
+    use p3_field::BasedVectorSpace;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    struct Row {
+        op: u8, // 0 = leaf, 1 = mul, 2 = add, 3 = sub
+        out_addr: u64,
+        out: Challenge,
+        a_addr: u64,
+        a: Challenge,
+        b_addr: u64,
+        b: Challenge,
+    }
+    struct B<G> {
+        rows: Vec<Row>,
+        memo: HashMap<usize, (u64, Challenge)>,
+        next: u64,
+        zero: Option<(u64, Challenge)>,
+        leaf_val: G,
+    }
+    impl<G: FnMut(&p3_uni_stark::BaseLeaf<Val>) -> Challenge> B<G> {
+        fn leaf(&mut self, val: Challenge) -> (u64, Challenge) {
+            let addr = self.next;
+            self.next += 1;
+            self.rows.push(Row { op: 0, out_addr: addr, out: val, a_addr: 0, a: Challenge::ZERO, b_addr: 0, b: Challenge::ZERO });
+            (addr, val)
+        }
+        fn emit(&mut self, op: u8, a: (u64, Challenge), b: (u64, Challenge)) -> (u64, Challenge) {
+            let val = match op {
+                1 => a.1 * b.1, // native Challenge mul = emul(7)
+                2 => a.1 + b.1,
+                3 => a.1 - b.1,
+                _ => unreachable!("op ∈ {{mul, add, sub}}"),
+            };
+            let addr = self.next;
+            self.next += 1;
+            self.rows.push(Row { op, out_addr: addr, out: val, a_addr: a.0, a: a.1, b_addr: b.0, b: b.1 });
+            (addr, val)
+        }
+        fn zero_wire(&mut self) -> (u64, Challenge) {
+            match self.zero {
+                Some(z) => z,
+                None => {
+                    let z = self.leaf(Challenge::ZERO);
+                    self.zero = Some(z);
+                    z
+                }
+            }
+        }
+        fn go_arc(&mut self, arc: &Arc<p3_air::symbolic::SymbolicExpression<Val>>) -> (u64, Challenge) {
+            let k = Arc::as_ptr(arc) as usize;
+            if let Some(v) = self.memo.get(&k) {
+                return *v;
+            }
+            let v = self.go(arc.as_ref());
+            self.memo.insert(k, v);
+            v
+        }
+        fn go(&mut self, node: &p3_air::symbolic::SymbolicExpression<Val>) -> (u64, Challenge) {
+            match node {
+                SymbolicExpr::Leaf(l) => {
+                    let v = (self.leaf_val)(l);
+                    self.leaf(v)
+                }
+                SymbolicExpr::Add { x, y, .. } => {
+                    let (a, c) = (self.go_arc(x), self.go_arc(y));
+                    self.emit(2, a, c)
+                }
+                SymbolicExpr::Sub { x, y, .. } => {
+                    let (a, c) = (self.go_arc(x), self.go_arc(y));
+                    self.emit(3, a, c)
+                }
+                SymbolicExpr::Mul { x, y, .. } => {
+                    let (a, c) = (self.go_arc(x), self.go_arc(y));
+                    self.emit(1, a, c)
+                }
+                SymbolicExpr::Neg { x, .. } => {
+                    let z = self.zero_wire();
+                    let a = self.go_arc(x);
+                    self.emit(3, z, a)
+                }
+            }
+        }
+    }
+
+    let mut b = B { rows: Vec::new(), memo: HashMap::new(), next: 0, zero: None, leaf_val };
+    let mut roots = Vec::with_capacity(constraints.len());
+    for root in constraints {
+        roots.push(b.go(root).1);
+    }
+
+    let mut fanout: HashMap<u64, u64> = HashMap::new();
+    for row in &b.rows {
+        if row.op != 0 {
+            *fanout.entry(row.a_addr).or_default() += 1;
+            *fanout.entry(row.b_addr).or_default() += 1;
+        }
+    }
+
+    let (w, cc) = (13usize, |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() });
+    let h = b.rows.len().next_power_of_two().max(1 << 4);
+    let mut flat = vec![Val::ZERO; h * w];
+    for (i, row) in b.rows.iter().enumerate() {
+        let base = i * w;
+        let one_if = |c: bool| if c { Val::ONE } else { Val::ZERO };
+        flat[base] = one_if(row.op == 1);
+        flat[base + 1] = one_if(row.op == 2);
+        flat[base + 2] = one_if(row.op == 3);
+        flat[base + 3] = Val::from_u64(row.out_addr);
+        flat[base + 4..base + 6].copy_from_slice(&cc(row.out));
+        flat[base + 6] = Val::from_u64(row.a_addr);
+        flat[base + 7..base + 9].copy_from_slice(&cc(row.a));
+        flat[base + 9] = Val::from_u64(row.b_addr);
+        flat[base + 10..base + 12].copy_from_slice(&cc(row.b));
+        flat[base + 12] = -Val::from_u64(*fanout.get(&row.out_addr).unwrap_or(&0));
+    }
+    (RowMajorMatrix::new(flat, w), roots)
+}
+
+/// A deterministic F_p² pseudo leaf-value closure (constants keep their value; Variables/selectors get
+/// distinct non-base `Challenge`s — both coefficients nonzero, so `emul`'s cross terms are exercised).
+#[cfg(test)]
+fn pseudo_leaf_f2() -> impl FnMut(&p3_uni_stark::BaseLeaf<Val>) -> crate::config::Challenge {
+    use crate::config::Challenge;
+    use p3_field::BasedVectorSpace;
+    use p3_uni_stark::BaseLeaf;
+    let mut ctr = 0u64;
+    move |l: &BaseLeaf<Val>| match l {
+        BaseLeaf::Constant(c) => Challenge::from(*c),
+        _ => {
+            ctr += 1;
+            let m = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(ctr);
+            Challenge::from_basis_coefficients_fn(|k| Val::from_u64(m.wrapping_add(0x1234_5678 * k as u64 + 1)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,5 +1273,95 @@ mod tests {
             2 * n_mul,
         );
         assert!(log_nqc <= LOG_BLOWUP, "the op-table must stay within the degree budget (got {log_nqc})");
+    }
+
+    /// **W3 op-table brick 2 — the F_p² op-table evaluates the real DAG via `emul` and proves + verifies.** The
+    /// faithful op-table carries 2-felt `Challenge` values (both coefficients nonzero here, so `emul`'s cross
+    /// terms are exercised) and routes them through the 3-felt wiring bus `(addr, v0, v1)`. Same real
+    /// `JoinSplitAir` DAG as brick 1, now over the extension field the real epilogue uses.
+    #[test]
+    fn op_table_f2_round_trips() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let (trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let proof = prove_lookup(&OpTableF2Air, trace, &[]);
+        assert!(
+            verify_lookup(&OpTableF2Air, &proof, &[]).is_ok(),
+            "the F_p² op-table must evaluate the real DAG (emul) and balance the wiring bus"
+        );
+    }
+
+    /// Corrupting one felt of a LEAF's F_p² value (a wire read by ≥1 op) unbalances the `(addr, v0, v1)` bus ⇒
+    /// non-zero terminal — the wiring binds the full 2-felt value.
+    #[test]
+    fn op_table_f2_rejects_broken_wire() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let (mut trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let w = 13;
+        let h = trace.values.len() / w;
+        let leaf = (0..h)
+            .find(|&r| {
+                let base = r * w;
+                trace.values[base] == Val::ZERO
+                    && trace.values[base + 1] == Val::ZERO
+                    && trace.values[base + 2] == Val::ZERO
+                    && trace.values[base + 12] != Val::ZERO
+            })
+            .expect("a leaf wire with fanout ≥ 1 exists");
+        trace.values[leaf * w + 4] += Val::ONE; // corrupt out0 (v0) of the leaf
+        let proof = prove_lookup(&OpTableF2Air, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&OpTableF2Air, &proof, &[]), Err(LookupVerifyError::NonZeroTerminal)),
+            "a corrupted F_p² wire value must unbalance the wiring bus"
+        );
+    }
+
+    /// Corrupting a ROOT op's F_p² output (fanout 0 ⇒ bus unaffected) violates its local `emul`/add/sub
+    /// relation ⇒ OOD mismatch — the two-component evaluation is checked.
+    #[test]
+    fn op_table_f2_rejects_broken_op() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let (mut trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let w = 13;
+        let h = trace.values.len() / w;
+        let root = (0..h)
+            .find(|&r| {
+                let base = r * w;
+                let is_op = trace.values[base] != Val::ZERO
+                    || trace.values[base + 1] != Val::ZERO
+                    || trace.values[base + 2] != Val::ZERO;
+                is_op && trace.values[base + 12] == Val::ZERO
+            })
+            .expect("a root op (fanout 0) exists");
+        trace.values[root * w + 4] += Val::ONE; // out0 ≠ (a ∘ b).0 now
+        let proof = prove_lookup(&OpTableF2Air, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&OpTableF2Air, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
+            "a corrupted F_p² op output must fail its local relation"
+        );
+    }
+
+    /// The F_p² op-table is width 13 (constant, independent of DAG size) and within the degree budget — the
+    /// extension lift costs only a fixed 3 value felts more per wire than the scalar demonstrator (still ROWS,
+    /// not columns; the DAG's `2·n_mul` witnessed columns still collapse to slack rows).
+    #[test]
+    fn op_table_f2_is_narrow_and_low_degree() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let (trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let (rows, w) = (trace.values.len() / 13, 13);
+        assert_eq!(BaseAir::<Val>::width(&OpTableF2Air), w, "F_p² op-table width is constant");
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&OpTableF2Air);
+        let (_layout, log_nqc) = combined_constraint_layout(&OpTableF2Air, &lookups, 1);
+        let mut seen = HashSet::new();
+        let n_mul: usize = constraints.iter().map(|c| count_mul_nodes(c, &mut seen)).sum();
+        println!(
+            "OpTableF2 (real join-split DAG, F_p²): width {w} (const), {rows} padded rows, log_nqc = {log_nqc} \
+             (budget {LOG_BLOWUP}) — the witnessed {} COLUMNS (2·{n_mul} Muls) collapse to slack ROWS",
+            2 * n_mul,
+        );
+        assert!(log_nqc <= LOG_BLOWUP, "the F_p² op-table must stay within the degree budget (got {log_nqc})");
     }
 }
