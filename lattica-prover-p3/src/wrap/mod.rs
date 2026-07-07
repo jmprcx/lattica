@@ -464,13 +464,14 @@ mod tests {
         println!("REAL epilogue INLINE (monolith, deg {max_deg}): log_nqc = {}", wrap_log_nqc(&inline));
     }
 
-    /// **Wrap degree-budget rollup.** `log_nqc` composes as the MAX over regions (it is monotonic in the max
-    /// constraint degree), so the whole wrap's budget is the max of its regions' log_nqc. Roll up the
-    /// ACCESSIBLE real regions — the OOD epilogue (B, over the real inner's 81 witnessed c_k), the real
-    /// Poseidon2 hash rows (the super-tile's Merkle + transcript hashing, class A/E/F), the cap-mux (I), and
-    /// the narrow-tall C eval — and confirm they compose within budget. (The remaining super-tile gadgets —
-    /// FRI β-fold / Merkle-path / DEEP — live behind `--features recursion`; the plan holds them ≤16, so if
-    /// that holds they keep the full composition ≤ 4.)
+    /// **Wrap degree-budget rollup (W2-super).** `log_nqc` composes as the MAX over regions (it is monotonic
+    /// in the max constraint degree), so the whole wrap's budget is the max of its regions' log_nqc. Roll up
+    /// the real regions and confirm they compose within budget: the OOD epilogue (B, over the real inner's 81
+    /// witnessed c_k), the real Poseidon2 hash rows (A), the cap-mux (I), and the narrow-tall C eval — plus,
+    /// under `--features recursion`, the reused super-tile verifier tiles D (FRI β-fold), E (Merkle-opening +
+    /// SUM-form not_term), F (transcript sponge). This turns the plan's "every other gadget is already ≤16"
+    /// premise into a measurement. (G/H/J — DEEP α_fri / OOD selectors / tx-root fold — are `monolith/air.rs`
+    /// regions, measured when the wrap AIR is assembled, W2-assemble.)
     #[test]
     fn wrap_degree_budget_rollup() {
         let n_inner =
@@ -482,14 +483,51 @@ mod tests {
         let l_chain =
             combined_constraint_layout(&ChainEvalAir, &Lookups::from_air::<Challenge, _>(&ChainEvalAir), 1).1;
 
-        let composed = [l_epilogue, l_hash, l_capmux, l_chain].into_iter().max().unwrap();
+        // Accessible without `--features recursion`: the OOD epilogue fold (B) over the real inner, the real
+        // Poseidon2 hash rows (A), the cap-mux lookup (I), the narrow-tall C eval.
+        let base = [
+            ("epilogue(B)", l_epilogue),
+            ("hash(Poseidon2,A)", l_hash),
+            ("cap-mux(I)", l_capmux),
+            ("chain-eval(C)", l_chain),
+        ];
+
+        // W2-super — the reused super-tile verifier tiles (standalone AIRs faithful to the monolith's fused
+        // fold/Merkle/transcript regions). D (FRI β-fold) is F_p² arithmetic; E (Merkle-opening) and F
+        // (transcript sponge) reuse the degree-7 Poseidon2 S-box. Each must land within the budget.
+        #[cfg(feature = "recursion")]
+        let extra: Vec<(&str, usize)> = {
+            use crate::recursion::fri_fold::FriFoldAir;
+            use crate::recursion::fri_merkle::FriMerkleAir;
+            use crate::recursion::transcript::SpongeAir;
+            vec![
+                ("fri-fold(D)", wrap_log_nqc(&FriFoldAir)),
+                ("fri-merkle(E)", wrap_log_nqc(&FriMerkleAir)),
+                ("transcript(F)", wrap_log_nqc(&SpongeAir { blocks: 2 })),
+            ]
+        };
+        #[cfg(not(feature = "recursion"))]
+        let extra: Vec<(&str, usize)> = Vec::new();
+
+        let regions: Vec<(&str, usize)> = base.iter().copied().chain(extra).collect();
+        let composed = regions.iter().map(|&(_, l)| l).max().unwrap();
+        let detail = regions.iter().map(|(n, l)| format!("{n}={l}")).collect::<Vec<_>>().join(", ");
+        println!("WRAP budget rollup: {detail} ⇒ composed log_nqc = {composed} (budget {LOG_BLOWUP})");
+
+        for (name, l) in &regions {
+            assert!(*l <= LOG_BLOWUP, "wrap region {name} exceeds the degree budget: log_nqc {l} > {LOG_BLOWUP}");
+        }
+        assert!(composed <= LOG_BLOWUP, "the wrap regions must compose within the degree budget");
+
+        #[cfg(not(feature = "recursion"))]
         println!(
-            "WRAP budget rollup (accessible regions): epilogue(B)={l_epilogue}, hash(Poseidon2)={l_hash}, \
-             cap-mux(I)={l_capmux}, chain-eval(C)={l_chain} ⇒ composed log_nqc = {composed} (budget {LOG_BLOWUP})"
+            "  (super-tile FRI β-fold (D) / Merkle-path (E) / transcript (F) live behind --features \
+             recursion — run `--features lookup,recursion` to fold them in)"
         );
-        assert!(composed <= LOG_BLOWUP, "the accessible wrap regions must compose within the degree budget");
+        #[cfg(feature = "recursion")]
         println!(
-            "  remaining: super-tile FRI β-fold / Merkle-path / DEEP (behind --features recursion, ≤16 per plan)"
+            "  remaining: DEEP α_fri (G) / OOD selectors (H) / tx-root fold (J) — monolith/air.rs regions, \
+             measured when the wrap AIR is assembled (W2-assemble)"
         );
     }
 }

@@ -21,6 +21,21 @@ aux-well-formedness validated) + a **working two-round prover skeleton** on the 
 **Design decisions:** wrap designed **K-ary / DAG-ready** — each wrap aggregates K children, aligning with a
 block-DAG where each block wraps K parents (the existing flat aggregator is already K-ary).
 
+## Status (built on `tree-tip5-research`; blow-by-blow lives in the commits + auto-memory — this doc is the forward spec)
+
+- **W1 — DONE.** The forked lookup-capable prover (`src/lookup/prover.rs`) is complete end-to-end: combined
+  AIR+lookup layout, the shared single-point constraint folder, quotient-over-domain, and the batched
+  ζ-opening of trace + aux + quotient. A range-check lookup AIR round-trips; imbalance → `NonZeroTerminal`,
+  tamper → `Pcs`/`OodMismatch`, forged aux → `OodMismatch`. 16/16 lookup tests.
+- **W2 — IN PROGRESS; the DEGREE crux is measured GO, the full assembly remains.** The prover is generalized
+  to arbitrary interaction AIRs (public values, multi-arity, periodic), and the three high-degree constructs
+  **B / C / I** are each built + measured in `src/wrap/mod.rs`. The `log_nqc ≤ 4` degree crux (vs the
+  monolith's 7) is measured **three independent ways** — synthetic 384-constraint models, the **real
+  81-constraint `JoinSplitAir`** epilogue, and the accessible-region rollup (composed 3). **W2-super** then
+  folded the reused `--features recursion` super-tile tiles into the rollup and measured them (D/E/F = 2/3/3),
+  so classes A/D/E/F sit ≤ budget too. **Remaining = W2-assemble + W2-measure** — build the actual wrap AIR
+  and measure the whole construction (incl. the G/H/J `monolith/air.rs` regions) — the actual gate.
+
 ## The load-bearing insight (from the grounded conversion map)
 
 The degree explosion has **one source**: the **α_stark constraint-fold** (Horner over the inner's
@@ -51,21 +66,72 @@ the defining wrap property): `nb→cm_rounds→lg`, `n_terms`→9-col tiles, `w_
 
 ## Phases (gated). W2 and W5 are the make-or-break research gates; the rest is spec'd engineering.
 
-**W1 — Complete the lookup-capable prover.** Extend `src/lookup/prover.rs` (the skeleton) per the fork spec:
-fork `quotient_values` to use `ProverConstraintFolderWithLookups` + `gadget.eval_all` (base + lookup
-constraints); put the aux trace on the quotient domain (`get_evaluations_on_domain` + reconstruct
-`PackedChallenge` from the `flatten_to_base` layout, col `c*D+d`); **size the layout over AIR+lookup
-constraints** via `InteractionSymbolicBuilder` (else the alpha-powers + quotient size are too small); add the
-**aux round** + `aux_local/aux_next` + `terminal` to the `Proof`; verifier uses
-`VerifierConstraintFolderWithLookups` + `verify_terminal_sum`. Keep **α_L** (denominator, after main commit)
-and the fold **alpha** (after aux commit) as distinct rounds. *Milestone:* a range-check lookup AIR
-proves+verifies end-to-end; a tampered trace → `OodEvaluationMismatch`/reject.
+**W1 — Complete the lookup-capable prover. — DONE.** `src/lookup/prover.rs`, forked over `p3-lookup` LogUp:
+- **W1.1** — the **combined AIR+lookup constraint layout** + `log_nqc` (`combined_constraint_layout`; p3's own
+  helper misses the lookup constraints, sizing the quotient domain too small).
+- **W1.2** — `batched_constraints_at_point`, a single-point scalar folder via
+  `VerifierConstraintFolderWithLookups` **deliberately shared by the prover quotient AND the verifier
+  ζ-check**; plus `lookup_quotient_values` (fold ÷ Z_H over the quotient domain; aux reconstructed from the
+  `flatten_to_base` layout, col `c*D+d`) and the 3-round `prove_lookup_with_quotient` (main → sample
+  α_L/β → commit aux → sample fold-α → commit quotient → ζ).
+- **W1.3** — the batched **ζ-opening** `prove_lookup` / `verify_lookup`: opens trace + aux at {ζ, ζ·g} and
+  each quotient chunk at ζ in one FRI proof (aux round appended so trace/quotient indices are undisturbed);
+  verify = `pcs.verify` + the OOD identity `folded(ζ)·Z_H(ζ)⁻¹ = Q(ζ)` (same folder) + the LogUp terminal.
 
-**W2 — [GATE 1 · DEGREE].** Build a wrap AIR (`src/wrap/`) that verifies a **real join-split inner**
-(Poseidon2 hashing reused = class A) with **B/C/I expressed as lookups**. Measure `log_nqc≤4` with the same
-probes as `native_verify.rs:2150-2189` on the *real* wrap — converting 0a′'s model to a measurement on the
-actual construction. **GO/NO-GO:** wrap holds ≤4 verifying a real inner ⇒ degree solved; else re-examine the
-inner-constraint lookup encoding.
+*Milestone met:* a range-check lookup AIR round-trips; imbalance → `NonZeroTerminal`, tampered opening →
+`Pcs`/`OodMismatch`, forged aux → `OodMismatch`. 16/16 lookup tests. (ZK caveat: the optional FRI-batch
+randomization poly is omitted — ZK-only, not soundness; salted-Merkle + random-column hiding retained.)
+
+**W2 — [GATE 1 · DEGREE]. — IN PROGRESS (degree crux measured GO; full assembly remains).** Build a wrap AIR
+(`src/wrap/`) that verifies a **real join-split inner** (Poseidon2 hashing reused = class A) with **B/C/I
+expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 4` (vs the monolith's 7) on the
+*real* construction (converting 0a′'s model to a measurement on the actual wrap).
+
+*Delivered (each committed + measured in `src/wrap/mod.rs`, probe = `wrap_log_nqc` over p3's own
+`get_log_num_quotient_chunks`):*
+- **W2.0–2.2** — generalized the W1 prover from `RangeCheckAir` to any interaction AIR, threading public
+  values, multi-arity lookups (2 challenges per lookup), and periodic columns. The fold now handles every AIR
+  feature the wrap needs.
+- **W2-B** (`FoldAir`) — the α_stark constraint-fold. **Witness** each inner-constraint value `c_k` in a
+  degree-1 column and **chunk** the α-Horner (`FOLD_CHUNK`): at the 384-constraint join-split scale,
+  `log_nqc 3`. Both levers are needed — inline deg-16 → 5, unchunked witnessed → 9.
+- **W2-C** (`DagFoldAir` wide + `ChainEvalAir` narrow-tall) — evaluate each `c_k` at low degree *without* the
+  inline degree-16 expression: either witnessed degree-2 steps (`t_i = t_{i−1}·x_{i+1}`, `c_k` degree-1, `2d−1`
+  cols) or a running product down the rows (constant width — `d` rows not `2d` cols). Both `log_nqc ≤ 3`; the
+  narrow-tall form also validates the prover's **transition** support end-to-end.
+- **W2-I** (`CapMuxAir`) — the cap-mux as a single 2-element `(index, value)` LogUp with signed multiplicity:
+  **width 3 (const, not `2^cap_height`), degree 3 (not `cap_height`)**. First wrap component to
+  PROVE+VERIFY through the W1 prover; wrong selection → `NonZeroTerminal`.
+- **W2-real** — grounded on the REAL inner: `get_symbolic_constraints(JoinSplitAir)` = 81 constraints, max
+  degree 8, 214 unique Mul nodes (= the witnessed C columns with `Arc`-identity sharing). The witnessed
+  epilogue over the real DAGs holds `log_nqc 3`.
+- **W2-rollup** (`wrap_degree_budget_rollup`) — `log_nqc` composes as the MAX over regions, so rolled up the
+  accessible real regions: epilogue B (real 81-constraint inner) = 3, real Poseidon2 hash (`Poseidon2RowsAir`,
+  the super-tile Merkle/transcript hash) = 3, cap-mux I = 1, chain-eval C = 2 ⇒ **composed `log_nqc 3 ≤ 4`**.
+- **W2-super** (`wrap_degree_budget_rollup` under `--features lookup,recursion`) — folded the reused
+  super-tile verifier tiles into the rollup and MEASURED each ≤ budget: **D (FRI β-fold) = 2, E
+  (Merkle-opening + SUM-form `not_term`) = 3, F (transcript sponge) = 3** (alongside A = 3, B over the real
+  inner = 3, I = 1, C = 2) ⇒ composed `log_nqc 3 ≤ 4`. The plan's "every other gadget is already ≤16"
+  premise is now a **measurement** for classes A/D/E/F (`FriFoldAir`/`FriMerkleAir`/`SpongeAir` are standalone
+  AIRs faithful to the monolith's fused regions; each satisfies `wrap_log_nqc`'s `SymbolicAirBuilder` bound).
+
+*Remaining — the full wrap assembly (the actual GATE; large, multi-session):*
+- **W2-assemble — build the actual wrap AIR** in `src/wrap/` (extend `mod.rs` into `air.rs`/`gadgets.rs`):
+  compose the transcript (F) + super-tile (A/D/E) regions over the real inner **on top of** the grounded
+  B/C/I epilogue + the class-J tx-root fold, reusing the recursion gadgets **verbatim** per the conversion
+  map. This is where the last unmeasured reuse-classes — **G (DEEP α_fri), H (OOD selectors + z_h squaring),
+  J (tx-root fold)** — enter, as regions of `monolith/air.rs` (not standalone AIRs), measured once a
+  `MonolithAir`-shaped instance exists. Like the monolith #86 build, this is *coupled* — no incremental
+  validation until it proves end-to-end.
+- **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
+  `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
+  prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the
+  offending region (its measured `log_nqc`) points straight back to its lookup encoding.
+
+The degree crux is already measured GO three independent ways (synthetic, real 81-constraint inner,
+accessible-region rollup — all ≤ 4), so W2's residual risk has narrowed from *"does the lookup encoding
+work"* to *"does the **assembled** composition stay ≤ 4"* — i.e. whether the remaining super-tile gadgets in
+fact hold ≤ 16 (the plan's premise, which W2-super now measures).
 
 **W3 — Canonicalize the shape.** Fix `nb/cm_rounds/n_terms/cap_height` to canonical constants; the cap-mux
 lookup (I) removes the `2^cap_height` blow-up; a canonical FRI shape fixes `n_terms`. *Milestone:* the wrap's
@@ -94,8 +160,9 @@ corrupted-trace matrix). The **C-ABI/Zig seam stays DEFERRED** (research; a node
 
 ## Files
 
-- **New / extend:** `src/lookup/prover.rs` (complete W1); `src/wrap/{mod,air,gadgets}.rs` (the wrap AIR + the
-  B/C/I lookup gadgets); extend `src/tree/` (K-ary self-composition + the W2/W5 probes); update
+- **New / extend:** `src/lookup/prover.rs` (W1 ✅ complete); `src/wrap/mod.rs` (the B/C/I constructs + the
+  rollup probe ✅ — extend into `air.rs`/`gadgets.rs` for the W2-assemble wrap AIR); `src/tree/mod.rs` (the
+  degree/size fixed-point models ✅ — extend for K-ary self-composition + the W5 probe); update
   `docs/deep-tree-tip5-design.md`.
 - **Reuse (committed recursion gadgets):** `recursion/poseidon2_air.rs` (A), `fri_merkle.rs` (E),
   `fri_fold.rs` (D), `transcript.rs` (F), `monolith/air.rs` G/H/J patterns, `native_fri.rs`/`native_verify.rs`
@@ -107,19 +174,25 @@ corrupted-trace matrix). The **C-ABI/Zig seam stays DEFERRED** (research; a node
 
 ## Verification / gates
 
-- **W1:** `cargo test --features lookup` — the range-check lookup AIR round-trips; tampered →
-  `OodEvaluationMismatch`/reject; `verify_terminal_sum` rejects a non-zero terminal.
-- **W2 (GATE 1):** a wrap probe measures **`log_nqc≤4`** (vs the monolith's 7) verifying a real join-split
-  inner — the degree GO/NO-GO.
+- **W1 ✅:** `cargo test --features lookup` — the range-check (and cap-mux) lookup AIRs round-trip; imbalance
+  → `NonZeroTerminal`; tamper → `Pcs`/`OodMismatch`; forged aux → `OodMismatch`. 16/16 lookup tests green.
+- **W2 (GATE 1):** `wrap_degree_budget_rollup` measures **`log_nqc ≤ 4`** — ✅ on the accessible regions
+  (composed 3) and, under `--features lookup,recursion` (W2-super ✅), with the reused super-tile tiles D/E/F
+  folded in (2/3/3, still composed 3). The gate closes when the same probe, run over the fully-assembled wrap
+  (W2-assemble, incl. the G/H/J monolith-air regions), still measures ≤ 4 verifying a real join-split inner.
 - **W5 (GATE 2):** a self-verify probe measures **`W_out≤W_in`** — the size/fixed-point GO/NO-GO.
 - **Throughout:** `check-abi-symbols.sh` green (feature-gated; 0 symbols in the default staticlib); each
   phase committed + pushed on `tree-tip5-research`.
 
 ## Honest risk framing
 
-W2 and W5 are genuine **research gates**, not foregone — but the built measurements point to GO: the degree
-fix rests on lookups being deg 3 (*measured*), the size fix on `B<1` (*modeled* from the measured monolith
-`B≈48` + lookups' fixed per-column cost). Everything else is bounded engineering with precise file:line
-specs. Rough scale: multi-month, one specialist; **W1 is the concrete first build** (~weeks, fully spec'd),
-**W2 is the highest-value early gate**. A NO-GO at W2 or W5 would point back to the encoding, not a
-fundamental barrier — the PQ mandate rules out the curve/SNARK-wrap shortcut, so the lookup wrap is the path.
+W2 and W5 are genuine **research gates**, not foregone — but the built measurements point hard to GO: **W1 is
+DONE**, and W2's **degree crux is now measured GO three independent ways** (synthetic models, the real
+81-constraint join-split inner, and the accessible-region rollup — all `log_nqc ≤ 4`), so its residual risk
+has narrowed to whether the **assembled** construction (with the `--features recursion` super-tile gadgets)
+holds ≤ 4. The size fix (W5) still rests on `B<1` (*modeled* from the measured monolith `B≈48` + lookups'
+fixed per-column cost). Everything else is bounded engineering with precise file:line specs. Rough scale:
+multi-month, one specialist; **the live front is the W2 full wrap assembly** (`src/wrap/`, large/multi-
+session — W2-super → -assemble → -measure). A NO-GO at the W2 assembly or W5 would point back to the
+encoding / canonical shape, not a fundamental barrier — the PQ mandate rules out the curve/SNARK-wrap
+shortcut, so the lookup wrap is the path.
