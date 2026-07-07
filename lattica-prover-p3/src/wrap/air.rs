@@ -342,4 +342,174 @@ mod tests {
             epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
         assert_eq!(eo_periodic.len(), N_PERIODIC, "periodic-column values at ζ (H) extracted");
     }
+
+    /// **W2-assemble.2 brick 1 — the reused-region trace builder** (wrap-local; `--features recursion`).
+    /// Assembles a REAL join-split inner's full reused-region (A–J) trace + public values via the exposed
+    /// witness pipeline (`sim_full` + the `native_fri` extractors + `monolith_build_trace` + the ζ-selector
+    /// fill), and SELF-VALIDATES the extracted witness — the pis layout matches `pis_count`, and the native
+    /// symbolic OOD fold equals `quotient(ζ)`. This is the foundation the B/C/I-lookup swap builds on: the
+    /// reused-region columns are correct; only B/C/I change. Returns `(air, trace, pis)`.
+    #[cfg(feature = "recursion")]
+    fn wrap_build_reused(
+        config: &crate::recursion::native_fri::MyConfig,
+        proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
+        pvs: &[Val],
+    ) -> (crate::recursion::monolith::MonolithAir, RowMajorMatrix<Val>, Vec<Val>) {
+        use crate::joinsplit_air::{JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::{monolith_build_trace, MonolithAir};
+        use crate::recursion::native_fri::{
+            epilogue_openings, eval_symbolic_native, multicol_query_terms, query_commit_merkle_all,
+            query_fold_data, query_input_merkle, query_quotient_merkle, quotient_recompose_weights,
+        };
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+
+        let inner = JoinSplitAir;
+        let n_queries = proof.opening_proof.query_proofs.len();
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(config, proof, pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let (mut per_query, mut quot_paths, mut commit_data) = (Vec::new(), Vec::new(), Vec::new());
+        let mut final0 = Challenge::ZERO;
+        for q in 0..n_queries {
+            let (terms, _x, alpha, ro, _w) = multicol_query_terms(config, &inner, proof, pvs, q);
+            let (_ro2, rounds, _folded, f0) = query_fold_data(config, proof, pvs, q);
+            let (_leaf, path, _ce) = query_input_merkle(config, proof, pvs, q);
+            let (_ql, qpath, _qce, _qw) = query_quotient_merkle(config, proof, pvs, q);
+            let cm = query_commit_merkle_all(config, proof, pvs, q);
+            if q == 0 {
+                final0 = f0;
+            }
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            per_query.push(((index, terms, alpha, ro, rounds), Val::ZERO, path));
+            quot_paths.push(qpath);
+            commit_data.push(cm);
+        }
+        let nqc = proof.opened_values.quotient_chunks.len();
+        let constraints = get_symbolic_constraints::<Val, _>(&inner, AirLayout::from_air::<Val>(&inner));
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries,
+            n_terms: 2 * WIDTH + 2 * nqc,
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+        };
+        let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
+            epilogue_openings(config, &inner, proof, pvs);
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+
+        // pis layout: FS challenges ‖ query indices ‖ final_poly(0) ‖ trace/quotient caps ‖ inner pubs ‖
+        // commit-round caps ‖ periodic values at ζ ‖ (quotient-recompose weights if nqc>1).
+        let mut pis = Vec::new();
+        for ch in &chs {
+            pis.extend_from_slice(ch);
+        }
+        pis.extend_from_slice(&index_felts);
+        pis.extend_from_slice(&cc(final0));
+        for e in proof.commitments.trace.roots().iter() {
+            pis.extend_from_slice(e);
+        }
+        for e in proof.commitments.quotient_chunks.roots().iter() {
+            pis.extend_from_slice(e);
+        }
+        pis.extend_from_slice(pvs);
+        for cm in proof.opening_proof.commit_phase_commits.iter() {
+            for e in cm.roots().iter() {
+                pis.extend_from_slice(e);
+            }
+        }
+        for pv in &eo_periodic {
+            pis.extend_from_slice(&cc(*pv));
+        }
+        if nqc > 1 {
+            for z in &quotient_recompose_weights(config, &inner, proof, pvs) {
+                pis.extend_from_slice(&cc(*z));
+            }
+        }
+        assert_eq!(pis.len(), air.pis_count(), "reused-region pis layout matches pis_count");
+
+        // Native pre-check: the symbolic OOD fold on the extracted openings == quotient(ζ) — validates the
+        // witness without a full prove (localizes any extraction/wiring bug).
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let mut folded = Challenge::ZERO;
+        for c in &air.constraints {
+            folded = folded * eo_alpha
+                + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, &eo_periodic, is_first, is_last, is_trans);
+        }
+        assert_eq!(folded * inv_van, eo_quot, "reused-region PRE-CHECK: symbolic OOD fold == quotient(ζ)");
+
+        // Build the trace + fill the witnessed Lagrange selectors at ζ (is_first/is_last/inv_van).
+        let mut trace = monolith_build_trace(
+            &air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], None,
+        );
+        let (isf, isl, iv) = (cc(is_first), cc(is_last), cc(inv_van));
+        let (fw, sb) = (air.fused_w(), air.sel_base());
+        for r in 0..air.height() {
+            trace.values[r * fw + sb..r * fw + sb + 2].copy_from_slice(&isf);
+            trace.values[r * fw + sb + 2..r * fw + sb + 4].copy_from_slice(&isl);
+            trace.values[r * fw + sb + 4..r * fw + sb + 6].copy_from_slice(&iv);
+        }
+        (air, trace, pis)
+    }
+
+    /// **Cheap always-on validation of the reused-region epilogue witness (B/H).** The same pre-check
+    /// `wrap_build_reused` runs, standalone (no heavy trace build): extract the OOD openings for a REAL
+    /// join-split inner and confirm the native symbolic fold equals `quotient(ζ)` — the identity the wrap's
+    /// B/C epilogue (lookup form) must reproduce. Localizes any extraction/wiring bug in the fast suite.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn wrap_reused_ood_identity() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::{epilogue_openings, eval_symbolic_native, make_config};
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
+            epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let mut folded = Challenge::ZERO;
+        for c in &constraints {
+            folded = folded * eo_alpha
+                + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, &eo_periodic, is_first, is_last, is_trans);
+        }
+        assert_eq!(folded * inv_van, eo_quot, "reused-region OOD identity: symbolic fold == quotient(ζ)");
+    }
+
+    /// The heavy end-to-end: the reused-region AIR, built from the wrap side, PROVES + VERIFIES over a real
+    /// inner and rejects a tampered inner public — the wrap-side trace builder is correct, not just
+    /// well-shaped. Ignored by default (2^16 rows, ~GBs); run with `--ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves the full reused-region monolith (2^16 rows, ~7 GB); run with `--release \
+                --features lookup,recursion -- --ignored` (debug is ~100× slower)"]
+    fn wrap_reused_trace_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{prove, verify};
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, trace, pis) = wrap_build_reused(&config, &proof, &pvs);
+        let prf = prove(&config, &air, trace, &pis);
+        assert!(verify(&config, &air, &prf, &pis).is_ok(), "the reused-region monolith must verify");
+        let mut bad = pis.clone();
+        bad[air.pub_pi()] += Val::ONE;
+        assert!(verify(&config, &air, &prf, &bad).is_err(), "a tampered inner pub must be rejected");
+    }
 }

@@ -144,10 +144,15 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
     quotient_recompose_weights}` + `monolith::{MonolithAir, monolith_build_trace}` + `make_config` — is
     already `pub(crate)` and callable from the wrap (validated end-to-end on a real inner). So the wrap↔
     recursion fence is fixed ONCE, deliberately; **no further exposure is needed** for W2-assemble.2.
-  - **Remaining (entirely wrap-local):** the wrap-specific **trace builder** (lay the extracted witness into
-    the wrap's column layout) + **re-authoring the reused-region constraints** into the wrap AIR with B/C/I as
-    lookups (reading `monolith/air.rs` + the gadget AIRs as reference). Then **W2-measure** on the built wrap
-    (`log_nqc ≤ 4` + prove/verify/tamper-reject over a real join-split inner) = the GATE.
+  - **Brick 1 — the reused-region trace builder, DONE** (`wrap_build_reused`, `src/wrap/air.rs`): the wrap
+    assembles a REAL join-split inner's full reused-region (A–J) trace + pis from the exposed pipeline, and it
+    **proves + verifies** end-to-end (`wrap_reused_trace_proves`, `--release --ignored`) + rejects a tampered
+    inner pub; the cheap always-on `wrap_reused_ood_identity` pins the symbolic OOD fold == quotient(ζ). So
+    the reused-region columns are correct — the foundation the B/C/I swap builds on.
+  - **Brick 2 — re-author the reused-region constraints** into the wrap AIR with **B/C/I as lookups** (reading
+    `monolith/air.rs` + the gadget AIRs as reference; the B/C/I lookup columns replace the inline forms in the
+    trace). Then **W2-measure** on the built wrap (`log_nqc ≤ 4` + prove/verify/tamper over a real inner) = the
+    GATE.
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
   prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the
