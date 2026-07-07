@@ -279,8 +279,32 @@ pub fn chain_eval_trace(height: usize) -> RowMajorMatrix<Val> {
 mod tests {
     use super::*;
     use crate::config::{Challenge, LOG_BLOWUP};
+    use crate::joinsplit_air::JoinSplitAir;
     use crate::lookup::prover::{combined_constraint_layout, prove_lookup, verify_lookup, LookupVerifyError};
-    use p3_lookup::{LookupProtocol, Lookups};
+    use p3_air::symbolic::{get_symbolic_constraints, SymbolicExpr, SymbolicExpression};
+    use p3_lookup::Lookups;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    /// Count the **unique** Mul nodes reachable from a constraint DAG (memoized by `Arc` identity via `seen`),
+    /// i.e. the witnessed intermediate columns the size-efficient C would need WITH sub-expression sharing
+    /// ("never re-evaluate the tree"). Add/Sub/Neg don't raise degree, so only Mul nodes are witnessed.
+    fn count_mul_nodes(expr: &SymbolicExpression<Val>, seen: &mut HashSet<usize>) -> usize {
+        match expr {
+            SymbolicExpr::Leaf(_) => 0,
+            SymbolicExpr::Neg { x, .. } => count_mul_arc(x, seen),
+            SymbolicExpr::Add { x, y, .. } | SymbolicExpr::Sub { x, y, .. } => {
+                count_mul_arc(x, seen) + count_mul_arc(y, seen)
+            }
+            SymbolicExpr::Mul { x, y, .. } => 1 + count_mul_arc(x, seen) + count_mul_arc(y, seen),
+        }
+    }
+    fn count_mul_arc(arc: &Arc<SymbolicExpression<Val>>, seen: &mut HashSet<usize>) -> usize {
+        if !seen.insert(Arc::as_ptr(arc) as usize) {
+            return 0; // already counted this shared sub-expression
+        }
+        count_mul_nodes(arc, seen)
+    }
 
     /// The **B degree fix**: with WITNESSED inner-constraint values (degree-1 columns) and the chunked fold,
     /// the α_stark fold stays within the degree-16 / `log_blowup` cliff — even for a realistic 384-constraint
@@ -408,5 +432,34 @@ mod tests {
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!("ChainEval: width = 3 (wide would be 2·degree), log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
         assert!(log_nqc <= LOG_BLOWUP, "narrow-tall running eval must stay within the degree budget (got {log_nqc})");
+    }
+
+    /// **The synthetic result, grounded in the REAL inner.** Extract the actual `JoinSplitAir` constraints,
+    /// report the real profile, and confirm the OOD epilogue — folding its `N` witnessed (degree-1) `c_k` via
+    /// the chunked Horner (B) — stays within the degree-16 / log_blowup cliff, versus the monolith's inline
+    /// evaluation at the real max degree.
+    #[test]
+    fn real_joinsplit_inner_epilogue_within_budget() {
+        let layout = AirLayout::from_air::<Val>(&JoinSplitAir);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, layout);
+        let n = constraints.len();
+        let max_deg = constraints.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
+        let mut seen = HashSet::new();
+        let muls: usize = constraints.iter().map(|c| count_mul_nodes(c, &mut seen)).sum();
+        println!(
+            "REAL JoinSplitAir inner: {n} constraints, max degree {max_deg}, {muls} unique Mul nodes \
+             (= witnessed C columns, shared)"
+        );
+
+        // The OOD epilogue folds the N witnessed degree-1 c_k via the chunked Horner (B).
+        let witnessed = FoldAir { n_constraints: n, chunk: 7, c_cols_per_constraint: 1 };
+        let log_nqc = wrap_log_nqc(&witnessed);
+        println!("REAL epilogue (witnessed C + fold B): log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
+        assert!(log_nqc <= LOG_BLOWUP, "the real-inner witnessed epilogue must stay ≤ log_blowup (got {log_nqc})");
+
+        // Contrast: the monolith's inline evaluation folds each c_k at the real max degree (reported, not
+        // asserted — the explosion's magnitude depends on the inner's exact max degree).
+        let inline = FoldAir { n_constraints: n, chunk: 7, c_cols_per_constraint: max_deg.max(1) };
+        println!("REAL epilogue INLINE (monolith, deg {max_deg}): log_nqc = {}", wrap_log_nqc(&inline));
     }
 }
