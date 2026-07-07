@@ -15,6 +15,12 @@ pub mod batch_htlc_air; // batch aggregation for the v3 shielded-HTLC spend (mir
 pub mod poseidon2_air;
 #[cfg(feature = "recursion")]
 pub mod recursion; // Phase B: recursive STARK verifier (B1 spike = in-circuit FRI Merkle-opening verifier)
+#[cfg(feature = "tip5")]
+pub mod tip5; // Phase-0 research: Tip5 permutation structural reference (Layer-A hash evaluation)
+#[cfg(feature = "lookup")]
+pub mod lookup; // Phase-0 research: minimal LogUp lookup-argument spike (gadget-level)
+#[cfg(feature = "tree")]
+pub mod tree; // Phase-0 research: wrap-feasibility model (0a) — the deep-tree GO/NO-GO crux
 #[cfg(feature = "gpu")]
 pub mod gpu; // opt-in OpenCL LDE acceleration (additive, prove-only; --features gpu)
 #[cfg(feature = "gpu")]
