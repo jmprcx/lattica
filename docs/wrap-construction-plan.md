@@ -157,9 +157,12 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
     every F_p² `Mul` to a witnessed column pair) so the fold degree is capped independent of the inner; the
     cap-mux (I) stays inline (degree `cap_height`, not the crux). **`WrapAir` (= `eval_bci` + `WrapBci`) over a
     real join-split inner measures `log_nqc 4 ≤ 4` at is_zk = 1** (`wrap_air_within_budget`; width 1201 =
-    fused_w 773 + 2·214 witnessed `c_k` cols) — the assembled wrap composes within budget. *Follow-ups:* the
-    high-degree demonstration (inline explodes / witnessed ≤4 on a monolith-as-inner — the R5/W5-adjacent
-    case), and a full prove of the wrap (fill the witnessed columns + `p3::prove`, vs the symbolic measure).
+    fused_w 773 + 2·214 witnessed `c_k` cols) — the assembled wrap composes within budget. **And it PROVES:**
+    `wrap_air_proves` (`--release --ignored`, ~32s) fills the witnessed `c_k` columns (`native_witnessed`, the
+    native mirror of the `Witnesser`) at each arith head and **proves + verifies + tamper-rejects** the full
+    `WrapAir` over a real inner — so the assembled wrap is **sound**, not just degree-≤4. *Remaining follow-up
+    (deferred):* the high-degree demonstration (inline explodes / witnessed ≤4 on a monolith-as-inner — the
+    R5/W5-adjacent case, where the degree *win* actually shows).
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
   prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the
