@@ -1032,6 +1032,7 @@ mod tests {
         };
         let olayout = AirLayout::from_air::<Val>(&outer);
         let inline_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
+        let (inner_w, outer_w) = (inner.fused_w(), outer.fused_w());
         let wrap = WrapAir::new(outer);
         let wlayout = AirLayout::from_air::<Val>(&wrap);
         let wrap_nqc = get_log_num_quotient_chunks::<Val, WrapAir>(&wrap, wlayout, 0);
@@ -1039,6 +1040,17 @@ mod tests {
             "R5 self-recursion (monolith-verifies-monolith, {} inner constraints): INLINE MonolithAir log_nqc = \
              {inline_nqc} (> {LOG_BLOWUP} = EXPLODES); WITNESSED WrapAir log_nqc = {wrap_nqc} (≤ {LOG_BLOWUP} = FIXED)",
             inner_cs.len()
+        );
+        // SIZE baseline (the W3–W5 target): the witnessed epilogue FIXES degree but ADDS width (2·n_mul c_k
+        // columns) — the size cost the SIZE program removes (W3 narrow-tall C / canonicalize, W4 Tip5, W5 the
+        // fixed point W_out ≤ W_in). Reported alongside the degree fix to ground the size program.
+        let wrap_w = <WrapAir as BaseAir<Val>>::width(&wrap);
+        println!(
+            "R5 SIZE baseline: inner monolith W={inner_w}, outer inline W={outer_w}, outer WRAP W={wrap_w} \
+             (+{} witnessed c_k cols for {} Muls). The witnessed degree fix TRADES for width ⇒ the SIZE \
+             program (narrow-tall C / canonicalize / Tip5) must contract it to a fixed point.",
+            wrap_w - outer_w,
+            wrap.n_mul
         );
         assert!(inline_nqc > LOG_BLOWUP, "the inline monolith must EXPLODE on a monolith-as-inner (the R5 bug)");
         assert!(wrap_nqc <= LOG_BLOWUP, "the wrap must FIX it — witnessed epilogue stays within budget");
