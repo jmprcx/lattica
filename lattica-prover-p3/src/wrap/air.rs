@@ -184,6 +184,244 @@ pub fn wrap_arith_trace(
     RowMajorMatrix::new(flat, fold_width + 3)
 }
 
+/// **W2-assemble.2 step 3 — the wrap AIR** (`--features recursion`). `WrapAir` reuses the whole monolith
+/// constraint system via `MonolithAir::eval_bci`, but supplies `WrapBci` for the B/C/I regions: the OOD
+/// epilogue's `c_k` are evaluated by the WITNESSED symbolic-circuit walker (each `Mul` bound to a degree-1
+/// column), so the fold degree is capped at ≈ `FOLD_CHUNK+1` INDEPENDENT of the inner's constraint degree —
+/// the fix for the self-recursion explosion (inline `c_k` = inner maxdeg → `log_nqc 7` verifying a monolith).
+/// The cap-mux (I) delegates to `InlineBci` (degree `cap_height`, already ≤ budget — not the degree crux).
+#[cfg(feature = "recursion")]
+mod wrap_air {
+    use super::Val;
+    use crate::recursion::monolith::{InlineBci, MonolithAir, MonolithBci};
+    use p3_air::{Air, AirBuilder, BaseAir};
+    use p3_field::PrimeCharacteristicRing;
+    use p3_goldilocks::Goldilocks;
+    use p3_uni_stark::{SymbolicExpr, SymbolicExpression};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    /// Count the unique `Mul` nodes across a constraint (memoized by `Arc` identity via `seen`) — the number
+    /// of witnessed F_p² intermediate columns the wrap allocates. Add/Sub/Neg don't raise degree.
+    pub(crate) fn count_mul(e: &SymbolicExpression<Val>, seen: &mut HashSet<usize>) -> usize {
+        match e {
+            SymbolicExpr::Leaf(_) => 0,
+            SymbolicExpr::Neg { x, .. } => count_mul_arc(x, seen),
+            SymbolicExpr::Add { x, y, .. } | SymbolicExpr::Sub { x, y, .. } => {
+                count_mul_arc(x, seen) + count_mul_arc(y, seen)
+            }
+            SymbolicExpr::Mul { x, y, .. } => 1 + count_mul_arc(x, seen) + count_mul_arc(y, seen),
+        }
+    }
+    fn count_mul_arc(arc: &Arc<SymbolicExpression<Val>>, seen: &mut HashSet<usize>) -> usize {
+        if !seen.insert(Arc::as_ptr(arc) as usize) {
+            return 0;
+        }
+        count_mul(arc, seen)
+    }
+
+    /// The WITNESSED symbolic-circuit walker (C's degree fix on the real DAGs): mirrors `eval_symbolic_circuit`
+    /// but at each `Mul` witnesses the F_p² product into a degree-1 column pair (`cur[mul_base + 2·i]`), bound
+    /// by a degree-2 constraint, so every node's value is degree 1. Shared sub-expressions (by `Arc` identity)
+    /// reuse their column. The column count MUST equal `count_mul` (the width `WrapAir` allocated).
+    struct Witnesser<'a, AB: AirBuilder<F = Goldilocks>> {
+        local: &'a [(AB::Expr, AB::Expr)],
+        next: &'a [(AB::Expr, AB::Expr)],
+        pubs: &'a [(AB::Expr, AB::Expr)],
+        periodic: &'a [(AB::Expr, AB::Expr)],
+        is_first: &'a (AB::Expr, AB::Expr),
+        is_last: &'a (AB::Expr, AB::Expr),
+        is_trans: &'a (AB::Expr, AB::Expr),
+        w: &'a AB::Expr,
+        cur: &'a [AB::Expr],
+        tf: &'a AB::Expr,
+        mul_base: usize,
+        counter: usize,
+        memo: HashMap<usize, (AB::Expr, AB::Expr)>,
+    }
+
+    impl<'a, AB: AirBuilder<F = Goldilocks>> Witnesser<'a, AB> {
+        fn emul(&self, a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)) -> (AB::Expr, AB::Expr) {
+            (
+                a.0.clone() * b.0.clone() + self.w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
+        }
+        fn walk_arc(&mut self, builder: &mut AB, arc: &Arc<SymbolicExpression<Val>>) -> (AB::Expr, AB::Expr) {
+            let key = Arc::as_ptr(arc) as usize;
+            if let Some(v) = self.memo.get(&key) {
+                return v.clone();
+            }
+            let v = self.walk(builder, arc.as_ref());
+            self.memo.insert(key, v.clone());
+            v
+        }
+        fn walk(&mut self, builder: &mut AB, e: &SymbolicExpression<Val>) -> (AB::Expr, AB::Expr) {
+            use p3_uni_stark::{BaseEntry, BaseLeaf};
+            match e {
+                SymbolicExpr::Leaf(leaf) => match leaf {
+                    BaseLeaf::Variable(v) => match v.entry {
+                        BaseEntry::Main { offset } => {
+                            if offset == 0 {
+                                self.local[v.index].clone()
+                            } else {
+                                self.next[v.index].clone()
+                            }
+                        }
+                        BaseEntry::Public => self.pubs[v.index].clone(),
+                        BaseEntry::Periodic => self.periodic[v.index].clone(),
+                        BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
+                    },
+                    BaseLeaf::IsFirstRow => self.is_first.clone(),
+                    BaseLeaf::IsLastRow => self.is_last.clone(),
+                    BaseLeaf::IsTransition => self.is_trans.clone(),
+                    BaseLeaf::Constant(c) => (AB::Expr::from(*c), AB::Expr::ZERO),
+                },
+                SymbolicExpr::Add { x, y, .. } => {
+                    let a = self.walk_arc(builder, x);
+                    let b = self.walk_arc(builder, y);
+                    (a.0 + b.0, a.1 + b.1)
+                }
+                SymbolicExpr::Sub { x, y, .. } => {
+                    let a = self.walk_arc(builder, x);
+                    let b = self.walk_arc(builder, y);
+                    (a.0 - b.0, a.1 - b.1)
+                }
+                SymbolicExpr::Neg { x, .. } => {
+                    let a = self.walk_arc(builder, x);
+                    (AB::Expr::ZERO - a.0, AB::Expr::ZERO - a.1)
+                }
+                SymbolicExpr::Mul { x, y, .. } => {
+                    let a = self.walk_arc(builder, x);
+                    let b = self.walk_arc(builder, y);
+                    let prod = self.emul(a, b); // degree 2 (a, b are degree-1)
+                    let col = self.mul_base + 2 * self.counter;
+                    self.counter += 1;
+                    let (wl, wh) = (self.cur[col].clone(), self.cur[col + 1].clone());
+                    builder.assert_zero(self.tf.clone() * (wl.clone() - prod.0)); // bind: t == a·b
+                    builder.assert_zero(self.tf.clone() * (wh.clone() - prod.1));
+                    (wl, wh) // c value = the degree-1 witnessed column
+                }
+            }
+        }
+    }
+
+    /// The wrap's B/C/I strategy: `emit_epilogue` witnesses `c_k` (degree 1) then folds (the degree fix);
+    /// `emit_capmux` delegates to `InlineBci` (not the degree crux).
+    pub(crate) struct WrapBci {
+        /// The offset where the witnessed `c_k` intermediate columns begin (= `MonolithAir::fused_w()`).
+        pub mul_base: usize,
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for WrapBci {
+        fn emit_capmux(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            pis: &[AB::Expr],
+            one: &AB::Expr,
+            tf: &AB::Expr,
+            openings: &[(usize, usize, usize, usize)],
+        ) {
+            InlineBci.emit_capmux(builder, air, cur, pis, one, tf, openings);
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn emit_epilogue(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            tf: &AB::Expr,
+            w: &AB::Expr,
+            local: &[(AB::Expr, AB::Expr)],
+            next: &[(AB::Expr, AB::Expr)],
+            pubs: &[(AB::Expr, AB::Expr)],
+            periodic: &[(AB::Expr, AB::Expr)],
+            is_first: &(AB::Expr, AB::Expr),
+            is_last: &(AB::Expr, AB::Expr),
+            is_trans: &(AB::Expr, AB::Expr),
+            alpha_stark: &(AB::Expr, AB::Expr),
+            inv_van: &(AB::Expr, AB::Expr),
+            quot: &(AB::Expr, AB::Expr),
+        ) {
+            let mut wit = Witnesser::<AB> {
+                local, next, pubs, periodic, is_first, is_last, is_trans, w, cur, tf,
+                mul_base: self.mul_base,
+                counter: 0,
+                memo: HashMap::new(),
+            };
+            let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+                (
+                    a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                    a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+                )
+            };
+            let chunked = air.column_window;
+            let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
+            let mut acc_i = 0usize;
+            let n_c = air.constraints.len();
+            for (k, c) in air.constraints.iter().enumerate() {
+                let ci = wit.walk(builder, c); // WITNESSED c_k (degree 1) — the fix
+                let fa = emul(folded.clone(), alpha_stark.clone());
+                folded = (fa.0 + ci.0, fa.1 + ci.1);
+                if chunked && (k + 1) % MonolithAir::FOLD_CHUNK == 0 && k + 1 < n_c {
+                    let fac = air.fold_acc(acc_i);
+                    let a = (cur[fac].clone(), cur[fac + 1].clone());
+                    builder.assert_zero(tf.clone() * (a.0.clone() - folded.0.clone()));
+                    builder.assert_zero(tf.clone() * (a.1.clone() - folded.1.clone()));
+                    folded = a;
+                    acc_i += 1;
+                }
+            }
+            let chk = emul(folded, inv_van.clone());
+            builder.assert_zero(tf.clone() * (chk.0 - quot.0.clone()));
+            builder.assert_zero(tf.clone() * (chk.1 - quot.1.clone()));
+        }
+    }
+
+    /// The wrap AIR: the whole monolith constraint system (`eval_bci`) with the B/C/I strategy swapped to
+    /// `WrapBci` — the witnessed epilogue caps the fold degree independent of the inner. Trace width =
+    /// the monolith's `fused_w` + `2·n_mul` witnessed `c_k` columns.
+    pub(crate) struct WrapAir {
+        pub(crate) m: MonolithAir,
+        pub(crate) n_mul: usize,
+    }
+
+    impl WrapAir {
+        pub(crate) fn new(m: MonolithAir) -> Self {
+            let mut seen = HashSet::new();
+            let n_mul: usize = m.constraints.iter().map(|c| count_mul(c, &mut seen)).sum();
+            Self { m, n_mul }
+        }
+    }
+
+    impl BaseAir<Goldilocks> for WrapAir {
+        fn width(&self) -> usize {
+            self.m.fused_w() + 2 * self.n_mul
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for WrapAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(builder, &WrapBci { mul_base: self.m.fused_w() });
+        }
+    }
+}
+
+#[cfg(feature = "recursion")]
+pub(crate) use wrap_air::WrapAir;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +749,58 @@ mod tests {
         let mut bad = pis.clone();
         bad[air.pub_pi()] += Val::ONE;
         assert!(verify(&config, &air, &prf, &bad).is_err(), "a tampered inner pub must be rejected");
+    }
+
+    /// **W2-measure — the assembled wrap.** Build a real join-split `MonolithAir`, wrap it (`WrapAir` reuses
+    /// the whole constraint system via `eval_bci`, with the WITNESSED epilogue + cap-mux delegated), and
+    /// measure the wrap's `log_nqc ≤ 4` at the production is_zk = 1. The witnessed `c_k` cap the epilogue fold
+    /// degree independent of the inner — so the assembled wrap (the refactor's payoff, `eval_bci` + `WrapBci`)
+    /// composes within budget.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn wrap_air_within_budget() {
+        use crate::joinsplit_air::{
+            build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
+        };
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+        };
+        let wrap = WrapAir::new(air);
+        let width = <WrapAir as p3_air::BaseAir<Val>>::width(&wrap);
+        let layout = AirLayout::from_air::<Val>(&wrap);
+        let log_nqc = get_log_num_quotient_chunks::<Val, WrapAir>(&wrap, layout, 1);
+        println!(
+            "WrapAir (join-split inner, witnessed epilogue): width {width} (+{} c_k cols), log_nqc {log_nqc} (budget {LOG_BLOWUP})",
+            2 * wrap.n_mul
+        );
+        assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap must be within the degree budget");
     }
 }
