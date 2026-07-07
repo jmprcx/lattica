@@ -530,4 +530,118 @@ mod tests {
              measured when the wrap AIR is assembled (W2-assemble)"
         );
     }
+
+    /// **W2-assemble prerequisite — the full wrap feature-combination in ONE AIR.** The composed wrap AIR
+    /// exercises transitions, periodic selectors, public values, AND multiple lookups simultaneously; each was
+    /// validated in isolation (`ChainEvalAir` transitions here; `PeriodicAir`/`PinnedAir`/`TwoLookupAir` in
+    /// the lookup prover) but never COMBINED. `CompositeAir` combines all four so the W1 lookup prover's
+    /// combined layout + quotient sizing is proven ready for the composed wrap before the coupled W2-assemble
+    /// build (a cheap gate on a genuine prover-integration risk).
+    ///
+    /// Cols `[x, prod, y, table, m1, m2]`: `x` is the running-product input, range-checked by two lookups;
+    /// `prod` is the running product (transition `prod' = prod·x'`, boundary `prod = x`) — kept OUTSIDE the
+    /// lookups so a broken product is isolable; `y` is pinned to `public[0]` (first row) and periodic-gated
+    /// (`sel·(y−1) = 0` on even rows) — also outside the lookups; `table` provides both range-checks.
+    struct CompositeAir;
+
+    impl<F: p3_field::Field> BaseAir<F> for CompositeAir {
+        fn width(&self) -> usize {
+            6
+        }
+        fn num_public_values(&self) -> usize {
+            1
+        }
+        fn num_periodic_columns(&self) -> usize {
+            1
+        }
+        fn periodic_columns(&self) -> Vec<Vec<F>> {
+            vec![vec![F::ONE, F::ZERO]] // period-2 selector: 1 on even rows
+        }
+    }
+
+    impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for CompositeAir {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let cur = main.current_slice().to_vec();
+            let nxt = main.next_slice().to_vec();
+            let (x, prod, y, table, m1, m2) = (cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
+            let sel: AB::Expr = builder.periodic_values()[0].into();
+            let pin: AB::Expr = builder.public_values()[0].into();
+
+            // base constraints over columns NOT carried in any lookup, so each is independently tamperable.
+            builder.when_first_row().assert_zero(prod.into() - x.into()); // boundary: prod = x
+            builder.when_transition().assert_zero(nxt[1].into() - prod.into() * nxt[0].into()); // prod' = prod·x'
+            builder.when_first_row().assert_eq(y, pin); // y(row 0) == public[0]
+            builder.assert_zero(sel * (y.into() - AB::Expr::ONE)); // even rows (sel = 1): y == 1
+
+            // two LogUp range-checks of x against the shared table (multi-lookup ⇒ aux width 3).
+            builder
+                .push_local_interaction(vec![(vec![x.into()], AB::Expr::ONE), (vec![table.into()], -(m1.into()))]);
+            builder
+                .push_local_interaction(vec![(vec![x.into()], AB::Expr::ONE), (vec![table.into()], -(m2.into()))]);
+        }
+    }
+
+    /// A valid trace: everything `1` (both range-checks self-cancel; running product of ones; even-row
+    /// `y == 1`; first-row `y == public[0] = 1`).
+    fn composite_trace(height: usize) -> RowMajorMatrix<Val> {
+        let mut flat = Vec::with_capacity(height * 6);
+        for _ in 0..height {
+            flat.extend_from_slice(&[Val::ONE; 6]);
+        }
+        RowMajorMatrix::new(flat, 6)
+    }
+
+    /// The combination proves + verifies end to end (aux width 3 = 1 accumulator + 2 fractions) — the W1
+    /// lookup prover threads transitions + periodic + public values + multi-lookup together, the composed
+    /// wrap AIR's prover requirements, validated before the coupled assembly.
+    #[test]
+    fn composite_air_round_trips() {
+        let air = CompositeAir;
+        let proof = prove_lookup(&air, composite_trace(1 << 5), &[Val::ONE]);
+        assert_eq!(proof.aux_width, 3, "two lookups ⇒ aux width = 1 accumulator + 2 fractions");
+        assert!(verify_lookup(&air, &proof, &[Val::ONE]).is_ok(), "the combined-feature AIR must verify end to end");
+    }
+
+    /// Breaking the running product (a column outside the lookups) violates the transition ⇒ OOD mismatch —
+    /// transitions fold correctly amid the periodic + multi-lookup constraints.
+    #[test]
+    fn composite_air_rejects_broken_product() {
+        let air = CompositeAir;
+        let mut trace = composite_trace(1 << 5);
+        trace.values[5 * 6 + 1] = Val::from_u64(2); // row 5's prod ≠ prod_4 · x_5
+        let proof = prove_lookup(&air, trace, &[Val::ONE]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[Val::ONE]), Err(LookupVerifyError::OodMismatch)),
+            "a broken running product must fail the OOD identity"
+        );
+    }
+
+    /// Violating an even row's periodic-gated bind (`y ≠ 1`, kept lookup-balanced since `y` is outside the
+    /// lookups) ⇒ OOD mismatch — periodic columns fold consistently alongside the lookups.
+    #[test]
+    fn composite_air_rejects_violated_periodic() {
+        let air = CompositeAir;
+        let mut trace = composite_trace(1 << 5);
+        trace.values[2 * 6 + 2] = Val::from_u64(5); // row 2 (even, sel = 1): y = 5 ≠ 1
+        let proof = prove_lookup(&air, trace, &[Val::ONE]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[Val::ONE]), Err(LookupVerifyError::OodMismatch)),
+            "a violated even-row periodic constraint must fail the OOD identity"
+        );
+    }
+
+    /// Unbalancing one lookup (bump a multiplicity) leaves the base constraints satisfied but breaks that
+    /// lookup's LogUp terminal ⇒ rejected — the two lookups are checked independently in the combined layout.
+    #[test]
+    fn composite_air_rejects_unbalanced_lookup() {
+        let air = CompositeAir;
+        let mut trace = composite_trace(1 << 5);
+        trace.values[7 * 6 + 4] = Val::from_u64(2); // row 7's m1 = 2 ⇒ lookup 1 no longer cancels
+        let proof = prove_lookup(&air, trace, &[Val::ONE]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[Val::ONE]), Err(LookupVerifyError::NonZeroTerminal)),
+            "an unbalanced lookup must be rejected by the terminal check"
+        );
+    }
 }

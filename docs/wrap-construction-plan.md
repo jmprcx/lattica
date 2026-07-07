@@ -33,8 +33,9 @@ block-DAG where each block wraps K parents (the existing flat aggregator is alre
   monolith's 7) is measured **three independent ways** — synthetic 384-constraint models, the **real
   81-constraint `JoinSplitAir`** epilogue, and the accessible-region rollup (composed 3). **W2-super** then
   folded the reused `--features recursion` super-tile tiles into the rollup and measured them (D/E/F = 2/3/3),
-  so classes A/D/E/F sit ≤ budget too. **Remaining = W2-assemble + W2-measure** — build the actual wrap AIR
-  and measure the whole construction (incl. the G/H/J `monolith/air.rs` regions) — the actual gate.
+  so classes A/D/E/F sit ≤ budget too; G/H/J are already ≤ 4 via the monolith's own degree guards, and the
+  prover-readiness for the composed AIR is validated (`CompositeAir`). **Remaining = W2-assemble + W2-measure**
+  — the coupled build of the actual wrap AIR + the whole-construction gate.
 
 ## The load-bearing insight (from the grounded conversion map)
 
@@ -114,24 +115,33 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
   inner = 3, I = 1, C = 2) ⇒ composed `log_nqc 3 ≤ 4`. The plan's "every other gadget is already ≤16"
   premise is now a **measurement** for classes A/D/E/F (`FriFoldAir`/`FriMerkleAir`/`SpongeAir` are standalone
   AIRs faithful to the monolith's fused regions; each satisfies `wrap_log_nqc`'s `SymbolicAirBuilder` bound).
+- **W2-assemble prereq — prover-readiness** (`CompositeAir`, `src/wrap/mod.rs`) — the composed wrap AIR needs
+  the W1 lookup prover to thread transitions + periodic selectors + public values + multiple lookups in ONE
+  AIR at once (each was validated in isolation, never combined). `CompositeAir` combines all four: proves +
+  verifies end-to-end (aux width 3) and rejects three isolable tampers (broken product / violated periodic →
+  `OodMismatch`; unbalanced lookup → `NonZeroTerminal`). The prover is ready for the coupled assembly.
 
 *Remaining — the full wrap assembly (the actual GATE; large, multi-session):*
 - **W2-assemble — build the actual wrap AIR** in `src/wrap/` (extend `mod.rs` into `air.rs`/`gadgets.rs`):
   compose the transcript (F) + super-tile (A/D/E) regions over the real inner **on top of** the grounded
   B/C/I epilogue + the class-J tx-root fold, reusing the recursion gadgets **verbatim** per the conversion
-  map. This is where the last unmeasured reuse-classes — **G (DEEP α_fri), H (OOD selectors + z_h squaring),
-  J (tx-root fold)** — enter, as regions of `monolith/air.rs` (not standalone AIRs), measured once a
-  `MonolithAir`-shaped instance exists. Like the monolith #86 build, this is *coupled* — no incremental
-  validation until it proves end-to-end.
+  map. The remaining reuse-classes **G (DEEP α_fri), H (OOD selectors + z_h squaring), J (tx-root fold)** are
+  `monolith/air.rs` regions (not standalone AIRs) — inner-independent super-tile machinery already measured
+  ≤ 4 by the monolith's always-on degree guards at BOTH is_zk = 0 (`phase8_joinsplit_degree_probe`) and the
+  production is_zk = 1 (`hiding_monolith_degree_probe`, `native_verify.rs`), which the wrap reuses verbatim —
+  so the assembly inherits them and W2-measure re-confirms the whole composition on the built wrap. Like the
+  monolith #86 build, this is *coupled* — no incremental validation until it proves end-to-end.
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
   prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the
   offending region (its measured `log_nqc`) points straight back to its lookup encoding.
 
-The degree crux is already measured GO three independent ways (synthetic, real 81-constraint inner,
-accessible-region rollup — all ≤ 4), so W2's residual risk has narrowed from *"does the lookup encoding
-work"* to *"does the **assembled** composition stay ≤ 4"* — i.e. whether the remaining super-tile gadgets in
-fact hold ≤ 16 (the plan's premise, which W2-super now measures).
+Because `log_nqc` is the MAX over regions (monotonic in the max constraint degree), the degree gate is now
+essentially closed **by construction**: every reused region is measured ≤ 4 at the production is_zk = 1
+(A/D/E/F via the W2-super rollup; G/H/J via the monolith's hiding degree guard) and the lookup B/C/I are
+deg ≤ 3 — so an assembly that reuses each gadget verbatim composes ≤ 4. W2's residual is no longer *"do the
+pieces fit the budget"* but the narrow *"does the assembly glue (region gating, the lookup ζ-openings
+composed with the super-tile) add a higher-degree constraint"* — which W2-measure confirms on the built wrap.
 
 **W3 — Canonicalize the shape.** Fix `nb/cm_rounds/n_terms/cap_height` to canonical constants; the cap-mux
 lookup (I) removes the `2^cap_height` blow-up; a canonical FRI shape fixes `n_terms`. *Milestone:* the wrap's
