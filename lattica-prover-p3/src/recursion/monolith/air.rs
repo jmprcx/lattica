@@ -1019,8 +1019,69 @@ impl BaseAir<Goldilocks> for MonolithAir {
     }
 }
 
+/// The B/C/I regions the deep-tree **wrap** swaps for lookups (`docs/wrap-construction-plan.md`). `InlineBci`
+/// = the monolith's inline high-degree forms (BYTE-IDENTICAL — guarded by the `pinned_constraint_fingerprints`
+/// pins); the wrap supplies a lookup form. Additive: `MonolithAir::eval` = `eval_bci` with `InlineBci`, so the
+/// audited monolith constraints are unchanged. RESEARCH plumbing; the lookup strategy is `--features lookup`.
+pub(crate) trait MonolithBci<AB: AirBuilder<F = Goldilocks>> {
+    /// **I (cap-mux):** bind each opening's cap carrier `cap_c[cg_off+k]` (k=0..4) to the index-selected
+    /// committed cap entry `pis[cbase + (index>>shift)·4 + k]`, gated by the arith-head `tf`. `openings` =
+    /// `(cg_off, shift, bits, cbase)` per opening (trace, quotient, `cm_rounds` commit rounds, [random]).
+    fn emit_capmux(
+        &self,
+        builder: &mut AB,
+        air: &MonolithAir,
+        cur: &[AB::Expr],
+        pis: &[AB::Expr],
+        one: &AB::Expr,
+        tf: &AB::Expr,
+        openings: &[(usize, usize, usize, usize)],
+    );
+}
+
+/// The monolith's inline B/C/I — the cap-mux as a degree-`bits` product-mux (the current behavior, kept
+/// byte-identical). The wrap replaces this with a LogUp (degree 3, width 3, `--features lookup`).
+pub(crate) struct InlineBci;
+
+impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for InlineBci {
+    fn emit_capmux(
+        &self,
+        builder: &mut AB,
+        air: &MonolithAir,
+        cur: &[AB::Expr],
+        pis: &[AB::Expr],
+        one: &AB::Expr,
+        tf: &AB::Expr,
+        openings: &[(usize, usize, usize, usize)],
+    ) {
+        for &(cg_off, shift, bits, cbase) in openings {
+            for k in 0..4 {
+                let mut acc = AB::Expr::ZERO;
+                for e in 0..(1usize << bits) {
+                    let mut sel = AB::Expr::ONE;
+                    for j in 0..bits {
+                        let b = cur[air.sb_b(shift + j)].clone();
+                        sel = sel * if (e >> j) & 1 == 1 { b } else { one.clone() - b };
+                    }
+                    acc = acc + sel * pis[cbase + e * 4 + k].clone();
+                }
+                builder.assert_zero(tf.clone() * (cur[air.cap_c(cg_off + k)].clone() - acc));
+            }
+        }
+    }
+}
+
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
     fn eval(&self, builder: &mut AB) {
+        self.eval_bci(builder, &InlineBci);
+    }
+}
+
+impl MonolithAir {
+    /// The monolith constraint system, parameterized over the B/C/I emission strategy (`bci`). `eval` calls
+    /// this with `InlineBci` (byte-identical); the wrap calls it with a lookup strategy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn eval_bci<AB: AirBuilder<F = Goldilocks>, S: MonolithBci<AB>>(&self, builder: &mut AB, bci: &S) {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
@@ -1649,20 +1710,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             if self.is_zk == 1 {
                 openings.push((8 + 4 * self.cm_rounds(), self.input_depth(), self.cap_height, self.random_cap_base()));
             }
-            for (cg_off, shift, bits, cbase) in openings {
-                for k in 0..4 {
-                    let mut acc = AB::Expr::ZERO;
-                    for e in 0..(1usize << bits) {
-                        let mut sel = AB::Expr::ONE;
-                        for j in 0..bits {
-                            let b = cur[self.sb_b(shift + j)].clone();
-                            sel = sel * if (e >> j) & 1 == 1 { b } else { one.clone() - b };
-                        }
-                        acc = acc + sel * pis[cbase + e * 4 + k].clone();
-                    }
-                    builder.assert_zero(tf.clone() * (cur[self.cap_c(cg_off + k)].clone() - acc));
-                }
-            }
+            bci.emit_capmux(builder, self, &cur, &pis, &one, &tf, &openings);
         } else {
             // ConstAir: all cap entries equal → a single shared cap entry per opening (the validated path).
             let qcap = self.qcap_base();
