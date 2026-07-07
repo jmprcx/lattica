@@ -417,10 +417,89 @@ mod wrap_air {
             self.m.eval_bci(builder, &WrapBci { mul_base: self.m.fused_w() });
         }
     }
+
+    /// Native mirror of `Witnesser` (IDENTICAL Arc-memoized DFS order): compute each `Mul` node's F_p² product
+    /// from the native OOD openings, so the witnessed `c_k` columns can be filled to satisfy the wrap's
+    /// degree-2 binding constraints. Returns the products in the wrap's column-allocation order (`out[i]` →
+    /// columns `fused_w + 2·i`).
+    pub(crate) fn native_witnessed(
+        constraints: &[SymbolicExpression<Val>],
+        local: &[crate::config::Challenge],
+        next: &[crate::config::Challenge],
+        pubs: &[crate::config::Challenge],
+        periodic: &[crate::config::Challenge],
+        is_first: crate::config::Challenge,
+        is_last: crate::config::Challenge,
+        is_trans: crate::config::Challenge,
+    ) -> Vec<crate::config::Challenge> {
+        use crate::config::Challenge;
+        struct Ctx<'a> {
+            local: &'a [Challenge],
+            next: &'a [Challenge],
+            pubs: &'a [Challenge],
+            periodic: &'a [Challenge],
+            is_first: Challenge,
+            is_last: Challenge,
+            is_trans: Challenge,
+            out: Vec<Challenge>,
+            memo: HashMap<usize, Challenge>,
+        }
+        fn walk_arc(arc: &Arc<SymbolicExpression<Val>>, ctx: &mut Ctx) -> Challenge {
+            let key = Arc::as_ptr(arc) as usize;
+            if let Some(v) = ctx.memo.get(&key) {
+                return *v;
+            }
+            let v = walk(arc.as_ref(), ctx);
+            ctx.memo.insert(key, v);
+            v
+        }
+        fn walk(e: &SymbolicExpression<Val>, ctx: &mut Ctx) -> Challenge {
+            use p3_uni_stark::{BaseEntry, BaseLeaf};
+            match e {
+                SymbolicExpr::Leaf(leaf) => match leaf {
+                    BaseLeaf::Variable(v) => match v.entry {
+                        BaseEntry::Main { offset } => {
+                            if offset == 0 {
+                                ctx.local[v.index]
+                            } else {
+                                ctx.next[v.index]
+                            }
+                        }
+                        BaseEntry::Public => ctx.pubs[v.index],
+                        BaseEntry::Periodic => ctx.periodic[v.index],
+                        BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
+                    },
+                    BaseLeaf::IsFirstRow => ctx.is_first,
+                    BaseLeaf::IsLastRow => ctx.is_last,
+                    BaseLeaf::IsTransition => ctx.is_trans,
+                    BaseLeaf::Constant(c) => Challenge::from(*c),
+                },
+                SymbolicExpr::Add { x, y, .. } => walk_arc(x, ctx) + walk_arc(y, ctx),
+                SymbolicExpr::Sub { x, y, .. } => walk_arc(x, ctx) - walk_arc(y, ctx),
+                SymbolicExpr::Neg { x, .. } => -walk_arc(x, ctx),
+                SymbolicExpr::Mul { x, y, .. } => {
+                    let a = walk_arc(x, ctx);
+                    let b = walk_arc(y, ctx);
+                    let p = a * b;
+                    ctx.out.push(p); // record in column-allocation order (matches Witnesser's counter)
+                    p
+                }
+            }
+        }
+        let mut ctx = Ctx {
+            local, next, pubs, periodic, is_first, is_last, is_trans,
+            out: Vec::new(),
+            memo: HashMap::new(),
+        };
+        for c in constraints {
+            let _ = walk(c, &mut ctx); // side effect: pushes each Mul's product in column order
+        }
+        ctx.out
+    }
 }
 
 #[cfg(feature = "recursion")]
-pub(crate) use wrap_air::WrapAir;
+pub(crate) use wrap_air::{native_witnessed, WrapAir};
 
 #[cfg(test)]
 mod tests {
@@ -802,5 +881,61 @@ mod tests {
             2 * wrap.n_mul
         );
         assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap must be within the degree budget");
+    }
+
+    /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
+    /// witnessed `c_k` columns (native mirror of the `Witnesser`) at each arith head, and PROVE + VERIFY the
+    /// full `WrapAir` over a real join-split inner + reject a tampered inner pub. Confirms the witnessed
+    /// epilogue (the assembled wrap, not just the symbolic degree) is correct. Heavy; `--release --ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves the assembled WrapAir (2^16 rows); run `--release --features lookup,recursion -- --ignored`"]
+    fn wrap_air_proves() {
+        use crate::config::Challenge;
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::{epilogue_openings, make_config};
+        use p3_field::BasedVectorSpace;
+        use p3_matrix::dense::RowMajorMatrix;
+        use p3_uni_stark::{prove, verify};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, mono_trace, pis) = wrap_build_reused(&config, &proof, &pvs);
+        // The native OOD openings the witnessed columns must equal (the same ζ-openings the epilogue reads).
+        let (eo_local, eo_next, is_first, is_last, is_trans, _iv, _q, _a, _z, eo_periodic) =
+            epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
+        let eo_pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+
+        let (fw, h, n_q, tr, mp) = (air.fused_w(), air.height(), air.n_queries, air.tr(), air.m_period());
+        let wrap = WrapAir::new(air);
+        let width = fw + 2 * wrap.n_mul;
+        let products = native_witnessed(
+            &wrap.m.constraints, &eo_local, &eo_next, &eo_pubs, &eo_periodic, is_first, is_last, is_trans,
+        );
+        assert_eq!(products.len(), wrap.n_mul, "native witnessed products == n_mul columns");
+
+        // Widen the monolith trace to the wrap width; fill the witnessed c_k columns at each arith head (M_TF).
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let mut wide = vec![Val::ZERO; h * width];
+        for r in 0..h {
+            wide[r * width..r * width + fw].copy_from_slice(&mono_trace.values[r * fw..(r + 1) * fw]);
+        }
+        for q in 0..n_q {
+            let head = tr + q * mp;
+            for (i, p) in products.iter().enumerate() {
+                let c = cc(*p);
+                wide[head * width + fw + 2 * i] = c[0];
+                wide[head * width + fw + 2 * i + 1] = c[1];
+            }
+        }
+        let wide_trace = RowMajorMatrix::new(wide, width);
+
+        let prf = prove(&config, &wrap, wide_trace, &pis);
+        assert!(verify(&config, &wrap, &prf, &pis).is_ok(), "the assembled wrap must verify over a real inner");
+        let mut bad = pis.clone();
+        bad[wrap.m.pub_pi()] += Val::ONE;
+        assert!(verify(&config, &wrap, &prf, &bad).is_err(), "a tampered inner pub must be rejected");
     }
 }
