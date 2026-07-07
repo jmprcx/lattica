@@ -1505,4 +1505,149 @@ mod tests {
         let lproof = prove_lookup(&OpTableF2Air, trace, &[]);
         assert!(verify_lookup(&OpTableF2Air, &lproof, &[]).is_ok(), "the folded op-table must verify");
     }
+
+    /// **W3 brick 5 prototype (is_zk=1) — region-gated op-table + a high-degree region, one AIR, one prover.**
+    /// The full integration wires the op-table into the wrap: the op rows live in the trace SLACK (a subset of
+    /// rows), the monolith's A–J tiles occupy the rest, and both compose in ONE lookup-carrying AIR through the
+    /// W1 lookup prover. This de-risks the core GLUE at the production hiding config: a **witnessed selector
+    /// `sel`** marks the op rows (the slack-tail marking, since op rows are not a periodic tile), so the
+    /// op-table's constraints AND its wiring bus fire ONLY where `sel = 1`; a **degree-7 region** (`y = x⁷`, a
+    /// Poseidon2 S-box degree stand-in for a real monolith tile) fires where `sel = 0`, **OVERLAYING** the
+    /// op-table's value columns (`a0`/`a1` are the op operand on op rows, `x`/`x⁷` on region rows). Both regions
+    /// coexist and prove through `prove_lookup` (is_zk=1) — the gating + column-overlay the integration rests on.
+    /// (The larger brick-5 work remains: binding the op-table leaves to the monolith's committed ζ-openings, the
+    /// full A–J regions, and — for production — porting to the non-hiding config.)
+    struct GatedWrapProtoAir;
+
+    impl BaseAir<Val> for GatedWrapProtoAir {
+        fn width(&self) -> usize {
+            14 // the 13 OpTableF2Air columns + a witnessed `sel` (op-row marker)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for GatedWrapProtoAir {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let r = main.current_slice().to_vec();
+            let (is_mul, is_add, is_sub) = (r[0], r[1], r[2]);
+            let (out_addr, o0, o1) = (r[3], r[4], r[5]);
+            let (a_addr, a0, a1) = (r[6], r[7], r[8]);
+            let (b_addr, b0, b1) = (r[9], r[10], r[11]);
+            let out_mult = r[12];
+            let sel: AB::Expr = r[13].into();
+            let w = AB::Expr::from(Val::from_u64(7));
+
+            builder.assert_zero(sel.clone() * (sel.clone() - AB::Expr::ONE)); // sel boolean
+
+            // Op-table region (sel = 1): all op-table constraints GATED by sel, so they are inert on sel = 0.
+            for s in [is_mul, is_add, is_sub] {
+                builder.assert_zero(sel.clone() * s.into() * (s.into() - AB::Expr::ONE));
+            }
+            let is_op: AB::Expr = is_mul.into() + is_add.into() + is_sub.into();
+            builder.assert_zero(sel.clone() * is_op.clone() * (is_op.clone() - AB::Expr::ONE));
+            builder.assert_zero(sel.clone() * is_mul.into() * (o0.into() - (a0.into() * b0.into() + w.clone() * a1.into() * b1.into())));
+            builder.assert_zero(sel.clone() * is_mul.into() * (o1.into() - (a0.into() * b1.into() + a1.into() * b0.into())));
+            builder.assert_zero(sel.clone() * is_add.into() * (o0.into() - (a0.into() + b0.into())));
+            builder.assert_zero(sel.clone() * is_add.into() * (o1.into() - (a1.into() + b1.into())));
+            builder.assert_zero(sel.clone() * is_sub.into() * (o0.into() - (a0.into() - b0.into())));
+            builder.assert_zero(sel.clone() * is_sub.into() * (o1.into() - (a1.into() - b1.into())));
+
+            // Monolith-tile stand-in (sel = 0): a degree-7 identity y = x⁷ OVERLAYING the op operand columns.
+            let one_minus: AB::Expr = AB::Expr::ONE - sel.clone();
+            let x: AB::Expr = a0.into();
+            let x7 = x.clone() * x.clone() * x.clone() * x.clone() * x.clone() * x.clone() * x.clone();
+            builder.assert_zero(one_minus * (a1.into() - x7));
+
+            // The wiring bus, GATED by sel (op rows only): reads +sel·is_op, define sel·out_mult (0 on sel = 0).
+            let read_mult = sel.clone() * is_op.clone();
+            let def_mult = sel * out_mult.into();
+            builder.push_local_interaction(vec![
+                (vec![a_addr.into(), a0.into(), a1.into()], read_mult.clone()),
+                (vec![b_addr.into(), b0.into(), b1.into()], read_mult),
+                (vec![out_addr.into(), o0.into(), o1.into()], def_mult),
+            ]);
+        }
+    }
+
+    /// Build a [`GatedWrapProtoAir`] trace: the real join-split op-table on the first rows (`sel = 1`, widened
+    /// to 14 cols) followed by `n_region` degree-7 region rows (`sel = 0`, `x`/`x⁷` overlaying `a0`/`a1`), padded
+    /// (pad rows `sel = 0`, all-zero — the region identity `0 = 0⁷` holds and the bus is inert).
+    fn gated_proto_trace(n_region: usize) -> RowMajorMatrix<Val> {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let (op, _r, _f) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
+        let h_op = op.values.len() / 13;
+        let (w, total) = (14, (h_op + n_region).next_power_of_two());
+        let mut flat = vec![Val::ZERO; total * w];
+        for row in 0..h_op {
+            flat[row * w..row * w + 13].copy_from_slice(&op.values[row * 13..row * 13 + 13]);
+            flat[row * w + 13] = Val::ONE; // sel = 1 (op rows)
+        }
+        for i in 0..n_region {
+            let row = h_op + i;
+            let x = Val::from_u64(3 + i as u64);
+            let mut x7 = Val::ONE;
+            for _ in 0..7 {
+                x7 *= x;
+            }
+            flat[row * w + 7] = x; // a0 = x
+            flat[row * w + 8] = x7; // a1 = x⁷ (sel = 0 ⇒ the region identity fires here)
+        }
+        RowMajorMatrix::new(flat, w)
+    }
+
+    /// The prototype proves + verifies through `prove_lookup` (is_zk=1): the op-table's wiring bus and the
+    /// degree-7 region compose in ONE AIR, region-gated, at the production hiding config.
+    #[test]
+    fn gated_wrap_proto_proves() {
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&GatedWrapProtoAir);
+        let (_layout, log_nqc) = combined_constraint_layout(&GatedWrapProtoAir, &lookups, 1);
+        println!("GatedWrapProto (op-table + deg-7 region, gated): log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
+        let proof = prove_lookup(&GatedWrapProtoAir, gated_proto_trace(16), &[]);
+        assert!(
+            verify_lookup(&GatedWrapProtoAir, &proof, &[]).is_ok(),
+            "the region-gated op-table + degree-7 region must prove through prove_lookup at is_zk=1"
+        );
+    }
+
+    /// Breaking a REGION row's `x⁷` violates the gated degree-7 identity ⇒ OOD mismatch — the region constraint
+    /// is checked on `sel = 0` rows (and is correctly inert on the op rows).
+    #[test]
+    fn gated_wrap_proto_rejects_broken_region() {
+        let mut trace = gated_proto_trace(16);
+        let (w, h) = (14, trace.values.len() / 14);
+        let region0 = (0..h).find(|&row| trace.values[row * w + 13] == Val::ZERO && trace.values[row * w + 7] != Val::ZERO)
+            .expect("a region row (sel = 0, x ≠ 0) exists");
+        trace.values[region0 * w + 8] += Val::ONE; // a1 ≠ x⁷ now
+        let proof = prove_lookup(&GatedWrapProtoAir, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&GatedWrapProtoAir, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
+            "a broken region identity must fail the OOD check"
+        );
+    }
+
+    /// Breaking an op-table LEAF value (on a `sel = 1` row) unbalances the wiring bus ⇒ non-zero terminal — the
+    /// op-table region is checked amid the gated degree-7 region.
+    #[test]
+    fn gated_wrap_proto_rejects_broken_optable() {
+        let mut trace = gated_proto_trace(16);
+        let (w, h) = (14, trace.values.len() / 14);
+        // A sel = 1 leaf row: op-selectors 0 and out_mult (col 12) ≠ 0 (a wire read ≥ 1 time).
+        let leaf = (0..h)
+            .find(|&row| {
+                let base = row * w;
+                trace.values[base + 13] == Val::ONE
+                    && trace.values[base] == Val::ZERO
+                    && trace.values[base + 1] == Val::ZERO
+                    && trace.values[base + 2] == Val::ZERO
+                    && trace.values[base + 12] != Val::ZERO
+            })
+            .expect("a sel = 1 leaf wire with fanout ≥ 1 exists");
+        trace.values[leaf * w + 4] += Val::ONE; // corrupt its provided value
+        let proof = prove_lookup(&GatedWrapProtoAir, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&GatedWrapProtoAir, &proof, &[]), Err(LookupVerifyError::NonZeroTerminal)),
+            "a corrupted op-table wire must unbalance the bus even amid the gated region"
+        );
+    }
 }
