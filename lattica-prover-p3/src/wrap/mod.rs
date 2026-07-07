@@ -233,6 +233,48 @@ pub fn cap_mux_trace(cap: &[Val], queries: &[usize]) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(rows.into_iter().flatten().collect(), 3)
 }
 
+/// **W2-C (size)** — the size-efficient form of C: evaluate a product DOWN THE ROWS as a running product
+/// (constant width) instead of across `2·degree − 1` columns (`DagFoldAir` witnessed). Boundary `prod = x` on
+/// the first row; transition `prod' = prod · x'` (degree 2). Width 3 (`[x, prod, mult]`, constant regardless of
+/// the product length — height carries the length), so a degree-`d` constraint costs `d` ROWS not `2d` columns
+/// ("never re-evaluate the tree" as a running eval). Carries a trivially-balanced range-check lookup so it
+/// proves + verifies through the W1 lookup prover — which also **exercises the prover's transition support**
+/// (every earlier lookup AIR is local-only; the wrap's real inner has transition constraints).
+pub struct ChainEvalAir;
+
+impl<F: p3_field::Field> BaseAir<F> for ChainEvalAir {
+    fn width(&self) -> usize {
+        3
+    }
+}
+
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for ChainEvalAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur = main.current_slice().to_vec();
+        let nxt = main.next_slice().to_vec();
+        let (x, prod, mult) = (cur[0], cur[1], cur[2]);
+        builder.when_first_row().assert_zero(prod.into() - x.into()); // boundary: prod = x
+        builder.when_transition().assert_zero(nxt[1].into() - prod.into() * nxt[0].into()); // prod' = prod·x'
+        // A trivially-balanced (query x, provide x) range-check lookup to commit a terminal.
+        builder.push_local_interaction(vec![
+            (vec![x.into()], AB::Expr::ONE),
+            (vec![x.into()], -(mult.into())),
+        ]);
+    }
+}
+
+/// A valid running-product trace: `x = 1` everywhere ⇒ `prod = 1`; `mult = 1` (the lookup self-cancels).
+pub fn chain_eval_trace(height: usize) -> RowMajorMatrix<Val> {
+    let mut flat = Vec::with_capacity(height * 3);
+    for _ in 0..height {
+        flat.push(Val::ONE); // x
+        flat.push(Val::ONE); // prod (running product of 1s)
+        flat.push(Val::ONE); // mult
+    }
+    RowMajorMatrix::new(flat, 3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +373,40 @@ mod tests {
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!("cap-mux lookup: width = 3, log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
         assert!(log_nqc <= LOG_BLOWUP, "cap-mux lookup must be within the degree budget (got {log_nqc})");
+    }
+
+    /// **W2-C (size)** — the narrow-tall running eval proves + verifies through the W1 lookup prover, which
+    /// also validates the prover's TRANSITION support end to end (every earlier lookup AIR is local-only).
+    #[test]
+    fn chain_eval_round_trips() {
+        let air = ChainEvalAir;
+        let proof = prove_lookup(&air, chain_eval_trace(1 << 5), &[]);
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "a valid running-product trace must verify");
+    }
+
+    /// Breaking the running product violates the `prod' = prod·x'` transition ⇒ OOD mismatch — confirming
+    /// transition constraints are folded correctly in both the prover's quotient and the ζ-check.
+    #[test]
+    fn chain_eval_rejects_broken_product() {
+        let air = ChainEvalAir;
+        let mut trace = chain_eval_trace(1 << 5);
+        trace.values[5 * 3 + 1] = Val::from_u64(2); // row 5's prod ≠ prod_4 · x_5
+        let proof = prove_lookup(&air, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
+            "a broken running product must fail the OOD identity"
+        );
+    }
+
+    /// The size win: the running eval is WIDTH 3 (constant) and within the degree budget — a degree-`d`
+    /// constraint costs `d` ROWS, not the wide layout's `2·d` columns.
+    #[test]
+    fn chain_eval_is_narrow_and_low_degree() {
+        let air = ChainEvalAir;
+        assert_eq!(BaseAir::<Val>::width(&air), 3, "running-eval width is constant (independent of length)");
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!("ChainEval: width = 3 (wide would be 2·degree), log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
+        assert!(log_nqc <= LOG_BLOWUP, "narrow-tall running eval must stay within the degree budget (got {log_nqc})");
     }
 }
