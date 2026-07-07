@@ -22,7 +22,7 @@
 //! symbolic epilogue as a table / running-sum) — is the next W2 step.
 
 use crate::config::Val;
-use p3_air::symbolic::AirLayout;
+use p3_air::symbolic::{AirLayout, SymbolicAirBuilder};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
 use p3_uni_stark::get_log_num_quotient_chunks;
@@ -86,12 +86,103 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for FoldAir {
     }
 }
 
-/// The `log_num_quotient_chunks` of the fold AIR — the quantity that must stay ≤ `LOG_BLOWUP` (= 4). Above it,
+/// The `log_num_quotient_chunks` of a wrap AIR — the quantity that must stay ≤ `LOG_BLOWUP` (= 4). Above it,
 /// p3-0.6.1 silently produces unverifiable proofs (the `native_verify.rs` degree guard). Computed symbolically
 /// at the production `is_zk = 1`.
-pub fn fold_log_nqc(air: &FoldAir) -> usize {
+pub fn wrap_log_nqc<A>(air: &A) -> usize
+where
+    A: BaseAir<Val> + Air<SymbolicAirBuilder<Val>>,
+{
     let layout = AirLayout::from_air::<Val>(air);
-    get_log_num_quotient_chunks::<Val, FoldAir>(air, layout, 1)
+    get_log_num_quotient_chunks::<Val, A>(air, layout, 1)
+}
+
+/// `wrap_log_nqc` specialized to the α_stark fold model (kept for the W2-B tests).
+pub fn fold_log_nqc(air: &FoldAir) -> usize {
+    wrap_log_nqc(air)
+}
+
+/// **W2-C** — the combined constraint-evaluation-**and**-fold epilogue (C + B). For each of `n_constraints`
+/// inner constraints, model its value `c_k` as a degree-`degree` product of opened columns, then α-fold the
+/// `c_k` (chunked, à la [`FoldAir`]). The `witnessed` knob is the **C fix**:
+/// - `witnessed = true` — evaluate each `c_k` through **degree-≤2 steps into witnessed intermediate columns**
+///   (`t_0 = x_0·x_1`, `t_i = t_{i−1}·x_{i+1}`, …), so `c_k` is a *degree-1* column the fold consumes cheaply.
+///   This is the low-degree analogue of `eval_symbolic_circuit` — "never re-evaluate the tree" as one
+///   degree-`degree` expression. (A single degree-16 constraint is already `log_nqc = 4`; the explosion is the
+///   fold stacking degree onto an inline degree-16 `c_k`, so witnessing the `c_k` is what lets B stay cheap.)
+/// - `witnessed = false` — the monolith's INLINE evaluation: each `c_k` is one degree-`degree` expression fed
+///   straight into the fold.
+///
+/// Soundness of the witnessed form: each intermediate is pinned by its own degree-2 constraint, so `c_k`
+/// equals the product; a wrong intermediate fails its constraint. (Width cost — `2·degree − 1` columns per
+/// constraint — is the SIZE lever addressed later by a shared op-table / lookup and Tip5, W3/W4; here we gate
+/// only the DEGREE.)
+pub struct DagFoldAir {
+    pub n_constraints: usize,
+    pub chunk: usize,
+    pub degree: usize,
+    pub witnessed: bool,
+}
+
+impl DagFoldAir {
+    fn cols_per_constraint(&self) -> usize {
+        if self.witnessed {
+            2 * self.degree - 1 // `degree` inputs + `degree − 1` witnessed intermediates
+        } else {
+            self.degree // just the inputs; c_k is the inline product
+        }
+    }
+    fn n_fold_acc(&self) -> usize {
+        self.n_constraints.div_ceil(self.chunk).saturating_sub(1)
+    }
+}
+
+impl<F: p3_field::Field> BaseAir<F> for DagFoldAir {
+    fn width(&self) -> usize {
+        2 + self.n_constraints * self.cols_per_constraint() + self.n_fold_acc()
+    }
+}
+
+impl<AB: AirBuilder<F = Val>> Air<AB> for DagFoldAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let local = main.current_slice();
+        let alpha = local[0];
+        let target = local[1];
+        let per = self.cols_per_constraint();
+        let base = 2;
+        let acc_base = base + self.n_constraints * per;
+
+        let mut folded: AB::Expr = AB::Expr::ZERO;
+        let mut ai = 0;
+        for k in 0..self.n_constraints {
+            let cb = base + k * per; // this constraint's column block
+            let ck: AB::Expr = if self.witnessed {
+                // C: evaluate the degree-`degree` product via degree-2 steps into witnessed intermediates.
+                let t = cb + self.degree; // intermediate base
+                builder.assert_zero(local[t].into() - local[cb].into() * local[cb + 1].into());
+                for i in 1..self.degree - 1 {
+                    builder.assert_zero(local[t + i].into() - local[t + i - 1].into() * local[cb + i + 1].into());
+                }
+                local[t + self.degree - 2].into() // c_k = final intermediate (degree-1 witnessed column)
+            } else {
+                // Inline (monolith): c_k is one degree-`degree` expression.
+                let mut prod: AB::Expr = AB::Expr::ONE;
+                for j in 0..self.degree {
+                    prod = prod * local[cb + j].into();
+                }
+                prod
+            };
+            folded = folded * alpha.into() + ck;
+            if (k + 1) % self.chunk == 0 && k + 1 < self.n_constraints {
+                let acc = local[acc_base + ai];
+                builder.assert_zero(acc.into() - folded.clone());
+                folded = acc.into();
+                ai += 1;
+            }
+        }
+        builder.assert_zero(folded - target.into());
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +219,26 @@ mod tests {
         let log_nqc = fold_log_nqc(&air);
         println!("UNCHUNKED witnessed fold (N=384): log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
         assert!(log_nqc > LOG_BLOWUP, "an unchunked α-Horner fold explodes even for witnessed c_k (got {log_nqc})");
+    }
+
+    /// **W2-C** — the combined epilogue: evaluating each `c_k` via WITNESSED degree-2 steps (C) and folding the
+    /// resulting degree-1 `c_k` (B) keeps the FULL fold within the degree-16 / log_blowup cliff, for a
+    /// realistic 384-constraint × degree-16 inner.
+    #[test]
+    fn witnessed_dag_fold_stays_within_blowup() {
+        let air = DagFoldAir { n_constraints: 384, chunk: 7, degree: 16, witnessed: true };
+        let log_nqc = wrap_log_nqc(&air);
+        println!("C+B WITNESSED (N=384, deg=16, chunk=7): log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
+        assert!(log_nqc <= LOG_BLOWUP, "witnessed c_k evaluation + fold must stay ≤ log_blowup (got {log_nqc})");
+    }
+
+    /// The monolith's inline path, for contrast: evaluating each `c_k` as one degree-16 expression and folding
+    /// it inline exceeds the cliff. Witnessing the `c_k` (above) is the fix.
+    #[test]
+    fn inline_dag_fold_exceeds_blowup() {
+        let air = DagFoldAir { n_constraints: 384, chunk: 7, degree: 16, witnessed: false };
+        let log_nqc = wrap_log_nqc(&air);
+        println!("C+B INLINE (N=384, deg=16, chunk=7): log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
+        assert!(log_nqc > LOG_BLOWUP, "inline degree-16 c_k evaluation + fold must exceed log_blowup (got {log_nqc})");
     }
 }
