@@ -138,7 +138,9 @@ here for the batch-aggregation delta: its constraint audit, C-ABI fuzz, and inte
 `docs/audit-readiness-status.md` (audit-readiness status + roadmap),
 `docs/lattica-implementation-audit.md` (the implementation audit + remediation log) and
 `docs/remediation-status.md` (live status). `docs/full-node-security-integration.md` is the production
-full-node checklist (host-chain scope). **Everything else in `docs/` is historical / reference-only**
+full-node checklist (host-chain scope). A **pre-v1 forward-looking** design note,
+`docs/hash-function-analysis.md` (why Poseidon2 stays the in-circuit/on-chain hash for v1, vs Monolith/Tip5),
+is **not part of the audit artifact**. **Everything else in `docs/` is historical / reference-only**
 (each carries a banner pointing back here) — `audit-scope.md`, `soundness.md`,
 `transaction-stack-audit.md`, `framework-decision.md`, `plonky3-port-plan.md`, `production-readiness.md`,
 and `parameters.md` predate the Plonky3 cutover and are not part of the audit artifact.
