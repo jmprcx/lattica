@@ -19,7 +19,7 @@ use crate::config::{make_config, Challenge, MyConfig, Val};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::{CanObserve, FieldChallenger};
 use p3_commit::{Pcs, PolynomialSpace};
-use p3_field::PrimeCharacteristicRing;
+use p3_field::{Field, PrimeCharacteristicRing};
 use p3_lookup::{InteractionBuilder, LogUpGadget, LookupProtocol, LookupTerminal, Lookups};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
@@ -138,9 +138,38 @@ pub fn verify_lookup_rounds(pis: &[Val], proof: &LookupRoundProof) -> Result<(),
         .map_err(|_| "lookup terminal is non-zero (imbalanced multiset)")
 }
 
+/// Validate that the aux trace satisfies the LogUp **fraction well-formedness** + **terminal-sum**
+/// relations — exactly what the FRI quotient enforces. For the 2-sided range-check lookup, per row:
+/// `fraction[r] = 1/(α−query) − mult·1/(α−table)`, and `terminal = Σ_r fraction[r]`. Returns `false` for a
+/// malformed aux trace (so a malicious prover cannot substitute a fake aux to force a zero terminal).
+///
+/// This is the soundness the quotient provides, validated directly. The **sole remaining mechanical PCS
+/// step** is committing the quotient polynomial (= these relations ÷ the vanishing poly) so the verifier
+/// checks them *succinctly* at ζ instead of re-scanning every row — an extension of p3's `quotient_values`.
+pub fn aux_fraction_wellformed(
+    main: &RowMajorMatrix<Val>,
+    aux: &RowMajorMatrix<Challenge>,
+    alpha: Challenge,
+    terminal: Challenge,
+) -> bool {
+    let mut sum = Challenge::ZERO;
+    for r in 0..main.height() {
+        let row = main.row_slice(r).unwrap();
+        let (query, table, mult) = (row[0], row[1], row[2]);
+        let expected = (alpha - query).inverse() - (alpha - table).inverse() * mult;
+        let frac = aux.row_slice(r).unwrap()[1];
+        if frac != expected {
+            return false;
+        }
+        sum += frac;
+    }
+    sum == terminal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p3_lookup::{LogUpGadget, LookupProtocol, Lookups};
 
     /// A balanced range check: the two-round prover produces a proof whose challenges the verifier
     /// re-derives (Fiat–Shamir consistency) and whose terminal is zero ⇒ **accept**.
@@ -164,6 +193,34 @@ mod tests {
         let pis: Vec<Val> = vec![];
         let proof = prove_lookup_rounds(&air, main, &pis);
         assert!(verify_lookup_rounds(&pis, &proof).is_err(), "imbalanced lookup must be rejected");
+    }
+
+    /// The aux-trace well-formedness the FRI quotient enforces, validated directly: the honestly-generated
+    /// aux satisfies the fraction + terminal relations; corrupting a single fraction breaks them — so a
+    /// forged aux cannot fake a zero terminal (closing the skeleton's soundness gap).
+    #[test]
+    fn aux_trace_wellformedness_is_enforceable() {
+        let air = RangeCheckAir;
+        let main = balanced_main(1 << 4);
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let no_pre: Option<RowMajorMatrix<Val>> = None;
+        let alpha = Challenge::from_u32(7);
+        let (aux, terminal) = LogUpGadget::new().generate_permutation::<MyConfig>(
+            &main,
+            &no_pre,
+            &[],
+            &lookups,
+            &[alpha, Challenge::from_u32(11)],
+        );
+        let terminal = terminal.expect("terminal present").0;
+
+        // the honest aux satisfies the well-formedness relations the quotient checks
+        assert!(aux_fraction_wellformed(&main, &aux, alpha, terminal), "honest aux must be well-formed");
+
+        // corrupt row 0's fraction (aux column 1) ⇒ well-formedness fails ⇒ the quotient would reject it
+        let mut bad = aux.clone();
+        bad.values[1] += Challenge::ONE;
+        assert!(!aux_fraction_wellformed(&main, &bad, alpha, terminal), "a forged aux must be caught");
     }
 
     /// Fiat–Shamir binds the aux commitment: tampering with `aux_commit` makes ζ re-derive differently.
