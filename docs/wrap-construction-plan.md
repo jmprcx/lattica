@@ -34,8 +34,10 @@ block-DAG where each block wraps K parents (the existing flat aggregator is alre
   81-constraint `JoinSplitAir`** epilogue, and the accessible-region rollup (composed 3). **W2-super** then
   folded the reused `--features recursion` super-tile tiles into the rollup and measured them (D/E/F = 2/3/3),
   so classes A/D/E/F sit ≤ budget too; G/H/J are already ≤ 4 via the monolith's own degree guards, and the
-  prover-readiness for the composed AIR is validated (`CompositeAir`). **Remaining = W2-assemble + W2-measure**
-  — the coupled build of the actual wrap AIR + the whole-construction gate.
+  prover-readiness for the composed AIR is validated (`CompositeAir`). **W2-assemble.1** (the novel B/C/I
+  regions) is now fused + proven end-to-end (`WrapArithAir`, `src/wrap/air.rs`); **remaining = W2-assemble.2**
+  (fold in the reused super-tile regions over a real inner — trace-construction, one `sim_full` blocker) +
+  **W2-measure** (the whole-construction gate).
 
 ## The load-bearing insight (from the grounded conversion map)
 
@@ -121,16 +123,21 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
   verifies end-to-end (aux width 3) and rejects three isolable tampers (broken product / violated periodic →
   `OodMismatch`; unbalanced lookup → `NonZeroTerminal`). The prover is ready for the coupled assembly.
 
-*Remaining — the full wrap assembly (the actual GATE; large, multi-session):*
-- **W2-assemble — build the actual wrap AIR** in `src/wrap/` (extend `mod.rs` into `air.rs`/`gadgets.rs`):
-  compose the transcript (F) + super-tile (A/D/E) regions over the real inner **on top of** the grounded
-  B/C/I epilogue + the class-J tx-root fold, reusing the recursion gadgets **verbatim** per the conversion
-  map. The remaining reuse-classes **G (DEEP α_fri), H (OOD selectors + z_h squaring), J (tx-root fold)** are
-  `monolith/air.rs` regions (not standalone AIRs) — inner-independent super-tile machinery already measured
-  ≤ 4 by the monolith's always-on degree guards at BOTH is_zk = 0 (`phase8_joinsplit_degree_probe`) and the
-  production is_zk = 1 (`hiding_monolith_degree_probe`, `native_verify.rs`), which the wrap reuses verbatim —
-  so the assembly inherits them and W2-measure re-confirms the whole composition on the built wrap. Like the
-  monolith #86 build, this is *coupled* — no incremental validation until it proves end-to-end.
+*Remaining — the full wrap assembly (the actual GATE; large, multi-session; `src/wrap/air.rs` STARTED):*
+- **W2-assemble.1 — the novel regions, DONE** (`WrapArithAir`, `src/wrap/air.rs`): the two constructs that
+  REPLACE the monolith's high-degree forms — the **C+B epilogue fold** (witnessed `c_k` degree-2 steps +
+  chunked α-Horner) and the **I cap-mux** (LogUp) — fused into ONE AIR that **proves + verifies end-to-end**
+  through the W1 lookup prover over a synthetic witness (broken fold → `OodMismatch`; wrong cap →
+  `NonZeroTerminal`; `log_nqc ≤ 4` at is_zk = 1). So the NEW half of the assembly is validated *incrementally*
+  — the build is not monolithically coupled after all; the novel regions stand alone.
+- **W2-assemble.2 — fold in the reused super-tile regions over a real inner** (the coupled part): add the
+  transcript (F) + super-tile (A/D/E/G/H) + tx-root (J) regions. Their degrees are already established
+  (W2-super + the monolith's hiding degree guard), so this is **trace-construction, not a degree question** —
+  and it hits the one blocker: the wrap trace needs the inner-proof witness extraction (`sim_full`, a private
+  `#[cfg(test)]` helper in the do-not-touch `monolith/tests.rs`). `MonolithAir` / `monolith_build_trace` /
+  `multicol_query_terms` / `make_config` are `pub(crate)` and reusable; only the extraction is walled off.
+  **Decision:** expose the extraction (surgical, additive) vs re-derive it wrap-local. Then **W2-measure** on
+  the built wrap (`log_nqc ≤ 4` + prove/verify/tamper-reject over a real join-split inner).
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and
   prove + verify + tamper-reject it. **GO/NO-GO:** the full construction holds ≤ 4 ⇒ degree solved; else the
@@ -171,9 +178,9 @@ corrupted-trace matrix). The **C-ABI/Zig seam stays DEFERRED** (research; a node
 ## Files
 
 - **New / extend:** `src/lookup/prover.rs` (W1 ✅ complete); `src/wrap/mod.rs` (the B/C/I constructs + the
-  rollup probe ✅ — extend into `air.rs`/`gadgets.rs` for the W2-assemble wrap AIR); `src/tree/mod.rs` (the
-  degree/size fixed-point models ✅ — extend for K-ary self-composition + the W5 probe); update
-  `docs/deep-tree-tip5-design.md`.
+  rollup probe ✅) + `src/wrap/air.rs` (the wrap AIR — W2-assemble.1 novel regions ✅, W2-assemble.2 super-tile
+  regions to add); `src/tree/mod.rs` (the degree/size fixed-point models ✅ — extend for K-ary self-composition
+  + the W5 probe); update `docs/deep-tree-tip5-design.md`.
 - **Reuse (committed recursion gadgets):** `recursion/poseidon2_air.rs` (A), `fri_merkle.rs` (E),
   `fri_fold.rs` (D), `transcript.rs` (F), `monolith/air.rs` G/H/J patterns, `native_fri.rs`/`native_verify.rs`
   (the verification-algorithm spec + the always-on degree guards).

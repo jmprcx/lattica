@@ -29,6 +29,8 @@ use p3_lookup::InteractionBuilder;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::get_log_num_quotient_chunks;
 
+pub mod air; // W2-assemble: the wrap AIR taking shape (the novel B/C/I regions fused, proven end-to-end)
+
 /// A faithful model of the monolith's α_stark constraint-fold (B). Folds `n_constraints` inner-constraint
 /// values `c_k` via the chunked α-Horner — `folded = folded·α + c_k`, binding the running fold to a degree-1
 /// witness column (`fold_acc`) every `chunk` constraints — then checks `folded == target`.
