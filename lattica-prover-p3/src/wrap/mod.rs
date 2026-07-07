@@ -25,6 +25,8 @@ use crate::config::Val;
 use p3_air::symbolic::{AirLayout, SymbolicAirBuilder};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
+use p3_lookup::InteractionBuilder;
+use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::get_log_num_quotient_chunks;
 
 /// A faithful model of the monolith's α_stark constraint-fold (B). Folds `n_constraints` inner-constraint
@@ -185,10 +187,58 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for DagFoldAir {
     }
 }
 
+/// **I (cap-mux)** — Merkle-cap membership as a LogUp lookup instead of the monolith's degree-`cap_height`
+/// selector product over `2^cap_height` entries (`recursion/monolith/air.rs:1652-1664`). Columns
+/// `[key, value, mult]` declare one 2-element `(key, value)` lookup carrying signed multiplicity `mult`: table
+/// rows carry `−count[key]`, query rows `+1`, so the multiset balances iff every queried `(index, value)` is a
+/// real `(j, cap[j])` pair — i.e. `value = cap[index]`. **Degree 3, width 3 (constant)** — killing both the
+/// `cap_height`-degree product and the `2^cap_height` width. Proves + verifies through the W1 lookup prover.
+///
+/// (In the real wrap the cap table rows are bound to the transcript-committed cap; here they are trace rows,
+/// so this validates the *mux mechanism* — that a query selects the right indexed entry — not that binding.)
+pub struct CapMuxAir;
+
+impl<F: p3_field::Field> BaseAir<F> for CapMuxAir {
+    fn width(&self) -> usize {
+        3
+    }
+}
+
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for CapMuxAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let local = main.current_slice();
+        let (key, value, mult) = (local[0], local[1], local[2]);
+        // One 2-element (key, value) lookup tuple with signed multiplicity `mult` (LogUp "bus"): query rows
+        // contribute +1, table rows −count[key]; balance ⇒ every queried (index, value) = a real (j, cap[j]).
+        builder.push_local_interaction(vec![(vec![key.into(), value.into()], mult.into())]);
+    }
+}
+
+/// Build a cap-mux trace: `cap.len()` table rows `(j, cap[j], −count[j])` plus one query row
+/// `(index, cap[index], +1)` per query, padded (mult 0 ⇒ no contribution) to a power-of-two height.
+pub fn cap_mux_trace(cap: &[Val], queries: &[usize]) -> RowMajorMatrix<Val> {
+    let mut count = vec![0u64; cap.len()];
+    for &q in queries {
+        count[q] += 1;
+    }
+    let mut rows: Vec<[Val; 3]> = Vec::with_capacity(cap.len() + queries.len());
+    for (j, &cj) in cap.iter().enumerate() {
+        rows.push([Val::from_u64(j as u64), cj, -Val::from_u64(count[j])]); // table row: −count[j]
+    }
+    for &q in queries {
+        rows.push([Val::from_u64(q as u64), cap[q], Val::ONE]); // query row: +1
+    }
+    rows.resize(rows.len().next_power_of_two(), [Val::ZERO, Val::ZERO, Val::ZERO]); // padding (mult 0)
+    RowMajorMatrix::new(rows.into_iter().flatten().collect(), 3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LOG_BLOWUP;
+    use crate::config::{Challenge, LOG_BLOWUP};
+    use crate::lookup::prover::{combined_constraint_layout, prove_lookup, verify_lookup, LookupVerifyError};
+    use p3_lookup::{LookupProtocol, Lookups};
 
     /// The **B degree fix**: with WITNESSED inner-constraint values (degree-1 columns) and the chunked fold,
     /// the α_stark fold stays within the degree-16 / `log_blowup` cliff — even for a realistic 384-constraint
@@ -240,5 +290,46 @@ mod tests {
         let log_nqc = wrap_log_nqc(&air);
         println!("C+B INLINE (N=384, deg=16, chunk=7): log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
         assert!(log_nqc > LOG_BLOWUP, "inline degree-16 c_k evaluation + fold must exceed log_blowup (got {log_nqc})");
+    }
+
+    /// **W2-I** — the cap-mux, as a lookup, proves + verifies end to end through the W1 lookup prover: queries
+    /// selecting the real `cap[index]` balance the multiset.
+    #[test]
+    fn cap_mux_round_trips() {
+        let cap: Vec<Val> = (0..(1u64 << 6)).map(|j| Val::from_u64(0x1000 + j)).collect();
+        let queries = vec![3usize, 3, 17, 40, 63, 0];
+        let air = CapMuxAir;
+        let proof = prove_lookup(&air, cap_mux_trace(&cap, &queries), &[]);
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "valid cap selections must verify");
+    }
+
+    /// A query selecting a WRONG value (≠ `cap[index]`) unbalances the multiset ⇒ non-zero terminal ⇒
+    /// rejected — the mux soundness, at degree 3 (the product-mux would need a degree-`cap_height` selector).
+    #[test]
+    fn cap_mux_rejects_wrong_selection() {
+        let cap: Vec<Val> = (0..(1u64 << 6)).map(|j| Val::from_u64(0x1000 + j)).collect();
+        let queries = vec![3usize, 17, 40];
+        let mut trace = cap_mux_trace(&cap, &queries);
+        // The first query row follows the cap.len() table rows; corrupt its value column (col 1).
+        let qrow = cap.len();
+        trace.values[qrow * 3 + 1] = Val::from_u64(0xDEAD); // index 3 now selects a non-cap value
+        let air = CapMuxAir;
+        let proof = prove_lookup(&air, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::NonZeroTerminal)),
+            "a query selecting value ≠ cap[index] must be rejected"
+        );
+    }
+
+    /// The degree + size win: the cap-mux lookup is **width 3 (constant)** and within the degree budget —
+    /// versus the product-mux's `2^cap_height` width and `cap_height` degree.
+    #[test]
+    fn cap_mux_is_low_degree_and_narrow() {
+        let air = CapMuxAir;
+        assert_eq!(BaseAir::<Val>::width(&air), 3, "cap-mux width is constant (not 2^cap_height)");
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!("cap-mux lookup: width = 3, log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
+        assert!(log_nqc <= LOG_BLOWUP, "cap-mux lookup must be within the degree budget (got {log_nqc})");
     }
 }
