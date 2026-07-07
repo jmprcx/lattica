@@ -1107,7 +1107,7 @@ fn build_inner_window(config: &MyConfig, value: u64, n_queries: usize) -> (Vec<V
 /// The AIR-level composition is free: `eval`'s `pis` accessor already reads the window in column-window
 /// mode, so the symbolic epilogue reads pubs/periodic/qwt from the window transparently.
 #[allow(clippy::too_many_arguments)]
-fn build_symbolic_inner_window<A>(
+pub(crate) fn build_symbolic_inner_window<A>( // exposed for the deep-tree wrap's self-recursion demonstration (research)
     config: &MyConfig,
     inner: &A,
     proof: &Proof<MyConfig>,
