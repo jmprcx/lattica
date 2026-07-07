@@ -30,7 +30,7 @@ low-degree canonical verifier, and **lookups + Tip5** are its enabling substrate
 | **0a′** degree-cliff **measurement** (Phase-3 spike) | `src/tree/mod.rs::degree_probe` | Model → hard numbers via p3's real `get_log_num_quotient_chunks`. Measured degree→log_nqc: **deg 91 → log_nqc 7** (exactly reproduces the baseline monolith + air.rs's "91"), **deg 7 (Tip5 x⁷) → log_nqc 3**, **deg 3 (lookup) → log_nqc 1** — both hold the cliff. The real budget is deg ≤ ~17 (cliff between 17 and 32). So the baseline explosion **is** a degree problem, and both levers clear it — **measured, not modelled**. |
 | **0b** lookup argument | `src/lookup/mod.rs` | `p3-lookup` LogUp runs over lattica's `MyConfig`; balanced lookup ⇒ zero terminal, tampered ⇒ rejected. |
 | **P2** lookup validation + degree | `src/lookup/mod.rs` | **Measured** `constraint_degree` = **3** for a 2-sided range-check lookup (formula `1 + Σ side-degrees`, correcting the modelled "2"); a k-way lookup is degree `1+k` ⇒ lookups must be **low-arity** (chunk the fold, cf. `FOLD_CHUNK`). Full argument validated at the constraint level with `check_lookups` (balanced accepts, tampered caught) — the aux-trace commit through FRI is the remaining mechanical plumbing. |
-| **0c** Tip5 | `src/tip5.rs` | Tip5 (width-16, 5-round, 4 split-lookup + 12 `x^7` lanes) slots into `PaddingFreeSponge`/`TruncatedPermutation`/`DuplexChallenger` ⇒ Layer-A swap is a `config.rs` type-alias change. **~7 rows/perm vs Poseidon2's 32 (4.6×)**; S-box degree still 7 (⇒ Tip5 buys **rows, not degree**). Structural — placeholder constants; byte-exact spec + KATs are Phase 1. |
+| **0c** Tip5 | `src/tip5.rs` | Tip5 (width-16, 5-round, 4 split-lookup + 12 `x^7` lanes) slots into `PaddingFreeSponge`/`TruncatedPermutation`/`DuplexChallenger` ⇒ Layer-A swap is a `config.rs` type-alias change. **~7 rows/perm vs Poseidon2's 32 (4.6×)**; S-box degree still 7 (⇒ Tip5 buys **rows, not degree**). **P1: now the real vetted constants** — fermat-cube lookup `(x+1)³−1 mod 257` (value-identical to Triton), real MDS (SHA-256("Tip5")), Blake3 round constants — as a **canonical-Goldilocks variant** (documented not byte-identical to Triton's Montgomery-raw form). |
 
 **The key conceptual result:** the two levers do *different* jobs. **Lookups** fix the **degree** (the
 `log_nqc=7` driver — the α-Horner fold over high-degree inner constraints becomes low-arity, low-degree lookups).
@@ -58,10 +58,12 @@ alone suffices; together they address both explosion drivers.
 1. **Tip5 + leaf Layer-A migration** — **[mechanical core ✅ done]** a Tip5 `MyConfig` (`tip5::proof_system`)
    proves + verifies a real AIR end-to-end through the standard `p3_uni_stark::{prove,verify}` — the FRI-PCS
    + Merkle + Fiat-Shamir stack composes with the width-16/digest-5 Tip5 hash (incl. the packed-SIMD
-   permutation for Merkle row hashing). *Remaining:* real Tip5 constants + KATs (needs the published spec),
-   the native packed impl (perf), the leaf-circuit swap, GPU Merkle kernels (`gpu.rs`), wire KATs
-   (`lib.rs`), Zig proof-*deserialization* seam. *Breaks the v1 proof wire (coordinated, pre-v1); note
-   hashing untouched.*
+   permutation for Merkle row hashing) — now with the **real vetted constants** (fermat-cube lookup, real
+   MDS, Blake3 round constants), a canonical-Goldilocks variant (not byte-identical to Triton's
+   Montgomery-raw form, which its degenerate representation makes impractical + unnecessary to replicate).
+   *Remaining:* the native packed impl (perf), the leaf-circuit swap, GPU Merkle kernels (`gpu.rs`), wire
+   KATs (`lib.rs`), Zig proof-*deserialization* seam. *Breaks the v1 proof wire (coordinated, pre-v1);
+   note hashing untouched.*
 2. **Lookup argument (production)** — harden 0b into a forked prove/verify + a new `Proof` type (aux
    permutation-trace commitment + `LookupTerminal` + α/β round + `…WithLookups` folders); re-express the
    recursion AIRs as `AirBuilder + InteractionBuilder`.
@@ -97,12 +99,14 @@ cliff) is now *measured*, not modelled: the baseline's `log_nqc=7` is a degree-~
 degree math, but did not *build* the wrap. The remaining risk is engineering, concentrated in Phase 3 and
 now sharply narrowed to two items:
 1. **Wrap construction** — express *every* FRI-fold / range / S-box relation in the verifier as a
-   lookup (deg 2) or a Tip5 hash lane (deg 7) so the built wrap's measured max degree actually lands ≤ 17.
-   The degree→`log_nqc` mapping is now measured (0a′); what remains is holding every relation under it.
+   low-arity lookup (deg 3) or a Tip5 hash lane (deg 7) so the built wrap's measured max degree actually
+   lands ≤ 17. The degree→`log_nqc` mapping is now measured (0a′); what remains is holding every relation
+   under it.
 2. **Size-stability** — verifying-a-wrap must re-emit a proof of the *same* canonical shape (the true fixed
    point), so outer width is constant.
-Also outstanding: real Tip5 constants + KATs (Phase 1 — needs the spec), the forked lookup prove/verify
-wire format (Phase 2), and the distributed harness (Phase 5). None is a fundamental barrier.
+Also outstanding: the native packed Tip5 impl (perf) + Triton-byte-exact interop *if ever needed* (its
+Montgomery-raw representation), the forked lookup prove/verify wire format (Phase 2), and the distributed
+harness (Phase 5). None is a fundamental barrier.
 
 **Recommended next step:** Phase 1 (real Tip5 + the leaf Layer-A migration) in parallel with a Phase-3
 **wrap AIR spike** that builds the smallest real canonical wrap and *measures* its `log_nqc` (turning 0a's

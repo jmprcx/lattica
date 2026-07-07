@@ -1,24 +1,24 @@
-//! Phase-0 (0c) — Tip5 permutation **structural reference** for cost analysis.
+//! Tip5 permutation — **real vetted constants**, canonical-Goldilocks variant (Phase 1).
 //!
 //! Tip5 (Szepieniec, 2023 — "The Tip5 Hash Function for Recursive STARKs"; Triton VM / Neptune) is the
 //! recursion-optimized Goldilocks permutation this program evaluates as the proof-system (Layer-A) hash.
 //! Its recursion appeal vs Poseidon2 is **fewer rounds** (5 vs 30) and a **split-and-lookup S-box** that a
 //! lookup argument verifies cheaply in-circuit.
 //!
-//! ## Status: STRUCTURAL, not byte-correct
-//! This implements the correct **shape** — width 16, 5 rounds, `NUM_SPLIT_LANES = 4` split-and-lookup
-//! lanes + 12 `x^7` power lanes, an MDS layer, and per-round constants — with **PLACEHOLDER constants**
-//! (the lookup table, the MDS matrix, and the round constants). It is NOT the real Tip5 and does NOT match
-//! published KATs. Its purpose is Phase-0 feasibility only:
-//!   (1) confirm Tip5 slots into the p3-symmetric `Permutation`/`CryptographicPermutation` traits (hence
-//!       into `PaddingFreeSponge`/`TruncatedPermutation`/`DuplexChallenger`) — i.e. a Layer-A swap is
-//!       mechanically a `config.rs` type-alias change; and
-//!   (2) produce the **in-circuit cost numbers** (rows/permutation, S-box degree) the wrap-feasibility
-//!       spike (0a) needs.
-//! Phase 1 replaces the three `PLACEHOLDER_*` tables with the published Tip5 constants and adds KAT tests.
+//! ## Real constants; canonical (not Triton-byte-identical) variant
+//! Shape: width 16, 5 rounds, `NUM_SPLIT_LANES = 4` split-and-lookup lanes + 12 `x^7` power lanes, MDS,
+//! per-round constants. The **constants are the real published Tip5 parameters**:
+//!   * `LOOKUP_TABLE` — the offset-Fermat-cube map `(x+1)³−1 mod 257`, generated from the spec formula
+//!     (value-identical to Triton's);
+//!   * `MDS_FIRST_COLUMN` — Tip5's circulant MDS (SHA-256("Tip5")); and
+//!   * `ROUND_CONSTANTS` — the real `Blake3("Tip5" ‖ i)` stream.
 //!
-//! The cost analysis depends only on the STRUCTURE (round count, lane split, S-box algebra), which IS
-//! faithful here; the constant VALUES do not affect rows/degree.
+//! It is a **canonical-Goldilocks variant**: the split-and-lookup decomposes the *canonical* field value,
+//! whereas Triton splits its *Montgomery raw* form (a non-canonical "degenerate" representation the Triton
+//! KAT even exercises). Replicating that exactly is impractical and unnecessary — lattica needs a
+//! **self-consistent** recursion hash (same prover/verifier/node), not Triton interop. The S-box bijection,
+//! the MDS, and the round-constant stream are the vetted ones, so the security argument carries; only the
+//! byte-basis of the split differs, so this does **not** match Triton's KATs (documented, deliberate).
 
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::Goldilocks;
@@ -35,43 +35,69 @@ pub const NUM_LOOKUP_BYTES: usize = 8;
 /// The power-map exponent on the non-lookup lanes (7 is coprime to Goldilocks p−1).
 pub const POWER: u64 = 7;
 
-// --- PLACEHOLDER constants (replace with the published Tip5 spec in Phase 1) ---------------------
+// --- Real Tip5 constants (published spec; canonical-Goldilocks variant) --------------------------
 
-/// PLACEHOLDER 8-bit S-box for the split-and-lookup lanes. A fixed bijection on `0..256` so the
-/// permutation is invertible and deterministic; NOT the real Tip5 lookup table. Structurally, what
-/// matters is that each split lane is 8 independent byte-lookups (the in-circuit lookup count).
-const fn placeholder_sbox(b: u8) -> u8 {
-    // an affine bijection over the byte (odd multiplier ⇒ invertible mod 256) — placeholder only.
-    b.wrapping_mul(29).wrapping_add(31)
-}
+/// The **real** Tip5 8-bit lookup S-box — the "offset Fermat cube map" `L(x) = (x+1)³ − 1` over F₂₅₇
+/// (`= ((x+1)³ + 256) mod 257`). Bijective on bytes (gcd(3,256)=1; only 256↦256, outside the byte range,
+/// so `L` restricted to `0..256` is a permutation of `0..256`). Generated at const time from the spec
+/// formula — value-identical to Triton VM's `LOOKUP_TABLE` (its `offset_fermat_cube_map`).
+const LOOKUP_TABLE: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let x = (i as u64) + 1;
+        t[i] = ((x * x * x + 256) % 257) as u8;
+        i += 1;
+    }
+    t
+};
 
-/// PLACEHOLDER MDS circulant first row. The real Tip5 MDS is a specific NTT-friendly matrix; any
-/// invertible linear map has the same in-circuit cost (degree 1), so a circulant suffices for 0c.
-const PLACEHOLDER_MDS_FIRST_ROW: [u64; WIDTH] = [
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+/// The **real** Tip5 circulant MDS matrix first column (the byte-form of SHA-256("Tip5")).
+const MDS_FIRST_COLUMN: [u64; WIDTH] = [
+    61402, 1108, 28750, 33823, 7454, 43244, 53865, 12034, 56951, 27521, 41351, 40901, 12021, 59689,
+    26798, 17845,
 ];
 
-/// The Tip5 permutation (structural reference).
+/// Goldilocks prime `p = 2⁶⁴ − 2³² + 1`.
+const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
+
+/// The **real** Tip5 round constants: `Blake3("Tip5" ‖ i)[0..16]` read LSB-first, reduced mod `p`, for
+/// `i = 0..NUM_ROUNDS·WIDTH`. (Triton additionally multiplies by `R⁻¹` to pre-encode the constant into its
+/// Montgomery storage; that `R⁻¹` is a representation artifact of Triton's non-canonical field and is
+/// omitted for this canonical-Goldilocks variant — the underlying nothing-up-my-sleeve Blake3 stream is
+/// the same.)
+static ROUND_CONSTANTS: std::sync::LazyLock<[Goldilocks; NUM_ROUNDS * WIDTH]> =
+    std::sync::LazyLock::new(|| {
+        core::array::from_fn(|i| {
+            let mut input = b"Tip5".to_vec();
+            input.push(i as u8);
+            let digest = blake3::hash(&input);
+            let lo = u128::from_le_bytes(digest.as_bytes()[0..16].try_into().unwrap());
+            Goldilocks::from_u64((lo % (GOLDILOCKS_P as u128)) as u64)
+        })
+    });
+
+/// The Tip5 permutation (real vetted constants; canonical-Goldilocks variant).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tip5;
 
 impl Tip5 {
-    /// The split-and-lookup S-box: decompose the element into `NUM_LOOKUP_BYTES` bytes, apply the 8-bit
-    /// S-box to each, recombine. This is the operation a lookup argument turns into `NUM_LOOKUP_BYTES`
-    /// cheap table lookups in-circuit (the whole point of Tip5 for recursion).
+    /// The split-and-lookup S-box: decompose the element into `NUM_LOOKUP_BYTES` bytes, apply the real
+    /// Tip5 `LOOKUP_TABLE` to each, recombine. This is the operation a lookup argument turns into
+    /// `NUM_LOOKUP_BYTES` cheap table lookups in-circuit (the whole point of Tip5 for recursion).
+    ///
+    /// **Canonical variant:** the bytes are those of the *canonical* Goldilocks value. Triton splits the
+    /// bytes of its *Montgomery* representation (`raw_bytes()`), which — because its representation is
+    /// non-canonical (`raw` may exceed `p`, the "degenerate form") — is impractical to replicate exactly
+    /// and unnecessary for lattica (which needs a self-consistent hash, not Triton interop). The S-box
+    /// bijection, and hence the security argument, is identical; only the byte-basis differs.
     #[inline]
     fn split_and_lookup(x: Goldilocks) -> Goldilocks {
-        let v = x.as_canonical_u64();
-        let mut out: u64 = 0;
-        let mut i = 0;
-        while i < NUM_LOOKUP_BYTES {
-            let byte = ((v >> (8 * i)) & 0xff) as u8;
-            out |= (placeholder_sbox(byte) as u64) << (8 * i);
-            i += 1;
+        let mut bytes = x.as_canonical_u64().to_le_bytes();
+        for b in &mut bytes {
+            *b = LOOKUP_TABLE[*b as usize];
         }
-        // `out < 2^64`; reduce into the field (the real Tip5 keeps bytes in range so no wraparound —
-        // placeholder reduction here is sufficient for structure/cost).
-        Goldilocks::from_u64(out)
+        Goldilocks::from_u64(u64::from_le_bytes(bytes))
     }
 
     /// The `x^7` power map on the non-lookup lanes (degree-7 constraint in-circuit — same as Poseidon2).
@@ -95,12 +121,13 @@ impl Tip5 {
 
     #[inline]
     fn mds_layer(state: &mut [Goldilocks; WIDTH]) {
-        // circulant multiply by PLACEHOLDER_MDS_FIRST_ROW (degree-1 linear map).
+        // circulant multiply by the real Tip5 MDS first column (degree-1 linear map):
+        // out[i] = Σ_j C[(i − j) mod WIDTH] · state[j].
         let mut out = [Goldilocks::ZERO; WIDTH];
         for (i, o) in out.iter_mut().enumerate() {
             let mut acc = Goldilocks::ZERO;
             for j in 0..WIDTH {
-                let c = Goldilocks::from_u64(PLACEHOLDER_MDS_FIRST_ROW[(j + WIDTH - i) % WIDTH]);
+                let c = Goldilocks::from_u64(MDS_FIRST_COLUMN[(i + WIDTH - j) % WIDTH]);
                 acc += c * state[j];
             }
             *o = acc;
@@ -110,9 +137,8 @@ impl Tip5 {
 
     #[inline]
     fn add_round_constants(state: &mut [Goldilocks; WIDTH], round: usize) {
-        // PLACEHOLDER round constants derived from (round, lane); the real Tip5 uses published constants.
         for (i, s) in state.iter_mut().enumerate() {
-            *s += Goldilocks::from_u64((round as u64 * 0x9E37_79B9 + i as u64 * 0x1000_0001) | 1);
+            *s += ROUND_CONSTANTS[round * WIDTH + i];
         }
     }
 }
@@ -204,7 +230,7 @@ mod tests {
     use super::*;
     use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 
-    /// The permutation is a bijection (invertibility sanity — placeholder constants, structural check).
+    /// The permutation is deterministic and mixing (sanity).
     #[test]
     fn tip5_permute_is_deterministic_and_mixing() {
         let a: [Goldilocks; WIDTH] = core::array::from_fn(|i| Goldilocks::from_u64(i as u64));
@@ -216,6 +242,36 @@ mod tests {
         assert_eq!(b, c);
         // mixing: output differs from input in every lane touched (not identity)
         assert_ne!(a, b);
+    }
+
+    /// The lookup S-box is the **real** Tip5 offset-Fermat-cube map: value-identical to Triton's
+    /// `LOOKUP_TABLE` — a byte bijection with the fixed points `L(0)=0`, `L(255)=255` that Triton asserts.
+    #[test]
+    fn real_lookup_table_is_the_fermat_cube_bijection() {
+        assert_eq!(LOOKUP_TABLE[0], 0, "L(0)=0");
+        assert_eq!(LOOKUP_TABLE[255], 255, "L(255)=255");
+        // it is a permutation of 0..256
+        let mut seen = [false; 256];
+        for &v in LOOKUP_TABLE.iter() {
+            seen[v as usize] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "LOOKUP_TABLE must be a permutation of the bytes");
+        // and matches ((x+1)^3 + 256) mod 257 on every input
+        for (i, &v) in LOOKUP_TABLE.iter().enumerate() {
+            let x = (i as u64) + 1;
+            assert_eq!(v as u64, (x * x * x + 256) % 257);
+        }
+    }
+
+    /// The real round constants derive from the Blake3("Tip5"‖i) stream (nothing-up-my-sleeve).
+    #[test]
+    fn round_constants_are_the_real_blake3_stream() {
+        assert_eq!(ROUND_CONSTANTS.len(), NUM_ROUNDS * WIDTH);
+        // deterministic + non-trivial (first constant matches the direct Blake3 derivation)
+        let mut input = b"Tip5".to_vec();
+        input.push(0u8);
+        let lo = u128::from_le_bytes(blake3::hash(&input).as_bytes()[0..16].try_into().unwrap());
+        assert_eq!(ROUND_CONSTANTS[0], Goldilocks::from_u64((lo % (GOLDILOCKS_P as u128)) as u64));
     }
 
     /// **The key wiring result:** Tip5 slots into the exact p3-symmetric wrappers the Layer-A config uses,

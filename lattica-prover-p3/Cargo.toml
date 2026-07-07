@@ -43,6 +43,7 @@ libc = { version = "0.2", optional = true } # streaming: mmap/ftruncate/munmap f
 p3-util = { version = "0.6.1", optional = true } # streaming FRI fork: p3's exact log2_strict_usize / reverse_slice_index_bits
 p3-maybe-rayon = { version = "0.6.1", optional = true, features = ["parallel"] } # streaming open: SIMD-parallel off-disk reduction
 p3-lookup = { version = "0.6.1", optional = true } # Phase-0 research: LogUp lookup-argument toolkit (gadget + folder adapters)
+blake3 = { version = "1", optional = true } # Phase-1 research: derives the real Tip5 round constants (Blake3("Tip5"||i))
 
 [dev-dependencies]
 rayon = "1" # streaming FRI test: pin a 1-thread pool so p3's `find_map_any` PoW grind is deterministic
@@ -63,8 +64,9 @@ recursion = []
 # 10 frozen externs never install it. Run with `--features stream`. See `src/spill_alloc.rs`.
 stream = ["dep:libc", "dep:p3-util", "dep:p3-maybe-rayon"]
 # --- Phase-0 research (deep-tree + lookup/Tip5 feasibility) — OFF by default, out of the audited staticlib ---
-# Tip5 permutation structural reference for the Layer-A proof-system-hash evaluation (src/tip5.rs).
-tip5 = []
+# Tip5 permutation (real vetted constants, canonical-Goldilocks variant) for the Layer-A proof-system-hash
+# evaluation (src/tip5.rs). blake3 derives the real round constants.
+tip5 = ["dep:blake3"]
 # Minimal LogUp lookup-argument prototype (src/lookup/) — forked prove/verify over p3-lookup.
 lookup = ["dep:p3-lookup"]
 # Wrap-feasibility model (src/tree/). Phase-0 model is pure analysis (no recursion compile); the actual
