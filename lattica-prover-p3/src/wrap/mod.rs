@@ -1364,4 +1364,68 @@ mod tests {
         );
         assert!(log_nqc <= LOG_BLOWUP, "the F_p² op-table must stay within the degree budget (got {log_nqc})");
     }
+
+    /// **W3 op-table brick 3 — the op-table faithfully computes the REAL epilogue** (`--features recursion`).
+    /// Seed the F_p² op-table's leaves with a real join-split inner's actual ζ-openings (the exact mapping the
+    /// W2 `Witnesser` uses: `Main{0}`→local, `Main{≠0}`→next, `Public`→pubs, `Periodic`→periodic, the three
+    /// selectors, constants) and confirm each constraint ROOT the op-table computes equals the native
+    /// `eval_symbolic_native` `c_k`. So the FLATTEN op-table is a faithful re-encoding of the epilogue's
+    /// constraint evaluation — not just "a" DAG — and then it proves + verifies through the W1 lookup prover.
+    /// This is the op-table's W2-real analog: the narrow-tall mechanism now stands on the actual openings the
+    /// wrap must bind, so the remaining W3 work is the fold/output check (α-Horner → `folded·inv_van == quot`)
+    /// and the monolith arith-tile integration (where the size contraction is finally measured on the wrap).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn op_table_f2_matches_native_epilogue() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::{epilogue_openings, eval_symbolic_native, make_config};
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout, BaseEntry, BaseLeaf};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (eo_local, eo_next, is_first, is_last, is_trans, _inv_van, _eo_quot, _eo_alpha, _z, eo_periodic) =
+            epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+
+        // The real leaf seed: map each leaf to its ζ-opening exactly as the epilogue does.
+        let seed = |l: &BaseLeaf<Val>| -> Challenge {
+            match l {
+                BaseLeaf::Constant(c) => Challenge::from(*c),
+                BaseLeaf::Variable(v) => match v.entry {
+                    BaseEntry::Main { offset } => {
+                        if offset == 0 {
+                            eo_local[v.index]
+                        } else {
+                            eo_next[v.index]
+                        }
+                    }
+                    BaseEntry::Public => pubs[v.index],
+                    BaseEntry::Periodic => eo_periodic[v.index],
+                    BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
+                },
+                BaseLeaf::IsFirstRow => is_first,
+                BaseLeaf::IsLastRow => is_last,
+                BaseLeaf::IsTransition => is_trans,
+            }
+        };
+        let (trace, roots) = op_table_f2_trace(&constraints, seed);
+
+        // FAITHFULNESS: each op-table root equals the native epilogue `c_k`.
+        for (k, c) in constraints.iter().enumerate() {
+            let native =
+                eval_symbolic_native(c, &eo_local, &eo_next, &pubs, &eo_periodic, is_first, is_last, is_trans);
+            assert_eq!(roots[k], native, "op-table root {k} must equal the native epilogue c_k");
+        }
+
+        // The real-seeded op-table proves + verifies through the W1 lookup prover.
+        let lproof = prove_lookup(&OpTableF2Air, trace, &[]);
+        assert!(
+            verify_lookup(&OpTableF2Air, &lproof, &[]).is_ok(),
+            "the op-table seeded with real ζ-openings must verify"
+        );
+    }
 }
