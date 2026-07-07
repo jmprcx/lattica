@@ -532,10 +532,17 @@ impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for OpTableF2Air {
 /// pseudo values here, real ζ-openings in brick 3). Ops compute `out = a ∘ b` in `Challenge` (native mul =
 /// `emul(7)`). Returns the trace and the constraint ROOT values (each the native `c_k` — the hook the fold /
 /// faithfulness check reads). Same wiring/fanout/padding as [`op_table_trace`].
+/// When `alpha` is `Some`, the builder appends the epilogue's **α-Horner fold (B)** as more op rows — reading
+/// the constraint ROOT wires (the `c_k`) and an α leaf: `folded = ((c_0·α + c_1)·α + …)·α + c_{n−1}`, each step
+/// a mul + an add. This makes the op-table a COMPLETE B+C epilogue (it computes `folded`, not just the `c_k`),
+/// still at constant width and needing no AIR change (the fold is ordinary mul/add rows). The final `folded`
+/// value is returned so the caller can check the epilogue identity `folded·inv_van == quot(ζ)` (the arith head
+/// does this O(1) check in the eventual integration; the fold itself no longer costs `2·n_mul` columns).
 pub fn op_table_f2_trace(
     constraints: &[p3_air::symbolic::SymbolicExpression<Val>],
     leaf_val: impl FnMut(&p3_uni_stark::BaseLeaf<Val>) -> crate::config::Challenge,
-) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>) {
+    alpha: Option<crate::config::Challenge>,
+) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>, Option<crate::config::Challenge>) {
     use crate::config::Challenge;
     use p3_air::symbolic::SymbolicExpr;
     use p3_field::BasedVectorSpace;
@@ -625,10 +632,25 @@ pub fn op_table_f2_trace(
     }
 
     let mut b = B { rows: Vec::new(), memo: HashMap::new(), next: 0, zero: None, leaf_val };
-    let mut roots = Vec::with_capacity(constraints.len());
+    let mut root_wires: Vec<(u64, Challenge)> = Vec::with_capacity(constraints.len());
     for root in constraints {
-        roots.push(b.go(root).1);
+        root_wires.push(b.go(root));
     }
+    let roots: Vec<Challenge> = root_wires.iter().map(|&(_, v)| v).collect();
+
+    // B — the α-Horner fold over the constraint roots (only op rows; reads roots + an α leaf).
+    let folded = match alpha {
+        Some(alpha) if !root_wires.is_empty() => {
+            let a_wire = b.leaf(alpha);
+            let mut f = root_wires[0];
+            for &rw in &root_wires[1..] {
+                let t = b.emit(1, f, a_wire); // t = f · α
+                f = b.emit(2, t, rw); // f = t + c_k
+            }
+            Some(f.1)
+        }
+        _ => None,
+    };
 
     let mut fanout: HashMap<u64, u64> = HashMap::new();
     for row in &b.rows {
@@ -655,7 +677,7 @@ pub fn op_table_f2_trace(
         flat[base + 10..base + 12].copy_from_slice(&cc(row.b));
         flat[base + 12] = -Val::from_u64(*fanout.get(&row.out_addr).unwrap_or(&0));
     }
-    (RowMajorMatrix::new(flat, w), roots)
+    (RowMajorMatrix::new(flat, w), roots, folded)
 }
 
 /// A deterministic F_p² pseudo leaf-value closure (constants keep their value; Variables/selectors get
@@ -1283,7 +1305,7 @@ mod tests {
     fn op_table_f2_round_trips() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let (trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
         let proof = prove_lookup(&OpTableF2Air, trace, &[]);
         assert!(
             verify_lookup(&OpTableF2Air, &proof, &[]).is_ok(),
@@ -1297,7 +1319,7 @@ mod tests {
     fn op_table_f2_rejects_broken_wire() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (mut trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let (mut trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
         let w = 13;
         let h = trace.values.len() / w;
         let leaf = (0..h)
@@ -1323,7 +1345,7 @@ mod tests {
     fn op_table_f2_rejects_broken_op() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (mut trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let (mut trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
         let w = 13;
         let h = trace.values.len() / w;
         let root = (0..h)
@@ -1350,7 +1372,7 @@ mod tests {
     fn op_table_f2_is_narrow_and_low_degree() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (trace, _roots) = op_table_f2_trace(&constraints, pseudo_leaf_f2());
+        let (trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
         let (rows, w) = (trace.values.len() / 13, 13);
         assert_eq!(BaseAir::<Val>::width(&OpTableF2Air), w, "F_p² op-table width is constant");
         let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&OpTableF2Air);
@@ -1412,7 +1434,7 @@ mod tests {
                 BaseLeaf::IsTransition => is_trans,
             }
         };
-        let (trace, roots) = op_table_f2_trace(&constraints, seed);
+        let (trace, roots, _folded) = op_table_f2_trace(&constraints, seed, None);
 
         // FAITHFULNESS: each op-table root equals the native epilogue `c_k`.
         for (k, c) in constraints.iter().enumerate() {
@@ -1427,5 +1449,60 @@ mod tests {
             verify_lookup(&OpTableF2Air, &lproof, &[]).is_ok(),
             "the op-table seeded with real ζ-openings must verify"
         );
+    }
+
+    /// **W3 op-table brick 4 — the COMPLETE B+C epilogue in the op-table** (`--features recursion`). With the
+    /// α-Horner fold appended (`alpha = Some`), the op-table computes not just each `c_k` but the folded value,
+    /// and it reproduces the epilogue's whole identity `folded·inv_van == quotient(ζ)` on a real join-split
+    /// inner's ζ-openings — B (the fold) and C (the `c_k` evaluation) both as narrow-tall op rows, no
+    /// `2·n_mul` witnessed columns. The fold needs no AIR change (ordinary mul/add rows reading the root wires
+    /// + an α leaf), and the final `folded·inv_van == quot` check is the O(1) binding the arith head does in
+    /// the eventual integration (brick 5). The op-table is now a full epilogue replacement, proven end-to-end.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn op_table_f2_folds_to_quotient() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::{epilogue_openings, make_config};
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout, BaseEntry, BaseLeaf};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
+            epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let seed = |l: &BaseLeaf<Val>| -> Challenge {
+            match l {
+                BaseLeaf::Constant(c) => Challenge::from(*c),
+                BaseLeaf::Variable(v) => match v.entry {
+                    BaseEntry::Main { offset } => {
+                        if offset == 0 {
+                            eo_local[v.index]
+                        } else {
+                            eo_next[v.index]
+                        }
+                    }
+                    BaseEntry::Public => pubs[v.index],
+                    BaseEntry::Periodic => eo_periodic[v.index],
+                    BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
+                },
+                BaseLeaf::IsFirstRow => is_first,
+                BaseLeaf::IsLastRow => is_last,
+                BaseLeaf::IsTransition => is_trans,
+            }
+        };
+        // Append the α-Horner fold (B) in the op-table and read out `folded`.
+        let (trace, _roots, folded) = op_table_f2_trace(&constraints, seed, Some(eo_alpha));
+        let folded = folded.expect("the fold produces a value for a non-empty constraint set");
+
+        // The op-table's in-table fold reproduces the epilogue's COMPLETE identity.
+        assert_eq!(folded * inv_van, eo_quot, "op-table α-Horner fold ⇒ folded·inv_van == quotient(ζ)");
+
+        // And the whole op-table (c_k evaluation + fold) proves + verifies through the W1 lookup prover.
+        let lproof = prove_lookup(&OpTableF2Air, trace, &[]);
+        assert!(verify_lookup(&OpTableF2Air, &lproof, &[]).is_ok(), "the folded op-table must verify");
     }
 }
