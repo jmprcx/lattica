@@ -281,6 +281,7 @@ mod tests {
     use crate::config::{Challenge, LOG_BLOWUP};
     use crate::joinsplit_air::JoinSplitAir;
     use crate::lookup::prover::{combined_constraint_layout, prove_lookup, verify_lookup, LookupVerifyError};
+    use crate::poseidon2_air::Poseidon2RowsAir;
     use p3_air::symbolic::{get_symbolic_constraints, SymbolicExpr, SymbolicExpression};
     use p3_lookup::Lookups;
     use std::collections::HashSet;
@@ -461,5 +462,34 @@ mod tests {
         // asserted — the explosion's magnitude depends on the inner's exact max degree).
         let inline = FoldAir { n_constraints: n, chunk: 7, c_cols_per_constraint: max_deg.max(1) };
         println!("REAL epilogue INLINE (monolith, deg {max_deg}): log_nqc = {}", wrap_log_nqc(&inline));
+    }
+
+    /// **Wrap degree-budget rollup.** `log_nqc` composes as the MAX over regions (it is monotonic in the max
+    /// constraint degree), so the whole wrap's budget is the max of its regions' log_nqc. Roll up the
+    /// ACCESSIBLE real regions — the OOD epilogue (B, over the real inner's 81 witnessed c_k), the real
+    /// Poseidon2 hash rows (the super-tile's Merkle + transcript hashing, class A/E/F), the cap-mux (I), and
+    /// the narrow-tall C eval — and confirm they compose within budget. (The remaining super-tile gadgets —
+    /// FRI β-fold / Merkle-path / DEEP — live behind `--features recursion`; the plan holds them ≤16, so if
+    /// that holds they keep the full composition ≤ 4.)
+    #[test]
+    fn wrap_degree_budget_rollup() {
+        let n_inner =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir)).len();
+        let l_epilogue = wrap_log_nqc(&FoldAir { n_constraints: n_inner, chunk: 7, c_cols_per_constraint: 1 });
+        let l_hash = wrap_log_nqc(&Poseidon2RowsAir);
+        let l_capmux =
+            combined_constraint_layout(&CapMuxAir, &Lookups::from_air::<Challenge, _>(&CapMuxAir), 1).1;
+        let l_chain =
+            combined_constraint_layout(&ChainEvalAir, &Lookups::from_air::<Challenge, _>(&ChainEvalAir), 1).1;
+
+        let composed = [l_epilogue, l_hash, l_capmux, l_chain].into_iter().max().unwrap();
+        println!(
+            "WRAP budget rollup (accessible regions): epilogue(B)={l_epilogue}, hash(Poseidon2)={l_hash}, \
+             cap-mux(I)={l_capmux}, chain-eval(C)={l_chain} ⇒ composed log_nqc = {composed} (budget {LOG_BLOWUP})"
+        );
+        assert!(composed <= LOG_BLOWUP, "the accessible wrap regions must compose within the degree budget");
+        println!(
+            "  remaining: super-tile FRI β-fold / Merkle-path / DEEP (behind --features recursion, ≤16 per plan)"
+        );
     }
 }
