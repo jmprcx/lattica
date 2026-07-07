@@ -137,9 +137,16 @@ expressed as lookups / witnessed low-degree columns**, and measure `log_nqc ≤ 
     is exposed `pub(crate)` (alongside the already-reusable `MonolithAir` / `monolith_build_trace` /
     `multicol_query_terms` / `make_config`), so the wrap now extracts a REAL join-split inner's witness and
     confirms the reused regions (A–J) compose `log_nqc ≤ 4` on the real inner — from the wrap side.
-  - **Remaining:** the wrap-specific **trace builder** (lay the extracted witness into the wrap's column
-    layout) + **fusing the reused gadget constraints** (`SpongeAir` / `FriFoldAir` / `FriMerkleAir` are
-    `#[cfg(test)]` — needs the same exposure treatment or re-authoring). Then **W2-measure** on the built wrap
+  - **The recursion research surface is COMPLETE + fixed** (`wrap_reused_witness_surface`): tracing the
+    monolith's own trace-build pipeline (`run_symbolic_monolith`) showed the entire witness surface —
+    `sim_full` (the one exposed fn) + `native_fri::{multicol_query_terms, query_fold_data, query_input_merkle,
+    query_quotient_merkle, query_commit_merkle_all, epilogue_openings, eval_symbolic_native,
+    quotient_recompose_weights}` + `monolith::{MonolithAir, monolith_build_trace}` + `make_config` — is
+    already `pub(crate)` and callable from the wrap (validated end-to-end on a real inner). So the wrap↔
+    recursion fence is fixed ONCE, deliberately; **no further exposure is needed** for W2-assemble.2.
+  - **Remaining (entirely wrap-local):** the wrap-specific **trace builder** (lay the extracted witness into
+    the wrap's column layout) + **re-authoring the reused-region constraints** into the wrap AIR with B/C/I as
+    lookups (reading `monolith/air.rs` + the gadget AIRs as reference). Then **W2-measure** on the built wrap
     (`log_nqc ≤ 4` + prove/verify/tamper-reject over a real join-split inner) = the GATE.
 - **W2-measure — the GATE.** Measure `log_nqc ≤ 4` (via `wrap_log_nqc` / the native
   `get_log_num_quotient_chunks` guard) on the **whole assembled wrap** verifying a real join-split inner, and

@@ -26,14 +26,23 @@
 //! sharing one trace, proven through [`crate::lookup::prover`]. Mirrors [`super::DagFoldAir`] (C+B) +
 //! [`super::CapMuxAir`] (I), fused.
 //!
-//! ## Trace construction (the next brick, and its one blocker)
+//! ## The recursion research surface (the wrap↔recursion boundary — fixed here, once, deliberately)
 //!
-//! Folding in the reused super-tile regions over a REAL join-split inner needs the inner-proof witness
-//! (challenges, opened values, Merkle/fold data). `MonolithAir`, `monolith_build_trace`, `multicol_query_terms`
-//! and `make_config` are `pub(crate)` (reusable here), but the witness extraction `sim_full` is a private
-//! `#[cfg(test)]` helper in `monolith/tests.rs` (on the plan's DO-NOT-TOUCH list) — so the real-inner wrap
-//! trace needs either exposing that extraction (a surgical, additive recursion change) or a wrap-local
-//! re-derivation. This brick sidesteps it with a synthetic arith witness.
+//! Folding in the reused super-tile regions over a REAL join-split inner needs the inner-proof witness. The
+//! wrap **re-authors** the reused-region constraints (reading `monolith/air.rs` + the gadget AIRs as a
+//! reference — reading, not calling) and **reuses** the recursion module's already-`pub(crate)` witness
+//! pipeline for the trace. So the wrap↔recursion boundary is a fixed, ENUMERATED surface — not a piecemeal
+//! erosion of the do-not-touch fence:
+//! - **Witness extraction:** `recursion::monolith::tests::sim_full` (the one function exposed for the wrap;
+//!   everything else was already `pub(crate)`) + `recursion::native_fri::{multicol_query_terms, query_fold_data,
+//!   query_input_merkle, query_quotient_merkle, query_commit_merkle_all, epilogue_openings, eval_symbolic_native,
+//!   quotient_recompose_weights, preamble_challenges}`.
+//! - **AIR + trace assembly:** `recursion::monolith::{MonolithAir, monolith_build_trace}` +
+//!   `recursion::native_fri::make_config`.
+//!
+//! `wrap_reused_witness_surface` validates every function in this surface is callable from the wrap and yields
+//! well-formed witness for a real inner — so **no further recursion exposure is needed** for W2-assemble.2; the
+//! remaining work (the wrap-specific trace builder + constraint fusion) is entirely wrap-local.
 
 use crate::config::Val;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
@@ -289,5 +298,48 @@ mod tests {
         let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
         println!("WRAP witness seam: real join-split MonolithAir (reused regions A–J) log_nqc = {log_nqc}");
         assert!(log_nqc <= LOG_BLOWUP, "the reused super-tile regions must compose ≤ log_blowup on the real inner");
+    }
+
+    /// **The recursion research surface is complete** (`--features lookup,recursion`). Every witness-extraction
+    /// function the wrap's reused-region trace builder needs is callable from the wrap and yields well-formed
+    /// data for a REAL join-split inner — so the wrap↔recursion boundary is fixed (no piecemeal erosion), and
+    /// the remaining W2-assemble.2 work is entirely wrap-local. See the module doc for the enumerated surface.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn wrap_reused_witness_surface() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, WIDTH};
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::native_fri::{
+            epilogue_openings, make_config, multicol_query_terms, query_commit_merkle_all, query_fold_data,
+            query_input_merkle, query_quotient_merkle,
+        };
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let nqc = proof.opened_values.quotient_chunks.len();
+
+        // Transcript witness (F).
+        let (block_inputs, _counts, _binds, _chs, _index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        assert!(!block_inputs.is_empty() && !index_felts.is_empty(), "sim_full yields transcript + index witness");
+
+        // Per-query fold / Merkle / commit witness at q = 0 (D/E/G).
+        let (terms, _x, _alpha, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        assert_eq!(terms.len(), 2 * WIDTH + 2 * nqc, "reduced-opening terms = 2·W trace + 2·nqc quotient");
+        let (_ro2, rounds, _folded, _f0) = query_fold_data(&config, &proof, &pvs, 0);
+        assert!(!rounds.is_empty(), "FRI fold-chain rounds (D) extracted");
+        let (_leaf, path, _ce) = query_input_merkle(&config, &proof, &pvs, 0);
+        assert!(!path.is_empty(), "input-Merkle path (E) extracted");
+        let (_ql, qpath, _qce, _qw) = query_quotient_merkle(&config, &proof, &pvs, 0);
+        assert!(!qpath.is_empty(), "quotient-Merkle path (E) extracted");
+        let cm = query_commit_merkle_all(&config, &proof, &pvs, 0);
+        assert!(!cm.is_empty(), "commit-phase Merkle data (E/G) extracted");
+
+        // OOD epilogue openings + selectors + periodic-column values at ζ (H).
+        let (_l, _n, _if, _il, _it, _iv, _q, _a, _z, eo_periodic) =
+            epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
+        assert_eq!(eo_periodic.len(), N_PERIODIC, "periodic-column values at ζ (H) extracted");
     }
 }
