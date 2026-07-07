@@ -114,18 +114,57 @@ mod tests {
         );
     }
 
-    /// (3) **The degree fact 0a needs, recorded as an executable note.** A LogUp constraint is degree ≤ 2:
-    ///   fraction well-formedness  `(alpha − value)·fraction − mult = 0`   (deg 2: value·fraction), and
-    ///   accumulator telescoping   `acc' − acc − fraction = 0`             (deg 1).
-    /// `alpha` is a verifier challenge (a constant in the constraint), `value`/`mult` are trace columns,
-    /// `fraction`/`acc` are aux columns. So a lookup replaces a high-degree relation (e.g. the FRI-fold's
-    /// α-Horner over degree-16 inner constraints, or a byte range-decomposition) with a **degree-2**
-    /// constraint. This is the lever that lets the wrap's outer fold stay under the ≤16 / log_nqc≤4 cliff.
+    /// (3) **The degree fact 0a needs — MEASURED via p3-lookup's own `constraint_degree`.** A LogUp
+    /// constraint's degree is `1 + Σ(side element-degrees)` (the shared denominator spans all sides).
+    /// For a 2-sided (query + table) range-check lookup with degree-1 elements that is `1 + (1+1) = 3` —
+    /// **not 2**, correcting the earlier structural estimate. The general rule matters for the wrap: a
+    /// lookup must be kept **low-arity** (few sides) to stay under the degree budget — e.g. a k-way fold
+    /// lookup is degree `1 + k`, so the α-fold must be chunked into small-arity lookups (mirroring the
+    /// existing `FOLD_CHUNK=7`). Degree 3 still clears the cliff comfortably (`log_nqc ≤ 1`, see 0a′).
     #[test]
-    fn logup_constraint_degree_is_two() {
-        // The bound is structural to LogUp (not p3-version-specific); asserted here so the number the
-        // 0a/0d analysis quotes is pinned in-tree next to the working gadget.
-        const LOGUP_MAX_CONSTRAINT_DEGREE: usize = 2;
-        assert_eq!(LOGUP_MAX_CONSTRAINT_DEGREE, 2);
+    fn logup_constraint_degree_measured() {
+        use p3_lookup::LookupProtocol;
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&RangeCheckAir);
+        let lookup = lookups.iter().next().expect("one lookup");
+        let deg = LogUpGadget::new().constraint_degree(lookup);
+        println!("LOGUP-DEGREE 2-sided range-check lookup: constraint_degree = {deg} (= 1 + Σ side-degrees)");
+        assert_eq!(deg, 3, "a 2-sided degree-1 lookup is degree 3 (corrects the modelled '2')");
+    }
+
+    /// (4) **The argument semantics — validated with p3-lookup's ground-truth oracle `check_lookups`.**
+    /// A balanced trace passes the multiset-balance check; a tampered one is caught (it panics on the
+    /// imbalance). Together with (1)/(2) — the aux-trace terminal agreeing — this validates the *complete*
+    /// lookup argument at the constraint level. (Committing the aux trace through FRI is the remaining
+    /// mechanical Phase-2 plumbing; the novel logic is validated here.)
+    #[test]
+    fn check_lookups_accepts_balanced_and_catches_tampered() {
+        use p3_lookup::debug_util::{check_lookups, LookupDebugInstance};
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&RangeCheckAir);
+        let lookup_slice: Vec<_> = lookups.iter().cloned().collect();
+        let no_pre: Option<RowMajorMatrix<Val>> = None;
+
+        // balanced ⇒ check passes.
+        let main = balanced_main(8);
+        check_lookups(&[LookupDebugInstance {
+            main_trace: &main,
+            preprocessed_trace: &no_pre,
+            public_values: &[],
+            lookups: &lookup_slice,
+            permutation_challenges: &[],
+        }]);
+
+        // tampered (table side no longer matches the query) ⇒ check_lookups panics on the imbalance.
+        let mut bad = balanced_main(8);
+        bad.values[3 * 3 + 1] = Val::from_u64(0xDEAD);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_lookups(&[LookupDebugInstance {
+                main_trace: &bad,
+                preprocessed_trace: &no_pre,
+                public_values: &[],
+                lookups: &lookup_slice,
+                permutation_challenges: &[],
+            }]);
+        }));
+        assert!(caught.is_err(), "check_lookups must catch a tampered (imbalanced) lookup");
     }
 }

@@ -6,7 +6,7 @@
 
 **Verdict (Phase 0): GO — with the residual risk being Phase-3 engineering, not a fundamental barrier.**
 The two mechanisms this program depends on are validated in-tree: a lookup argument runs over lattica's
-Goldilocks/F_p² config with **degree-2** constraints (0b), and Tip5 slots into the Layer-A hash traits at
+Goldilocks/F_p² config with **low-degree** constraints (measured 3 for a 2-sided lookup, P2), and Tip5 slots into the Layer-A hash traits at
 **4.6× fewer rows/permutation** than Poseidon2 (0c). Wired against the measured self-recursion explosion
 (0a), the wrap's degree math closes (≤7 ≤ 16) and its size is stabilizable by a canonical fixed-shape
 design. See §5 for the gate.
@@ -27,12 +27,13 @@ low-degree canonical verifier, and **lookups + Tip5** are its enabling substrate
 | Spike | Artifact | Result |
 |---|---|---|
 | **0a** wrap feasibility | `src/tree/mod.rs` | Baseline (probe, first-hand): monolith-verifies-monolith **W 193→8520 (44×), log_nqc=7, ~133 GB** — diverges. Modelled lookup-based canonical wrap: **max degree 7 ≤ 16 ⇒ log_nqc ≤ 4**, size-stable by canonical design ⇒ **GO=true**. |
-| **0a′** degree-cliff **measurement** (Phase-3 spike) | `src/tree/mod.rs::degree_probe` | Model → hard numbers via p3's real `get_log_num_quotient_chunks`. Measured degree→log_nqc: **deg 91 → log_nqc 7** (exactly reproduces the baseline monolith + air.rs's "91"), **deg 7 (Tip5 x⁷) → log_nqc 3**, **deg 2 (lookup) → log_nqc 0** — both hold the cliff. The real budget is deg ≤ ~17 (cliff between 17 and 32). So the baseline explosion **is** a degree problem, and both levers clear it — **measured, not modelled**. |
-| **0b** lookup argument | `src/lookup/mod.rs` | `p3-lookup` LogUp runs over lattica's `MyConfig`; balanced lookup ⇒ zero terminal, tampered ⇒ rejected; **LogUp constraint degree = 2**. (Full forked prove/verify is Phase 2.) |
+| **0a′** degree-cliff **measurement** (Phase-3 spike) | `src/tree/mod.rs::degree_probe` | Model → hard numbers via p3's real `get_log_num_quotient_chunks`. Measured degree→log_nqc: **deg 91 → log_nqc 7** (exactly reproduces the baseline monolith + air.rs's "91"), **deg 7 (Tip5 x⁷) → log_nqc 3**, **deg 3 (lookup) → log_nqc 1** — both hold the cliff. The real budget is deg ≤ ~17 (cliff between 17 and 32). So the baseline explosion **is** a degree problem, and both levers clear it — **measured, not modelled**. |
+| **0b** lookup argument | `src/lookup/mod.rs` | `p3-lookup` LogUp runs over lattica's `MyConfig`; balanced lookup ⇒ zero terminal, tampered ⇒ rejected. |
+| **P2** lookup validation + degree | `src/lookup/mod.rs` | **Measured** `constraint_degree` = **3** for a 2-sided range-check lookup (formula `1 + Σ side-degrees`, correcting the modelled "2"); a k-way lookup is degree `1+k` ⇒ lookups must be **low-arity** (chunk the fold, cf. `FOLD_CHUNK`). Full argument validated at the constraint level with `check_lookups` (balanced accepts, tampered caught) — the aux-trace commit through FRI is the remaining mechanical plumbing. |
 | **0c** Tip5 | `src/tip5.rs` | Tip5 (width-16, 5-round, 4 split-lookup + 12 `x^7` lanes) slots into `PaddingFreeSponge`/`TruncatedPermutation`/`DuplexChallenger` ⇒ Layer-A swap is a `config.rs` type-alias change. **~7 rows/perm vs Poseidon2's 32 (4.6×)**; S-box degree still 7 (⇒ Tip5 buys **rows, not degree**). Structural — placeholder constants; byte-exact spec + KATs are Phase 1. |
 
 **The key conceptual result:** the two levers do *different* jobs. **Lookups** fix the **degree** (the
-`log_nqc=7` driver — the α-Horner fold over high-degree inner constraints becomes a degree-2 lookup).
+`log_nqc=7` driver — the α-Horner fold over high-degree inner constraints becomes low-arity, low-degree lookups).
 **Tip5** fixes the **size** (fewer hash rows) and is the hash a lookup argument verifies cheaply. Neither
 alone suffices; together they address both explosion drivers.
 
@@ -83,14 +84,14 @@ constraints — so the note-format audit stands.
 | Criterion | Needed | Phase-0 result |
 |---|---|---|
 | A lookup argument runs in this stack | end-to-end gadget over `MyConfig` | ✅ 0b — runs; sound accept/reject |
-| Lookup constraint degree low enough to fold under 16 | ≤ ~8 | ✅ 0b — **degree 2** |
+| Lookup constraint degree low enough to fold under 16 | ≤ ~8 | ✅ P2 — **measured degree 3** (2-sided); low-arity keeps it ≤ ~8 |
 | Tip5 fits Layer A | slots into the p3-symmetric traits | ✅ 0c — mechanical alias change |
-| Wrap holds the degree cliff | `log_nqc ≤ 4` | ✅ 0a′ — **MEASURED** (p3's `get_log_num_quotient_chunks`): deg 7 → log_nqc 3, deg 2 → log_nqc 0; baseline deg 91 → log_nqc 7 reproduced |
+| Wrap holds the degree cliff | `log_nqc ≤ 4` | ✅ 0a′ — **MEASURED** (p3's `get_log_num_quotient_chunks`): deg 7 → log_nqc 3, deg 3 → log_nqc 1; baseline deg 91 → log_nqc 7 reproduced |
 | Wrap size-stable | outer W bounded | ✅ 0a — by canonical fixed-shape design (Phase-3) |
 
 **Decision: GO.** All five criteria pass with validated, in-tree mechanisms — and the crux (the degree
 cliff) is now *measured*, not modelled: the baseline's `log_nqc=7` is a degree-~91 problem, and both levers
-(Tip5's degree-7 residual, the lookup's degree-2) drop it to `log_nqc ≤ 3`, comfortably under the cliff.
+(Tip5's degree-7 residual, the lookup's measured degree-3) drop it to `log_nqc ≤ 3`, comfortably under the cliff.
 
 **Honest residual risk (what Phase 0 did NOT prove).** Phase 0 validated the mechanisms and *measured* the
 degree math, but did not *build* the wrap. The remaining risk is engineering, concentrated in Phase 3 and

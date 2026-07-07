@@ -15,8 +15,10 @@
 //! This module does NOT build the wrap (that is Phase 3). It records — as an executable model wired to the
 //! two validated Phase-0 inputs — whether Tip5 + a lookup argument *address both drivers*, which is the
 //! GO/NO-GO question:
-//!   * **0b** proved a LogUp constraint is **degree 2** (`crate::lookup`), so re-expressing the FRI-fold /
-//!     range-decomposition relations as lookups replaces the degree-inflating operations with degree-2 ones.
+//!   * **0b/0c-P2** measured a LogUp constraint at **degree `1 + Σ side-degrees`** (`crate::lookup`) — 3 for
+//!     a 2-sided range-check lookup — so re-expressing the FRI-fold / range-decomposition relations as
+//!     *low-arity* lookups replaces the degree-inflating operations with low-degree ones (a k-way lookup is
+//!     degree `1+k`, so the fold must be chunked into small-arity lookups, mirroring `FOLD_CHUNK`).
 //!   * **0c** measured Tip5 at **~7 rows/permutation vs Poseidon2's 32 (4.6×)** with a residual `x^7`
 //!     (degree-7) hash lane (`crate::tip5`), shrinking the hash-dominated verification width.
 //!
@@ -43,7 +45,8 @@ pub const BASELINE: SelfRecursionBaseline = SelfRecursionBaseline {
 /// The two Phase-0-validated levers, as inputs to the model.
 #[derive(Clone, Copy, Debug)]
 pub struct WrapLevers {
-    /// Max constraint degree of a LogUp lookup (validated in `crate::lookup`, 0b).
+    /// Max constraint degree of a (low-arity) LogUp lookup — MEASURED at 3 for a 2-sided range-check
+    /// (`1 + Σ side-degrees`) in `crate::lookup` (P2). Kept low by bounding lookup arity.
     pub logup_constraint_degree: usize,
     /// Residual non-lookup S-box degree in the verification hash (Tip5 `x^7` lanes, 0c). The FRI-fold and
     /// range relations move to lookups (degree `logup_constraint_degree`); this `x^7` is what remains
@@ -54,7 +57,7 @@ pub struct WrapLevers {
 }
 
 pub const LEVERS: WrapLevers = WrapLevers {
-    logup_constraint_degree: 2,
+    logup_constraint_degree: 3, // MEASURED (P2): 2-sided range-check lookup = 1 + (1+1)
     residual_hash_sbox_degree: 7,
     row_reduction_vs_poseidon2: 32.0 / 7.0,
 };
@@ -84,7 +87,7 @@ pub struct WrapVerdict {
 /// cliff (log_nqc=7). The wrap breaks this by being a **fixed point**: each level verifies a *canonical
 /// wrap* proof whose OWN constraints are kept low-degree because the operations that would otherwise be
 /// high-degree — the α-Horner fold batching, the FRI range/bit decompositions, and the hash S-box — are
-/// expressed as **lookups (degree 2, validated in 0b)** rather than inline high-degree polynomials. So the
+/// expressed as **low-arity lookups (measured degree 3, P2)** rather than inline high-degree polynomials. So the
 /// wrap's max constraint degree is `max(logup_degree, residual_hash_sbox_degree)` (≈ 7 with an `x^7` lane,
 /// or 2 if the power lanes are range-checked too) — bounded by the wrap's *own* design, and low enough that
 /// re-evaluating + folding it at the next level stays ≤ 16. The inner's shape no longer matters because the
@@ -154,19 +157,19 @@ mod tests {
     /// **0a's model → a measurement.** Measure the degree→log_nqc mapping p3 actually applies, and confirm:
     ///   * the BASELINE explosion is a *degree* problem — the monolith's ~degree-91 fold (air.rs:473) maps to
     ///     the measured `log_nqc = 7` (matching `phase9_self_recursion_probe`); and
-    ///   * the WRAP holds the cliff — Tip5's residual `x^7` (degree 7, 0c) and a lookup (degree 2, 0b) both
+    ///   * the WRAP holds the cliff — Tip5's residual `x^7` (degree 7, 0c) and a lookup (measured degree 3, P2) both
     ///     map to `log_nqc ≤ log_blowup = 4`.
     #[test]
     fn wrap_degree_cliff_is_measured() {
         let ceiling = BASELINE.log_blowup; // 4
-        let degrees = [2usize, 4, 7, 8, 16, 17, 32, 64, 91, 128];
+        let degrees = [2usize, 3, 4, 7, 8, 16, 17, 32, 64, 91, 128];
         let rows: Vec<(usize, usize)> = degrees.iter().map(|&d| (d, log_nqc_for_degree(d))).collect();
         for (d, nqc) in &rows {
             println!("DEGREE-PROBE degree={:>3} → log_nqc={} {}", d, nqc, if *nqc <= ceiling { "≤ cliff (provable)" } else { "> cliff (DIVERGES)" });
         }
 
         // WRAP side — the two validated levers hold the cliff:
-        assert!(log_nqc_for_degree(2) <= ceiling, "lookup (deg 2) must hold log_nqc ≤ {ceiling}");
+        assert!(log_nqc_for_degree(3) <= ceiling, "lookup (deg 3, measured P2) must hold log_nqc ≤ {ceiling}");
         assert!(log_nqc_for_degree(7) <= ceiling, "Tip5 residual x^7 (deg 7) must hold log_nqc ≤ {ceiling}");
         // BASELINE side — the monolith's ~degree-91 inline fold reproduces the measured log_nqc = 7:
         assert_eq!(log_nqc_for_degree(91), BASELINE.outer_log_nqc, "degree-91 fold ⇒ the baseline's log_nqc=7");
@@ -210,11 +213,11 @@ mod tests {
     }
 
     /// Even the residual x^7 can be removed: range-checking the power lanes via lookups drops the max
-    /// degree to the lookup degree (2), i.e. log_nqc ≤ 1 — extra margin under the cliff.
+    /// degree to the lookup degree (3, measured), i.e. log_nqc ≤ 1 — extra margin under the cliff.
     #[test]
     fn full_lookup_verifier_has_ample_degree_margin() {
         let levers = WrapLevers { residual_hash_sbox_degree: LEVERS.logup_constraint_degree, ..LEVERS };
         let v = evaluate(BASELINE, levers);
-        assert!(v.modelled_max_degree <= 2 && v.degree_converges);
+        assert!(v.modelled_max_degree <= 3 && v.degree_converges);
     }
 }
