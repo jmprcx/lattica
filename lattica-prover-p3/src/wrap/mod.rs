@@ -277,6 +277,203 @@ pub fn chain_eval_trace(height: usize) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(flat, 3)
 }
 
+/// **W3 (size) — the FLATTEN op-table: a narrow-tall arithmetic-circuit evaluator with a LogUp wiring bus.**
+/// The W2 witnessed epilogue pays `2·n_mul` dedicated COLUMNS (each F_p² `Mul` → a degree-1 column pair,
+/// filled only at the `n_queries` arith heads, wasted on every other row). W3 replaces them with this
+/// op-table: each DAG operation (mul / add / sub) is ONE trace ROW at CONSTANT width, and its two operands are
+/// routed from their producing rows *by address* through a single LogUp "wiring bus" `(addr, value)`. Leaves
+/// (opening values) are seeded as provide-only bus entries; each producer defines its wire with multiplicity
+/// `−fanout`, each consumer reads `+1`, so the multiset balances iff every operand read equals the value its
+/// producer wrote at that address — the standard offline-memory / permutation argument. `joinsplit_epilogue_
+/// dag_shape` chose this FLATTEN form (fan-in exactly 2 per row) over a one-row-per-`Mul` hybrid (operands
+/// fan-in ≤ 15). The DAG size becomes ROWS (cheap slack) instead of the witnessed COLUMNS.
+///
+/// Columns (width 10, scalar `Val`): `[is_mul, is_add, is_sub, out_addr, out_val, a_addr, a_val, b_addr, b_val,
+/// out_mult]`. A row is either a leaf-seed (`is_*` all 0, defines `(out_addr, out_val)`) or an op (`out_val =
+/// a_val ∘ b_val`, defines its output AND reads both operands). Degree 3 (`is_mul·a·b`); the bus is degree ≤ 3.
+/// **Brick 1 validates the WIRING mechanism over scalar `Val`** — the F_p² lift (2-felt values + `emul`), the
+/// real-ζ-opening leaf seed, and the fold/output-check integration are the later W3 bricks; the novel/risky
+/// part here is the DAG operand routing (the F_p² `emul` is already proven by the W2 `Witnesser`).
+pub struct OpTableAir;
+
+impl<F: p3_field::Field> BaseAir<F> for OpTableAir {
+    fn width(&self) -> usize {
+        10
+    }
+}
+
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for OpTableAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let r = main.current_slice().to_vec();
+        let (is_mul, is_add, is_sub) = (r[0], r[1], r[2]);
+        let (out_addr, out_val) = (r[3], r[4]);
+        let (a_addr, a_val) = (r[5], r[6]);
+        let (b_addr, b_val) = (r[7], r[8]);
+        let out_mult = r[9];
+
+        // Each opcode selector is boolean, and at most one fires (their sum `is_op` is boolean too) — so `is_op`
+        // is exactly the operand-read count: 0 on leaf/pad rows, 1 on op rows.
+        for s in [is_mul, is_add, is_sub] {
+            builder.assert_zero(s.into() * (s.into() - AB::Expr::ONE));
+        }
+        let is_op: AB::Expr = is_mul.into() + is_add.into() + is_sub.into();
+        builder.assert_zero(is_op.clone() * (is_op.clone() - AB::Expr::ONE));
+
+        // The gated op relation: out = a·b (mul) / a+b (add) / a−b (sub). Leaf/pad rows (all selectors 0) leave
+        // `out_val` unconstrained here — a leaf's value is an input, bound only by the bus (not computed).
+        builder.assert_zero(is_mul.into() * (out_val.into() - a_val.into() * b_val.into()));
+        builder.assert_zero(is_add.into() * (out_val.into() - (a_val.into() + b_val.into())));
+        builder.assert_zero(is_sub.into() * (out_val.into() - (a_val.into() - b_val.into())));
+
+        // The wiring bus (one LogUp channel): DEFINE this row's output `(out_addr, out_val)` with signed
+        // multiplicity `out_mult` (= −fanout for a producer, 0 for pad), and READ both operands with `+is_op`
+        // (leaf/pad rows read nothing). Balance ⇒ every read value equals the value its producer wrote there.
+        builder.push_local_interaction(vec![
+            (vec![a_addr.into(), a_val.into()], is_op.clone()),
+            (vec![b_addr.into(), b_val.into()], is_op.clone()),
+            (vec![out_addr.into(), out_val.into()], out_mult.into()),
+        ]);
+    }
+}
+
+/// Build an [`OpTableAir`] trace evaluating a constraint DAG (structure from `get_symbolic_constraints`). Each
+/// unique node (Arc identity) becomes one wire: leaves get a deterministic pseudo-value (constants keep their
+/// actual value), ops compute `out = a ∘ b` over `Val`. Emits a leaf-seed row per leaf and an op row per
+/// operation in definition order, sets each producer's `out_mult = −fanout` (fanout = how many operand-reads
+/// reference it), and pads to a power-of-two height (pad rows contribute nothing: all selectors 0, `out_mult`
+/// 0). The 81 owned constraint ROOTS are processed directly; sub-expression sharing lives in their Arc
+/// children (deduped by the memo, matching the `joinsplit_epilogue_dag_shape` census).
+pub fn op_table_trace(constraints: &[p3_air::symbolic::SymbolicExpression<Val>]) -> RowMajorMatrix<Val> {
+    use p3_air::symbolic::SymbolicExpr;
+    use p3_uni_stark::BaseLeaf;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    struct Row {
+        op: u8, // 0 = leaf, 1 = mul, 2 = add, 3 = sub
+        out_addr: u64,
+        out_val: Val,
+        a_addr: u64,
+        a_val: Val,
+        b_addr: u64,
+        b_val: Val,
+    }
+    struct B {
+        rows: Vec<Row>,
+        memo: HashMap<usize, (u64, Val)>,
+        next: u64,
+        ctr: u64,
+        zero: Option<(u64, Val)>,
+    }
+    impl B {
+        fn pseudo(&mut self) -> Val {
+            self.ctr += 1;
+            Val::from_u64(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.ctr))
+        }
+        fn leaf(&mut self, val: Val) -> (u64, Val) {
+            let addr = self.next;
+            self.next += 1;
+            self.rows.push(Row { op: 0, out_addr: addr, out_val: val, a_addr: 0, a_val: Val::ZERO, b_addr: 0, b_val: Val::ZERO });
+            (addr, val)
+        }
+        fn emit(&mut self, op: u8, a: (u64, Val), b: (u64, Val)) -> (u64, Val) {
+            let val = match op {
+                1 => a.1 * b.1,
+                2 => a.1 + b.1,
+                3 => a.1 - b.1,
+                _ => unreachable!("op ∈ {{mul, add, sub}}"),
+            };
+            let addr = self.next;
+            self.next += 1;
+            self.rows.push(Row { op, out_addr: addr, out_val: val, a_addr: a.0, a_val: a.1, b_addr: b.0, b_val: b.1 });
+            (addr, val)
+        }
+        fn zero_wire(&mut self) -> (u64, Val) {
+            match self.zero {
+                Some(z) => z,
+                None => {
+                    let z = self.leaf(Val::ZERO);
+                    self.zero = Some(z);
+                    z
+                }
+            }
+        }
+    }
+    fn go_arc(arc: &Arc<p3_air::symbolic::SymbolicExpression<Val>>, b: &mut B) -> (u64, Val) {
+        let k = Arc::as_ptr(arc) as usize;
+        if let Some(v) = b.memo.get(&k) {
+            return *v;
+        }
+        let v = go(arc.as_ref(), b);
+        b.memo.insert(k, v);
+        v
+    }
+    fn go(node: &p3_air::symbolic::SymbolicExpression<Val>, b: &mut B) -> (u64, Val) {
+        match node {
+            SymbolicExpr::Leaf(l) => {
+                let v = match l {
+                    BaseLeaf::Constant(c) => *c,
+                    _ => b.pseudo(), // Variable / is_first / is_last / is_trans — an opening value (pseudo here)
+                };
+                b.leaf(v)
+            }
+            SymbolicExpr::Add { x, y, .. } => {
+                let (a, c) = (go_arc(x, b), go_arc(y, b));
+                b.emit(2, a, c)
+            }
+            SymbolicExpr::Sub { x, y, .. } => {
+                let (a, c) = (go_arc(x, b), go_arc(y, b));
+                b.emit(3, a, c)
+            }
+            SymbolicExpr::Mul { x, y, .. } => {
+                let (a, c) = (go_arc(x, b), go_arc(y, b));
+                b.emit(1, a, c)
+            }
+            SymbolicExpr::Neg { x, .. } => {
+                let z = b.zero_wire(); // 0 − x (0 negs in join-split; keeps the builder total for any DAG)
+                let a = go_arc(x, b);
+                b.emit(3, z, a)
+            }
+        }
+    }
+
+    let mut b = B { rows: Vec::new(), memo: HashMap::new(), next: 0, ctr: 0, zero: None };
+    for root in constraints {
+        let _ = go(root, &mut b); // the root's wire (fanout 0 in brick 1 — read by the fold in a later brick)
+    }
+
+    // Fanout: how many operand-reads reference each address (only op rows read). Each producer's `out_mult` is
+    // −fanout, so the bus balances (def −fanout, read +1 × fanout).
+    let mut fanout: HashMap<u64, u64> = HashMap::new();
+    for row in &b.rows {
+        if row.op != 0 {
+            *fanout.entry(row.a_addr).or_default() += 1;
+            *fanout.entry(row.b_addr).or_default() += 1;
+        }
+    }
+
+    let w = 10;
+    let h = b.rows.len().next_power_of_two().max(1 << 4);
+    let mut flat = vec![Val::ZERO; h * w];
+    for (i, row) in b.rows.iter().enumerate() {
+        let base = i * w;
+        let one_if = |c: bool| if c { Val::ONE } else { Val::ZERO };
+        flat[base] = one_if(row.op == 1);
+        flat[base + 1] = one_if(row.op == 2);
+        flat[base + 2] = one_if(row.op == 3);
+        flat[base + 3] = Val::from_u64(row.out_addr);
+        flat[base + 4] = row.out_val;
+        flat[base + 5] = Val::from_u64(row.a_addr);
+        flat[base + 6] = row.a_val;
+        flat[base + 7] = Val::from_u64(row.b_addr);
+        flat[base + 8] = row.b_val;
+        flat[base + 9] = -Val::from_u64(*fanout.get(&row.out_addr).unwrap_or(&0));
+    }
+    RowMajorMatrix::new(flat, w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +974,102 @@ mod tests {
             matches!(verify_lookup(&air, &proof, &[Val::ONE]), Err(LookupVerifyError::NonZeroTerminal)),
             "an unbalanced lookup must be rejected by the terminal check"
         );
+    }
+
+    /// **W3 op-table brick 1 — the FLATTEN op-table evaluates the REAL join-split DAG and proves + verifies.**
+    /// Build the op-table over the actual `JoinSplitAir` constraint DAG (501 ops + 372 leaf seeds ⇒ ~873 rows at
+    /// constant width 10) and run it through the W1 lookup prover: the local op relations (out = a ∘ b) hold and
+    /// the wiring bus balances (every operand read = its producer's write). This validates the narrow-tall
+    /// mechanism the size fix rests on, on real structure at real scale — the analog of `chain_eval_round_trips`
+    /// for a full DAG (with the operand-routing bus, not just a running product).
+    #[test]
+    fn op_table_round_trips() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let trace = op_table_trace(&constraints);
+        let proof = prove_lookup(&OpTableAir, trace, &[]);
+        assert!(
+            verify_lookup(&OpTableAir, &proof, &[]).is_ok(),
+            "the op-table must evaluate the real DAG and balance the wiring bus"
+        );
+    }
+
+    /// Corrupting a LEAF's provided value (a wire read by ≥1 op) unbalances the bus — the consumers still read
+    /// the old value, so the `(addr, value)` multiset no longer cancels ⇒ non-zero LogUp terminal. This is the
+    /// WIRING half: the bus binds each read to its producer's write.
+    #[test]
+    fn op_table_rejects_broken_wire() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let mut trace = op_table_trace(&constraints);
+        let w = 10;
+        // A leaf row has all selectors 0 and (if read) `out_mult` (col 9) ≠ 0 (= −fanout). Corrupt its value.
+        let h = trace.values.len() / w;
+        let leaf = (0..h)
+            .find(|&r| {
+                let base = r * w;
+                trace.values[base] == Val::ZERO
+                    && trace.values[base + 1] == Val::ZERO
+                    && trace.values[base + 2] == Val::ZERO
+                    && trace.values[base + 9] != Val::ZERO
+            })
+            .expect("a leaf wire with fanout ≥ 1 exists");
+        trace.values[leaf * w + 4] += Val::ONE; // provided value ≠ what consumers read
+        let proof = prove_lookup(&OpTableAir, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&OpTableAir, &proof, &[]), Err(LookupVerifyError::NonZeroTerminal)),
+            "a corrupted wire value must unbalance the wiring bus"
+        );
+    }
+
+    /// Corrupting a ROOT op's output (a constraint value, fanout 0 ⇒ `out_mult` 0, so the bus is unaffected)
+    /// violates its local relation `out = a ∘ b` ⇒ OOD mismatch. This is the EVALUATION half: each op row is
+    /// checked to compute its operation correctly.
+    #[test]
+    fn op_table_rejects_broken_op() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let mut trace = op_table_trace(&constraints);
+        let w = 10;
+        // A root op row: some selector set (is_op = 1) and `out_mult` (col 9) == 0 (nothing reads it).
+        let h = trace.values.len() / w;
+        let root = (0..h)
+            .find(|&r| {
+                let base = r * w;
+                let is_op = trace.values[base] != Val::ZERO
+                    || trace.values[base + 1] != Val::ZERO
+                    || trace.values[base + 2] != Val::ZERO;
+                is_op && trace.values[base + 9] == Val::ZERO
+            })
+            .expect("a root op (fanout 0) exists");
+        trace.values[root * w + 4] += Val::ONE; // out ≠ a ∘ b now
+        let proof = prove_lookup(&OpTableAir, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&OpTableAir, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
+            "a corrupted op output must fail its local op relation"
+        );
+    }
+
+    /// **The SIZE win, measured.** The op-table width is a CONSTANT 10 — independent of the DAG size — because
+    /// the DAG becomes ROWS, not columns. So the epilogue's `2·n_mul` witnessed COLUMNS (428 for the real
+    /// join-split inner; 2088 for the R5 monolith-as-inner) collapse to a fixed narrow tile plus slack rows,
+    /// and it stays within the degree budget (`log_nqc ≤ 4`).
+    #[test]
+    fn op_table_is_narrow_and_low_degree() {
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let trace = op_table_trace(&constraints);
+        let (rows, w) = (trace.values.len() / 10, 10);
+        assert_eq!(BaseAir::<Val>::width(&OpTableAir), w, "op-table width is constant (independent of DAG size)");
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&OpTableAir);
+        let (_layout, log_nqc) = combined_constraint_layout(&OpTableAir, &lookups, 1);
+        let mut seen = HashSet::new();
+        let n_mul: usize = constraints.iter().map(|c| count_mul_nodes(c, &mut seen)).sum();
+        println!(
+            "OpTable (real join-split DAG): width {w} (const), {rows} padded rows, log_nqc = {log_nqc} (budget \
+             {LOG_BLOWUP}) — replaces the witnessed {} COLUMNS (2·{n_mul} Muls) with slack ROWS at constant width",
+            2 * n_mul,
+        );
+        assert!(log_nqc <= LOG_BLOWUP, "the op-table must stay within the degree budget (got {log_nqc})");
     }
 }
