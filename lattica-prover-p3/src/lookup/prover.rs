@@ -16,11 +16,14 @@
 //! `quotient_values` + `open`, not new cryptographic structure.
 
 use crate::config::{make_config, Challenge, MyConfig, Val};
+use p3_air::symbolic::{AirLayout, ConstraintLayout};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::{CanObserve, FieldChallenger};
 use p3_commit::Pcs;
 use p3_field::{Field, PrimeCharacteristicRing};
-use p3_lookup::{InteractionBuilder, LogUpGadget, LookupProtocol, LookupTerminal, Lookups};
+use p3_lookup::{
+    InteractionBuilder, InteractionSymbolicBuilder, LogUpGadget, LookupProtocol, LookupTerminal, Lookups,
+};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
 use p3_uni_stark::StarkGenericConfig;
@@ -166,10 +169,64 @@ pub fn aux_fraction_wellformed(
     sum == terminal
 }
 
+/// W1.1 — the **combined** (AIR-base + LogUp-lookup) constraint layout + `log_num_quotient_chunks`, sized
+/// over the FULL constraint set (base `assert_zero`s **plus** the lookup fraction/accumulator constraints).
+/// p3's `get_log_num_quotient_chunks` runs only `air.eval` and so misses the lookup constraints — using it
+/// would make the alpha-power layout and the quotient domain too small. The forked quotient (W1.2) must use
+/// THIS layout + degree. Emission order is `air.eval` then `gadget.eval_all` (matched by prover + verifier).
+pub fn combined_constraint_layout(
+    air: &RangeCheckAir,
+    lookups: &Lookups<Val>,
+    is_zk: usize,
+) -> (ConstraintLayout, usize) {
+    let layout = AirLayout {
+        preprocessed_width: 0,
+        main_width: BaseAir::<Val>::width(air),
+        num_public_values: 0,
+        permutation_width: lookups.len() + 1, // accumulator + one fraction column per lookup
+        num_permutation_challenges: 2,        // LogUp (α_L, β)
+        num_permutation_values: 1,            // the committed terminal
+        num_periodic_columns: 0,
+    };
+    let mut isb = InteractionSymbolicBuilder::<Val, Challenge>::new(layout);
+    air.eval(&mut isb);
+    LogUpGadget::new().eval_all(&mut isb, lookups);
+
+    let clayout = isb.constraint_layout();
+    let max_deg = isb
+        .base_constraints()
+        .iter()
+        .map(|c| c.degree_multiple())
+        .chain(isb.extension_constraints().iter().map(|c| c.degree_multiple()))
+        .max()
+        .unwrap_or(0);
+    let constraint_degree = (max_deg + is_zk).max(2);
+    let log_nqc = (constraint_degree - 1).next_power_of_two().ilog2() as usize;
+    (clayout, log_nqc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use p3_lookup::{LogUpGadget, LookupProtocol, Lookups};
+
+    /// W1.1 — the combined layout counts the base + lookup constraints, and their degree gives a small
+    /// `log_nqc` (the number the forked quotient domain + alpha-powers must be sized against).
+    #[test]
+    fn combined_layout_counts_base_plus_lookup_constraints() {
+        let air = RangeCheckAir;
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "W1.1 combined layout: {} constraints (base {} + ext {}), log_nqc={}",
+            layout.total_constraints(),
+            layout.base_indices.len(),
+            layout.ext_indices.len(),
+            log_nqc
+        );
+        assert!(layout.total_constraints() >= 1, "the lookup fraction/accumulator constraints must be counted");
+        assert!(log_nqc <= 2, "a degree-3 lookup ⇒ log_nqc ≤ 2");
+    }
 
     /// A balanced range check: the two-round prover produces a proof whose challenges the verifier
     /// re-derives (Fiat–Shamir consistency) and whose terminal is zero ⇒ **accept**.
