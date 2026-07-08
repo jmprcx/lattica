@@ -1061,6 +1061,13 @@ pub(crate) trait MonolithBci<AB: AirBuilder<F = Goldilocks>> {
         inv_van: &(AB::Expr, AB::Expr),
         quot: &(AB::Expr, AB::Expr),
     );
+
+    /// **Super-tile arith (DEEP reduced-opening fold):** the FRI DEEP query check — decode the index bits into
+    /// the query point `x = GEN·Π g^bit`, bind α_fri, and fold `ro = Σ α^k·(pz_k − px_k)/(z_k − x)`, checking
+    /// `QT_E == ro`, gated by `tf`. The inline form lays every one of the `n_terms` terms in COLUMNS
+    /// (`9·n_terms`, the dominant inner-scaling width); a narrow-tall strategy instead witnesses `ro` from slack
+    /// ROWS (the deep-tree size lever — see `wrap::DeepFoldAir`).
+    fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, w: &AB::Expr);
 }
 
 /// The monolith's inline B/C/I — the cap-mux as a degree-`bits` product-mux (the current behavior, kept
@@ -1140,6 +1147,52 @@ impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for InlineBci {
         builder.assert_zero(tf.clone() * (chk.0 - quot.0.clone()));
         builder.assert_zero(tf.clone() * (chk.1 - quot.1.clone()));
     }
+
+    fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, w: &AB::Expr) {
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
+        let g = Goldilocks::two_adic_generator(air.lg());
+        let carry = air.carry();
+        for i in 0..air.lg() {
+            let b = cur[QT_DBITS + i].clone();
+            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
+        }
+        let mut prev = one.clone();
+        for i in 0..air.lg() {
+            let ci = AB::Expr::from(g.exp_power_of_2(air.lg() - 1 - i));
+            let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
+            builder.assert_zero(tf.clone() * (cur[air.qt_acc() + i].clone() - prev * factor));
+            prev = cur[air.qt_acc() + i].clone();
+        }
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[air.qt_acc() + air.lg() - 1].clone();
+        // air.qt_alpha() bound to the carried α_fri
+        builder.assert_zero(tf.clone() * (cur[air.qt_alpha()].clone() - cur[carry].clone()));
+        builder.assert_zero(tf.clone() * (cur[air.qt_alpha() + 1].clone() - cur[carry + 1].clone()));
+        let alpha = gg(air.qt_alpha());
+        builder.assert_zero(tf.clone() * (cur[air.apow(0)].clone() - one.clone()));
+        builder.assert_zero(tf.clone() * cur[air.apow(0) + 1].clone());
+        for k in 1..air.n_terms {
+            let prod = emul(gg(air.apow(k - 1)), alpha.clone());
+            builder.assert_zero(tf.clone() * (cur[air.apow(k)].clone() - prod.0));
+            builder.assert_zero(tf.clone() * (cur[air.apow(k) + 1].clone() - prod.1));
+        }
+        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
+        for k in 0..air.n_terms {
+            let z = gg(air.z(k));
+            let inv = gg(air.inv(k));
+            let z_m_x = (z.0 - x.clone(), z.1);
+            let chk = emul(inv.clone(), z_m_x);
+            builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
+            builder.assert_zero(tf.clone() * chk.1);
+            let d = (cur[air.pz(k)].clone() - cur[air.px(k)].clone(), cur[air.pz(k) + 1].clone());
+            let t = emul(emul(gg(air.apow(k)), d), inv);
+            ro = (ro.0 + t.0, ro.1 + t.1);
+        }
+        builder.assert_zero(tf.clone() * (cur[QT_E].clone() - ro.0));
+        builder.assert_zero(tf.clone() * (cur[QT_E + 1].clone() - ro.1));
+    }
 }
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
@@ -1167,7 +1220,6 @@ impl MonolithAir {
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
         let half = AB::Expr::from(Goldilocks::ONE.halve());
-        let g = Goldilocks::two_adic_generator(self.lg());
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
@@ -1257,43 +1309,9 @@ impl MonolithAir {
         }
 
         // ---------- super-tile arith (block 0, gated by M_TF / P_ROUND / M_TL) ----------
-        for i in 0..self.lg() {
-            let b = cur[QT_DBITS + i].clone();
-            builder.assert_zero(tf.clone() * (b.clone() * (one.clone() - b)));
-        }
-        let mut prev = one.clone();
-        for i in 0..self.lg() {
-            let ci = AB::Expr::from(g.exp_power_of_2(self.lg() - 1 - i));
-            let factor = one.clone() + cur[QT_DBITS + i].clone() * (ci - one.clone());
-            builder.assert_zero(tf.clone() * (cur[self.qt_acc() + i].clone() - prev * factor));
-            prev = cur[self.qt_acc() + i].clone();
-        }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[self.qt_acc() + self.lg() - 1].clone();
-        // self.qt_alpha() bound to the carried α_fri
-        builder.assert_zero(tf.clone() * (cur[self.qt_alpha()].clone() - cur[carry].clone()));
-        builder.assert_zero(tf.clone() * (cur[self.qt_alpha() + 1].clone() - cur[carry + 1].clone()));
-        let alpha = gg(self.qt_alpha());
-        builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
-        builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
-        for k in 1..self.n_terms {
-            let prod = emul(gg(self.apow(k - 1)), alpha.clone());
-            builder.assert_zero(tf.clone() * (cur[self.apow(k)].clone() - prod.0));
-            builder.assert_zero(tf.clone() * (cur[self.apow(k) + 1].clone() - prod.1));
-        }
-        let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
-        for k in 0..self.n_terms {
-            let z = gg(self.z(k));
-            let inv = gg(self.inv(k));
-            let z_m_x = (z.0 - x.clone(), z.1);
-            let chk = emul(inv.clone(), z_m_x);
-            builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
-            builder.assert_zero(tf.clone() * chk.1);
-            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
-            let t = emul(emul(gg(self.apow(k)), d), inv);
-            ro = (ro.0 + t.0, ro.1 + t.1);
-        }
-        builder.assert_zero(tf.clone() * (cur[QT_E].clone() - ro.0));
-        builder.assert_zero(tf.clone() * (cur[QT_E + 1].clone() - ro.1));
+        // Factored through the B/C/I strategy: `InlineBci` re-emits the `9·n_terms`-COLUMN inline fold verbatim
+        // (byte-identical); a narrow-tall strategy witnesses `ro` from slack ROWS (the deep-tree size lever).
+        bci.emit_arith(builder, self, &cur, &tf, &one, &w);
         // β_r binding (per-round one-hots → public β_r = binds[3+r])
         for r in 0..(self.nb() - 3) {
             let pr = p[self.p_round(r)].clone();

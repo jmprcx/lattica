@@ -314,6 +314,11 @@ mod wrap_air {
     }
 
     impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for WrapBci {
+        // The wrap witnesses only the epilogue `c_k` (B/C); the arith tile stays inline (unchanged).
+        fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, w: &AB::Expr) {
+            InlineBci.emit_arith(builder, air, cur, tf, one, w);
+        }
+
         fn emit_capmux(
             &self,
             builder: &mut AB,
@@ -430,6 +435,11 @@ mod wrap_air {
     }
 
     impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for OpTableBci {
+        // The op-table witnesses only the epilogue `c_k` (B/C); the arith tile stays inline (unchanged).
+        fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, w: &AB::Expr) {
+            InlineBci.emit_arith(builder, air, cur, tf, one, w);
+        }
+
         fn emit_capmux(
             &self,
             builder: &mut AB,
