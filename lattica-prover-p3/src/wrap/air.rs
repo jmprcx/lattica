@@ -503,11 +503,17 @@ mod wrap_air {
         pub(crate) fn op_sel(&self) -> usize {
             self.op_base() + 13
         }
+        /// Witnessed arith-head marker (= the `tf` periodic selector, bound by a constraint). The `folded` bus
+        /// READ is gated by this COLUMN, not by `tf` directly — the lookup prover's aux generation resolves
+        /// interaction multiplicities with an empty periodic slice, so periodic must stay out of interactions.
+        pub(crate) fn is_head(&self) -> usize {
+            self.op_base() + 14
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledWrapAir {
         fn width(&self) -> usize {
-            self.m.fused_w() + 2 + 14 // fused + folded(2) + op-table(13) + op_sel(1) — O(1) over fused_w
+            self.m.fused_w() + 2 + 15 // fused + folded(2) + op-table(13) + op_sel(1) + is_head(1) — O(1) over fused_w
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
@@ -553,18 +559,24 @@ mod wrap_air {
             builder.assert_zero(op_sel.clone() * is_sub.clone() * (o0.clone() - (a0.clone() - b0.clone())));
             builder.assert_zero(op_sel.clone() * is_sub.clone() * (o1.clone() - (a1.clone() - b1.clone())));
 
-            // (3) The wiring bus (one LogUp channel): the op-table's internal wiring (reads +op_sel·is_op,
-            // define op_sel·out_mult), plus the arith head READING the op-table's `folded` output at the reserved
-            // FOLDED_ADDR (gated by `tf`) — binding `folded_col` to the op-table's result. On non-op / non-arith
-            // rows the respective mults are 0 (inert).
+            // Bind the witnessed arith-head marker `is_head` to the periodic `tf` (a CONSTRAINT, where periodic
+            // is available) — so the `folded` bus read below can be gated by the COLUMN `is_head` instead of the
+            // periodic `tf` (the lookup prover's aux generation feeds interactions an empty periodic slice).
             let tf = p[self.m.m_tf()].clone();
+            let is_head = cur[self.is_head()].clone();
+            builder.assert_zero(is_head.clone() - tf);
+
+            // (3) The wiring bus (one LogUp channel): the op-table's internal wiring (reads +op_sel·is_op,
+            // define op_sel·out_mult), plus the arith head READING the op-table's `folded` output at the
+            // `folded_addr` (gated by the `is_head` column) — binding `folded_col` to the op-table's result. On
+            // non-op / non-arith rows the respective mults are 0 (inert).
             let read_mult = op_sel.clone() * is_op;
             let folded = (cur[self.folded_col()].clone(), cur[self.folded_col() + 1].clone());
             builder.push_local_interaction(vec![
                 (vec![a_addr, a0, a1], read_mult.clone()),
                 (vec![b_addr, b0, b1], read_mult),
                 (vec![out_addr, o0, o1], op_sel * out_mult),
-                (vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1], tf),
+                (vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1], is_head),
             ]);
         }
     }
@@ -981,7 +993,7 @@ mod tests {
         let (fw, h) = (air.fused_w(), air.height());
         let used = air.tr() + air.n_queries * air.m_period();
         let op_h = op_matrix.values.len() / 13;
-        let width = fw + 16;
+        let width = fw + 17;
         assert!(used + op_h <= h, "op-table rows ({op_h}) must fit in the monolith slack ({})", h - used);
 
         // The arith heads = the rows where the epilogue selector `tf` (= m_tf periodic) fires.
@@ -996,6 +1008,7 @@ mod tests {
         let fc = cc(folded_val);
         for &head in &heads {
             wide[head * width + fw..head * width + fw + 2].copy_from_slice(&fc); // folded_col at arith heads
+            wide[head * width + fw + 16] = Val::ONE; // is_head (= tf) — gates the folded bus read
         }
         let ob = fw + 2;
         for i in 0..op_h {
@@ -1031,8 +1044,7 @@ mod tests {
         let (asm, trace, _pis) = assemble_wrap(&config, &proof, &pvs);
 
         let (fw, h) = (asm.m.fused_w(), asm.m.height());
-        let (width, ob) = (fw + 16, fw + 2);
-        let tf_col = BaseAir::<Val>::periodic_columns(&asm.m)[asm.m.m_tf()].clone();
+        let (width, ob) = (fw + 17, fw + 2);
         const P: u64 = 0xFFFF_FFFF_0000_0001; // Goldilocks order
         let sgn = |v: Val| -> i128 {
             let u = v.as_canonical_u64();
@@ -1050,12 +1062,42 @@ mod tests {
             *bus.entry(key(g(ob + 6), g(ob + 7), g(ob + 8))).or_default() += read; // read a
             *bus.entry(key(g(ob + 9), g(ob + 10), g(ob + 11))).or_default() += read; // read b
             *bus.entry(key(g(ob + 3), g(ob + 4), g(ob + 5))).or_default() += op_sel * sgn(g(ob + 12)); // define out
-            let tf = sgn(tf_col[r % tf_col.len()]);
-            *bus.entry((asm.folded_addr, g(fw).as_canonical_u64(), g(fw + 1).as_canonical_u64())).or_default() += tf; // folded read
+            let is_head = sgn(g(fw + 16)); // arith-head marker (= tf), gates the folded read
+            *bus.entry((asm.folded_addr, g(fw).as_canonical_u64(), g(fw + 1).as_canonical_u64())).or_default() += is_head;
         }
         let bad: Vec<_> = bus.iter().filter(|(_, &m)| m != 0).take(5).collect();
         assert!(bad.is_empty(), "the wiring bus must balance; {} nonzero net entries, e.g. {bad:?}", bus.values().filter(|&&m| m != 0).count());
         println!("assembled wrap bus: {} distinct (addr,val) entries, all net-zero — the cross-region wiring is consistent", bus.len());
+    }
+
+    /// **Brick 5 increment 2b-ii — the assembled wrap PROVES through `prove_lookup`.** The definitive
+    /// soundness check: build the full assembled wrap trace (reused monolith regions + the op-table region +
+    /// the wiring bus) and prove + verify it end-to-end through the W1 lookup prover (outer is_zk=1). This
+    /// confirms the op-table-based wrap is a SOUND STARK — the monolith A–J constraints, the op-table's local
+    /// op relations, the wiring bus (binding `folded_col` to the op-table's computed fold), and the
+    /// `OpTableBci` epilogue (`folded·inv_van == quot`) all hold together — at width `fused_w + 16` (O(1)),
+    /// not `fused_w + 2·n_mul`. Heavy (2^16 → 2^17 hiding commit); `--release --ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves the assembled wrap (2^16 rows) through prove_lookup; run `--release --features lookup,recursion -- --ignored`"]
+    fn wrap_assembled_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::lookup::prover::{prove_lookup, verify_lookup};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_wrap(&config, &proof, &pvs);
+        let width = <AssembledWrapAir as BaseAir<Val>>::width(&asm);
+        println!("proving assembled wrap: width {width} = fused_w {} + 17, {} rows", asm.m.fused_w(), asm.m.height());
+        let lproof = prove_lookup(&asm, trace, &pis);
+        assert!(
+            verify_lookup(&asm, &lproof, &pis).is_ok(),
+            "the assembled op-table-based wrap must prove + verify through prove_lookup"
+        );
     }
 
     /// **Cheap always-on validation of the reused-region epilogue witness (B/H).** The same pre-check
@@ -1215,12 +1257,12 @@ mod tests {
         let lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
         println!(
-            "AssembledWrapAir (op-table region + bus): width {width} = fused_w {fused_w} + 16 (folded 2 + \
-             op-table 13 + op_sel 1), {} lookup(s), log_nqc {log_nqc} (budget {LOG_BLOWUP}) — O(1) over fused_w \
-             vs WrapAir's fused_w + 2·n_mul",
+            "AssembledWrapAir (op-table region + bus): width {width} = fused_w {fused_w} + 17 (folded 2 + \
+             op-table 13 + op_sel 1 + is_head 1), {} lookup(s), log_nqc {log_nqc} (budget {LOG_BLOWUP}) — O(1) \
+             over fused_w vs WrapAir's fused_w + 2·n_mul",
             lookups.len()
         );
-        assert_eq!(width, fused_w + 16, "the assembled wrap adds only O(1) cols (folded + op-table + op_sel)");
+        assert_eq!(width, fused_w + 17, "the assembled wrap adds only O(1) cols (folded + op-table + op_sel + is_head)");
         assert!(log_nqc <= LOG_BLOWUP, "the assembled lookup AIR must compose within the degree budget");
     }
 
