@@ -418,6 +418,103 @@ mod wrap_air {
         }
     }
 
+    /// **Brick 5 — the op-table-based epilogue strategy.** Unlike `WrapBci` (which WITNESSES each `c_k` in a
+    /// column pair — the 2·n_mul width cost), `OpTableBci` emits NO epilogue columns: the `c_k` evaluation +
+    /// α-fold live in the FLATTEN op-table (separate slack rows, `crate::wrap::OpTableF2Air`), and the epilogue
+    /// just READS the op-table's `folded` result from a dedicated column (bound to the op-table by the wiring
+    /// bus, emitted in the outer AIR) and checks `folded·inv_van == quot(ζ)`. So the epilogue costs O(1) columns
+    /// (a 2-felt `folded`) instead of 2·n_mul. Cap-mux delegates to `InlineBci` (as `WrapBci`).
+    pub(crate) struct OpTableBci {
+        /// The column holding the op-table's `folded` result (F_p² pair at `folded_col`, `folded_col + 1`).
+        pub folded_col: usize,
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for OpTableBci {
+        fn emit_capmux(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            pis: &[AB::Expr],
+            one: &AB::Expr,
+            tf: &AB::Expr,
+            openings: &[(usize, usize, usize, usize)],
+        ) {
+            InlineBci.emit_capmux(builder, air, cur, pis, one, tf, openings);
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn emit_epilogue(
+            &self,
+            builder: &mut AB,
+            _air: &MonolithAir,
+            cur: &[AB::Expr],
+            tf: &AB::Expr,
+            w: &AB::Expr,
+            _local: &[(AB::Expr, AB::Expr)],
+            _next: &[(AB::Expr, AB::Expr)],
+            _pubs: &[(AB::Expr, AB::Expr)],
+            _periodic: &[(AB::Expr, AB::Expr)],
+            _is_first: &(AB::Expr, AB::Expr),
+            _is_last: &(AB::Expr, AB::Expr),
+            _is_trans: &(AB::Expr, AB::Expr),
+            _alpha_stark: &(AB::Expr, AB::Expr),
+            inv_van: &(AB::Expr, AB::Expr),
+            quot: &(AB::Expr, AB::Expr),
+        ) {
+            let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+                (
+                    a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                    a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+                )
+            };
+            // The op-table (separate rows) computes `folded`; read it from `folded_col` (bound to the op-table's
+            // result by the wiring bus in the outer AIR) and check the epilogue identity — NO `c_k` witnessing,
+            // so the epilogue costs O(1) columns.
+            let folded = (cur[self.folded_col].clone(), cur[self.folded_col + 1].clone());
+            let chk = emul(folded, inv_van.clone());
+            builder.assert_zero(tf.clone() * (chk.0 - quot.0.clone()));
+            builder.assert_zero(tf.clone() * (chk.1 - quot.1.clone()));
+        }
+    }
+
+    /// **Brick 5 — the assembled wrap AIR (skeleton, increment 1).** Reuses the ENTIRE monolith constraint
+    /// system via `eval_bci` with `OpTableBci`: the reused A–J regions are byte-identical, and the epilogue
+    /// reads the op-table's `folded` (O(1) columns) instead of witnessing 2·n_mul `c_k`. This skeleton
+    /// establishes the strategy plumbing + measures the epilogue-side width contraction (`fused_w + 2` vs
+    /// `WrapAir`'s `fused_w + 2·n_mul`); the op-table REGION (the slack rows computing `folded`) + the wiring
+    /// bus (binding `folded_col` + the openings→leaves seam) are the next increments.
+    pub(crate) struct AssembledWrapAir {
+        pub(crate) m: MonolithAir,
+    }
+
+    impl AssembledWrapAir {
+        pub(crate) fn folded_col(&self) -> usize {
+            self.m.fused_w() // the `folded` pair is appended after the monolith's fused columns
+        }
+    }
+
+    impl BaseAir<Goldilocks> for AssembledWrapAir {
+        fn width(&self) -> usize {
+            self.m.fused_w() + 2 // + the `folded` F_p² pair (increment 1; the op-table columns are added next)
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AssembledWrapAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(builder, &OpTableBci { folded_col: self.folded_col() });
+        }
+    }
+
     /// Native mirror of `Witnesser` (IDENTICAL Arc-memoized DFS order): compute each `Mul` node's F_p² product
     /// from the native OOD openings, so the witnessed `c_k` columns can be filled to satisfy the wrap's
     /// degree-2 binding constraints. Returns the products in the wrap's column-allocation order (`out[i]` →
@@ -499,7 +596,7 @@ mod wrap_air {
 }
 
 #[cfg(feature = "recursion")]
-pub(crate) use wrap_air::{native_witnessed, WrapAir};
+pub(crate) use wrap_air::{native_witnessed, AssembledWrapAir, WrapAir};
 
 #[cfg(test)]
 mod tests {
@@ -881,6 +978,61 @@ mod tests {
             2 * wrap.n_mul
         );
         assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap must be within the degree budget");
+    }
+
+    /// **Brick 5 increment 1 — the assembled wrap AIR composes.** Build a real join-split `MonolithAir`, wrap it
+    /// in `AssembledWrapAir` (`eval_bci` + `OpTableBci` — the epilogue READS the op-table's `folded` instead of
+    /// witnessing 2·n_mul `c_k`), and measure: its width is `fused_w + 2` (the epilogue-side width contraction,
+    /// vs `WrapAir`'s `fused_w + 2·n_mul`) and it stays within the degree budget at is_zk=1. The op-table REGION
+    /// (the slack rows computing `folded`) + the wiring bus (making `folded` sound) are the next increments.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn wrap_assembled_composes() {
+        use crate::joinsplit_air::{
+            build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
+        };
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+        };
+        let fused_w = air.fused_w();
+        let asm = AssembledWrapAir { m: air };
+        let width = <AssembledWrapAir as p3_air::BaseAir<Val>>::width(&asm);
+        let layout = AirLayout::from_air::<Val>(&asm);
+        let log_nqc = get_log_num_quotient_chunks::<Val, AssembledWrapAir>(&asm, layout, 1);
+        println!(
+            "AssembledWrapAir (skeleton): width {width} = fused_w {fused_w} + 2 (epilogue reads folded, NO \
+             2·n_mul c_k cols), log_nqc {log_nqc} (budget {LOG_BLOWUP})"
+        );
+        assert_eq!(width, fused_w + 2, "the assembled epilogue costs O(1) columns, not 2·n_mul");
+        assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap must compose within the degree budget");
     }
 
     /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
