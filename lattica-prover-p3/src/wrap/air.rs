@@ -494,6 +494,11 @@ mod wrap_air {
     /// 2c seam binding — wiring-bus base for the committed-opening region (above any op-table wire address).
     pub(crate) const OPEN_BASE: u64 = 1 << 24;
 
+    /// 2c degree fix — the openings' provides are SPLIT across `N_GROUPS` lookup channels (each ≤ ~16 terms ⇒
+    /// degree ≤ budget), instead of one ~120-term channel (which was log_nqc 6). An opening's channel is
+    /// `open_index % N_GROUPS`; its leaf carries a one-hot `is_ch` selector routing its read to that channel.
+    pub(crate) const N_GROUPS: usize = 8;
+
     /// The canonical `open_id` for an opening, from its `opening_key` `(tag, index)` (tag: 0/1 = Main{0/1} =
     /// local/next, 2 = Public, 3 = Periodic, 4/5/6 = is_first/last/trans) + the inner geometry. Used by BOTH the
     /// arith-head provides (AIR) and the op-table opening-leaf seed (trace), so they address the same opening.
@@ -539,11 +544,18 @@ mod wrap_air {
         pub(crate) fn is_leaf_col(&self) -> usize {
             self.op_base() + 16
         }
+        /// One-hot channel selector `g` (0..N_GROUPS) — routes an opening-leaf's read to the lookup channel its
+        /// opening's provide is on (so the ~120 provides split across N_GROUPS ≤~16-term lookups, keeping degree
+        /// within budget).
+        pub(crate) fn is_ch_col(&self, g: usize) -> usize {
+            self.op_base() + 17 + g
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledWrapAir {
         fn width(&self) -> usize {
-            self.m.fused_w() + 2 + 17 // folded(2)+op-table(13)+op_sel(1)+is_head(1)+open_id(1)+is_leaf(1) — O(1) over fused_w
+            // folded(2) + op-table(13) + op_sel(1) + is_head(1) + open_id(1) + is_leaf(1) + is_ch(N_GROUPS) — O(1).
+            self.m.fused_w() + 2 + 17 + N_GROUPS
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
@@ -596,47 +608,63 @@ mod wrap_air {
             let tf = p[self.m.m_tf()].clone();
             let is_head = cur[self.is_head()].clone();
             builder.assert_zero(is_head.clone() - tf);
+            // is_leaf boolean + one-hot `is_ch` (each boolean, Σ == is_leaf) — routes each opening-leaf's read to
+            // its opening's lookup channel. `is_ch_g ⟹ is_leaf`, so the leaf-read mult `is_ch_g·n_heads` is deg 1.
             let is_leaf = cur[self.is_leaf_col()].clone();
-            builder.assert_zero(is_leaf.clone() * (is_leaf.clone() - one.clone())); // is_leaf boolean
+            builder.assert_zero(is_leaf.clone() * (is_leaf.clone() - one.clone()));
+            let is_ch: Vec<AB::Expr> = (0..N_GROUPS).map(|g| cur[self.is_ch_col(g)].clone()).collect();
+            let mut ch_sum: AB::Expr = AB::Expr::ZERO;
+            for c in &is_ch {
+                builder.assert_zero(c.clone() * (c.clone() - one.clone()));
+                ch_sum = ch_sum + c.clone();
+            }
+            builder.assert_zero(ch_sum - is_leaf);
 
-            // (3) The wiring bus (one LogUp channel). Op-table wiring (reads +op_sel·is_op, define op_sel·out_mult)
-            // + the arith head reading `folded` at `folded_addr` (+is_head) + the **2c SEAM binding**: each
-            // opening-leaf READS its committed opening at `open_id` (mult is_leaf·n_heads), and the arith head
-            // PROVIDES every ζ-opening there from the monolith's committed columns (pz local/next, pis pubs/
-            // periodic, sel is_first/last, ζ−g⁻¹ is_trans; mult −is_head, so −n_heads total). Balance ⇒ every
-            // opening-leaf value equals the committed `pz`/`pis`/`sel` — the op-table's trace openings are BOUND.
+            // (3) The wiring bus, SPLIT across channels to keep each lookup's degree within budget. Channel 0 =
+            // op-table wiring (reads +op_sel·is_op, define op_sel·out_mult) + the `folded` read (+is_head).
+            // Channels 1..=N_GROUPS = the **2c opening binding** groups: each opening is PROVIDED (from the
+            // committed pz/pis/sel, mult −is_head) on channel `open_index % N_GROUPS + 1`, and its leaf READS it
+            // there (mult is_ch·n_heads). Balance ⇒ every opening-leaf value == the committed column — BOUND.
             let read_mult = op_sel.clone() * is_op;
             let folded = (cur[self.folded_col()].clone(), cur[self.folded_col() + 1].clone());
             let n_heads = AB::Expr::from(Goldilocks::from_u64(self.m.n_queries as u64));
             let neg_head = AB::Expr::ZERO - is_head.clone();
             let (w_in, np, nper) = (self.m.w_inner() as u64, self.m.n_pub() as u64, self.m.n_periodic() as u64);
             let oid = |x: u64| AB::Expr::from(Goldilocks::from_u64(x));
-            let mut terms = vec![
-                (vec![a_addr, a0, a1], read_mult.clone()),
-                (vec![b_addr, b0, b1], read_mult),
-                (vec![out_addr, o0.clone(), o1.clone()], op_sel * out_mult),
-                (vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1], is_head),
-                (vec![cur[self.open_id_col()].clone(), o0, o1], is_leaf * n_heads), // leaf reads its opening
-            ];
+            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); N_GROUPS + 1];
+            chans[0].push((vec![a_addr, a0, a1], read_mult.clone()));
+            chans[0].push((vec![b_addr, b0, b1], read_mult));
+            chans[0].push((vec![out_addr, o0.clone(), o1.clone()], op_sel * out_mult));
+            chans[0].push((vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1], is_head));
+            let (open_id_v, lo0, lo1) = (cur[self.open_id_col()].clone(), o0, o1);
+            for g in 0..N_GROUPS {
+                chans[g + 1].push((vec![open_id_v.clone(), lo0.clone(), lo1.clone()], is_ch[g].clone() * n_heads.clone()));
+            }
+            // Collect every opening's provide `(open_index, value)`, then route to channel `idx % N_GROUPS + 1`.
+            let mut prov: Vec<(u64, AB::Expr, AB::Expr)> = Vec::new();
             for c in 0..self.m.w_inner() {
                 let (pl, pn) = (self.m.pz(self.m.trm_trace(c)), self.m.pz(self.m.trm_next(c)));
-                terms.push((vec![oid(open_id((0, c as u64), w_in, np, nper)), cur[pl].clone(), cur[pl + 1].clone()], neg_head.clone()));
-                terms.push((vec![oid(open_id((1, c as u64), w_in, np, nper)), cur[pn].clone(), cur[pn + 1].clone()], neg_head.clone()));
+                prov.push((open_id((0, c as u64), w_in, np, nper) - OPEN_BASE, cur[pl].clone(), cur[pl + 1].clone()));
+                prov.push((open_id((1, c as u64), w_in, np, nper) - OPEN_BASE, cur[pn].clone(), cur[pn + 1].clone()));
             }
             for i in 0..self.m.n_pub() {
-                let v = pis[self.m.pub_pi() + i].clone();
-                terms.push((vec![oid(open_id((2, i as u64), w_in, np, nper)), v, AB::Expr::ZERO], neg_head.clone()));
+                prov.push((open_id((2, i as u64), w_in, np, nper) - OPEN_BASE, pis[self.m.pub_pi() + i].clone(), AB::Expr::ZERO));
             }
             for i in 0..self.m.n_periodic() {
-                let (v0, v1) = (pis[self.m.periodic_base() + 2 * i].clone(), pis[self.m.periodic_base() + 2 * i + 1].clone());
-                terms.push((vec![oid(open_id((3, i as u64), w_in, np, nper)), v0, v1], neg_head.clone()));
+                let (pb0, pb1) = (self.m.periodic_base() + 2 * i, self.m.periodic_base() + 2 * i + 1);
+                prov.push((open_id((3, i as u64), w_in, np, nper) - OPEN_BASE, pis[pb0].clone(), pis[pb1].clone()));
             }
             let (s0, s2) = (self.m.sel(0), self.m.sel(2));
-            terms.push((vec![oid(open_id((4, 0), w_in, np, nper)), cur[s0].clone(), cur[s0 + 1].clone()], neg_head.clone()));
-            terms.push((vec![oid(open_id((5, 0), w_in, np, nper)), cur[s2].clone(), cur[s2 + 1].clone()], neg_head.clone()));
+            prov.push((open_id((4, 0), w_in, np, nper) - OPEN_BASE, cur[s0].clone(), cur[s0 + 1].clone()));
+            prov.push((open_id((5, 0), w_in, np, nper) - OPEN_BASE, cur[s2].clone(), cur[s2 + 1].clone()));
             let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(self.m.cm_rounds() - self.m.is_zk).inverse());
-            terms.push((vec![oid(open_id((6, 0), w_in, np, nper)), pis[2].clone() - g_inv, pis[3].clone()], neg_head));
-            builder.push_local_interaction(terms);
+            prov.push((open_id((6, 0), w_in, np, nper) - OPEN_BASE, pis[2].clone() - g_inv, pis[3].clone()));
+            for (idx, v0, v1) in prov {
+                chans[(idx as usize % N_GROUPS) + 1].push((vec![oid(OPEN_BASE + idx), v0, v1], neg_head.clone()));
+            }
+            for ch in chans {
+                builder.push_local_interaction(ch);
+            }
         }
     }
 
@@ -721,7 +749,7 @@ mod wrap_air {
 }
 
 #[cfg(feature = "recursion")]
-pub(crate) use wrap_air::{native_witnessed, open_id, AssembledWrapAir, WrapAir};
+pub(crate) use wrap_air::{native_witnessed, open_id, AssembledWrapAir, WrapAir, N_GROUPS, OPEN_BASE};
 
 #[cfg(test)]
 mod tests {
@@ -1073,7 +1101,7 @@ mod tests {
         let (fw, h) = (air.fused_w(), air.height());
         let used = air.tr() + air.n_queries * air.m_period();
         let op_h = op_matrix.values.len() / 13;
-        let width = fw + 19;
+        let width = fw + 19 + N_GROUPS;
         assert!(used + op_h <= h, "op-table rows ({op_h}) must fit in the monolith slack ({})", h - used);
 
         // The arith heads = the rows where the epilogue selector `tf` (= m_tf periodic) fires.
@@ -1106,6 +1134,8 @@ mod tests {
             let dst = used + row;
             wide[dst * width + fw + 17] = Val::from_u64(oid); // open_id
             wide[dst * width + fw + 18] = Val::ONE; // is_leaf
+            let ch = ((oid - OPEN_BASE) as usize) % N_GROUPS; // one-hot channel = open_index % N_GROUPS
+            wide[dst * width + fw + 19 + ch] = Val::ONE; // is_ch[ch]
         }
         (AssembledWrapAir { m: air, folded_addr }, RowMajorMatrix::new(wide, width), pis)
     }
@@ -1132,7 +1162,7 @@ mod tests {
         let (asm, trace, pis) = assemble_wrap(&config, &proof, &pvs);
 
         let (fw, h) = (asm.m.fused_w(), asm.m.height());
-        let (width, ob) = (fw + 19, fw + 2);
+        let (width, ob) = (fw + 19 + N_GROUPS, fw + 2);
         let tf_col = BaseAir::<Val>::periodic_columns(&asm.m)[asm.m.m_tf()].clone();
         let n_heads = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).count() as i128;
         let (wu, npu, nperu) = (asm.m.w_inner() as u64, asm.m.n_pub() as u64, asm.m.n_periodic() as u64);
@@ -1143,44 +1173,49 @@ mod tests {
             if u > P / 2 { u as i128 - P as i128 } else { u as i128 }
         };
         let ku = |v: Val| v.as_canonical_u64();
+        let chan = |oid: u64| ((oid - OPEN_BASE) as usize % N_GROUPS) + 1; // an opening's lookup channel
 
-        let mut bus: HashMap<(u64, u64, u64), i128> = HashMap::new();
+        // Key by (CHANNEL, addr, v0, v1) — each LogUp channel must balance INDEPENDENTLY (so a mis-routed
+        // leaf-read is caught, not just a value mismatch).
+        let mut bus: HashMap<(usize, u64, u64, u64), i128> = HashMap::new();
         for r in 0..h {
             let b = r * width;
             let g = |c: usize| trace.values[b + c];
             let op_sel = sgn(g(fw + 15));
             let is_op = sgn(g(ob)) + sgn(g(ob + 1)) + sgn(g(ob + 2));
             let read = op_sel * is_op;
-            *bus.entry((ku(g(ob + 6)), ku(g(ob + 7)), ku(g(ob + 8)))).or_default() += read; // read a
-            *bus.entry((ku(g(ob + 9)), ku(g(ob + 10)), ku(g(ob + 11)))).or_default() += read; // read b
-            *bus.entry((ku(g(ob + 3)), ku(g(ob + 4)), ku(g(ob + 5)))).or_default() += op_sel * sgn(g(ob + 12)); // define
+            *bus.entry((0, ku(g(ob + 6)), ku(g(ob + 7)), ku(g(ob + 8)))).or_default() += read; // read a (ch 0)
+            *bus.entry((0, ku(g(ob + 9)), ku(g(ob + 10)), ku(g(ob + 11)))).or_default() += read; // read b
+            *bus.entry((0, ku(g(ob + 3)), ku(g(ob + 4)), ku(g(ob + 5)))).or_default() += op_sel * sgn(g(ob + 12)); // def
             let is_head = sgn(g(fw + 16));
-            *bus.entry((asm.folded_addr, ku(g(fw)), ku(g(fw + 1)))).or_default() += is_head; // folded read
-            let is_leaf = sgn(g(fw + 18));
-            *bus.entry((ku(g(fw + 17)), ku(g(ob + 4)), ku(g(ob + 5)))).or_default() += is_leaf * n_heads; // leaf read
+            *bus.entry((0, asm.folded_addr, ku(g(fw)), ku(g(fw + 1)))).or_default() += is_head; // folded read (ch 0)
+            for gc in 0..N_GROUPS {
+                let is_ch = sgn(g(fw + 19 + gc));
+                *bus.entry((gc + 1, ku(g(fw + 17)), ku(g(ob + 4)), ku(g(ob + 5)))).or_default() += is_ch * n_heads; // leaf read → its channel
+            }
             if is_head != 0 {
-                // 2c provides — the arith head provides every committed ζ-opening (mult −is_head).
+                let mut prov = |oid: u64, v0: u64, v1: u64| *bus.entry((chan(oid), oid, v0, v1)).or_default() -= is_head;
                 for c in 0..asm.m.w_inner() {
                     let (pl, pn) = (asm.m.pz(asm.m.trm_trace(c)), asm.m.pz(asm.m.trm_next(c)));
-                    *bus.entry((open_id((0, c as u64), wu, npu, nperu), ku(g(pl)), ku(g(pl + 1)))).or_default() -= is_head;
-                    *bus.entry((open_id((1, c as u64), wu, npu, nperu), ku(g(pn)), ku(g(pn + 1)))).or_default() -= is_head;
+                    prov(open_id((0, c as u64), wu, npu, nperu), ku(g(pl)), ku(g(pl + 1)));
+                    prov(open_id((1, c as u64), wu, npu, nperu), ku(g(pn)), ku(g(pn + 1)));
                 }
                 for i in 0..asm.m.n_pub() {
-                    *bus.entry((open_id((2, i as u64), wu, npu, nperu), ku(pis[asm.m.pub_pi() + i]), 0)).or_default() -= is_head;
+                    prov(open_id((2, i as u64), wu, npu, nperu), ku(pis[asm.m.pub_pi() + i]), 0);
                 }
                 for i in 0..asm.m.n_periodic() {
                     let (pb0, pb1) = (asm.m.periodic_base() + 2 * i, asm.m.periodic_base() + 2 * i + 1);
-                    *bus.entry((open_id((3, i as u64), wu, npu, nperu), ku(pis[pb0]), ku(pis[pb1]))).or_default() -= is_head;
+                    prov(open_id((3, i as u64), wu, npu, nperu), ku(pis[pb0]), ku(pis[pb1]));
                 }
                 let (s0, s2) = (asm.m.sel(0), asm.m.sel(2));
-                *bus.entry((open_id((4, 0), wu, npu, nperu), ku(g(s0)), ku(g(s0 + 1)))).or_default() -= is_head;
-                *bus.entry((open_id((5, 0), wu, npu, nperu), ku(g(s2)), ku(g(s2 + 1)))).or_default() -= is_head;
-                *bus.entry((open_id((6, 0), wu, npu, nperu), ku(pis[2] - g_inv), ku(pis[3]))).or_default() -= is_head;
+                prov(open_id((4, 0), wu, npu, nperu), ku(g(s0)), ku(g(s0 + 1)));
+                prov(open_id((5, 0), wu, npu, nperu), ku(g(s2)), ku(g(s2 + 1)));
+                prov(open_id((6, 0), wu, npu, nperu), ku(pis[2] - g_inv), ku(pis[3]));
             }
         }
         let bad: Vec<_> = bus.iter().filter(|(_, &m)| m != 0).take(8).collect();
-        assert!(bad.is_empty(), "the wiring bus must balance; {} nonzero net entries, e.g. {bad:?}", bus.values().filter(|&&m| m != 0).count());
-        println!("assembled wrap bus (with 2c opening binding): {} distinct (addr,val) entries, all net-zero — the op-table's trace-opening leaves are BOUND to the committed columns", bus.len());
+        assert!(bad.is_empty(), "each lookup channel must balance; {} nonzero net entries, e.g. {bad:?}", bus.values().filter(|&&m| m != 0).count());
+        println!("assembled wrap bus (2c binding, SPLIT into {} channels): {} distinct (channel,addr,val) entries, all net-zero — the opening leaves are BOUND, per-channel", N_GROUPS + 1, bus.len());
     }
 
     /// **Brick 5 increment 2b-ii — the assembled wrap PROVES through `prove_lookup`.** The definitive
@@ -1370,22 +1405,16 @@ mod tests {
         let lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
         println!(
-            "AssembledWrapAir (op-table + bus + 2c binding): width {width} = fused_w {fused_w} + 19 (folded 2 + \
-             op-table 13 + op_sel 1 + is_head 1 + open_id 1 + is_leaf 1), {} lookup(s), log_nqc {log_nqc} \
-             (budget {LOG_BLOWUP}) — O(1) over fused_w vs WrapAir's fused_w + 2·n_mul",
+            "AssembledWrapAir (op-table + bus + 2c binding, SPLIT): width {width} = fused_w {fused_w} + {} (folded \
+             2 + op-table 13 + op_sel 1 + is_head 1 + open_id 1 + is_leaf 1 + is_ch {N_GROUPS}), {} lookup(s), \
+             log_nqc {log_nqc} (budget {LOG_BLOWUP}) — O(1) over fused_w vs WrapAir's fused_w + 2·n_mul",
+            19 + N_GROUPS,
             lookups.len()
         );
-        assert_eq!(width, fused_w + 19, "the assembled wrap adds only O(1) cols (folded + op-table + selectors + binding)");
-        // **2c degree obstacle (measured):** the opening binding puts ~120 arith-head provides on ONE lookup
-        // channel, which drives `log_nqc` to 6 > the budget 4 — the naive single-lookup binding is
-        // DEGREE-INFEASIBLE (the LogUp constraint degree grows with the term count). The binding itself is
-        // CORRECT (the trace bus balances — `wrap_assembled_bus_balances` = 1416 net-zero, the opening leaves ARE
-        // bound to the committed pz/pis/sel columns); the OPEN follow-up is a LOW-DEGREE opening binding: split
-        // the provides across ≤~12-term lookups with leaf→channel routing, or bind an RLC of the openings in a
-        // 2nd challenge round. So W3's SIZE contraction stands (width fused_w+O(1)); 2c's soundness binding is
-        // built + validated correct but needs the degree fix.
-        println!("  (2c binding degree: log_nqc = {log_nqc} > budget {LOG_BLOWUP} — the 120-provide bus needs splitting; binding is correct per the native bus check)");
-        assert!(log_nqc <= 8, "sanity: the binding's degree is bounded (the fix reduces it to ≤ budget)");
+        assert_eq!(width, fused_w + 19 + N_GROUPS, "the assembled wrap adds only O(1) cols (op-table + binding + routing)");
+        // The 2c opening binding's ~120 provides are SPLIT across N_GROUPS+1 lookup channels (each ≤ ~16 terms),
+        // so the assembled wrap composes WITHIN the degree budget again (was log_nqc 6 on one channel; now 4).
+        assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap (split binding) must compose within the degree budget");
     }
 
     /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
@@ -1602,15 +1631,16 @@ mod tests {
         let asm_lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_al, asm_nqc) = combined_constraint_layout(&asm, &asm_lookups, 1);
         println!(
-            "R5 ASSEMBLED (the op-table wrap, PROVEN on join-split): width {asm_width} = fused_w {outer_w} + 19 \
-             (folded 2 + op-table 13 + op_sel 1 + is_head 1 + open_id 1 + is_leaf 1), composes log_nqc {asm_nqc} ≤ {LOG_BLOWUP}. ⇒ the \
+            "R5 ASSEMBLED (the op-table wrap, PROVEN on join-split): width {asm_width} = fused_w {outer_w} + {} \
+             (op-table + folded + binding + is_ch routing), composes log_nqc {asm_nqc} ≤ {LOG_BLOWUP}. ⇒ the \
              WITNESSED WrapAir {wrap_w} CONTRACTS to the ASSEMBLED {asm_width} — back to ≈ the inline monolith \
-             {outer_w}; the 2·n_mul c_k columns become {op_rows} slack ROWS. W3 SIZE FIX: PROVEN + MEASURED."
+             {outer_w}; the 2·n_mul c_k columns become {op_rows} slack ROWS. W3 SIZE FIX: PROVEN + MEASURED.",
+            19 + N_GROUPS
         );
-        assert_eq!(asm_width, outer_w + 19, "the assembled wrap is fused_w + O(1), not fused_w + 2·n_mul");
-        // 2c note: with the opening binding, asm_nqc > budget (the 120-provide bus is degree-infeasible in the
-        // naive single-lookup form — see wrap_assembled_composes); the WIDTH result (fused_w+O(1)) stands.
-        assert!(asm_nqc <= 8, "sanity: the binding's degree is bounded (the low-degree fix reduces it to ≤ budget)");
+        assert_eq!(asm_width, outer_w + 19 + N_GROUPS, "the assembled wrap is fused_w + O(1), not fused_w + 2·n_mul");
+        // The 2c binding's provides are split across N_GROUPS+1 lookup channels, so the assembled R5 wrap
+        // composes within the degree budget (the naive single-lookup form was over budget).
+        assert!(asm_nqc <= LOG_BLOWUP, "the assembled R5 wrap (split binding) must compose within the degree budget");
         assert!(inline_nqc > LOG_BLOWUP, "the inline monolith must EXPLODE on a monolith-as-inner (the R5 bug)");
         assert!(wrap_nqc <= LOG_BLOWUP, "the wrap must FIX it — witnessed epilogue stays within budget");
     }
