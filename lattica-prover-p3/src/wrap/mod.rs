@@ -337,6 +337,35 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for DeepFoldAir {
     }
 }
 
+/// A valid [`DeepFoldAir`] trace of `n_terms` synthetic DEEP terms (padded): `α`, `x` constant; each term's
+/// `z` (distinct, invertible `z − x`), `pz`, `px` chosen; `inv = 1/(z − x)`, `t = α^k·(pz − px)·inv`, and `ro`
+/// the running sum. Padding rows continue the fold (they are valid terms), so every row satisfies the AIR.
+pub fn deep_fold_trace(n_terms: usize) -> RowMajorMatrix<Val> {
+    use crate::config::Challenge;
+    use p3_field::{BasedVectorSpace, Field};
+    let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+    let alpha = Challenge::from_basis_coefficients_fn(|k| Val::from_u64(if k == 0 { 3 } else { 2 }));
+    let x = Challenge::from_basis_coefficients_fn(|k| Val::from_u64(if k == 0 { 5 } else { 7 }));
+    let h = n_terms.next_power_of_two().max(1 << 4);
+    let mut flat = vec![Val::ZERO; h * 18];
+    let (mut apow, mut ro) = (Challenge::ONE, Challenge::ZERO);
+    for k in 0..h {
+        // z is a base-field value (imaginary 0); z − x has imaginary −7 ≠ 0 ⇒ always invertible.
+        let z = Challenge::from(Val::from_u64(100 + k as u64 * 13));
+        let pz = Challenge::from(Val::from_u64(200 + k as u64 * 7));
+        let px = Challenge::from(Val::from_u64(50 + k as u64 * 11));
+        let inv = (z - x).inverse();
+        let t = apow * (pz - px) * inv;
+        ro += t;
+        let b = k * 18;
+        for (o, v) in [(0, alpha), (2, x), (4, apow), (6, z), (8, pz), (10, px), (12, inv), (14, t), (16, ro)] {
+            flat[b + o..b + o + 2].copy_from_slice(&cc(v));
+        }
+        apow *= alpha;
+    }
+    RowMajorMatrix::new(flat, 18)
+}
+
 /// **W3 (size) — the FLATTEN op-table: a narrow-tall arithmetic-circuit evaluator with a LogUp wiring bus.**
 /// The W2 witnessed epilogue pays `2·n_mul` dedicated COLUMNS (each F_p² `Mul` → a degree-1 column pair,
 /// filled only at the `n_queries` arith heads, wasted on every other row). W3 replaces them with this
@@ -976,6 +1005,34 @@ mod tests {
              (budget {LOG_BLOWUP}) — replaces the 486-COLUMN arith tile (join-split n_terms=54) with 54 slack ROWS"
         );
         assert!(log_nqc <= LOG_BLOWUP, "the narrow-tall DEEP fold must stay within the degree budget (got {log_nqc})");
+    }
+
+    /// **Arith-tile narrow-tall brick 2 — PROVE the recurrence is correct.** The measure test shows constant
+    /// width + low degree; this proves the DEEP-fold *constraints* are right. A synthetic 54-term fold (the real
+    /// join-split `n_terms`) proves + verifies through the PRODUCTION prover, and corrupting a single
+    /// running-sum cell is rejected (prove can't close the quotient, or verify catches it) — so the narrow-tall
+    /// `ro = Σ α^k·(pz − px)/(z − x)` recurrence is sound, ready to swap for the monolith's `9·n_terms` columns.
+    #[test]
+    fn deep_fold_proves() {
+        use crate::config::make_config;
+        use p3_uni_stark::{prove, verify};
+        let config = make_config();
+        let proof = prove(&config, &DeepFoldAir, deep_fold_trace(54), &[]);
+        assert!(verify(&config, &DeepFoldAir, &proof, &[]).is_ok(), "the narrow-tall DEEP fold must verify");
+
+        // Corrupt one running-sum (ro.0, row 0) ⇒ the fold recurrence breaks. A broken trace must NOT yield a
+        // valid proof: prove either fails to form the quotient (panics in debug) or verify rejects it.
+        let mut bad = deep_fold_trace(54);
+        bad.values[16] += Val::ONE;
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // a broken-trace prove panic is expected — keep test output clean
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = prove(&config, &DeepFoldAir, bad, &[]);
+            verify(&config, &DeepFoldAir, &p, &[]).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted DEEP fold must not produce a valid proof");
     }
 
     /// **The synthetic result, grounded in the REAL inner.** Extract the actual `JoinSplitAir` constraints,
