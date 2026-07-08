@@ -1581,6 +1581,25 @@ mod tests {
             width / w_inner,
             arith_tile * 100 / fused_w
         );
+
+        // **The arith-tile narrow-tall WIN, projected + feasibility-checked (post-`ffe9f47`).** With `DeepFoldBci`
+        // the `9·n_terms` inline arith COLUMNS are externalized (ArithWrapAir today: `ro` witnessed, columns still
+        // present). The completed swap places the narrow-tall `DeepFoldAir` (n_terms ROWS per query, width 18) in
+        // trace SLACK and removes the columns. Grounded on THIS real inner: (1) the region FITS the slack, and
+        // (2) the width contracts — the concrete size-fixed-point lever.
+        let (n_q, hgt) = (asm.m.n_queries, asm.m.height());
+        let (used, region_rows) = (asm.m.tr() + n_q * asm.m.m_period(), n_terms * n_q);
+        assert!(region_rows <= hgt - used, "narrow-tall region ({region_rows} rows) must fit the slack ({})", hgt - used);
+        let swapped_w = fused_w - arith_tile + 18 + 2; // −9·n_terms cols, +DeepFoldAir region (18) + ro_col (2)
+        println!(
+            "  → ARITH-TILE narrow-tall projection: region {region_rows} rows ≤ slack {} ✓; width fused_w {fused_w} \
+             → SWAPPED {swapped_w} (−{arith_tile} arith cols + 20 O(1)) ⇒ B {}→{} (outer/inner). The 9·n_terms \
+             COLUMNS are the removed inner-scaling term; caps + canonicalization + Tip5 then drive B → ≤ 1.",
+            hgt - used,
+            width / w_inner,
+            swapped_w / w_inner
+        );
+        assert!(swapped_w < fused_w, "the narrow-tall arith swap must strictly shrink the monolith width");
     }
 
     /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
