@@ -1037,6 +1037,8 @@ mod wrap_air {
                 } else {
                     (cur[self.m.z(k)].clone(), cur[self.m.z(k) + 1].clone())
                 };
+                // NARROW: px is not stored — SOURCE it from the ov/qc carrier it's bound to; FULL: cur[px(k)].
+                let px_col = if self.m.narrow_arith { self.m.px_source(k) } else { self.m.px(k) };
                 let head_provide = vec![
                     x_head.clone(),
                     AB::Expr::ZERO,
@@ -1045,7 +1047,7 @@ mod wrap_air {
                     z1,
                     cur[self.m.pz(k)].clone(),
                     cur[self.m.pz(k) + 1].clone(),
-                    cur[self.m.px(k)].clone(),
+                    cur[px_col].clone(),
                 ];
                 chans[k % N_GROUPS + 1].push((head_provide, AB::Expr::ZERO - is_head.clone()));
             }
@@ -1876,9 +1878,9 @@ mod tests {
         };
         let full = mk(false);
         let (full_fused_w, n_terms, w_inner) = (full.fused_w(), full.n_terms, full.w_inner());
-        let air = mk(true); // NARROW: z + inv/apow gone (stride 9→3), the fold externalized + z re-derived
+        let air = mk(true); // NARROW: z+px+inv/apow gone (stride 9→2), fold externalized, z re-derived, px sourced
         let fused_w = air.fused_w();
-        assert_eq!(fused_w, full_fused_w - 6 * n_terms, "narrow_arith drops z+inv+apow (6 felts/term) from fused_w");
+        assert_eq!(fused_w, full_fused_w - 7 * n_terms, "narrow_arith drops z+px+inv+apow (7 felts/term) from fused_w");
 
         let asm = AssembledArithWrapAir { m: air };
         let width = <AssembledArithWrapAir as p3_air::BaseAir<Val>>::width(&asm);
@@ -1886,16 +1888,16 @@ mod tests {
         let lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
         println!(
-            "AA5.3 NARROW arith harvest: full fused_w {full_fused_w} (B {}×) → narrow {fused_w} (B {}×); wrap width \
+            "AA5.4 NARROW arith harvest: full fused_w {full_fused_w} (B {}×) → narrow {fused_w} (B {}×); wrap width \
              {width} = fused_w {fused_w} + {} (ro 2 + DeepFoldAir 18 + 4 markers + term_idx 1 + is_ch {N_GROUPS}), \
-             was {full_width}; {} lookup(s), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Dropped z+inv+apow = {} felts \
-             (6·n_terms: inv/apow externalized, z re-derived = ζ/ζ·g); only [pz, px] kept. AA5.4 (source px from \
-             the Merkle super-tile) then leaves only pz.",
+             was {full_width}; {} lookup(s), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Dropped z+px+inv+apow = {} felts \
+             (7·n_terms: inv/apow externalized, z re-derived = ζ/ζ·g, px sourced from the ov/qc Merkle-leaf \
+             carriers); only [pz] (the genuine OOD opening) kept — the arith tile is now the FULL-WIN minimum.",
             full_width / w_inner,
             width / w_inner,
             25 + N_GROUPS,
             lookups.len(),
-            6 * n_terms
+            7 * n_terms
         );
         assert_eq!(width, fused_w + 25 + N_GROUPS, "the wrap adds only O(1) cols over the narrow fused_w");
         assert!(log_nqc <= LOG_BLOWUP, "the narrow arith-assembled wrap must compose within the degree budget");
@@ -1969,7 +1971,9 @@ mod tests {
                     } else {
                         gv(air.z(k))
                     };
-                    (z, gv(air.pz(k)), Challenge::from(row(air.px(k))))
+                    // NARROW: source px from the ov/qc carrier it's bound to; FULL: the stored px(k).
+                    let px_col = if air.narrow_arith { air.px_source(k) } else { air.px(k) };
+                    (z, gv(air.pz(k)), Challenge::from(row(px_col)))
                 })
                 .collect();
             let region = deep_fold_trace_from(alpha, x, &terms, 0);
@@ -2055,9 +2059,10 @@ mod tests {
                     } else {
                         (g(m.z(k)), g(m.z(k) + 1))
                     };
+                    let px_col = if m.narrow_arith { m.px_source(k) } else { m.px(k) };
                     let tuple = vec![
                         ku(x_head), 0, k as u64,
-                        ku(z0), ku(z1), ku(g(m.pz(k))), ku(g(m.pz(k) + 1)), ku(g(m.px(k))),
+                        ku(z0), ku(z1), ku(g(m.pz(k))), ku(g(m.pz(k) + 1)), ku(g(px_col)),
                     ];
                     *bus.entry((k % N_GROUPS + 1, tuple)).or_default() -= 1;
                 }

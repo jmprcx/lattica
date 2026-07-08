@@ -124,9 +124,9 @@ pub(crate) fn monolith_build_trace(
             }
             t[base0 + air.pz(k)] = pzc[0];
             t[base0 + air.pz(k) + 1] = pzc[1];
-            t[base0 + air.px(k)] = px;
-            // `inv`/`apow` are the inline fold's helpers — absent in NARROW mode (the wrap externalizes the fold).
+            // `px`/`inv`/`apow` are FULL-only: NARROW sources px from the ov/qc carrier + externalizes the fold.
             if !air.narrow_arith {
+                t[base0 + air.px(k)] = px;
                 let inv = c((z - Challenge::from(x)).inverse());
                 t[base0 + air.inv(k)] = inv[0];
                 t[base0 + air.inv(k) + 1] = inv[1];

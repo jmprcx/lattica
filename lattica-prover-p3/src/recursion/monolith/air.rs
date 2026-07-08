@@ -336,10 +336,28 @@ impl MonolithAir {
     // opening the epilogue folds) + `px` (the authenticated leaf) stay. See `narrow_arith`.
     pub(crate) fn arith_stride(&self) -> usize {
         if self.narrow_arith {
-            3
+            2
         } else {
             9
         }
+    }
+    // NARROW: `px(k)` is not stored — it's the authenticated leaf, so it's SOURCED from the `ov`/quotient-leaf
+    // carrier it is bound to (`px_bind` at the OOD region: trace ζ/ζ_next → `ov_c(c)`, quotient → `qc(i·stride+j)`).
+    // This inverts that binding. FULL never calls it (px is stored at `px(k)`).
+    pub(crate) fn px_source(&self, k: usize) -> usize {
+        for c in 0..self.trm_committed_w() {
+            if self.trm_trace(c) == k || self.trm_next(c) == k {
+                return self.ov_c(c);
+            }
+        }
+        let stride = self.quot_chunk_stride();
+        for c in 0..self.quot_leaf_felts() {
+            let (i, j) = (c / stride, c % stride);
+            if j < self.trm_chunk_w() && self.trm_quot(i, j) == k {
+                return self.qc(c);
+            }
+        }
+        panic!("narrow arith term {k} has no px carrier (px_source)");
     }
     // `z`/`inv`/`apow` exist only in FULL mode; never read when `narrow_arith` (z re-derived, inv/apow externalized).
     pub(crate) fn z(&self, k: usize) -> usize {
@@ -1574,7 +1592,8 @@ impl MonolithAir {
         for c in 0..self.input_leaf_felts() {
             let ovc = self.ov_c(c);
             builder.when_transition().assert_zero(hold.clone() * (nxt[ovc].clone() - cur[ovc].clone()));
-            if c < self.trm_committed_w() {
+            // NARROW: px is not stored (the wrap SOURCES it from this ov carrier); nothing to bind here.
+            if c < self.trm_committed_w() && !self.narrow_arith {
                 builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_trace(c))].clone())); // @ ζ
                 builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_next(c))].clone())); // @ ζ_next
             }
@@ -1599,7 +1618,8 @@ impl MonolithAir {
                 let qcj = self.qc(c);
                 builder.when_transition().assert_zero(hold.clone() * (nxt[qcj].clone() - cur[qcj].clone()));
                 let (i, j) = (c / stride, c % stride);
-                if j < self.trm_chunk_w() {
+                // NARROW: px sourced from this qc carrier; nothing to bind.
+                if j < self.trm_chunk_w() && !self.narrow_arith {
                     builder.assert_zero(tf.clone() * (cur[qcj].clone() - cur[self.px(self.trm_quot(i, j))].clone()));
                 }
             }
