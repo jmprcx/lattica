@@ -277,6 +277,66 @@ pub fn chain_eval_trace(height: usize) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(flat, 3)
 }
 
+/// **Arith-tile narrow-tall (the W5 fixed-point's biggest remaining lever).** After W3 the wrap's dominant
+/// inner-scaling term is the super-tile ARITH TILE — the DEEP reduced-opening fold
+/// `ro = Σ_k α^k·(pz_k − px_k)/(z_k − x)` — which lays its `n_terms` terms in COLUMNS (`9·n_terms` cols, ≈ 62%
+/// of `fused_w`, so B ≈ 42; `recursion/monolith/air.rs:1283-1296`). `DeepFoldAir` models it NARROW-TALL: each
+/// term is a ROW, with the running product `α^k` and running sum `ro` carried DOWN the rows (transitions), at
+/// CONSTANT width — the SAME columns→rows contraction the op-table did for `c_k`, now for the reduced-opening
+/// fold. Feasibility brick (like [`DagFoldAir`]); the full arith-tile swap + its opening binding (reusing the
+/// `OpTableF2Air` + 2c machinery, since `pz`/`px` are the same committed openings) is the next big effort.
+///
+/// Columns (F_p², 2 felts each, 18 total): `[α, x, apow, z, pz, px, inv, t, ro]`. Per row (term k):
+/// `apow' = apow·α`; `inv·(z − x) = 1`; `t = apow·(pz − px)·inv`; `ro' = ro + t'`. Boundary `apow = 1`, `ro = t`.
+pub struct DeepFoldAir;
+
+impl<F: p3_field::Field> BaseAir<F> for DeepFoldAir {
+    fn width(&self) -> usize {
+        18 // constant, INDEPENDENT of n_terms (vs the monolith's 9·n_terms columns)
+    }
+}
+
+impl<AB: AirBuilder<F = Val>> Air<AB> for DeepFoldAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let we = AB::Expr::from(Val::from_u64(7)); // F_p² : X² = 7
+        let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+            (a.0.clone() * b.0.clone() + we.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        };
+        let gg = |r: &[AB::Expr], o: usize| (r[o].clone(), r[o + 1].clone());
+        let (alpha, x) = (gg(&cur, 0), gg(&cur, 2));
+        let (apow, z, pz, px, inv, t, ro) =
+            (gg(&cur, 4), gg(&cur, 6), gg(&cur, 8), gg(&cur, 10), gg(&cur, 12), gg(&cur, 14), gg(&cur, 16));
+        let one = AB::Expr::ONE;
+
+        // α and x are constant across the fold (same FRI batch challenge + query point).
+        for i in 0..4 {
+            builder.when_transition().assert_zero(nxt[i].clone() - cur[i].clone());
+        }
+        // apow = α^k (running product), boundary α^0 = 1.
+        builder.when_first_row().assert_zero(apow.0.clone() - one.clone());
+        builder.when_first_row().assert_zero(apow.1.clone());
+        let ap = emul(apow.clone(), alpha);
+        builder.when_transition().assert_zero(gg(&nxt, 4).0 - ap.0);
+        builder.when_transition().assert_zero(gg(&nxt, 4).1 - ap.1);
+        // inv = 1/(z − x): inv·(z − x) == 1.
+        let chk = emul(inv.clone(), (z.0 - x.0, z.1 - x.1));
+        builder.assert_zero(chk.0 - one);
+        builder.assert_zero(chk.1);
+        // t = apow · (pz − px) · inv (the term's DEEP contribution).
+        let tv = emul(emul(apow, (pz.0 - px.0, pz.1 - px.1)), inv);
+        builder.assert_zero(t.0.clone() - tv.0);
+        builder.assert_zero(t.1.clone() - tv.1);
+        // ro = running sum of t; boundary ro_0 = t_0; transition ro' = ro + t'.
+        builder.when_first_row().assert_zero(ro.0.clone() - t.0.clone());
+        builder.when_first_row().assert_zero(ro.1.clone() - t.1.clone());
+        builder.when_transition().assert_zero(gg(&nxt, 16).0 - (ro.0.clone() + gg(&nxt, 14).0));
+        builder.when_transition().assert_zero(gg(&nxt, 16).1 - (ro.1 + gg(&nxt, 14).1));
+    }
+}
+
 /// **W3 (size) — the FLATTEN op-table: a narrow-tall arithmetic-circuit evaluator with a LogUp wiring bus.**
 /// The W2 witnessed epilogue pays `2·n_mul` dedicated COLUMNS (each F_p² `Mul` → a degree-1 column pair,
 /// filled only at the `n_queries` arith heads, wasted on every other row). W3 replaces them with this
@@ -898,6 +958,24 @@ mod tests {
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!("ChainEval: width = 3 (wide would be 2·degree), log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
         assert!(log_nqc <= LOG_BLOWUP, "narrow-tall running eval must stay within the degree budget (got {log_nqc})");
+    }
+
+    /// **Arith-tile narrow-tall feasibility (W5).** The DEEP reduced-opening fold (the wrap's dominant
+    /// inner-scaling term post-W3, `9·n_terms` COLUMNS ≈ 62% of `fused_w`) is CONSTANT width 18 as a narrow-tall
+    /// `DeepFoldAir` (each term a ROW, `α^k`/`ro` carried down) and stays within the degree budget — so the same
+    /// columns→rows contraction the op-table did for `c_k` applies to the arith tile (`9·n_terms` cols → 18).
+    #[test]
+    fn deep_fold_is_narrow_and_low_degree() {
+        let air = DeepFoldAir;
+        assert_eq!(BaseAir::<Val>::width(&air), 18, "the DEEP fold is constant width (independent of n_terms)");
+        let log_nqc = wrap_log_nqc(&air);
+        // A real join-split inner has n_terms = 2·W + 2·nqc = 2·19 + 2·8 = 54 ⇒ the monolith arith tile is
+        // 9·54 = 486 COLUMNS; the narrow-tall form is 54 ROWS at constant width 18.
+        println!(
+            "DeepFoldAir (arith-tile narrow-tall): width 18 (const, vs monolith 9·n_terms), log_nqc = {log_nqc} \
+             (budget {LOG_BLOWUP}) — replaces the 486-COLUMN arith tile (join-split n_terms=54) with 54 slack ROWS"
+        );
+        assert!(log_nqc <= LOG_BLOWUP, "the narrow-tall DEEP fold must stay within the degree budget (got {log_nqc})");
     }
 
     /// **The synthetic result, grounded in the REAL inner.** Extract the actual `JoinSplitAir` constraints,
