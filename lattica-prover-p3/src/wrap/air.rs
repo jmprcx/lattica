@@ -1816,6 +1816,138 @@ mod tests {
         assert!(arith_tile > w_inner, "the 9·n_terms arith tile ({arith_tile}) is the inner-scaling width AA5 removes");
     }
 
+    /// **Arith-tile assembly increment AA2 — assemble the full arith-wrap trace.** Widen the reused monolith
+    /// trace to `fused_w + 24`; for each query's arith head, seed a narrow-tall `DeepFoldAir` region from THAT
+    /// head's committed openings (`α = qt_alpha`, `x = GEN·qt_acc[lg−1]`, per-term `(z, pz, px)` — the exact
+    /// `deep_fold_matches_monolith_arith_tile` seed, now per query), place its `n_terms` rows in the trace SLACK
+    /// (`df_sel = 1`, `df_first`/`df_end` at the ends), and fill `ro_col` at the head with the region's last-row
+    /// `ro` (= the committed `QT_E`). The `ro` bus then binds each head's `ro_col` to its region's fold.
+    /// Returns `(AssembledArithWrapAir, trace, pis)`.
+    #[cfg(feature = "recursion")]
+    fn assemble_arith_wrap(
+        config: &crate::recursion::native_fri::MyConfig,
+        proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
+        pvs: &[Val],
+    ) -> (AssembledArithWrapAir, RowMajorMatrix<Val>, Vec<Val>) {
+        use crate::config::Challenge;
+        use crate::wrap::deep_fold_trace_from;
+        use p3_field::{BasedVectorSpace, Field};
+        use p3_goldilocks::Goldilocks;
+
+        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs);
+        let (fw, h) = (air.fused_w(), air.height());
+        let (n_terms, n_q) = (air.n_terms, air.n_queries);
+        let used = air.tr() + n_q * air.m_period();
+        let width = fw + 24;
+        assert!(
+            used + n_terms * n_q <= h,
+            "DeepFold regions ({} rows) must fit the monolith slack ({})",
+            n_terms * n_q,
+            h - used
+        );
+
+        // Arith heads = the rows where the epilogue selector `tf` (= m_tf periodic) fires (one per query).
+        let tf_col = BaseAir::<Val>::periodic_columns(&air)[air.m_tf()].clone();
+        let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
+        assert_eq!(heads.len(), n_q, "one arith head per query");
+
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let mut wide = vec![Val::ZERO; h * width];
+        for r in 0..h {
+            wide[r * width..r * width + fw].copy_from_slice(&mono_trace.values[r * fw..(r + 1) * fw]);
+        }
+        // Column bases — MUST match `AssembledArithWrapAir`'s accessors.
+        let (ro_col, db) = (fw, fw + 2);
+        let (df_sel, df_first, df_end, is_head) = (db + 18, db + 19, db + 20, db + 21);
+
+        for (q, &head) in heads.iter().enumerate() {
+            // Seed query q's region from the head's committed columns (the per-query `deep_fold_matches` seed).
+            let row = |col: usize| mono_trace.values[head * fw + col];
+            let gv = |col: usize| Challenge::from_basis_coefficients_fn(|i| row(col + i));
+            let alpha = gv(air.qt_alpha());
+            let x = Challenge::from(<Goldilocks as Field>::GENERATOR * row(air.qt_acc() + air.lg() - 1));
+            let terms: Vec<(Challenge, Challenge, Challenge)> =
+                (0..n_terms).map(|k| (gv(air.z(k)), gv(air.pz(k)), Challenge::from(row(air.px(k))))).collect();
+            let region = deep_fold_trace_from(alpha, x, &terms, 0);
+            let dw = region.width; // 18
+
+            // `ro_col` at the head = the region's last real term's `ro` (= the committed `QT_E`).
+            let ro_last = Challenge::from_basis_coefficients_fn(|i| region.values[(n_terms - 1) * dw + 16 + i]);
+            wide[head * width + ro_col..head * width + ro_col + 2].copy_from_slice(&cc(ro_last));
+            wide[head * width + is_head] = Val::ONE;
+
+            // Place the region's `n_terms` rows in the slack, with the boundary / end / sel markers.
+            for k in 0..n_terms {
+                let dst = used + q * n_terms + k;
+                wide[dst * width + db..dst * width + db + 18].copy_from_slice(&region.values[k * dw..k * dw + 18]);
+                wide[dst * width + df_sel] = Val::ONE;
+                if k == 0 {
+                    wide[dst * width + df_first] = Val::ONE;
+                }
+                if k == n_terms - 1 {
+                    wide[dst * width + df_end] = Val::ONE;
+                }
+            }
+        }
+        (AssembledArithWrapAir { m: air }, RowMajorMatrix::new(wide, width), pis)
+    }
+
+    /// **Arith-tile assembly increment AA2 — the assembled arith-wrap's `ro` bus balances** (native, cheap — NO
+    /// prove). Assemble the trace and confirm the `ro` wiring bus balances as a signed multiset: each region's
+    /// last row PROVIDES `[x, ro]` (−1) and each arith head READS `[x_head, ro_col]` (+1); addressed by the
+    /// query point `x`, they cancel iff every head's `ro_col` == its region's fold `ro`. Localizes any address /
+    /// placement / multiplicity bug before the heavy `prove_lookup` (as `wrap_assembled_bus_balances` did for
+    /// the op-table).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn arith_wrap_assembled_bus_balances() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_field::{Field, PrimeField64};
+        use p3_goldilocks::Goldilocks;
+        use p3_uni_stark::prove;
+        use std::collections::HashMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_arith_wrap(&config, &proof, &pvs);
+
+        let (fw, h) = (asm.m.fused_w(), asm.m.height());
+        let width = fw + 24;
+        let db = fw + 2;
+        let (ro_col, df_end, is_head) = (fw, db + 20, db + 21);
+        let ku = |v: Val| v.as_canonical_u64();
+
+        // Key by the full (addr = x, value = ro) 4-tuple; the single `ro` channel must balance.
+        let mut bus: HashMap<(u64, u64, u64, u64), i128> = HashMap::new();
+        for r in 0..h {
+            let b = r * width;
+            let g = |c: usize| trace.values[b + c];
+            // Region END provides `[x, ro]` (mult −1): x = region cols db+2/db+3, ro = db+16/db+17.
+            if g(df_end) == Val::ONE {
+                *bus.entry((ku(g(db + 2)), ku(g(db + 3)), ku(g(db + 16)), ku(g(db + 17)))).or_default() -= 1;
+            }
+            // Arith head reads `[x_head, ro_col]` (mult +1): x_head = GEN·qt_acc[lg−1] (imaginary 0).
+            if g(is_head) == Val::ONE {
+                let x_head = <Goldilocks as Field>::GENERATOR * g(asm.m.qt_acc() + asm.m.lg() - 1);
+                *bus.entry((ku(x_head), 0, ku(g(ro_col)), ku(g(ro_col + 1)))).or_default() += 1;
+            }
+        }
+        let bad: Vec<_> = bus.iter().filter(|(_, &m)| m != 0).take(8).collect();
+        assert!(
+            bad.is_empty(),
+            "the ro bus must balance; {} nonzero net entries, e.g. {bad:?}",
+            bus.values().filter(|&&m| m != 0).count()
+        );
+        println!(
+            "assembled arith-wrap ro bus: {} distinct (x, ro) entries, all net-zero — each head's ro_col is bound \
+             to its slack region's fold",
+            bus.len()
+        );
+    }
+
     /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
     /// witnessed `c_k` columns (native mirror of the `Witnesser`) at each arith head, and PROVE + VERIFY the
     /// full `WrapAir` over a real join-split inner + reject a tampered inner pub. Confirms the witnessed
