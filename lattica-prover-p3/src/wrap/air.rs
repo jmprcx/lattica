@@ -1240,7 +1240,7 @@ mod tests {
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (asm, trace, pis) = assemble_wrap(&config, &proof, &pvs);
         let width = <AssembledWrapAir as BaseAir<Val>>::width(&asm);
-        println!("proving assembled wrap: width {width} = fused_w {} + 19, {} rows", asm.m.fused_w(), asm.m.height());
+        println!("proving assembled wrap (op-table + 2c opening binding, split): width {width}, {} rows", asm.m.height());
         let lproof = prove_lookup(&asm, trace, &pis);
         assert!(
             verify_lookup(&asm, &lproof, &pis).is_ok(),
