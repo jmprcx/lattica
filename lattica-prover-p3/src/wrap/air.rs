@@ -1838,10 +1838,12 @@ mod tests {
         let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let air = MonolithAir {
-            counts,
-            binds,
-            index_binds,
+        // Build the same monolith at FULL vs NARROW arith to MEASURE the AA5.2 width harvest. Narrow drops the
+        // inline fold's `inv`+`apow` (4 felts/term); `[z, pz, px]` stay (the wrap externalizes only the fold).
+        let mk = |narrow: bool| MonolithAir {
+            counts: counts.clone(),
+            binds: binds.clone(),
+            index_binds: index_binds.clone(),
             n_queries: index_felts.len(),
             n_terms: terms.len(),
             inner_counter: false,
@@ -1849,35 +1851,41 @@ mod tests {
             k_instances: 1,
             fold: false,
             fold_txstmt: false,
-            constraints,
+            constraints: constraints.clone(),
             w_inner_f: WIDTH,
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
-        let (fused_w, n_terms, w_inner) = (air.fused_w(), air.n_terms, air.w_inner());
-        let arith_tile = 9 * n_terms; // the inline DEEP reduced-opening columns AA5 removes
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: narrow,
+        };
+        let full = mk(false);
+        let (full_fused_w, n_terms, w_inner) = (full.fused_w(), full.n_terms, full.w_inner());
+        let air = mk(true); // NARROW: inv/apow gone (stride 9→5), the reduced-opening fold externalized
+        let fused_w = air.fused_w();
+        assert_eq!(fused_w, full_fused_w - 4 * n_terms, "narrow_arith drops inv+apow (4 felts/term) from fused_w");
+
         let asm = AssembledArithWrapAir { m: air };
         let width = <AssembledArithWrapAir as p3_air::BaseAir<Val>>::width(&asm);
+        let full_width = full_fused_w + 25 + N_GROUPS; // the AA3 (full-arith) wrap width, for comparison
         let lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
         println!(
-            "AssembledArithWrapAir (DeepFold region + ro bus + input binding): width {width} = fused_w {fused_w} \
-             + {} (ro 2 + DeepFoldAir 18 + 4 markers + term_idx 1 + is_ch {N_GROUPS}), {} lookup(s), log_nqc \
-             {log_nqc} (budget {LOG_BLOWUP}). The 9·n_terms = {arith_tile} inline arith COLUMNS are externalized \
-             to a narrow-tall slack region; `ro` AND its (z,pz,px) inputs are bound to the committed columns via \
-             the bus (AA1+AA3). AA5 removes the columns for the B win.",
+            "AA5.2 NARROW arith harvest: full fused_w {full_fused_w} (B {}×) → narrow {fused_w} (B {}×); wrap width \
+             {width} = fused_w {fused_w} + {} (ro 2 + DeepFoldAir 18 + 4 markers + term_idx 1 + is_ch {N_GROUPS}), \
+             was {full_width}; {} lookup(s), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Dropped inv+apow = {} felts \
+             (4·n_terms, the fold-only helpers); [z, pz, px] kept. AA5.3 (re-derive z) + AA5.4 (source px) then \
+             leave only pz.",
+            full_width / w_inner,
+            width / w_inner,
             25 + N_GROUPS,
-            lookups.len()
+            lookups.len(),
+            4 * n_terms
         );
-        assert_eq!(
-            width,
-            fused_w + 25 + N_GROUPS,
-            "AA3 adds only O(1) cols (ro + DeepFoldAir + markers + term_idx + is_ch)"
-        );
-        assert!(log_nqc <= LOG_BLOWUP, "the arith-assembled wrap (ro bus) must compose within the degree budget");
-        // Sanity: the swap target is real — the inline arith tile it externalizes is the dominant inner-scaling term.
-        assert!(arith_tile > w_inner, "the 9·n_terms arith tile ({arith_tile}) is the inner-scaling width AA5 removes");
+        assert_eq!(width, fused_w + 25 + N_GROUPS, "the wrap adds only O(1) cols over the narrow fused_w");
+        assert!(log_nqc <= LOG_BLOWUP, "the narrow arith-assembled wrap must compose within the degree budget");
+        assert!(width < full_width, "narrow_arith must strictly shrink the wrap width (the AA5.2 win)");
+        assert!(w_inner > 0);
     }
 
     /// **Arith-tile assembly increment AA2 — assemble the full arith-wrap trace.** Widen the reused monolith
