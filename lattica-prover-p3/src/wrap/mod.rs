@@ -538,11 +538,17 @@ impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for OpTableF2Air {
 /// still at constant width and needing no AIR change (the fold is ordinary mul/add rows). The final `folded`
 /// value is returned so the caller can check the epilogue identity `folded·inv_van == quot(ζ)` (the arith head
 /// does this O(1) check in the eventual integration; the fold itself no longer costs `2·n_mul` columns).
+/// `preseed` (for the assembly's soundness binding, 2c) pre-creates a leaf wire for each `(opening_key, value,
+/// open_id)` BEFORE the DAG walk, so EVERY opening the arith head will provide on the bus has a leaf that reads
+/// it — even openings the DAG doesn't use (they become fanout-0 leaves). The DAG walk then REUSES these
+/// (by `opening_key`). The 4th return value maps each such opening-leaf's ROW to its `open_id` (so the assembly
+/// can set the `is_leaf`/`open_id` columns). Standalone callers pass `&[]` (no preseed, empty bindings).
 pub fn op_table_f2_trace(
     constraints: &[p3_air::symbolic::SymbolicExpression<Val>],
     leaf_val: impl FnMut(&p3_uni_stark::BaseLeaf<Val>) -> crate::config::Challenge,
     alpha: Option<crate::config::Challenge>,
-) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>, Option<(crate::config::Challenge, u64)>) {
+    preseed: &[((u8, u64), crate::config::Challenge, u64)],
+) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>, Option<(crate::config::Challenge, u64)>, Vec<(usize, u64)>) {
     use crate::config::Challenge;
     use p3_air::symbolic::SymbolicExpr;
     use p3_field::{BasedVectorSpace, PrimeField64};
@@ -659,6 +665,15 @@ pub fn op_table_f2_trace(
     }
 
     let mut b = B { rows: Vec::new(), memo: HashMap::new(), leaf_memo: HashMap::new(), next: 0, zero: None, leaf_val };
+    // 2c preseed: pre-create an opening-leaf per `(key, value, open_id)` so EVERY opening the arith head provides
+    // has a reader (the DAG walk below reuses these via `leaf_memo`; unused openings become fanout-0 leaves).
+    let mut leaf_bindings: Vec<(usize, u64)> = Vec::with_capacity(preseed.len());
+    for &(key, val, open_id) in preseed {
+        let row_index = b.rows.len();
+        let wire = b.leaf(val);
+        b.leaf_memo.insert(key, wire);
+        leaf_bindings.push((row_index, open_id));
+    }
     let mut root_wires: Vec<(u64, Challenge)> = Vec::with_capacity(constraints.len());
     for root in constraints {
         root_wires.push(b.go(root));
@@ -704,7 +719,7 @@ pub fn op_table_f2_trace(
         flat[base + 10..base + 12].copy_from_slice(&cc(row.b));
         flat[base + 12] = -Val::from_u64(*fanout.get(&row.out_addr).unwrap_or(&0));
     }
-    (RowMajorMatrix::new(flat, w), roots, folded)
+    (RowMajorMatrix::new(flat, w), roots, folded, leaf_bindings)
 }
 
 /// A deterministic F_p² pseudo leaf-value closure (constants keep their value; Variables/selectors get
@@ -1332,7 +1347,7 @@ mod tests {
     fn op_table_f2_round_trips() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
+        let (trace, _roots, _folded, _lb) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None, &[]);
         let proof = prove_lookup(&OpTableF2Air, trace, &[]);
         assert!(
             verify_lookup(&OpTableF2Air, &proof, &[]).is_ok(),
@@ -1346,7 +1361,7 @@ mod tests {
     fn op_table_f2_rejects_broken_wire() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (mut trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
+        let (mut trace, _roots, _folded, _lb) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None, &[]);
         let w = 13;
         let h = trace.values.len() / w;
         let leaf = (0..h)
@@ -1372,7 +1387,7 @@ mod tests {
     fn op_table_f2_rejects_broken_op() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (mut trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
+        let (mut trace, _roots, _folded, _lb) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None, &[]);
         let w = 13;
         let h = trace.values.len() / w;
         let root = (0..h)
@@ -1399,7 +1414,7 @@ mod tests {
     fn op_table_f2_is_narrow_and_low_degree() {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (trace, _roots, _folded) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
+        let (trace, _roots, _folded, _lb) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None, &[]);
         let (rows, w) = (trace.values.len() / 13, 13);
         assert_eq!(BaseAir::<Val>::width(&OpTableF2Air), w, "F_p² op-table width is constant");
         let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&OpTableF2Air);
@@ -1461,7 +1476,7 @@ mod tests {
                 BaseLeaf::IsTransition => is_trans,
             }
         };
-        let (trace, roots, _folded) = op_table_f2_trace(&constraints, seed, None);
+        let (trace, roots, _folded, _lb) = op_table_f2_trace(&constraints, seed, None, &[]);
 
         // FAITHFULNESS: each op-table root equals the native epilogue `c_k`.
         for (k, c) in constraints.iter().enumerate() {
@@ -1522,7 +1537,7 @@ mod tests {
             }
         };
         // Append the α-Horner fold (B) in the op-table and read out `folded`.
-        let (trace, _roots, folded) = op_table_f2_trace(&constraints, seed, Some(eo_alpha));
+        let (trace, _roots, folded, _lb) = op_table_f2_trace(&constraints, seed, Some(eo_alpha), &[]);
         let folded = folded.expect("the fold produces a value for a non-empty constraint set").0;
 
         // The op-table's in-table fold reproduces the epilogue's COMPLETE identity.
@@ -1602,7 +1617,7 @@ mod tests {
     fn gated_proto_trace(n_region: usize) -> RowMajorMatrix<Val> {
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let (op, _r, _f) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None);
+        let (op, _r, _f, _lb) = op_table_f2_trace(&constraints, pseudo_leaf_f2(), None, &[]);
         let h_op = op.values.len() / 13;
         let (w, total) = (14, (h_op + n_region).next_power_of_two());
         let mut flat = vec![Val::ZERO; total * w];
