@@ -194,7 +194,7 @@ pub fn wrap_arith_trace(
 mod wrap_air {
     use super::Val;
     use crate::recursion::monolith::{InlineBci, MonolithAir, MonolithBci};
-    use p3_air::{Air, AirBuilder, BaseAir};
+    use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
     use p3_field::PrimeCharacteristicRing;
     use p3_goldilocks::Goldilocks;
     use p3_uni_stark::{SymbolicExpr, SymbolicExpression};
@@ -488,15 +488,27 @@ mod wrap_air {
         pub(crate) m: MonolithAir,
     }
 
+    /// Reserved wiring-bus address for the op-table's `folded` output (so the arith head can read it by a fixed
+    /// address); the op-table's other wires take addresses ≥ 1.
+    pub(crate) const FOLDED_ADDR: u64 = 0;
+
     impl AssembledWrapAir {
+        /// The `folded` F_p² pair the epilogue reads — appended right after the monolith's fused columns.
         pub(crate) fn folded_col(&self) -> usize {
-            self.m.fused_w() // the `folded` pair is appended after the monolith's fused columns
+            self.m.fused_w()
+        }
+        /// The op-table region's column base (after `folded`): the 13 `OpTableF2Air` columns + `op_sel`.
+        pub(crate) fn op_base(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        pub(crate) fn op_sel(&self) -> usize {
+            self.op_base() + 13
         }
     }
 
     impl BaseAir<Goldilocks> for AssembledWrapAir {
         fn width(&self) -> usize {
-            self.m.fused_w() + 2 // + the `folded` F_p² pair (increment 1; the op-table columns are added next)
+            self.m.fused_w() + 2 + 14 // fused + folded(2) + op-table(13) + op_sel(1) — O(1) over fused_w
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
@@ -509,9 +521,52 @@ mod wrap_air {
         }
     }
 
-    impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AssembledWrapAir {
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for AssembledWrapAir {
         fn eval(&self, builder: &mut AB) {
+            // (1) The reused monolith regions + the OpTableBci epilogue (reads `folded_col`, checks vs quot).
             self.m.eval_bci(builder, &OpTableBci { folded_col: self.folded_col() });
+
+            // (2) The op-table REGION — the FLATTEN op-table (`crate::wrap::OpTableF2Air`) inlined and gated by
+            // `op_sel`, so it computes the `c_k` + α-fold on the trace's SLACK rows without disturbing the
+            // monolith tiles. Reads collected once (borrow released before asserting).
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let ob = self.op_base();
+            let (is_mul, is_add, is_sub) = (cur[ob].clone(), cur[ob + 1].clone(), cur[ob + 2].clone());
+            let (out_addr, o0, o1) = (cur[ob + 3].clone(), cur[ob + 4].clone(), cur[ob + 5].clone());
+            let (a_addr, a0, a1) = (cur[ob + 6].clone(), cur[ob + 7].clone(), cur[ob + 8].clone());
+            let (b_addr, b0, b1) = (cur[ob + 9].clone(), cur[ob + 10].clone(), cur[ob + 11].clone());
+            let out_mult = cur[ob + 12].clone();
+            let op_sel = cur[self.op_sel()].clone();
+            let one = AB::Expr::ONE;
+            let we = AB::Expr::from(Goldilocks::from_u64(7)); // F_p² : X² = 7
+
+            builder.assert_zero(op_sel.clone() * (op_sel.clone() - one.clone())); // op_sel boolean
+            for s in [&is_mul, &is_add, &is_sub] {
+                builder.assert_zero(op_sel.clone() * s.clone() * (s.clone() - one.clone()));
+            }
+            let is_op = is_mul.clone() + is_add.clone() + is_sub.clone();
+            builder.assert_zero(op_sel.clone() * is_op.clone() * (is_op.clone() - one.clone()));
+            builder.assert_zero(op_sel.clone() * is_mul.clone() * (o0.clone() - (a0.clone() * b0.clone() + we.clone() * a1.clone() * b1.clone())));
+            builder.assert_zero(op_sel.clone() * is_mul.clone() * (o1.clone() - (a0.clone() * b1.clone() + a1.clone() * b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_add.clone() * (o0.clone() - (a0.clone() + b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_add.clone() * (o1.clone() - (a1.clone() + b1.clone())));
+            builder.assert_zero(op_sel.clone() * is_sub.clone() * (o0.clone() - (a0.clone() - b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_sub.clone() * (o1.clone() - (a1.clone() - b1.clone())));
+
+            // (3) The wiring bus (one LogUp channel): the op-table's internal wiring (reads +op_sel·is_op,
+            // define op_sel·out_mult), plus the arith head READING the op-table's `folded` output at the reserved
+            // FOLDED_ADDR (gated by `tf`) — binding `folded_col` to the op-table's result. On non-op / non-arith
+            // rows the respective mults are 0 (inert).
+            let tf = p[self.m.m_tf()].clone();
+            let read_mult = op_sel.clone() * is_op;
+            let folded = (cur[self.folded_col()].clone(), cur[self.folded_col() + 1].clone());
+            builder.push_local_interaction(vec![
+                (vec![a_addr, a0, a1], read_mult.clone()),
+                (vec![b_addr, b0, b1], read_mult),
+                (vec![out_addr, o0, o1], op_sel * out_mult),
+                (vec![AB::Expr::from(Goldilocks::from_u64(FOLDED_ADDR)), folded.0, folded.1], tf),
+            ]);
         }
     }
 
@@ -980,21 +1035,27 @@ mod tests {
         assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap must be within the degree budget");
     }
 
-    /// **Brick 5 increment 1 — the assembled wrap AIR composes.** Build a real join-split `MonolithAir`, wrap it
-    /// in `AssembledWrapAir` (`eval_bci` + `OpTableBci` — the epilogue READS the op-table's `folded` instead of
-    /// witnessing 2·n_mul `c_k`), and measure: its width is `fused_w + 2` (the epilogue-side width contraction,
-    /// vs `WrapAir`'s `fused_w + 2·n_mul`) and it stays within the degree budget at is_zk=1. The op-table REGION
-    /// (the slack rows computing `folded`) + the wiring bus (making `folded` sound) are the next increments.
+    /// **Brick 5 increment 2 — the assembled wrap AIR (op-table region + wiring bus) composes as a LookupAir.**
+    /// Build a real join-split `MonolithAir`, wrap it in `AssembledWrapAir` = the reused monolith regions
+    /// (`eval_bci` + `OpTableBci`, epilogue reads `folded`) + the FLATTEN op-table region (gated by `op_sel`) +
+    /// the wiring bus (op wiring + the arith head reading `folded` at `FOLDED_ADDR`). Measured through the W1
+    /// lookup prover's OWN layout (`combined_constraint_layout`, since it now carries the bus lookup): its width
+    /// is `fused_w + 16` (folded 2 + op-table 13 + op_sel 1 — **O(1) over fused_w**, vs `WrapAir`'s
+    /// `fused_w + 2·n_mul`) and it composes within budget at is_zk=1. So `eval_bci` (the whole monolith
+    /// constraint system) THREADS the interaction builders — the assembly is a valid, in-budget lookup AIR. The
+    /// trace builder + prove through `prove_lookup`, then the openings→leaves seam, are the next increments.
     #[cfg(feature = "recursion")]
     #[test]
     fn wrap_assembled_composes() {
         use crate::joinsplit_air::{
             build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
         };
+        use crate::lookup::prover::combined_constraint_layout;
         use crate::recursion::monolith::tests::sim_full;
         use crate::recursion::monolith::MonolithAir;
         use crate::recursion::native_fri::{make_config, multicol_query_terms};
-        use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, prove, AirLayout};
+        use p3_lookup::Lookups;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
 
         let config = make_config(1, 4);
         let w = demo_witness();
@@ -1025,14 +1086,16 @@ mod tests {
         let fused_w = air.fused_w();
         let asm = AssembledWrapAir { m: air };
         let width = <AssembledWrapAir as p3_air::BaseAir<Val>>::width(&asm);
-        let layout = AirLayout::from_air::<Val>(&asm);
-        let log_nqc = get_log_num_quotient_chunks::<Val, AssembledWrapAir>(&asm, layout, 1);
+        let lookups = Lookups::from_air::<Challenge, _>(&asm);
+        let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
         println!(
-            "AssembledWrapAir (skeleton): width {width} = fused_w {fused_w} + 2 (epilogue reads folded, NO \
-             2·n_mul c_k cols), log_nqc {log_nqc} (budget {LOG_BLOWUP})"
+            "AssembledWrapAir (op-table region + bus): width {width} = fused_w {fused_w} + 16 (folded 2 + \
+             op-table 13 + op_sel 1), {} lookup(s), log_nqc {log_nqc} (budget {LOG_BLOWUP}) — O(1) over fused_w \
+             vs WrapAir's fused_w + 2·n_mul",
+            lookups.len()
         );
-        assert_eq!(width, fused_w + 2, "the assembled epilogue costs O(1) columns, not 2·n_mul");
-        assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap must compose within the degree budget");
+        assert_eq!(width, fused_w + 16, "the assembled wrap adds only O(1) cols (folded + op-table + op_sel)");
+        assert!(log_nqc <= LOG_BLOWUP, "the assembled lookup AIR must compose within the degree budget");
     }
 
     /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
