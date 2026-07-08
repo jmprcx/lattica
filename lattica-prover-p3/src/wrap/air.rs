@@ -844,10 +844,159 @@ mod wrap_air {
             self.m.eval_bci(builder, &DeepFoldBci { ro_col: self.m.fused_w() });
         }
     }
+
+    /// **Arith-tile assembly — the sound narrow-tall reduced-opening fold** (the [`AssembledWrapAir`] analog one
+    /// region deeper). Where [`ArithWrapAir`] externalizes the DEEP fold's `ro` to a FREE witness column
+    /// (provable but UNSOUND — a prover can put any `ro`), this AIR discharges `ro`'s soundness through the
+    /// LogUp bus. Each query's fold is a narrow-tall [`crate::wrap::DeepFoldAir`] region placed in the trace
+    /// SLACK (18 cols overlaid at `df_base`, gated by `df_sel`), carrying `α^k` (`apow`) + the running sum `ro`
+    /// down the rows at constant width; the region's LAST row PROVIDES `[x, ro]` on a wiring bus addressed by
+    /// the query point `x` (distinct per query), and each arith head READS `[x_head, ro_col]` — so the `ro` the
+    /// head binds `QT_E` to is a fold actually computed in slack, not a free witness. The point derivation
+    /// (`arith_point`) stays inline + SOUND and `bind_reduced_opening` checks `QT_E == ro_col`.
+    ///
+    /// **Increment AA1 (this): composes.** The region + the `ro` bus (1 channel, 2 interactions ⇒ low degree —
+    /// unlike the op-table's ~120-provide channels the query-input binding will need). AA1 leaves the region's
+    /// `z`/`pz`/`px` INPUTS unbound to the committed openings (that 2c-style split-channel binding is AA3); here
+    /// `ro` is bound to the slack fold, closing the free-witness gap for the mechanism + fixing the degree.
+    pub(crate) struct AssembledArithWrapAir {
+        pub(crate) m: MonolithAir,
+    }
+
+    impl AssembledArithWrapAir {
+        /// The witnessed reduced opening `ro` (F_p² pair) the arith head binds `QT_E` to — appended after the
+        /// monolith's fused columns (the slot `DeepFoldBci`/`ArithWrapAir` use).
+        pub(crate) fn ro_col(&self) -> usize {
+            self.m.fused_w()
+        }
+        /// The DeepFold region's column base (18 `DeepFoldAir` cols: `[α, x, apow, z, pz, px, inv, t, ro]`).
+        pub(crate) fn df_base(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        /// Region row selector (1 on every DeepFold slack row).
+        pub(crate) fn df_sel(&self) -> usize {
+            self.df_base() + 18
+        }
+        /// Region FIRST-row marker (the fold's boundary: `apow = 1`, `ro = t`).
+        pub(crate) fn df_first(&self) -> usize {
+            self.df_base() + 19
+        }
+        /// Region LAST-row marker (carries the full `ro`; the bus PROVIDE fires here).
+        pub(crate) fn df_end(&self) -> usize {
+            self.df_base() + 20
+        }
+        /// Witnessed arith-head marker (= the periodic `tf` selector, bound by a constraint) — gates the `ro`
+        /// bus READ. Periodic must stay out of interactions (the lookup prover's aux gen feeds an empty periodic
+        /// slice), so the read is gated by this COLUMN, not `tf` directly.
+        pub(crate) fn is_head(&self) -> usize {
+            self.df_base() + 21
+        }
+    }
+
+    impl BaseAir<Goldilocks> for AssembledArithWrapAir {
+        fn width(&self) -> usize {
+            // ro(2) + DeepFoldAir region(18) + df_sel + df_first + df_end + is_head — all O(1) over fused_w.
+            self.m.fused_w() + 2 + 18 + 4
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for AssembledArithWrapAir {
+        fn eval(&self, builder: &mut AB) {
+            // (1) The reused monolith regions + the `DeepFoldBci` arith strategy: `arith_point` stays inline +
+            // SOUND, the reduced-opening fold reads `ro_col` (bound to the slack region below), and
+            // `bind_reduced_opening` checks `QT_E == ro_col`. Epilogue + cap-mux delegate to `InlineBci`.
+            self.m.eval_bci(builder, &DeepFoldBci { ro_col: self.ro_col() });
+
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let nxt: Vec<AB::Expr> = builder.main().next_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let one = AB::Expr::ONE;
+            let we = AB::Expr::from(Goldilocks::from_u64(7)); // F_p² : X² = 7
+            let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+                (
+                    a.0.clone() * b.0.clone() + we.clone() * a.1.clone() * b.1.clone(),
+                    a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+                )
+            };
+            let db = self.df_base();
+            let gg = |r: &[AB::Expr], o: usize| (r[db + o].clone(), r[db + o + 1].clone());
+
+            // (2) Region markers — booleans; `is_head` bound to the periodic `tf` (so the bus READ is gated by
+            // the COLUMN, not the periodic). A transition stays WITHIN a region: every region row that is not its
+            // last (`df_sel · (1 − df_end)`), so the fold never carries across a region boundary.
+            let df_sel = cur[self.df_sel()].clone();
+            let df_first = cur[self.df_first()].clone();
+            let df_end = cur[self.df_end()].clone();
+            let is_head = cur[self.is_head()].clone();
+            for m in [&df_sel, &df_first, &df_end, &is_head] {
+                builder.assert_zero(m.clone() * (m.clone() - one.clone()));
+            }
+            builder.assert_zero(is_head.clone() - p[self.m.m_tf()].clone());
+            let df_trans = df_sel.clone() * (one.clone() - df_end.clone());
+
+            // (3) The DeepFold region (mirrors `crate::wrap::DeepFoldAir`, gated to the slack rows): each term is
+            // a ROW carrying `apow = α^k` + the running sum `ro`, at constant width — the narrow-tall arith tile.
+            let (alpha, x) = (gg(&cur, 0), gg(&cur, 2));
+            let (apow, z, pz, px, inv, t, ro) = (
+                gg(&cur, 4), gg(&cur, 6), gg(&cur, 8), gg(&cur, 10), gg(&cur, 12), gg(&cur, 14), gg(&cur, 16),
+            );
+            // α, x constant across the fold.
+            for i in 0..4 {
+                builder.when_transition().assert_zero(df_trans.clone() * (nxt[db + i].clone() - cur[db + i].clone()));
+            }
+            // apow = α^k (running product), boundary α^0 = 1.
+            builder.assert_zero(df_first.clone() * (apow.0.clone() - one.clone()));
+            builder.assert_zero(df_first.clone() * apow.1.clone());
+            let ap = emul(apow.clone(), alpha);
+            builder.when_transition().assert_zero(df_trans.clone() * (gg(&nxt, 4).0 - ap.0));
+            builder.when_transition().assert_zero(df_trans.clone() * (gg(&nxt, 4).1 - ap.1));
+            // inv = 1/(z − x): inv·(z − x) == 1.
+            let chk = emul(inv.clone(), (z.0.clone() - x.0.clone(), z.1.clone() - x.1.clone()));
+            builder.assert_zero(df_sel.clone() * (chk.0 - one.clone()));
+            builder.assert_zero(df_sel.clone() * chk.1);
+            // t = apow · (pz − px) · inv (the term's DEEP contribution).
+            let tv = emul(emul(apow, (pz.0.clone() - px.0.clone(), pz.1.clone() - px.1.clone())), inv);
+            builder.assert_zero(df_sel.clone() * (t.0.clone() - tv.0));
+            builder.assert_zero(df_sel.clone() * (t.1.clone() - tv.1));
+            // ro = running sum of t; boundary ro_0 = t_0; transition ro' = ro + t'.
+            builder.assert_zero(df_first.clone() * (ro.0.clone() - t.0.clone()));
+            builder.assert_zero(df_first * (ro.1.clone() - t.1.clone()));
+            builder.when_transition().assert_zero(df_trans.clone() * (gg(&nxt, 16).0 - (ro.0.clone() + gg(&nxt, 14).0)));
+            builder.when_transition().assert_zero(df_trans * (gg(&nxt, 16).1 - (ro.1.clone() + gg(&nxt, 14).1)));
+
+            // (4) The `ro` wiring bus, addressed by the query point `x` (distinct per query). The region's LAST
+            // row (`df_end`) PROVIDES `[x, ro]` (mult −1); each arith head READS `[x_head, ro_col]` (mult
+            // +is_head), where `x_head = GEN · qt_acc[lg−1]` is the head's committed query point (= `arith_point`
+            // x, imaginary 0). Balance ⇒ `ro_col` at head q == the slack region's `ro` for query q, so the fold
+            // `DeepFoldBci` binds to `QT_E` is one actually computed in slack — not a free witness. One channel,
+            // 2 interactions ⇒ low degree (the query-input binding's many-provide channels come in AA3).
+            let x_head =
+                AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[self.m.qt_acc() + self.m.lg() - 1].clone();
+            let ro_read = (cur[self.ro_col()].clone(), cur[self.ro_col() + 1].clone());
+            let neg_end = AB::Expr::ZERO - df_end;
+            let bus: Vec<(Vec<AB::Expr>, AB::Expr)> = vec![
+                (vec![x.0, x.1, ro.0, ro.1], neg_end),                          // region-end PROVIDE [x, ro]  (−1)
+                (vec![x_head, AB::Expr::ZERO, ro_read.0, ro_read.1], is_head),  // head READ [x, ro_col]  (+is_head)
+            ];
+            builder.push_local_interaction(bus);
+        }
+    }
 }
 
 #[cfg(feature = "recursion")]
-pub(crate) use wrap_air::{native_witnessed, open_id, ArithWrapAir, AssembledWrapAir, WrapAir, N_GROUPS, OPEN_BASE};
+pub(crate) use wrap_air::{
+    native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledWrapAir, WrapAir, N_GROUPS,
+    OPEN_BASE,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1600,6 +1749,71 @@ mod tests {
             swapped_w / w_inner
         );
         assert!(swapped_w < fused_w, "the narrow-tall arith swap must strictly shrink the monolith width");
+    }
+
+    /// **Arith-tile assembly increment AA1 — `AssembledArithWrapAir` composes as a LookupAir.** The sibling of
+    /// `wrap_assembled_composes` for the arith tile: the reused monolith regions (`eval_bci` + `DeepFoldBci`) +
+    /// the narrow-tall `DeepFoldAir` region (gated to slack) + the `ro` wiring bus form ONE lookup-carrying AIR
+    /// that composes WITHIN the degree budget. `ro` is now bound to the slack region's fold via the bus (not a
+    /// free witness); the query-input (`z`/`pz`/`px`) binding + the trace + the prove are AA2–AA4. Cheap (no
+    /// prove) — mirrors the op-table's first assembly increment (`wrap_assembled_composes`).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn arith_wrap_assembled_composes() {
+        use crate::joinsplit_air::{
+            build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
+        };
+        use crate::lookup::prover::combined_constraint_layout;
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_lookup::Lookups;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+        };
+        let (fused_w, n_terms, w_inner) = (air.fused_w(), air.n_terms, air.w_inner());
+        let arith_tile = 9 * n_terms; // the inline DEEP reduced-opening columns AA5 removes
+        let asm = AssembledArithWrapAir { m: air };
+        let width = <AssembledArithWrapAir as p3_air::BaseAir<Val>>::width(&asm);
+        let lookups = Lookups::from_air::<Challenge, _>(&asm);
+        let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
+        println!(
+            "AssembledArithWrapAir (DeepFold region + ro bus): width {width} = fused_w {fused_w} + 24 (ro 2 + \
+             DeepFoldAir 18 + df_sel/df_first/df_end/is_head 4), {} lookup(s), log_nqc {log_nqc} (budget \
+             {LOG_BLOWUP}). The 9·n_terms = {arith_tile} inline arith COLUMNS are externalized to a narrow-tall \
+             slack region; `ro` is bound to that region's fold via the bus (AA1). AA5 removes the columns for the \
+             B win.",
+            lookups.len()
+        );
+        assert_eq!(width, fused_w + 24, "AA1 adds only O(1) cols (ro + DeepFoldAir region + 4 markers)");
+        assert!(log_nqc <= LOG_BLOWUP, "the arith-assembled wrap (ro bus) must compose within the degree budget");
+        // Sanity: the swap target is real — the inline arith tile it externalizes is the dominant inner-scaling term.
+        assert!(arith_tile > w_inner, "the 9·n_terms arith tile ({arith_tile}) is the inner-scaling width AA5 removes");
     }
 
     /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
