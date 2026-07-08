@@ -486,11 +486,10 @@ mod wrap_air {
     /// bus (binding `folded_col` + the openings→leaves seam) are the next increments.
     pub(crate) struct AssembledWrapAir {
         pub(crate) m: MonolithAir,
+        /// The op-table wiring-bus address holding the `folded` output (set from the op-table build; the arith
+        /// head reads `folded_col` from the bus at this address). Any value for pure composition/degree checks.
+        pub(crate) folded_addr: u64,
     }
-
-    /// Reserved wiring-bus address for the op-table's `folded` output (so the arith head can read it by a fixed
-    /// address); the op-table's other wires take addresses ≥ 1.
-    pub(crate) const FOLDED_ADDR: u64 = 0;
 
     impl AssembledWrapAir {
         /// The `folded` F_p² pair the epilogue reads — appended right after the monolith's fused columns.
@@ -565,7 +564,7 @@ mod wrap_air {
                 (vec![a_addr, a0, a1], read_mult.clone()),
                 (vec![b_addr, b0, b1], read_mult),
                 (vec![out_addr, o0, o1], op_sel * out_mult),
-                (vec![AB::Expr::from(Goldilocks::from_u64(FOLDED_ADDR)), folded.0, folded.1], tf),
+                (vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1], tf),
             ]);
         }
     }
@@ -932,6 +931,133 @@ mod tests {
         (air, trace, pis)
     }
 
+    /// **Brick 5 increment 2b — assemble the full wrap trace** (`--features recursion`). Widen the reused
+    /// monolith trace to `fused_w + 16`; seed the FLATTEN op-table with the REAL ζ-openings + fold; place its
+    /// rows in the trace SLACK (`op_sel = 1`); fill `folded_col` at each arith head (`tf = 1` rows) with the
+    /// op-table's `folded` value; and override the `folded` wire's `out_mult` to `−n_heads` (it is read once per
+    /// arith head, not internally). Returns `(AssembledWrapAir, trace, pis)`.
+    #[cfg(feature = "recursion")]
+    fn assemble_wrap(
+        config: &crate::recursion::native_fri::MyConfig,
+        proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
+        pvs: &[Val],
+    ) -> (AssembledWrapAir, RowMajorMatrix<Val>, Vec<Val>) {
+        use crate::config::Challenge;
+        use crate::joinsplit_air::JoinSplitAir;
+        use crate::recursion::native_fri::epilogue_openings;
+        use crate::wrap::op_table_f2_trace;
+        use p3_field::BasedVectorSpace;
+        use p3_uni_stark::{get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf};
+
+        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs);
+        let (eo_local, eo_next, is_first, is_last, is_trans, _iv, _eq, eo_alpha, _z, eo_periodic) =
+            epilogue_openings(config, &JoinSplitAir, proof, pvs);
+        let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+        let seed = |l: &BaseLeaf<Val>| -> Challenge {
+            match l {
+                BaseLeaf::Constant(c) => Challenge::from(*c),
+                BaseLeaf::Variable(v) => match v.entry {
+                    BaseEntry::Main { offset } => {
+                        if offset == 0 {
+                            eo_local[v.index]
+                        } else {
+                            eo_next[v.index]
+                        }
+                    }
+                    BaseEntry::Public => pubs[v.index],
+                    BaseEntry::Periodic => eo_periodic[v.index],
+                    BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
+                },
+                BaseLeaf::IsFirstRow => is_first,
+                BaseLeaf::IsLastRow => is_last,
+                BaseLeaf::IsTransition => is_trans,
+            }
+        };
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let (op_matrix, _roots, folded) = op_table_f2_trace(&constraints, seed, Some(eo_alpha));
+        let (folded_val, folded_addr) = folded.expect("the join-split epilogue folds to a value");
+
+        let (fw, h) = (air.fused_w(), air.height());
+        let used = air.tr() + air.n_queries * air.m_period();
+        let op_h = op_matrix.values.len() / 13;
+        let width = fw + 16;
+        assert!(used + op_h <= h, "op-table rows ({op_h}) must fit in the monolith slack ({})", h - used);
+
+        // The arith heads = the rows where the epilogue selector `tf` (= m_tf periodic) fires.
+        let tf_col = BaseAir::<Val>::periodic_columns(&air)[air.m_tf()].clone();
+        let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
+
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let mut wide = vec![Val::ZERO; h * width];
+        for r in 0..h {
+            wide[r * width..r * width + fw].copy_from_slice(&mono_trace.values[r * fw..(r + 1) * fw]);
+        }
+        let fc = cc(folded_val);
+        for &head in &heads {
+            wide[head * width + fw..head * width + fw + 2].copy_from_slice(&fc); // folded_col at arith heads
+        }
+        let ob = fw + 2;
+        for i in 0..op_h {
+            let dst = used + i;
+            let mut cols: [Val; 13] = op_matrix.values[i * 13..i * 13 + 13].try_into().unwrap();
+            if cols[3] == Val::from_u64(folded_addr) {
+                cols[12] = -Val::from_u64(heads.len() as u64); // folded read once per arith head, not internally
+            }
+            wide[dst * width + ob..dst * width + ob + 13].copy_from_slice(&cols);
+            wide[dst * width + fw + 15] = Val::ONE; // op_sel
+        }
+        (AssembledWrapAir { m: air, folded_addr }, RowMajorMatrix::new(wide, width), pis)
+    }
+
+    /// **Brick 5 increment 2b — the assembled wrap trace's wiring bus balances** (native, cheap — NO heavy
+    /// prove). Assemble the full wrap trace and confirm the LogUp wiring bus balances as a signed multiset:
+    /// every op-table wire's provide (`−fanout`, or `−n_heads` for `folded`) is matched by its reads (`+1`
+    /// each), and the arith heads' `folded` reads match the op-table's `folded` provide. Localizes any
+    /// addressing / multiplicity / placement bug before `prove_lookup`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn wrap_assembled_bus_balances() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_field::PrimeField64;
+        use p3_uni_stark::prove;
+        use std::collections::HashMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_wrap(&config, &proof, &pvs);
+
+        let (fw, h) = (asm.m.fused_w(), asm.m.height());
+        let (width, ob) = (fw + 16, fw + 2);
+        let tf_col = BaseAir::<Val>::periodic_columns(&asm.m)[asm.m.m_tf()].clone();
+        const P: u64 = 0xFFFF_FFFF_0000_0001; // Goldilocks order
+        let sgn = |v: Val| -> i128 {
+            let u = v.as_canonical_u64();
+            if u > P / 2 { u as i128 - P as i128 } else { u as i128 }
+        };
+        let key = |a: Val, x: Val, y: Val| (a.as_canonical_u64(), x.as_canonical_u64(), y.as_canonical_u64());
+
+        let mut bus: HashMap<(u64, u64, u64), i128> = HashMap::new();
+        for r in 0..h {
+            let b = r * width;
+            let g = |c: usize| trace.values[b + c];
+            let op_sel = sgn(g(fw + 15));
+            let is_op = sgn(g(ob)) + sgn(g(ob + 1)) + sgn(g(ob + 2));
+            let read = op_sel * is_op; // op rows only (op_sel·is_op ∈ {0,1})
+            *bus.entry(key(g(ob + 6), g(ob + 7), g(ob + 8))).or_default() += read; // read a
+            *bus.entry(key(g(ob + 9), g(ob + 10), g(ob + 11))).or_default() += read; // read b
+            *bus.entry(key(g(ob + 3), g(ob + 4), g(ob + 5))).or_default() += op_sel * sgn(g(ob + 12)); // define out
+            let tf = sgn(tf_col[r % tf_col.len()]);
+            *bus.entry((asm.folded_addr, g(fw).as_canonical_u64(), g(fw + 1).as_canonical_u64())).or_default() += tf; // folded read
+        }
+        let bad: Vec<_> = bus.iter().filter(|(_, &m)| m != 0).take(5).collect();
+        assert!(bad.is_empty(), "the wiring bus must balance; {} nonzero net entries, e.g. {bad:?}", bus.values().filter(|&&m| m != 0).count());
+        println!("assembled wrap bus: {} distinct (addr,val) entries, all net-zero — the cross-region wiring is consistent", bus.len());
+    }
+
     /// **Cheap always-on validation of the reused-region epilogue witness (B/H).** The same pre-check
     /// `wrap_build_reused` runs, standalone (no heavy trace build): extract the OOD openings for a REAL
     /// join-split inner and confirm the native symbolic fold equals `quotient(ζ)` — the identity the wrap's
@@ -1084,7 +1210,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
         };
         let fused_w = air.fused_w();
-        let asm = AssembledWrapAir { m: air };
+        let asm = AssembledWrapAir { m: air, folded_addr: 0 }; // any address for the pure composition check
         let width = <AssembledWrapAir as p3_air::BaseAir<Val>>::width(&asm);
         let lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);

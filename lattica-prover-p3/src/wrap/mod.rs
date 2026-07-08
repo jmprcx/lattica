@@ -542,7 +542,7 @@ pub fn op_table_f2_trace(
     constraints: &[p3_air::symbolic::SymbolicExpression<Val>],
     leaf_val: impl FnMut(&p3_uni_stark::BaseLeaf<Val>) -> crate::config::Challenge,
     alpha: Option<crate::config::Challenge>,
-) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>, Option<crate::config::Challenge>) {
+) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>, Option<(crate::config::Challenge, u64)>) {
     use crate::config::Challenge;
     use p3_air::symbolic::SymbolicExpr;
     use p3_field::BasedVectorSpace;
@@ -647,7 +647,7 @@ pub fn op_table_f2_trace(
                 let t = b.emit(1, f, a_wire); // t = f · α
                 f = b.emit(2, t, rw); // f = t + c_k
             }
-            Some(f.1)
+            Some((f.1, f.0)) // (folded value, its wiring-bus address)
         }
         _ => None,
     };
@@ -1496,7 +1496,7 @@ mod tests {
         };
         // Append the α-Horner fold (B) in the op-table and read out `folded`.
         let (trace, _roots, folded) = op_table_f2_trace(&constraints, seed, Some(eo_alpha));
-        let folded = folded.expect("the fold produces a value for a non-empty constraint set");
+        let folded = folded.expect("the fold produces a value for a non-empty constraint set").0;
 
         // The op-table's in-table fold reproduces the epilogue's COMPLETE identity.
         assert_eq!(folded * inv_van, eo_quot, "op-table α-Horner fold ⇒ folded·inv_van == quotient(ζ)");
