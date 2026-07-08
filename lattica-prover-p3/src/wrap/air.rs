@@ -1022,13 +1022,27 @@ mod wrap_air {
             chans[0].push((vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()));
             chans[0].push((vec![x_head.clone(), AB::Expr::ZERO, ro_read.0, ro_read.1], is_head.clone()));
             // Channels 1..=N_GROUPS — the input binding. Head PROVIDES committed term k on channel k%N_GROUPS.
+            // NARROW-ARITH: `z` is not stored — re-derive it (= ζ, or ζ·g_trace for the trace-ζ_next term block)
+            // from the committed ζ = `pis[2..4]`, exactly the FULL z-binding's value; FULL: read the stored z(k).
+            let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&v| v.into()).collect();
+            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(self.m.cm_rounds() - self.m.is_zk));
+            let (zeta0, zeta1) = (pis[2].clone(), pis[3].clone());
             for k in 0..self.m.n_terms {
+                let (z0, z1) = if self.m.narrow_arith {
+                    if k >= self.m.trm_next_base() && k < self.m.trm_quot_base() {
+                        (zeta0.clone() * g_trace.clone(), zeta1.clone() * g_trace.clone())
+                    } else {
+                        (zeta0.clone(), zeta1.clone())
+                    }
+                } else {
+                    (cur[self.m.z(k)].clone(), cur[self.m.z(k) + 1].clone())
+                };
                 let head_provide = vec![
                     x_head.clone(),
                     AB::Expr::ZERO,
                     AB::Expr::from(Goldilocks::from_u64(k as u64)),
-                    cur[self.m.z(k)].clone(),
-                    cur[self.m.z(k) + 1].clone(),
+                    z0,
+                    z1,
                     cur[self.m.pz(k)].clone(),
                     cur[self.m.pz(k) + 1].clone(),
                     cur[self.m.px(k)].clone(),
@@ -1862,9 +1876,9 @@ mod tests {
         };
         let full = mk(false);
         let (full_fused_w, n_terms, w_inner) = (full.fused_w(), full.n_terms, full.w_inner());
-        let air = mk(true); // NARROW: inv/apow gone (stride 9→5), the reduced-opening fold externalized
+        let air = mk(true); // NARROW: z + inv/apow gone (stride 9→3), the fold externalized + z re-derived
         let fused_w = air.fused_w();
-        assert_eq!(fused_w, full_fused_w - 4 * n_terms, "narrow_arith drops inv+apow (4 felts/term) from fused_w");
+        assert_eq!(fused_w, full_fused_w - 6 * n_terms, "narrow_arith drops z+inv+apow (6 felts/term) from fused_w");
 
         let asm = AssembledArithWrapAir { m: air };
         let width = <AssembledArithWrapAir as p3_air::BaseAir<Val>>::width(&asm);
@@ -1872,16 +1886,16 @@ mod tests {
         let lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
         println!(
-            "AA5.2 NARROW arith harvest: full fused_w {full_fused_w} (B {}×) → narrow {fused_w} (B {}×); wrap width \
+            "AA5.3 NARROW arith harvest: full fused_w {full_fused_w} (B {}×) → narrow {fused_w} (B {}×); wrap width \
              {width} = fused_w {fused_w} + {} (ro 2 + DeepFoldAir 18 + 4 markers + term_idx 1 + is_ch {N_GROUPS}), \
-             was {full_width}; {} lookup(s), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Dropped inv+apow = {} felts \
-             (4·n_terms, the fold-only helpers); [z, pz, px] kept. AA5.3 (re-derive z) + AA5.4 (source px) then \
-             leave only pz.",
+             was {full_width}; {} lookup(s), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Dropped z+inv+apow = {} felts \
+             (6·n_terms: inv/apow externalized, z re-derived = ζ/ζ·g); only [pz, px] kept. AA5.4 (source px from \
+             the Merkle super-tile) then leaves only pz.",
             full_width / w_inner,
             width / w_inner,
             25 + N_GROUPS,
             lookups.len(),
-            4 * n_terms
+            6 * n_terms
         );
         assert_eq!(width, fused_w + 25 + N_GROUPS, "the wrap adds only O(1) cols over the narrow fused_w");
         assert!(log_nqc <= LOG_BLOWUP, "the narrow arith-assembled wrap must compose within the degree budget");
@@ -1904,10 +1918,10 @@ mod tests {
     ) -> (AssembledArithWrapAir, RowMajorMatrix<Val>, Vec<Val>) {
         use crate::config::Challenge;
         use crate::wrap::deep_fold_trace_from;
-        use p3_field::{BasedVectorSpace, Field};
+        use p3_field::{BasedVectorSpace, Field, TwoAdicField};
         use p3_goldilocks::Goldilocks;
 
-        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs, true); // NARROW: inv/apow dropped
+        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs, true); // NARROW: inv/apow + z dropped
         let (fw, h) = (air.fused_w(), air.height());
         let (n_terms, n_q) = (air.n_terms, air.n_queries);
         let used = air.tr() + n_q * air.m_period();
@@ -1940,8 +1954,24 @@ mod tests {
             let gv = |col: usize| Challenge::from_basis_coefficients_fn(|i| row(col + i));
             let alpha = gv(air.qt_alpha());
             let x = Challenge::from(<Goldilocks as Field>::GENERATOR * row(air.qt_acc() + air.lg() - 1));
-            let terms: Vec<(Challenge, Challenge, Challenge)> =
-                (0..n_terms).map(|k| (gv(air.z(k)), gv(air.pz(k)), Challenge::from(row(air.px(k))))).collect();
+            // NARROW: re-derive z (= ζ / ζ·g_trace) from the committed ζ = pis[2..4] (matching the wrap eval's
+            // provide); FULL: read the stored z(k). pz/px are always the committed openings.
+            let zeta = Challenge::from_basis_coefficients_fn(|i| pis[2 + i]);
+            let g_trace = Challenge::from(Goldilocks::two_adic_generator(air.cm_rounds() - air.is_zk));
+            let terms: Vec<(Challenge, Challenge, Challenge)> = (0..n_terms)
+                .map(|k| {
+                    let z = if air.narrow_arith {
+                        if k >= air.trm_next_base() && k < air.trm_quot_base() {
+                            zeta * g_trace
+                        } else {
+                            zeta
+                        }
+                    } else {
+                        gv(air.z(k))
+                    };
+                    (z, gv(air.pz(k)), Challenge::from(row(air.px(k))))
+                })
+                .collect();
             let region = deep_fold_trace_from(alpha, x, &terms, 0);
             let dw = region.width; // 18
 
@@ -1979,7 +2009,7 @@ mod tests {
     fn arith_wrap_assembled_bus_balances() {
         use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
         use crate::recursion::native_fri::make_config;
-        use p3_field::{Field, PrimeField64};
+        use p3_field::{Field, PrimeField64, TwoAdicField};
         use p3_goldilocks::Goldilocks;
         use p3_uni_stark::prove;
         use std::collections::HashMap;
@@ -1988,7 +2018,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_arith_wrap(&config, &proof, &pvs);
+        let (asm, trace, pis) = assemble_arith_wrap(&config, &proof, &pvs);
 
         let (fw, h) = (asm.m.fused_w(), asm.m.height());
         let width = fw + 25 + N_GROUPS;
@@ -2012,10 +2042,22 @@ mod tests {
                 // Head READ `[x_head, ro_col]` (+1) on channel 0.
                 *bus.entry((0, vec![ku(x_head), 0, ku(g(ro_col)), ku(g(ro_col + 1))])).or_default() += 1;
                 // Head PROVIDES each committed term k (−1) on channel k%N_GROUPS+1: addr (x_head, k), value (z,pz,px).
+                // NARROW: z re-derived (= ζ / ζ·g_trace from pis[2..4], matching the AIR + the region seed);
+                // FULL: g(m.z(k)).
+                let g_trace = Goldilocks::two_adic_generator(m.cm_rounds() - m.is_zk);
                 for k in 0..m.n_terms {
+                    let (z0, z1) = if m.narrow_arith {
+                        if k >= m.trm_next_base() && k < m.trm_quot_base() {
+                            (pis[2] * g_trace, pis[3] * g_trace)
+                        } else {
+                            (pis[2], pis[3])
+                        }
+                    } else {
+                        (g(m.z(k)), g(m.z(k) + 1))
+                    };
                     let tuple = vec![
                         ku(x_head), 0, k as u64,
-                        ku(g(m.z(k))), ku(g(m.z(k) + 1)), ku(g(m.pz(k))), ku(g(m.pz(k) + 1)), ku(g(m.px(k))),
+                        ku(z0), ku(z1), ku(g(m.pz(k))), ku(g(m.pz(k) + 1)), ku(g(m.px(k))),
                     ];
                     *bus.entry((k % N_GROUPS + 1, tuple)).or_default() -= 1;
                 }

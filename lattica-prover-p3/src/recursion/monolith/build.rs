@@ -117,8 +117,11 @@ pub(crate) fn monolith_build_trace(
         let mut apow = Challenge::ONE;
         for (k, &(z, pz, px)) in terms.iter().enumerate() {
             let (zc, pzc) = (c(z), c(pz));
-            t[base0 + air.z(k)] = zc[0];
-            t[base0 + air.z(k) + 1] = zc[1];
+            // NARROW: `z` is not stored (re-derived = ζ / ζ·g). FULL: store it.
+            if !air.narrow_arith {
+                t[base0 + air.z(k)] = zc[0];
+                t[base0 + air.z(k) + 1] = zc[1];
+            }
             t[base0 + air.pz(k)] = pzc[0];
             t[base0 + air.pz(k) + 1] = pzc[1];
             t[base0 + air.px(k)] = px;

@@ -330,25 +330,28 @@ impl MonolithAir {
     pub(crate) fn qt_terms(&self) -> usize {
         self.qt_alpha() + 2
     }
-    // arith (super-tile block 0) — the QT_* layout. Per-term stride is 9 (full) or 5 (narrow: the fold-only
-    // `inv`/`apow` dropped; `[z, pz, px]` kept — see `narrow_arith`).
+    // arith (super-tile block 0) — the QT_* layout. Per-term stride is 9 (FULL: `[z, pz, px, inv, apow]`) or 3
+    // (NARROW: `[pz, px]` — the fold-only `inv`/`apow` AND the DEEP point `z` dropped). `z` is re-derivable (= ζ
+    // or ζ·g_trace, bound to the committed ζ), so the wrap re-derives it rather than storing it; `pz` (the OOD
+    // opening the epilogue folds) + `px` (the authenticated leaf) stay. See `narrow_arith`.
     pub(crate) fn arith_stride(&self) -> usize {
         if self.narrow_arith {
-            5
+            3
         } else {
             9
         }
     }
+    // `z`/`inv`/`apow` exist only in FULL mode; never read when `narrow_arith` (z re-derived, inv/apow externalized).
     pub(crate) fn z(&self, k: usize) -> usize {
-        self.qt_terms() + self.arith_stride() * k
+        self.qt_terms() + 9 * k
     }
     pub(crate) fn pz(&self, k: usize) -> usize {
-        self.z(k) + 2
+        // NARROW: `pz` is the block start (no `z`); FULL: `z + 2`. (Full: qt+9k+2 = z+2, byte-identical.)
+        self.qt_terms() + self.arith_stride() * k + if self.narrow_arith { 0 } else { 2 }
     }
     pub(crate) fn px(&self, k: usize) -> usize {
-        self.z(k) + 4
+        self.pz(k) + 2
     }
-    // `inv`/`apow` exist only in FULL mode (the inline fold's helpers); never read when `narrow_arith`.
     pub(crate) fn inv(&self, k: usize) -> usize {
         self.z(k) + 5
     }
@@ -1544,16 +1547,20 @@ impl MonolithAir {
             // trace-ζ, and quotient terms; ζ·g_trace (the HALVED constraint-domain generator) for the trace-ζ_next
             // block [trm_next_base, trm_quot_base). is_zk=0 ⇒ [0,W)→ζ, [W,2W)→ζ·g, [2W,·)→ζ (byte-for-byte). So
             // each QT_pz(k) is genuinely the opening AT its point.
-            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(cdb));
-            for k in 0..self.n_terms {
-                let at_next = k >= self.trm_next_base() && k < self.trm_quot_base();
-                let (zx, zy) = if at_next {
-                    (zeta.0.clone() * g_trace.clone(), zeta.1.clone() * g_trace.clone())
-                } else {
-                    (zeta.0.clone(), zeta.1.clone())
-                };
-                builder.assert_zero(tf.clone() * (cur[self.z(k)].clone() - zx));
-                builder.assert_zero(tf.clone() * (cur[self.z(k) + 1].clone() - zy));
+            // NARROW-ARITH: `z` is not stored (re-derived = ζ / ζ·g); the wrap binds the re-derived z via its
+            // input bus, so there is no z column to bind here. FULL: bind each stored z(k) to its ζ-value.
+            if !self.narrow_arith {
+                let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(cdb));
+                for k in 0..self.n_terms {
+                    let at_next = k >= self.trm_next_base() && k < self.trm_quot_base();
+                    let (zx, zy) = if at_next {
+                        (zeta.0.clone() * g_trace.clone(), zeta.1.clone() * g_trace.clone())
+                    } else {
+                        (zeta.0.clone(), zeta.1.clone())
+                    };
+                    builder.assert_zero(tf.clone() * (cur[self.z(k)].clone() - zx));
+                    builder.assert_zero(tf.clone() * (cur[self.z(k) + 1].clone() - zy));
+                }
             }
         }
 
