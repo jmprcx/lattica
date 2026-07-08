@@ -545,9 +545,29 @@ pub fn op_table_f2_trace(
 ) -> (RowMajorMatrix<Val>, Vec<crate::config::Challenge>, Option<(crate::config::Challenge, u64)>) {
     use crate::config::Challenge;
     use p3_air::symbolic::SymbolicExpr;
-    use p3_field::BasedVectorSpace;
+    use p3_field::{BasedVectorSpace, PrimeField64};
+    use p3_uni_stark::{BaseEntry, BaseLeaf};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    // A leaf's OPENING identity — so leaves are deduped by which ζ-opening they are (`(entry, index/value)`),
+    // NOT per-Arc. Each distinct opening ⇒ ONE wire (read by the ops), so the assembly's soundness binding can
+    // provide each opening on the bus with a CONSTANT multiplicity (see the 2c design). Tags: 0/1 = Main{0/1}
+    // (local/next), 2 = Public, 3 = Periodic, 4/5/6 = is_first/last/trans, 7 = Constant (deduped by value).
+    fn opening_key(l: &BaseLeaf<Val>) -> (u8, u64) {
+        match l {
+            BaseLeaf::Variable(v) => match v.entry {
+                BaseEntry::Main { offset } => (offset as u8, v.index as u64),
+                BaseEntry::Public => (2, v.index as u64),
+                BaseEntry::Periodic => (3, v.index as u64),
+                BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
+            },
+            BaseLeaf::IsFirstRow => (4, 0),
+            BaseLeaf::IsLastRow => (5, 0),
+            BaseLeaf::IsTransition => (6, 0),
+            BaseLeaf::Constant(c) => (7, c.as_canonical_u64()),
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct Row {
@@ -562,6 +582,7 @@ pub fn op_table_f2_trace(
     struct B<G> {
         rows: Vec<Row>,
         memo: HashMap<usize, (u64, Challenge)>,
+        leaf_memo: HashMap<(u8, u64), (u64, Challenge)>, // dedupe leaves by opening identity
         next: u64,
         zero: Option<(u64, Challenge)>,
         leaf_val: G,
@@ -607,8 +628,14 @@ pub fn op_table_f2_trace(
         fn go(&mut self, node: &p3_air::symbolic::SymbolicExpression<Val>) -> (u64, Challenge) {
             match node {
                 SymbolicExpr::Leaf(l) => {
+                    let key = opening_key(l);
+                    if let Some(&wire) = self.leaf_memo.get(&key) {
+                        return wire; // same opening (across different Arcs) ⇒ one shared leaf wire
+                    }
                     let v = (self.leaf_val)(l);
-                    self.leaf(v)
+                    let wire = self.leaf(v);
+                    self.leaf_memo.insert(key, wire);
+                    wire
                 }
                 SymbolicExpr::Add { x, y, .. } => {
                     let (a, c) = (self.go_arc(x), self.go_arc(y));
@@ -631,7 +658,7 @@ pub fn op_table_f2_trace(
         }
     }
 
-    let mut b = B { rows: Vec::new(), memo: HashMap::new(), next: 0, zero: None, leaf_val };
+    let mut b = B { rows: Vec::new(), memo: HashMap::new(), leaf_memo: HashMap::new(), next: 0, zero: None, leaf_val };
     let mut root_wires: Vec<(u64, Challenge)> = Vec::with_capacity(constraints.len());
     for root in constraints {
         root_wires.push(b.go(root));
