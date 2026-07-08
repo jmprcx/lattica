@@ -1409,9 +1409,10 @@ mod tests {
             build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in);
         let cap_h = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
         let outer = MonolithAir {
-            counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false,
-            column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(),
-            w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h,
+            counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
+            inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
+            constraints: inner_cs.clone(), w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
+            cap_height: cap_h,
         };
         let olayout = AirLayout::from_air::<Val>(&outer);
         let inline_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
@@ -1459,6 +1460,33 @@ mod tests {
             wrap_w - outer_w,
         );
         assert!(op_rows > 0 && 13 <= outer_w, "the op-table has rows and its width overlays fused_w (ample room)");
+
+        // W3 op-table INTEGRATION — the ASSEMBLED wrap AIR at R5 scale (the brick-5 GATE, now PROVEN on
+        // join-split). Build `AssembledWrapAir` over THIS R5 outer and measure: width `fused_w + 17` (O(1)) and
+        // it composes within the degree budget. The join-split `AssembledWrapAir` PROVES through `prove_lookup`
+        // at `fused_w + 17` (`wrap_assembled_proves`), so this is the SAME proven mechanism at R5 scale — the
+        // `2·n_mul` c_k COLUMNS are gone, replaced by op-table slack ROWS.
+        use crate::lookup::prover::combined_constraint_layout;
+        use p3_lookup::Lookups;
+        let asm = AssembledWrapAir {
+            m: MonolithAir {
+                counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false,
+                column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(),
+                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h,
+            },
+            folded_addr: 0,
+        };
+        let asm_width = <AssembledWrapAir as BaseAir<Val>>::width(&asm);
+        let asm_lookups = Lookups::from_air::<Challenge, _>(&asm);
+        let (_al, asm_nqc) = combined_constraint_layout(&asm, &asm_lookups, 1);
+        println!(
+            "R5 ASSEMBLED (the op-table wrap, PROVEN on join-split): width {asm_width} = fused_w {outer_w} + 17 \
+             (folded 2 + op-table 13 + op_sel 1 + is_head 1), composes log_nqc {asm_nqc} ≤ {LOG_BLOWUP}. ⇒ the \
+             WITNESSED WrapAir {wrap_w} CONTRACTS to the ASSEMBLED {asm_width} — back to ≈ the inline monolith \
+             {outer_w}; the 2·n_mul c_k columns become {op_rows} slack ROWS. W3 SIZE FIX: PROVEN + MEASURED."
+        );
+        assert_eq!(asm_width, outer_w + 17, "the assembled wrap is fused_w + O(1), not fused_w + 2·n_mul");
+        assert!(asm_nqc <= LOG_BLOWUP, "the assembled R5 wrap must compose within the degree budget");
         assert!(inline_nqc > LOG_BLOWUP, "the inline monolith must EXPLODE on a monolith-as-inner (the R5 bug)");
         assert!(wrap_nqc <= LOG_BLOWUP, "the wrap must FIX it — witnessed epilogue stays within budget");
     }
