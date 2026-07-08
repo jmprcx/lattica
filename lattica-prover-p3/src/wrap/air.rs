@@ -193,7 +193,7 @@ pub fn wrap_arith_trace(
 #[cfg(feature = "recursion")]
 mod wrap_air {
     use super::Val;
-    use crate::recursion::monolith::{InlineBci, MonolithAir, MonolithBci};
+    use crate::recursion::monolith::{arith_point, bind_reduced_opening, InlineBci, MonolithAir, MonolithBci};
     use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
     use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
     use p3_goldilocks::Goldilocks;
@@ -756,10 +756,98 @@ mod wrap_air {
         }
         ctx.out
     }
+
+    /// **Arith-tile assembly (plumbing) — the narrow-tall arith strategy.** Unlike `InlineBci`, whose
+    /// `emit_arith` folds the reduced opening in `9·n_terms` COLUMNS (apow/z/pz/px/inv per term — the dominant
+    /// inner-scaling width), `DeepFoldBci` keeps the cheap point derivation (`arith_point` — index→x + α_fri
+    /// bind, SOUND) but WITNESSES the fold result `ro` from a dedicated column (`ro_col`), binding `QT_E == ro`
+    /// (`bind_reduced_opening`). So the arith tile costs O(1) columns; `ro`'s soundness is discharged by the
+    /// narrow-tall `DeepFoldAir` region in trace slack (proven faithful on real openings, `cd51eae`) — the
+    /// size-fixed-point analog of `OpTableBci` for the epilogue. Cap-mux + epilogue delegate to `InlineBci`.
+    pub(crate) struct DeepFoldBci {
+        /// The column holding the witnessed reduced opening `ro` (F_p² pair at `ro_col`, `ro_col + 1`).
+        pub(crate) ro_col: usize,
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for DeepFoldBci {
+        fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, _w: &AB::Expr) {
+            // The point stays inline + SOUND (index→x, α_fri bind); only the reduced-opening FOLD is externalized.
+            let _ = arith_point(builder, air, cur, tf, one);
+            let ro = (cur[self.ro_col].clone(), cur[self.ro_col + 1].clone());
+            bind_reduced_opening(builder, cur, tf, ro);
+        }
+
+        fn emit_capmux(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            pis: &[AB::Expr],
+            one: &AB::Expr,
+            tf: &AB::Expr,
+            openings: &[(usize, usize, usize, usize)],
+        ) {
+            InlineBci.emit_capmux(builder, air, cur, pis, one, tf, openings);
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn emit_epilogue(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            tf: &AB::Expr,
+            w: &AB::Expr,
+            local: &[(AB::Expr, AB::Expr)],
+            next: &[(AB::Expr, AB::Expr)],
+            pubs: &[(AB::Expr, AB::Expr)],
+            periodic: &[(AB::Expr, AB::Expr)],
+            is_first: &(AB::Expr, AB::Expr),
+            is_last: &(AB::Expr, AB::Expr),
+            is_trans: &(AB::Expr, AB::Expr),
+            alpha_stark: &(AB::Expr, AB::Expr),
+            inv_van: &(AB::Expr, AB::Expr),
+            quot: &(AB::Expr, AB::Expr),
+        ) {
+            InlineBci.emit_epilogue(
+                builder, air, cur, tf, w, local, next, pubs, periodic, is_first, is_last, is_trans, alpha_stark,
+                inv_van, quot,
+            );
+        }
+    }
+
+    /// The arith-tile wrap AIR: the whole monolith (`eval_bci`) with the arith strategy swapped to `DeepFoldBci`
+    /// — the reduced-opening fold externalized to a witnessed `ro` column (at `fused_w`), everything else inline.
+    /// Width = `fused_w + 2` (the plumbing step; the narrow-tall `DeepFoldAir` region in slack + the `9·n_terms`
+    /// column removal — the actual width win — follow).
+    pub(crate) struct ArithWrapAir {
+        pub(crate) m: MonolithAir,
+    }
+
+    impl BaseAir<Goldilocks> for ArithWrapAir {
+        fn width(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ArithWrapAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(builder, &DeepFoldBci { ro_col: self.m.fused_w() });
+        }
+    }
 }
 
 #[cfg(feature = "recursion")]
-pub(crate) use wrap_air::{native_witnessed, open_id, AssembledWrapAir, WrapAir, N_GROUPS, OPEN_BASE};
+pub(crate) use wrap_air::{native_witnessed, open_id, ArithWrapAir, AssembledWrapAir, WrapAir, N_GROUPS, OPEN_BASE};
 
 #[cfg(test)]
 mod tests {
@@ -1549,6 +1637,64 @@ mod tests {
         let mut bad = pis.clone();
         bad[wrap.m.pub_pi()] += Val::ONE;
         assert!(verify(&config, &wrap, &prf, &bad).is_err(), "a tampered inner pub must be rejected");
+    }
+
+    /// **Arith-tile assembly brick 1 (plumbing) — `ArithWrapAir` PROVES with the reduced-opening fold
+    /// EXTERNALIZED.** The monolith with `DeepFoldBci`: the `9·n_terms`-column inline fold replaced by a
+    /// witnessed `ro` column bound to `QT_E` (the point stays inline + sound via `arith_point`). Filling `ro`
+    /// with the correct reduced opening — the trace's own `QT_E`, which `deep_fold_matches_monolith_arith_tile`
+    /// independently proves the narrow-tall `DeepFoldAir` reproduces — the wrap proves + verifies over a real
+    /// join-split inner, and corrupting `ro` at an arith head is rejected. So the `emit_arith` override binds
+    /// correctly end-to-end. (`ro`'s IN-CIRCUIT soundness — that it IS the fold of the committed openings — is
+    /// the next brick: the narrow-tall `DeepFoldAir` region in slack + the opening seam. Width = fused_w + 2;
+    /// the `9·n_terms` column removal — the actual width win — follows.) Heavy; `--release --ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves ArithWrapAir (2^16 rows); run `--release --features lookup,recursion -- --ignored`"]
+    fn arith_wrap_witnessed_ro_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_matrix::dense::RowMajorMatrix;
+        use p3_uni_stark::{prove, verify};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, mono_trace, pis) = wrap_build_reused(&config, &proof, &pvs);
+
+        let (fw, h, n_q, tr, mp) = (air.fused_w(), air.height(), air.n_queries, air.tr(), air.m_period());
+        let width = fw + 2;
+        let wrap = ArithWrapAir { m: air };
+
+        // Widen the monolith trace by the `ro` column; fill `ro` (= the correct reduced opening, which the trace
+        // already carries at QT_E = column 0) at each arith head (M_TF fires at tr + q·m_period).
+        let mut wide = vec![Val::ZERO; h * width];
+        for r in 0..h {
+            wide[r * width..r * width + fw].copy_from_slice(&mono_trace.values[r * fw..(r + 1) * fw]);
+        }
+        for q in 0..n_q {
+            let head = tr + q * mp;
+            wide[head * width + fw] = mono_trace.values[head * fw]; // ro.0 = QT_E.0
+            wide[head * width + fw + 1] = mono_trace.values[head * fw + 1]; // ro.1 = QT_E.1
+        }
+        let wide_trace = RowMajorMatrix::new(wide, width);
+
+        let prf = prove(&config, &wrap, wide_trace.clone(), &pis);
+        assert!(verify(&config, &wrap, &prf, &pis).is_ok(), "ArithWrapAir must verify with the fold externalized");
+
+        // Corrupt `ro` at the first arith head ⇒ QT_E ≠ ro ⇒ reject (prove can't close the quotient, or verify).
+        let mut bad = wide_trace;
+        bad.values[tr * width + fw] += Val::ONE;
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = prove(&config, &wrap, bad, &pis);
+            verify(&config, &wrap, &p, &pis).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted `ro` (QT_E ≠ ro) must not produce a valid ArithWrapAir proof");
     }
 
     /// **The wrap FIXES the self-recursion explosion (R5) — the degree WIN, demonstrated.** Build the OUTER
