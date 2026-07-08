@@ -1406,6 +1406,80 @@ mod tests {
         assert!(verify(&pc, &DeepFoldAir, &dproof, &[]).is_ok(), "the real-seeded narrow-tall fold must verify");
     }
 
+    /// **Caps narrow-tall brick — the LogUp cap-select MATCHES the monolith product-mux on a REAL inner**
+    /// (`--features recursion`). The cap analog of `deep_fold_matches_monolith_arith_tile`, one region over, and
+    /// the faithfulness gate for the caps track (the 85%-of-`column_window`-`fused_w` lever). Build the real
+    /// join-split monolith trace; read its arith-head cap carriers `cap_c[g]` (the monolith's degree-`cap_height`
+    /// product-mux result, `InlineBci::emit_capmux`); and for EVERY opening (trace, quotient, each of the
+    /// `cm_rounds` commit rounds) independently select the entry the committed index bits address — `E =
+    /// Σ_j bit(shift+j)·2^j`, entry `pis[cbase + E·4 + k]` — the narrow-tall selection. It reproduces `cap_c`
+    /// BIT-FOR-BIT across all openings, so the columns→rows swap is faithful on the REAL multi-cap layout (many
+    /// caps, real shifts/bits), not just the synthetic `cap_mux_*` model. Then a `CapMuxAir` seeded with the REAL
+    /// (flattened) trace cap + the real selected cells PROVES + VERIFIES through the W1 lookup prover — real
+    /// committed cap data selects + proves. (Binding the slack rows to the transcript-committed cap + removing the
+    /// `2^cap_height·4` cap column-window is the assembly still ahead — the `DeepFoldBci`/AA-arc analog for caps.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_mux_matches_monolith() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use crate::wrap::{cap_mux_trace, CapMuxAir};
+        use p3_field::PrimeField64;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, tr, pis) = wrap_build_reused(&config, &proof, &pvs, false);
+
+        let width = tr.width;
+        let off = air.tr(); // q = 0 arith head — where the cap-mux seeds cap_c
+        let row = |col: usize| tr.values[off * width + col];
+        // The entry index the committed index bits [shift .. shift+bits) address (the mux's selected `e`).
+        let entry = |shift: usize, bits: usize| -> usize {
+            (0..bits)
+                .map(|j| {
+                    let b = row(air.sb_b(shift + j)).as_canonical_u64();
+                    assert!(b <= 1, "index bit sb_b({}) must be boolean, got {b}", shift + j);
+                    (b as usize) << j
+                })
+                .sum()
+        };
+
+        // Reconstruct the monolith's openings list (the air.rs emit path, is_zk=0): (cg_off, shift, bits, cbase) —
+        // trace + quotient at max height (shift = input_depth), then each commit round at its folded height.
+        let mut openings = vec![
+            (0usize, air.input_depth(), air.cap_height, air.cap_base()),
+            (4, air.input_depth(), air.cap_height, air.qcap_base()),
+        ];
+        for r in 0..air.cm_rounds() {
+            openings.push((8 + 4 * r, air.commit_shift(r), air.commit_bits(r), air.commit_cap_base(r)));
+        }
+
+        // FAITHFULNESS: for every opening, the index-addressed entry equals the monolith's product-mux carrier.
+        for &(cg_off, shift, bits, cbase) in &openings {
+            let e = entry(shift, bits);
+            for k in 0..4 {
+                assert_eq!(
+                    row(air.cap_c(cg_off + k)),
+                    pis[cbase + e * 4 + k],
+                    "opening cg_off={cg_off}: narrow-tall select cap[E={e}][{k}] must equal the product-mux cap_c",
+                );
+            }
+        }
+
+        // …and the REAL cap selects + PROVES through the W1 lookup prover. Flatten the trace cap (2^cap_height
+        // entries × 4 felts → scalar cells `cap[e·4+k]`); query the 4 cells of the selected trace entry E.
+        let bits = air.cap_height;
+        let flat: Vec<Val> = (0..((1usize << bits) * 4)).map(|c| pis[air.cap_base() + c]).collect();
+        let e_tr = entry(air.input_depth(), bits);
+        let queries: Vec<usize> = (0..4).map(|k| e_tr * 4 + k).collect();
+        let cproof = prove_lookup(&CapMuxAir, cap_mux_trace(&flat, &queries), &[]);
+        assert!(verify_lookup(&CapMuxAir, &cproof, &[]).is_ok(), "the real-cap LogUp select must verify");
+        assert!(openings.len() == 2 + air.cm_rounds() && bits > 0);
+    }
+
     /// **Brick 5 increment 2b — assemble the full wrap trace** (`--features recursion`). Widen the reused
     /// monolith trace to `fused_w + 16`; seed the FLATTEN op-table with the REAL ζ-openings + fold; place its
     /// rows in the trace SLACK (`op_sel = 1`); fill `folded_col` at each arith head (`tf = 1` rows) with the
@@ -1903,6 +1977,117 @@ mod tests {
         assert!(log_nqc <= LOG_BLOWUP, "the narrow arith-assembled wrap must compose within the degree budget");
         assert!(width < full_width, "narrow_arith must strictly shrink the wrap width (the AA5.2 win)");
         assert!(w_inner > 0);
+    }
+
+    /// **POST-SWAP SIZE MAP — which region now dominates `fused_w` (the B≤1 next-lever decision).** After the
+    /// arith-tile narrow-tall swap (AA5.4: `9·n_terms` → `2·n_terms` columns), decompose the narrow join-split
+    /// monolith's `fused_w` into its constituent regions, tag each with its SCALING LAW (inner-width, FRI-depth,
+    /// or constant), and SELF-CHECK that the region widths sum to `fused_w()` exactly (the guard that the map is
+    /// faithful, not hand-waved). Also isolates the `column_window` pis/cap window — the regime where the inner
+    /// proof's `2^cap_height` caps become OUTER columns — so the caps-vs-canonicalization-vs-Tip5 fork is decided
+    /// on measured widths, not the handoff's guess. Cheap (no prove): builds the air and reads offsets.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn post_swap_region_breakdown() {
+        use crate::joinsplit_air::{
+            build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
+        };
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints =
+            get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let mk = |narrow: bool, column_window: bool| MonolithAir {
+            counts: counts.clone(),
+            binds: binds.clone(),
+            index_binds: index_binds.clone(),
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints: constraints.clone(),
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: narrow,
+        };
+
+        // Decompose fused_w (column_window=false: the arith-wrap regime the whole track measures B in). The regions
+        // are laid out in offset order; each width is a difference of consecutive region bases. `S` tags scaling:
+        // "inner" = grows with the inner's shape (w_inner / nqc / n_terms), "depth" = grows with the FRI depth `lg`,
+        // "const" = fixed. n_terms ≈ 2·w_inner + 2·nqc, so the arith tile is the dominant inner-scaling term.
+        let breakdown = |a: &MonolithAir| {
+            let cw = a.cw(); // 0 at is_zk=0
+            let _ = cw;
+            vec![
+                ("deep-hdr (DEEP idx region 9+lg + acc chain lg + alpha 2)", a.qt_terms(), "depth"),
+                ("ARITH TILE (arith_stride · n_terms)", a.tile_w() - a.qt_terms(), "inner"),
+                ("index-decomp SB (64 bits + sb_q + rem + carry)", a.ov() - a.sb_x(), "const"),
+                ("trace-leaf carriers (input_leaf_felts)", a.input_leaf_felts() + a.random_carriers(), "inner"),
+                ("quot-leaf carriers (2·nqc)", a.quot_leaf_felts(), "inner"),
+                ("commit fold-group carriers (4·cm_rounds)", 4 * a.cm_rounds(), "depth"),
+                ("cap-ENTRY carriers (selected entry, (2+cm_rounds)·4)", a.n_cap_c(), "depth"),
+                ("Lagrange selectors", 6, "const"),
+            ]
+        };
+
+        let full = mk(false, false);
+        let narrow = mk(true, false);
+        let (fw_full, fw) = (full.fused_w(), narrow.fused_w());
+        let (n_terms, w_inner, lg, nqc, cap_h) =
+            (narrow.n_terms, narrow.w_inner(), narrow.lg(), narrow.nqc(), narrow.cap_height);
+
+        // SELF-CHECK: the region map must reconstruct fused_w exactly (else the map is wrong, not the code).
+        let sum: usize = breakdown(&narrow).iter().map(|(_, wdt, _)| wdt).sum();
+        assert_eq!(sum, fw, "narrow region breakdown ({sum}) must sum to fused_w ({fw})");
+        let sum_full: usize = breakdown(&full).iter().map(|(_, wdt, _)| wdt).sum();
+        assert_eq!(sum_full, fw_full, "full region breakdown ({sum_full}) must sum to fused_w ({fw_full})");
+
+        let mut rows = breakdown(&narrow);
+        rows.sort_by(|x, y| y.1.cmp(&x.1)); // largest first
+        println!(
+            "\n=== POST-SWAP fused_w REGION MAP (narrow join-split inner: w_inner={w_inner}, nqc={nqc}, \
+             n_terms={n_terms}, lg={lg}, cap_height={cap_h}) ===\n  fused_w: FULL {fw_full} → NARROW {fw} \
+             (arith 9→2/term saved {} cols)",
+            fw_full - fw
+        );
+        for (name, wdt, scale) in &rows {
+            println!("    {wdt:>4}  ({:>4.1}%)  [{scale:>5}]  {name}", 100.0 * *wdt as f64 / fw as f64);
+        }
+
+        // The column_window regime: the inner proof's pis (challenges/indices/final_poly/PUB/CAPS/periodic/qwt) are
+        // mirrored into OUTER columns (+ the fold accumulators). This is where 2^cap_height enters fused_w — the
+        // self-composition regime. Isolate its size and the cap portion within it.
+        let narrow_cw = mk(true, true);
+        let fw_cw = narrow_cw.fused_w();
+        let cap_stride = narrow_cw.cap_stride(); // 2^cap_height · 4 (full cap)
+        let cap_felts = 2 * cap_stride + narrow_cw.commit_caps_len(); // trace + quot + commit-round caps
+        let fold_acc = 2 * narrow_cw.n_fold_acc();
+        println!(
+            "  --- column_window (self-composition) regime ---\n    fused_w with column_window: {fw_cw} \
+             (= {fw} + pis-window {} + fold-acc {fold_acc})\n    of the pis window, CAPS = {cap_felts} felts \
+             (cap_stride {cap_stride} = 2^{cap_h}·4; SCALES 2^cap_height with tree depth — small here, cap_height={cap_h})",
+            fw_cw - fw - fold_acc
+        );
+
+        // Assertions that pin the findings so a regression is caught.
+        assert_eq!(rows[0].0, "ARITH TILE (arith_stride · n_terms)", "arith tile is still the largest region post-swap");
+        assert_eq!(narrow.tile_w() - narrow.qt_terms(), 2 * n_terms, "narrow arith tile = 2·n_terms");
+        assert!(fw_cw > fw, "column_window mode widens fused_w by the pis window");
+        assert!(w_inner > 0 && cap_h < lg);
     }
 
     /// **Arith-tile assembly increment AA2 — assemble the full arith-wrap trace.** Widen the reused monolith
