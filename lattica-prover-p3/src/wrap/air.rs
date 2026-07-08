@@ -845,6 +845,94 @@ mod wrap_air {
         }
     }
 
+    /// **Caps assembly (plumbing) — the narrow-tall cap strategy.** The `emit_capmux` analog of [`DeepFoldBci`]:
+    /// where [`InlineBci::emit_capmux`] binds each cap carrier `cap_c` to the index-selected committed cap entry
+    /// via a degree-`cap_height` product-mux over ALL `2^cap_height` entries (`cap_c[k] = Σ_e (Π_j sel_bit_j(e))·
+    /// pis[cbase+e·4+k]` — whose `2^cap_height·4` cap COLUMNS are 85% of the `column_window` fused_w), `CapMuxBci`
+    /// EXTERNALIZES it: `emit_capmux` emits NOTHING. `cap_c` already exists as a carrier column and STAYS bound to
+    /// the Merkle terminal (`terminal == cap_c`, emitted in `eval_bci`) + held across the super-tile; the missing
+    /// binding — `cap_c` == the COMMITTED cap `cap[index>>shift]` — is discharged by a narrow-tall cap-row region
+    /// in slack + the wiring bus (the AA-arc, next), exactly as `DeepFoldAir` discharges `ro`. A free binding here
+    /// (provable — `cap_c` is bound to the computed Merkle root — but UNSOUND w.r.t. the committed cap until
+    /// bus-bound). Arith + epilogue delegate to `InlineBci`. (Plumbing at `column_window=false`, mirroring
+    /// `ArithWrapAir`; the `2^cap_height·4` cap-COLUMN removal — the width win — is `column_window`-only, later.)
+    pub(crate) struct CapMuxBci;
+
+    impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for CapMuxBci {
+        fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, w: &AB::Expr) {
+            InlineBci.emit_arith(builder, air, cur, tf, one, w);
+        }
+
+        fn emit_capmux(
+            &self,
+            _builder: &mut AB,
+            _air: &MonolithAir,
+            _cur: &[AB::Expr],
+            _pis: &[AB::Expr],
+            _one: &AB::Expr,
+            _tf: &AB::Expr,
+            _openings: &[(usize, usize, usize, usize)],
+        ) {
+            // EXTERNALIZED: no product-mux. `cap_c` is bound to the Merkle terminal (+ held) by `eval_bci`; the
+            // narrow-tall cap-row region + bus (next brick) re-bind it to the committed cap `cap[index>>shift]`.
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn emit_epilogue(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            tf: &AB::Expr,
+            w: &AB::Expr,
+            local: &[(AB::Expr, AB::Expr)],
+            next: &[(AB::Expr, AB::Expr)],
+            pubs: &[(AB::Expr, AB::Expr)],
+            periodic: &[(AB::Expr, AB::Expr)],
+            is_first: &(AB::Expr, AB::Expr),
+            is_last: &(AB::Expr, AB::Expr),
+            is_trans: &(AB::Expr, AB::Expr),
+            alpha_stark: &(AB::Expr, AB::Expr),
+            inv_van: &(AB::Expr, AB::Expr),
+            quot: &(AB::Expr, AB::Expr),
+        ) {
+            InlineBci.emit_epilogue(
+                builder, air, cur, tf, w, local, next, pubs, periodic, is_first, is_last, is_trans, alpha_stark,
+                inv_van, quot,
+            );
+        }
+    }
+
+    /// The caps wrap AIR: the whole monolith (`eval_bci`) with the cap-mux strategy swapped to [`CapMuxBci`] — the
+    /// `2^cap_height`-entry product-mux externalized, everything else inline. Width = `fused_w` (UNCHANGED: `cap_c`
+    /// is a pre-existing carrier, unlike `ArithWrapAir`'s `+2` for the witnessed `ro`). The plumbing step; the
+    /// narrow-tall cap-row region in slack + the bus binding + the `column_window` cap-column removal (the width
+    /// win) follow — the [`AssembledArithWrapAir`]/AA arc for caps.
+    pub(crate) struct CapWrapAir {
+        pub(crate) m: MonolithAir,
+    }
+
+    impl BaseAir<Goldilocks> for CapWrapAir {
+        fn width(&self) -> usize {
+            self.m.fused_w()
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CapWrapAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(builder, &CapMuxBci);
+        }
+    }
+
     /// **Arith-tile assembly — the sound narrow-tall reduced-opening fold** (the [`AssembledWrapAir`] analog one
     /// region deeper). Where [`ArithWrapAir`] externalizes the DEEP fold's `ro` to a FREE witness column
     /// (provable but UNSOUND — a prover can put any `ro`), this AIR discharges `ro`'s soundness through the
@@ -1074,8 +1162,8 @@ mod wrap_air {
 
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
-    native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledWrapAir, WrapAir, N_GROUPS,
-    OPEN_BASE,
+    native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledWrapAir, CapWrapAir, WrapAir,
+    N_GROUPS, OPEN_BASE,
 };
 
 #[cfg(test)]
@@ -1478,6 +1566,85 @@ mod tests {
         let cproof = prove_lookup(&CapMuxAir, cap_mux_trace(&flat, &queries), &[]);
         assert!(verify_lookup(&CapMuxAir, &cproof, &[]).is_ok(), "the real-cap LogUp select must verify");
         assert!(openings.len() == 2 + air.cm_rounds() && bits > 0);
+    }
+
+    /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
+    /// The cheap half of the `CapMuxBci` plumbing (the `ArithWrapAir` analog): swapping the cap-mux strategy to
+    /// `CapMuxBci` (`emit_capmux` → nothing) drops the `openings·4` product-mux constraints (and their `2^cap_height`
+    /// entry reads) while keeping width at `fused_w` (cap_c is a pre-existing carrier) and NOT raising the degree
+    /// (removing constraints can't). Confirms the externalized AIR is well-formed + a strict constraint SUBSET of
+    /// the monolith; `cap_wrap_externalized_proves` is the heavy end-to-end confirmation.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_wrap_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, _tr, _pis) = wrap_build_reused(&config, &proof, &pvs, false);
+        let fw = air.fused_w();
+
+        // The full monolith's constraints (InlineBci product-mux included), for the subset + degree comparison.
+        let mono_cs = get_symbolic_constraints::<Val, _>(&air, AirLayout::from_air::<Val>(&air));
+        let mono_deg = mono_cs.iter().map(|c| c.degree_multiple()).max().unwrap();
+
+        let wrap = CapWrapAir { m: air };
+        assert_eq!(BaseAir::<Val>::width(&wrap), fw, "CapWrapAir adds no columns (cap_c is a pre-existing carrier)");
+        let cs = get_symbolic_constraints::<Val, _>(&wrap, AirLayout::from_air::<Val>(&wrap));
+        let deg = cs.iter().map(|c| c.degree_multiple()).max().unwrap();
+        println!(
+            "CapWrapAir: width {fw} (== fused_w, NO cap cols added), {} constraints (monolith {}, −{} product-mux), \
+             max degree {deg} (monolith {mono_deg}). Product-mux externalized; cap_c stays bound to the Merkle terminal.",
+            cs.len(),
+            mono_cs.len(),
+            mono_cs.len() - cs.len()
+        );
+        assert!(deg <= mono_deg, "externalizing the product-mux must not raise the constraint degree");
+        assert!(cs.len() < mono_cs.len(), "CapWrapAir must be a strict constraint subset (product-mux dropped)");
+    }
+
+    /// **Caps plumbing brick — `CapWrapAir` proves with the product-mux externalized** (`--release --ignored`).
+    /// The heavy end-to-end half: the monolith trace already satisfies the full monolith ⊇ `CapWrapAir`
+    /// (product-mux dropped), so `CapWrapAir` proves it DIRECTLY (no widening — cap_c is a pre-existing carrier,
+    /// bound to the Merkle terminal + held). And corrupting a cap_c at an arith head is rejected (the remaining
+    /// cap_c binding — hold + terminal — still fires). So the `emit_capmux` externalization is trace-faithful end
+    /// to end; the cap_c→committed-cap binding (the removed product-mux) is the next brick (the bus). Mirrors
+    /// `arith_wrap_witnessed_ro_proves`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves CapWrapAir (2^16 rows); run `--release --features lookup,recursion -- --ignored`"]
+    fn cap_wrap_externalized_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{prove, verify};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, mono_trace, pis) = wrap_build_reused(&config, &proof, &pvs, false);
+        let (tr, width, cap0) = (air.tr(), air.fused_w(), air.cap_c(0));
+        let wrap = CapWrapAir { m: air };
+
+        let prf = prove(&config, &wrap, mono_trace.clone(), &pis);
+        assert!(verify(&config, &wrap, &prf, &pis).is_ok(), "CapWrapAir must verify with the product-mux externalized");
+
+        // Corrupt cap_c[0] at the first arith head ⇒ the remaining cap_c constraints (hold + Merkle terminal) break.
+        let mut bad = mono_trace;
+        bad.values[tr * width + cap0] += Val::ONE;
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = prove(&config, &wrap, bad, &pis);
+            verify(&config, &wrap, &p, &pis).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted cap_c must not produce a valid CapWrapAir proof");
     }
 
     /// **Brick 5 increment 2b — assemble the full wrap trace** (`--features recursion`). Widen the reused
