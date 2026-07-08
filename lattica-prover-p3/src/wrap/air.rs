@@ -1231,6 +1231,7 @@ mod tests {
         config: &crate::recursion::native_fri::MyConfig,
         proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
         pvs: &[Val],
+        narrow: bool, // NARROW-ARITH: drop the inline fold's inv/apow (the wrap externalizes the fold)
     ) -> (crate::recursion::monolith::MonolithAir, RowMajorMatrix<Val>, Vec<Val>) {
         use crate::joinsplit_air::{JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
         use crate::recursion::monolith::tests::sim_full;
@@ -1280,7 +1281,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: narrow };
         let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
             epilogue_openings(config, &inner, proof, pvs);
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
@@ -1361,7 +1362,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (air, tr, _pis) = wrap_build_reused(&config, &proof, &pvs);
+        let (air, tr, _pis) = wrap_build_reused(&config, &proof, &pvs, false);
 
         // The first query's arith head row carries the entire DEEP reduced-opening fold + its committed QT_E.
         let width = tr.width;
@@ -1407,7 +1408,7 @@ mod tests {
         use p3_field::BasedVectorSpace;
         use p3_uni_stark::{get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf};
 
-        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs);
+        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs, false);
         let (eo_local, eo_next, is_first, is_last, is_trans, _iv, _eq, eo_alpha, _z, eo_periodic) =
             epilogue_openings(config, &JoinSplitAir, proof, pvs);
         let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
@@ -1649,7 +1650,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (air, trace, pis) = wrap_build_reused(&config, &proof, &pvs);
+        let (air, trace, pis) = wrap_build_reused(&config, &proof, &pvs, false);
         let prf = prove(&config, &air, trace, &pis);
         assert!(verify(&config, &air, &prf, &pis).is_ok(), "the reused-region monolith must verify");
         let mut bad = pis.clone();
@@ -1906,7 +1907,7 @@ mod tests {
         use p3_field::{BasedVectorSpace, Field};
         use p3_goldilocks::Goldilocks;
 
-        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs);
+        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs, true); // NARROW: inv/apow dropped
         let (fw, h) = (air.fused_w(), air.height());
         let (n_terms, n_q) = (air.n_terms, air.n_queries);
         let used = air.tr() + n_q * air.m_period();
@@ -2113,7 +2114,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (air, mono_trace, pis) = wrap_build_reused(&config, &proof, &pvs);
+        let (air, mono_trace, pis) = wrap_build_reused(&config, &proof, &pvs, false);
         // The native OOD openings the witnessed columns must equal (the same ζ-openings the epilogue reads).
         let (eo_local, eo_next, is_first, is_last, is_trans, _iv, _q, _a, _z, eo_periodic) =
             epilogue_openings(&config, &JoinSplitAir, &proof, &pvs);
@@ -2172,7 +2173,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (air, mono_trace, pis) = wrap_build_reused(&config, &proof, &pvs);
+        let (air, mono_trace, pis) = wrap_build_reused(&config, &proof, &pvs, false);
 
         let (fw, h, n_q, tr, mp) = (air.fused_w(), air.height(), air.n_queries, air.tr(), air.m_period());
         let width = fw + 2;
