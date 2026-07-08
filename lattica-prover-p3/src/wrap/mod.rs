@@ -1650,4 +1650,117 @@ mod tests {
             "a corrupted op-table wire must unbalance the bus even amid the gated region"
         );
     }
+
+    /// **W3 brick 5 prototype (is_zk=1) — the openings→bus SEAM: one gated region PROVIDES a value that another
+    /// gated region CONSUMES and uses in a constraint.** This is the exact integration seam — in the full wrap
+    /// the arith head (an A–J tile) provides each committed ζ-opening on the bus and the op-table leaves consume
+    /// them by address. Neither the op-table (provider+consumer, but NOT gated into separate regions) nor the
+    /// gated prototype (two regions, but sharing NO data) shows this alone. `SeamProtoAir` (F_p², width 9): a
+    /// **provider** region (`sel = 1`) provides `(addr, v0, v1)` on the wiring bus; a **consumer** region
+    /// (`sel = 0`) reads `(addr, r0, r1)` — so the bus BINDS `recv = v` (same addr) across the region boundary —
+    /// and asserts `recv² = sq` (emul), proving the consumer actually received and used the provided value.
+    struct SeamProtoAir;
+
+    impl BaseAir<Val> for SeamProtoAir {
+        fn width(&self) -> usize {
+            9 // [is_cons, addr, v0, v1, r0, r1, s0, s1, mult]
+        }
+    }
+
+    impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for SeamProtoAir {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let r = main.current_slice().to_vec();
+            let is_cons: AB::Expr = r[0].into(); // 1 on consumer rows, 0 on provider AND pad rows
+            let (addr, v0, v1) = (r[1], r[2], r[3]);
+            let (r0, r1) = (r[4], r[5]);
+            let (s0, s1) = (r[6], r[7]);
+            let mult = r[8]; // define multiplicity: −n_consumers on the provider, 0 elsewhere
+            let w = AB::Expr::from(Val::from_u64(7));
+
+            builder.assert_zero(is_cons.clone() * (is_cons.clone() - AB::Expr::ONE)); // is_cons boolean
+
+            // Consumer (is_cons = 1): the received value (bound to the provider's by the bus) squares to `sq`.
+            builder.assert_zero(is_cons.clone() * (s0.into() - (r0.into() * r0.into() + w * r1.into() * r1.into())));
+            builder.assert_zero(is_cons.clone() * (s1.into() - (r0.into() * r1.into() + r1.into() * r0.into())));
+
+            // One wiring bus: the DEFINE term `(addr, v)` carries `mult` (nonzero only on the provider), the
+            // READ term `(addr, recv)` fires only on consumers (`is_cons`) — so PAD rows (both 0) are inert.
+            // Balance ⇒ every consumed `(addr, recv)` matches the provided `(addr, v)` — the cross-region
+            // binding `recv = v`.
+            builder.push_local_interaction(vec![
+                (vec![addr.into(), v0.into(), v1.into()], mult.into()),
+                (vec![addr.into(), r0.into(), r1.into()], is_cons),
+            ]);
+        }
+    }
+
+    /// Build a [`SeamProtoAir`] trace: one provider row `(is_cons = 0, addr, v, mult = −n_consumers)` and
+    /// `n_consumers` consumer rows `(is_cons = 1, addr, recv = v, sq = v²)`, padded (pad rows all-zero: `is_cons
+    /// = 0` ⇒ the square is vacuous and both bus terms are 0). `v` has both F_p² coefficients nonzero so `emul`
+    /// is exercised.
+    fn seam_proto_trace(n_consumers: usize) -> RowMajorMatrix<Val> {
+        use p3_field::BasedVectorSpace;
+        let v = Challenge::from_basis_coefficients_fn(|k| Val::from_u64(if k == 0 { 3 } else { 5 }));
+        let vsq = v * v;
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let (addr, w) = (Val::from_u64(7), 9);
+        let total = (1 + n_consumers).next_power_of_two().max(1 << 4);
+        let mut flat = vec![Val::ZERO; total * w];
+        // Provider row 0: is_cons = 0, addr, v, mult = −n_consumers (nothing read yet).
+        flat[1] = addr;
+        flat[2..4].copy_from_slice(&cc(v));
+        flat[8] = -Val::from_u64(n_consumers as u64);
+        // Consumer rows: is_cons = 1, addr, recv = v, sq = v².
+        for i in 0..n_consumers {
+            let base = (1 + i) * w;
+            flat[base] = Val::ONE; // is_cons
+            flat[base + 1] = addr;
+            flat[base + 4..base + 6].copy_from_slice(&cc(v)); // recv = v
+            flat[base + 6..base + 8].copy_from_slice(&cc(vsq)); // sq = v²
+        }
+        RowMajorMatrix::new(flat, w)
+    }
+
+    /// The seam proves + verifies through `prove_lookup` (is_zk=1): a value crosses the region boundary via the
+    /// bus and is used in the consumer's constraint.
+    #[test]
+    fn seam_proto_proves() {
+        let proof = prove_lookup(&SeamProtoAir, seam_proto_trace(3), &[]);
+        assert!(
+            verify_lookup(&SeamProtoAir, &proof, &[]).is_ok(),
+            "the cross-region openings→bus seam must prove through prove_lookup at is_zk=1"
+        );
+    }
+
+    /// A consumer that received a value NOT provided (`recv ≠ v`, but squared correctly so its local constraint
+    /// still holds) breaks the bus balance ⇒ non-zero terminal — the bus binds the consumer's received value to
+    /// the provider's, independently of the local use.
+    #[test]
+    fn seam_proto_rejects_wrong_recv() {
+        use p3_field::BasedVectorSpace;
+        let mut trace = seam_proto_trace(3);
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let bad = Challenge::from(Val::from_u64(999)); // ≠ v, and never provided
+        trace.values[9 + 4..9 + 6].copy_from_slice(&cc(bad)); // consumer 0 recv = bad
+        trace.values[9 + 6..9 + 8].copy_from_slice(&cc(bad * bad)); // sq = bad² (local square still holds)
+        let proof = prove_lookup(&SeamProtoAir, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&SeamProtoAir, &proof, &[]), Err(LookupVerifyError::NonZeroTerminal)),
+            "a consumer that received an unprovided value must unbalance the bus"
+        );
+    }
+
+    /// A consumer that received the right value but mis-squares it (`sq ≠ recv²`) fails its local constraint ⇒
+    /// OOD mismatch — the consumer's USE of the seam value is checked.
+    #[test]
+    fn seam_proto_rejects_wrong_square() {
+        let mut trace = seam_proto_trace(3);
+        trace.values[1 * 9 + 6] += Val::ONE; // consumer 0's s0 ≠ recv²
+        let proof = prove_lookup(&SeamProtoAir, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&SeamProtoAir, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
+            "a consumer that misuses the received value must fail its local constraint"
+        );
+    }
 }
