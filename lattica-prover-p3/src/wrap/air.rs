@@ -1170,8 +1170,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-        };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
         let layout = AirLayout::from_air::<Val>(&air);
         let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
         println!("WRAP witness seam: real join-split MonolithAir (reused regions A–J) log_nqc = {log_nqc}");
@@ -1281,8 +1280,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-        };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
         let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
             epilogue_openings(config, &inner, proof, pvs);
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
@@ -1699,8 +1697,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-        };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
         let wrap = WrapAir::new(air);
         let width = <WrapAir as p3_air::BaseAir<Val>>::width(&wrap);
         let layout = AirLayout::from_air::<Val>(&wrap);
@@ -1758,8 +1755,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-        };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
         let fused_w = air.fused_w();
         let asm = AssembledWrapAir { m: air, folded_addr: 0 }; // any address for the pure composition check
         let width = <AssembledWrapAir as p3_air::BaseAir<Val>>::width(&asm);
@@ -1858,8 +1854,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-        };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
         let (fused_w, n_terms, w_inner) = (air.fused_w(), air.n_terms, air.w_inner());
         let arith_tile = 9 * n_terms; // the inline DEEP reduced-opening columns AA5 removes
         let asm = AssembledArithWrapAir { m: air };
@@ -2259,8 +2254,7 @@ mod tests {
         let inner = MonolithAir {
             counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false,
             column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![],
-            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6,
-        };
+            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -2295,8 +2289,7 @@ mod tests {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h,
-        };
+            cap_height: cap_h, narrow_arith: false };
         let olayout = AirLayout::from_air::<Val>(&outer);
         let inline_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
         let (inner_w, outer_w) = (inner.fused_w(), outer.fused_w());
@@ -2355,8 +2348,7 @@ mod tests {
             m: MonolithAir {
                 counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false,
                 column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(),
-                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h,
-            },
+                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h, narrow_arith: false },
             folded_addr: 0,
         };
         let asm_width = <AssembledWrapAir as BaseAir<Val>>::width(&asm);

@@ -82,6 +82,13 @@ pub(crate) struct MonolithAir {
     /// deeper per-query Merkle paths. Every existing construction passes 6 ⇒ all geometry methods reproduce
     /// the old CM_CAP_HEIGHT-const values byte-for-byte.
     pub cap_height: usize,
+    /// NARROW-ARITH mode (the deep-tree wrap's W5 size lever). When true the arith super-tile drops the
+    /// fold-only helper columns from each DEEP term — the reduced-opening fold is externalized to a narrow-tall
+    /// slack region (`src/wrap` `AssembledArithWrapAir`), so `inv(k)`/`apow(k)` are never read. The per-term
+    /// stride shrinks 9→5 felts (`[z, pz, px]` kept: `pz` is the epilogue's opening, `z`/`px` feed the wrap's
+    /// input binding). `false` = the exact 9-felt/term layout every non-wrap construction uses, byte-for-byte
+    /// (the `pinned_constraint_fingerprints` guard covers is_zk 0/1 at false). Set true ONLY by the wrap.
+    pub narrow_arith: bool,
 }
 
 #[allow(dead_code)]
@@ -323,9 +330,17 @@ impl MonolithAir {
     pub(crate) fn qt_terms(&self) -> usize {
         self.qt_alpha() + 2
     }
-    // arith (super-tile block 0) — the QT_* layout
+    // arith (super-tile block 0) — the QT_* layout. Per-term stride is 9 (full) or 5 (narrow: the fold-only
+    // `inv`/`apow` dropped; `[z, pz, px]` kept — see `narrow_arith`).
+    pub(crate) fn arith_stride(&self) -> usize {
+        if self.narrow_arith {
+            5
+        } else {
+            9
+        }
+    }
     pub(crate) fn z(&self, k: usize) -> usize {
-        self.qt_terms() + 9 * k
+        self.qt_terms() + self.arith_stride() * k
     }
     pub(crate) fn pz(&self, k: usize) -> usize {
         self.z(k) + 2
@@ -333,6 +348,7 @@ impl MonolithAir {
     pub(crate) fn px(&self, k: usize) -> usize {
         self.z(k) + 4
     }
+    // `inv`/`apow` exist only in FULL mode (the inline fold's helpers); never read when `narrow_arith`.
     pub(crate) fn inv(&self, k: usize) -> usize {
         self.z(k) + 5
     }
@@ -340,7 +356,7 @@ impl MonolithAir {
         self.z(k) + 7
     }
     pub(crate) fn tile_w(&self) -> usize {
-        self.qt_terms() + 9 * self.n_terms
+        self.qt_terms() + self.arith_stride() * self.n_terms
     }
     // index decomposition (SB) on the super-tile arith head + the fold-bit shift register
     pub(crate) fn sb_x(&self) -> usize {
