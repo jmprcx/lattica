@@ -1415,6 +1415,24 @@ mod tests {
         // The 2c opening binding's ~120 provides are SPLIT across N_GROUPS+1 lookup channels (each ≤ ~16 terms),
         // so the assembled wrap composes WITHIN the degree budget again (was log_nqc 6 on one channel; now 4).
         assert!(log_nqc <= LOG_BLOWUP, "the assembled wrap (split binding) must compose within the degree budget");
+
+        // **W5 fixed-point situation after W3 (measured).** W3's op-table removed the `2·n_mul` c_k COLUMNS, but
+        // the outer width still scales with the INNER width via the super-tile ARITH TILE (`9·n_terms`, with
+        // `n_terms ≈ 2·w_inner` — the reduced-opening/DEEP terms laid out in COLUMNS, `z(k)=qt_terms+9k`). So the
+        // B factor (outer width / inner width) is still ≫ 1 — NOT yet the fixed point (`W_out ≤ W_in`). This is
+        // the honest gap the `tree/mod.rs` model currently ASSUMES away ("size-stable by construction IF
+        // canonical fixed-shape"): the arith tile + the caps (`2^cap_height`) + `n_terms` must be made
+        // inner-independent (narrow-tall columns→rows, like the op-table did for `c_k`, + canonicalization).
+        let (n_terms, w_inner) = (asm.m.n_terms, asm.m.w_inner());
+        let arith_tile = 9 * n_terms; // the DEEP reduced-opening columns (z(n_terms) − qt_terms)
+        println!(
+            "W5 fixed-point GAP (post-W3): assembled wrap width {width} verifying a w_inner={w_inner} inner ⇒ B = \
+             {}× (needs ≤ 1). The ARITH TILE = 9·n_terms = {arith_tile} ({}% of fused_w {fused_w}, n_terms={n_terms} \
+             ≈ 2·w_inner) is the DOMINANT inner-scaling term — the NEXT narrow-tall target. W3 removed the c_k \
+             COLUMNS; the arith tile + caps + canonicalization remain for the size fixed point.",
+            width / w_inner,
+            arith_tile * 100 / fused_w
+        );
     }
 
     /// **W2-measure (prove) — the assembled wrap is SOUND.** Build the reused-region trace (brick 1), fill the
