@@ -1030,6 +1030,56 @@ mod tests {
         (air, trace, pis)
     }
 
+    /// **Arith-tile narrow-tall brick 3 — "matches native" on a REAL inner** (`--features recursion`). Build the
+    /// monolith trace over a real join-split inner, read its arith-head row (`off = tr + 0·m_period`), and seed
+    /// the narrow-tall `DeepFoldAir` with the SAME openings the wide arith tile committed (α, x, and each term's
+    /// z/pz/px). The narrow-tall running sum `ro` reproduces the monolith's committed reduced opening `QT_E`
+    /// (`= 0`) bit-for-bit — and the real-seeded trace proves. So the `9·n_terms`-COLUMN arith tile has a
+    /// narrow-tall replacement faithful on REAL data, not just a synthetic model (the DEEP-fold analog of
+    /// `op_table_f2_matches_native_epilogue`).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn deep_fold_matches_monolith_arith_tile() {
+        use crate::config::Challenge;
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use crate::wrap::{deep_fold_trace_from, DeepFoldAir};
+        use p3_field::{BasedVectorSpace, Field};
+        use p3_goldilocks::Goldilocks;
+        use p3_uni_stark::{prove, verify};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, tr, _pis) = wrap_build_reused(&config, &proof, &pvs);
+
+        // The first query's arith head row carries the entire DEEP reduced-opening fold + its committed QT_E.
+        let width = tr.width;
+        let off = air.tr(); // q = 0
+        let row = |col: usize| tr.values[off * width + col];
+        let gv = |col: usize| Challenge::from_basis_coefficients_fn(|i| row(col + i));
+
+        let alpha = gv(air.qt_alpha());
+        let x = Challenge::from(<Goldilocks as Field>::GENERATOR * row(air.qt_acc() + air.lg() - 1));
+        let qt_e = gv(0); // QT_E = 0: the monolith's committed reduced opening `ro`
+        let n = air.n_terms;
+        // px is stored base-field (imaginary 0), exactly as the AIR reads `d = (pz − px, pz.1)`.
+        let terms: Vec<(Challenge, Challenge, Challenge)> =
+            (0..n).map(|k| (gv(air.z(k)), gv(air.pz(k)), Challenge::from(row(air.px(k))))).collect();
+
+        // FAITHFULNESS: the narrow-tall fold's `ro` at the last real term equals the monolith's wide `QT_E`.
+        let dft = deep_fold_trace_from(alpha, x, &terms, 0);
+        let dw = dft.width;
+        let ro_last = Challenge::from_basis_coefficients_fn(|i| dft.values[(n - 1) * dw + 16 + i]);
+        assert_eq!(ro_last, qt_e, "narrow-tall DEEP fold `ro` must equal the monolith's committed `QT_E`");
+
+        // …and the real-seeded narrow-tall trace proves through the production prover.
+        let pc = crate::config::make_config();
+        let dproof = prove(&pc, &DeepFoldAir, dft, &[]);
+        assert!(verify(&pc, &DeepFoldAir, &dproof, &[]).is_ok(), "the real-seeded narrow-tall fold must verify");
+    }
+
     /// **Brick 5 increment 2b — assemble the full wrap trace** (`--features recursion`). Widen the reused
     /// monolith trace to `fused_w + 16`; seed the FLATTEN op-table with the REAL ζ-openings + fold; place its
     /// rows in the trace SLACK (`op_sel = 1`); fill `folded_col` at each arith head (`tf = 1` rows) with the

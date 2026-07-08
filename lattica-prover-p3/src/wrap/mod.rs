@@ -337,23 +337,33 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for DeepFoldAir {
     }
 }
 
-/// A valid [`DeepFoldAir`] trace of `n_terms` synthetic DEEP terms (padded): `α`, `x` constant; each term's
-/// `z` (distinct, invertible `z − x`), `pz`, `px` chosen; `inv = 1/(z − x)`, `t = α^k·(pz − px)·inv`, and `ro`
-/// the running sum. Padding rows continue the fold (they are valid terms), so every row satisfies the AIR.
-pub fn deep_fold_trace(n_terms: usize) -> RowMajorMatrix<Val> {
+/// A valid [`DeepFoldAir`] trace over explicit `(z, pz, px)` terms with `α`, `x` fixed — the general seed that
+/// grounds the narrow-tall fold in a REAL inner's openings (the monolith arith tile at `air.rs:1278-1296`).
+/// `inv = 1/(z − x)`, `t = α^k·(pz − px)·inv`, `ro` the running sum. Rows past `terms.len()` are synthetic
+/// padding whose `z` carries a nonzero imaginary part (so `z − x` is invertible for ANY base-field `x`); every
+/// row — real or pad — satisfies the AIR, and `ro` at row `k` is `Σ_{j≤k} t_j` (so row `terms.len()−1` holds
+/// the full reduced opening, matching the monolith's committed `QT_E`).
+pub fn deep_fold_trace_from(
+    alpha: crate::config::Challenge,
+    x: crate::config::Challenge,
+    terms: &[(crate::config::Challenge, crate::config::Challenge, crate::config::Challenge)],
+    min_rows: usize,
+) -> RowMajorMatrix<Val> {
     use crate::config::Challenge;
     use p3_field::{BasedVectorSpace, Field};
-    let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
-    let alpha = Challenge::from_basis_coefficients_fn(|k| Val::from_u64(if k == 0 { 3 } else { 2 }));
-    let x = Challenge::from_basis_coefficients_fn(|k| Val::from_u64(if k == 0 { 5 } else { 7 }));
-    let h = n_terms.next_power_of_two().max(1 << 4);
+    let cc = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
+    let h = terms.len().max(min_rows).max(1).next_power_of_two().max(1 << 4);
     let mut flat = vec![Val::ZERO; h * 18];
     let (mut apow, mut ro) = (Challenge::ONE, Challenge::ZERO);
     for k in 0..h {
-        // z is a base-field value (imaginary 0); z − x has imaginary −7 ≠ 0 ⇒ always invertible.
-        let z = Challenge::from(Val::from_u64(100 + k as u64 * 13));
-        let pz = Challenge::from(Val::from_u64(200 + k as u64 * 7));
-        let px = Challenge::from(Val::from_u64(50 + k as u64 * 11));
+        let (z, pz, px) = terms.get(k).copied().unwrap_or_else(|| {
+            // padding: z has imaginary 1 ⇒ z − x invertible for any base-field x; pz/px arbitrary.
+            (
+                Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { 100 + k as u64 } else { 1 })),
+                Challenge::ZERO,
+                Challenge::ZERO,
+            )
+        });
         let inv = (z - x).inverse();
         let t = apow * (pz - px) * inv;
         ro += t;
@@ -364,6 +374,26 @@ pub fn deep_fold_trace(n_terms: usize) -> RowMajorMatrix<Val> {
         apow *= alpha;
     }
     RowMajorMatrix::new(flat, 18)
+}
+
+/// A valid [`DeepFoldAir`] trace of `n_terms` synthetic terms (padded) — the self-contained seed for the
+/// standalone prove test. Delegates to [`deep_fold_trace_from`] with `α`, `x` and per-term `z/pz/px` chosen so
+/// every `z − x` is invertible (`z` base-field, `x` imaginary 7 ⇒ `z − x` imaginary −7 ≠ 0).
+pub fn deep_fold_trace(n_terms: usize) -> RowMajorMatrix<Val> {
+    use crate::config::Challenge;
+    use p3_field::BasedVectorSpace;
+    let alpha = Challenge::from_basis_coefficients_fn(|k| Val::from_u64(if k == 0 { 3 } else { 2 }));
+    let x = Challenge::from_basis_coefficients_fn(|k| Val::from_u64(if k == 0 { 5 } else { 7 }));
+    let terms: Vec<(Challenge, Challenge, Challenge)> = (0..n_terms)
+        .map(|k| {
+            (
+                Challenge::from(Val::from_u64(100 + k as u64 * 13)),
+                Challenge::from(Val::from_u64(200 + k as u64 * 7)),
+                Challenge::from(Val::from_u64(50 + k as u64 * 11)),
+            )
+        })
+        .collect();
+    deep_fold_trace_from(alpha, x, &terms, 0)
 }
 
 /// **W3 (size) — the FLATTEN op-table: a narrow-tall arithmetic-circuit evaluator with a LogUp wiring bus.**
