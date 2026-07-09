@@ -235,6 +235,96 @@ pub fn cap_mux_trace(cap: &[Val], queries: &[usize]) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(rows.into_iter().flatten().collect(), 3)
 }
 
+/// **AA5 — the in-circuit ORDERED SPONGE-CAP BUS** (feasibility, real data). The FS-anchor AA5 needs binds the
+/// narrow-tall cap region to the caps the transcript sponge ACTUALLY absorbed (so removing the pw cap columns in
+/// cw=true keeps inner-auth non-vacuous, and closes the pre-existing FS⟂auth cap decoupling). This proves that
+/// binding through the W1 lookup prover on the REAL join-split absorb stream. ONE LogUp channel keyed by the
+/// enumeration index `gi` (0..n_cap_felts, the [`crate::recursion::monolith::tests::sim_cap_positions`] order):
+///  - SPONGE rows carry the real sponge block-input rate lanes `[0..RATE)`; for each lane `l` a witnessed
+///    `(gi_l, sel_l)` PROVIDES `(gi_l, lane_l)` with mult `−sel_l` — the ordered PER-LANE provide (up to RATE per
+///    row; the trace cap's straddle means one row's lanes can belong to different cap entries, so tags are
+///    per-lane, not per-row).
+///  - REGION rows are the narrow-tall cap entries flattened one felt/row: `(gi, val)` READS `(gi, val)` mult
+///    `+is_region`, `val` sourced from the COMMITTED cap (`roots()[entry][k]`).
+/// Balance on `(gi, value)` ⇒ every committed region felt == the FS-absorbed felt at its stream position: the
+/// FS-anchor. Degree ~2, width `3·RATE + 3` (constant). Tags are WITNESSED here (a MECHANISM brick — the
+/// assembly PINS them to periodic, the FT_BIND pattern, so the prover can't shuffle the order);
+/// `cap_absorb_stream_matches_committed_caps` already validated the `(block,lane)→(cap_id,entry,k)` map
+/// bit-for-bit, so this isolates that the LogUp binding COMPOSES + PROVES.
+pub struct SpongeCapBusAir;
+
+/// Rate = the sponge absorbs `RATE` felts/block; each cap ENTRY is a `DIGEST`(4)-felt run, so `RATE == DIGEST`.
+const SCB_RATE: usize = 4;
+/// Column layout: `[lane_0..RATE, gi_0..RATE, sel_0..RATE, rgi, rval, is_region]`.
+const SCB_WIDTH: usize = 3 * SCB_RATE + 3;
+
+impl<F: p3_field::Field> BaseAir<F> for SpongeCapBusAir {
+    fn width(&self) -> usize {
+        SCB_WIDTH
+    }
+}
+
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for SpongeCapBusAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let one = AB::Expr::ONE;
+        let is_region = cur[3 * SCB_RATE + 2].clone();
+        builder.assert_zero(is_region.clone() * (is_region.clone() - one.clone())); // boolean
+        let mut tuples: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(SCB_RATE + 1);
+        // SPONGE side: per lane, PROVIDE (gi_l, lane_l) with mult −sel_l (sel_l boolean).
+        for l in 0..SCB_RATE {
+            let sel = cur[2 * SCB_RATE + l].clone();
+            builder.assert_zero(sel.clone() * (sel.clone() - one.clone())); // boolean
+            tuples.push((vec![cur[SCB_RATE + l].clone(), cur[l].clone()], AB::Expr::ZERO - sel));
+        }
+        // REGION side: READ (rgi, rval) with mult +is_region.
+        tuples.push((vec![cur[3 * SCB_RATE].clone(), cur[3 * SCB_RATE + 1].clone()], is_region));
+        builder.push_local_interaction(tuples);
+    }
+}
+
+/// Build the ordered sponge-cap bus trace from a REAL absorb stream: SPONGE rows (one per distinct sponge block
+/// that holds ≥1 cap felt — rate lanes from `block_inputs[block]`, per-lane `gi`/`sel` marking the absorbed cap
+/// felts) followed by REGION rows (one per cap felt, `(gi = its index, committed[gi])`). `positions` and
+/// `committed` are index-aligned (`positions[gi]` ↔ `committed[gi]` = that felt's committed cap value). Padded
+/// (mult 0) to a power-of-two height.
+pub fn sponge_cap_bus_trace(
+    block_inputs: &[[Val; crate::poseidon2_air::W]],
+    positions: &[(usize, usize, usize, usize, usize)], // (cap_id, entry, k, block, lane)
+    committed: &[Val],
+) -> RowMajorMatrix<Val> {
+    assert_eq!(positions.len(), committed.len(), "positions and committed values must be index-aligned");
+    use std::collections::BTreeMap;
+    // block → per-lane (present, gi).
+    let mut by_block: BTreeMap<usize, [(bool, usize); SCB_RATE]> = BTreeMap::new();
+    for (gi, &(_c, _e, _k, block, lane)) in positions.iter().enumerate() {
+        assert!(lane < SCB_RATE, "cap felt must land in a rate lane");
+        by_block.entry(block).or_insert([(false, 0); SCB_RATE])[lane] = (true, gi);
+    }
+    let mut rows: Vec<[Val; SCB_WIDTH]> = Vec::new();
+    for (&block, lanes) in &by_block {
+        let mut row = [Val::ZERO; SCB_WIDTH];
+        for (l, &(present, gi)) in lanes.iter().enumerate() {
+            row[l] = block_inputs[block][l]; // the actual FS-absorbed rate lane
+            if present {
+                row[SCB_RATE + l] = Val::from_u64(gi as u64);
+                row[2 * SCB_RATE + l] = Val::ONE; // sel
+            }
+        }
+        rows.push(row);
+    }
+    for (gi, &val) in committed.iter().enumerate() {
+        let mut row = [Val::ZERO; SCB_WIDTH];
+        row[3 * SCB_RATE] = Val::from_u64(gi as u64); // rgi
+        row[3 * SCB_RATE + 1] = val; // rval = committed cap felt
+        row[3 * SCB_RATE + 2] = Val::ONE; // is_region
+        rows.push(row);
+    }
+    rows.resize(rows.len().next_power_of_two(), [Val::ZERO; SCB_WIDTH]);
+    RowMajorMatrix::new(rows.into_iter().flatten().collect(), SCB_WIDTH)
+}
+
 /// **W2-C (size)** — the size-efficient form of C: evaluate a product DOWN THE ROWS as a running product
 /// (constant width) instead of across `2·degree − 1` columns (`DagFoldAir` witnessed). Boundary `prod = x` on
 /// the first row; transition `prod' = prod · x'` (degree 2). Width 3 (`[x, prod, mult]`, constant regardless of
