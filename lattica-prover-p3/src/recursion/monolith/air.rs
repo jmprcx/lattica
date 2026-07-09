@@ -1538,27 +1538,38 @@ impl MonolithAir {
                 let biv = emul(inv_van.clone(), z_h.clone());
                 builder.assert_zero(tf.clone() * (biv.0 - one.clone()));
                 builder.assert_zero(tf.clone() * biv.1);
-                let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_trace(c)))).collect();
-                let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_next(c)))).collect();
-                // recompose quotient(ζ) from the nqc chunk-openings: Σ_i zps_i·(pz(2W+2i)+pz(2W+2i+1)·X). nqc=1 ⇒
-                // the single chunk c0+c1·X (implicit weight 1, byte-for-byte); nqc>1 ⇒ verifier-computed weights
-                // zps_i (the qwt pis region) — exactly p3's recompose_quotient_from_chunks (validated by the oracle).
-                let quot = {
-                    let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
-                    for i in 0..self.nqc() {
-                        let d0 = gg(self.pz(self.trm_quot(i, 0)));
-                        let d1 = gg(self.pz(self.trm_quot(i, 1)));
-                        let chunk = (d0.0.clone() + w.clone() * d1.1.clone(), d0.1.clone() + d1.0.clone());
-                        let weighted = if self.nqc() == 1 {
-                            chunk
-                        } else {
-                            let zps = (pis[self.qwt_base() + 2 * i].clone(), pis[self.qwt_base() + 2 * i + 1].clone());
-                            emul(zps, chunk)
+                // NARROW-OPENINGS externalizes the OOD openings (local/next + the quot chunk-openings — the inner's
+                // `opened_values`) OFF the arith-head row to the sponge-opening bus, so the epilogue strategy
+                // (`OpeningsBci`/`OpTableBci`) sources `folded`+`quot` from its own bus-bound columns and IGNORES
+                // these. Pass empties + a zero quot when narrow; otherwise recompose from the committed `pz` columns
+                // exactly as before (byte-identical at false — `pinned_constraint_fingerprints` guards it).
+                let (local, next, quot): (Vec<(AB::Expr, AB::Expr)>, Vec<(AB::Expr, AB::Expr)>, (AB::Expr, AB::Expr)) =
+                    if self.narrow_openings {
+                        (Vec::new(), Vec::new(), (AB::Expr::ZERO, AB::Expr::ZERO))
+                    } else {
+                        let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_trace(c)))).collect();
+                        let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_next(c)))).collect();
+                        // recompose quotient(ζ) from the nqc chunk-openings: Σ_i zps_i·(pz(2W+2i)+pz(2W+2i+1)·X). nqc=1 ⇒
+                        // the single chunk c0+c1·X (implicit weight 1, byte-for-byte); nqc>1 ⇒ verifier-computed weights
+                        // zps_i (the qwt pis region) — exactly p3's recompose_quotient_from_chunks (validated by the oracle).
+                        let quot = {
+                            let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
+                            for i in 0..self.nqc() {
+                                let d0 = gg(self.pz(self.trm_quot(i, 0)));
+                                let d1 = gg(self.pz(self.trm_quot(i, 1)));
+                                let chunk = (d0.0.clone() + w.clone() * d1.1.clone(), d0.1.clone() + d1.0.clone());
+                                let weighted = if self.nqc() == 1 {
+                                    chunk
+                                } else {
+                                    let zps = (pis[self.qwt_base() + 2 * i].clone(), pis[self.qwt_base() + 2 * i + 1].clone());
+                                    emul(zps, chunk)
+                                };
+                                acc = (acc.0 + weighted.0, acc.1 + weighted.1);
+                            }
+                            acc
                         };
-                        acc = (acc.0 + weighted.0, acc.1 + weighted.1);
-                    }
-                    acc
-                };
+                        (local, next, quot)
+                    };
                 let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub()).map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO)).collect();
                 // periodic column values at ζ (verifier-computed publics in the periodic pis region).
                 let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic()).map(|i| (pis[self.periodic_base() + 2 * i].clone(), pis[self.periodic_base() + 2 * i + 1].clone())).collect();

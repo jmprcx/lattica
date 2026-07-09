@@ -933,6 +933,125 @@ mod wrap_air {
         }
     }
 
+    /// **AA6 — the narrow-openings strategy (DeepFold arith ⊕ OpTable epilogue).** When `narrow_openings` drops the
+    /// `2·n_terms` `pz` opening columns, BOTH the arith fold AND the epilogue must externalize their openings —
+    /// neither [`DeepFoldBci`] (arith only) nor [`OpTableBci`] (epilogue only) suffices, so this combines them.
+    /// `emit_arith` witnesses the reduced-opening fold `ro` from `ro_col` (the point derivation `arith_point` stays
+    /// inline + SOUND — reads only the DEEP index bits/α, no `pz`), exactly like [`DeepFoldBci`]. `emit_epilogue`
+    /// reads the op-table's `folded` from `folded_col` AND the recomposed `quot` from `quot_col` (the shared
+    /// `eval_bci` passes EMPTY local/next + a zero quot when `narrow_openings`, so this strategy is self-contained),
+    /// checking `folded·inv_van == quot(ζ)`. `emit_capmux` delegates to [`InlineBci`] (cw=false — caps in `pis`).
+    /// The three F_p² columns are FREE witnesses here (the plumbing/compose step, mirroring [`ArithWrapAir`]/
+    /// [`CapWrapAir`]); binding `ro`/`folded`/`quot` to the FS-absorbed openings via the sponge-opening bus + the
+    /// DeepFold/op-table slack regions is the assembled increment (the [`AssembledCapWrapCwAir`] analog).
+    pub(crate) struct OpeningsBci {
+        pub(crate) ro_col: usize,
+        pub(crate) folded_col: usize,
+        pub(crate) quot_col: usize,
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for OpeningsBci {
+        fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, _w: &AB::Expr) {
+            // Point stays inline + SOUND (index→x, α_fri bind); the reduced-opening FOLD is externalized to `ro_col`.
+            let _ = arith_point(builder, air, cur, tf, one);
+            let ro = (cur[self.ro_col].clone(), cur[self.ro_col + 1].clone());
+            bind_reduced_opening(builder, cur, tf, ro);
+        }
+
+        fn emit_capmux(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            pis: &[AB::Expr],
+            one: &AB::Expr,
+            tf: &AB::Expr,
+            openings: &[(usize, usize, usize, usize)],
+        ) {
+            InlineBci.emit_capmux(builder, air, cur, pis, one, tf, openings);
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn emit_epilogue(
+            &self,
+            builder: &mut AB,
+            _air: &MonolithAir,
+            cur: &[AB::Expr],
+            tf: &AB::Expr,
+            w: &AB::Expr,
+            _local: &[(AB::Expr, AB::Expr)],
+            _next: &[(AB::Expr, AB::Expr)],
+            _pubs: &[(AB::Expr, AB::Expr)],
+            _periodic: &[(AB::Expr, AB::Expr)],
+            _is_first: &(AB::Expr, AB::Expr),
+            _is_last: &(AB::Expr, AB::Expr),
+            _is_trans: &(AB::Expr, AB::Expr),
+            _alpha_stark: &(AB::Expr, AB::Expr),
+            inv_van: &(AB::Expr, AB::Expr),
+            _quot: &(AB::Expr, AB::Expr),
+        ) {
+            let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
+                (
+                    a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                    a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+                )
+            };
+            // NARROW-OPENINGS: `folded` (the op-table's α-fold result) + `quot` (recomposed from the chunk-openings)
+            // are both bus-bound columns here (the shared eval_bci passed empty/zero openings). Check the epilogue
+            // identity `folded·inv_van == quot`. Both columns are FREE witnesses until the sponge-opening bus binds them.
+            let folded = (cur[self.folded_col].clone(), cur[self.folded_col + 1].clone());
+            let quot = (cur[self.quot_col].clone(), cur[self.quot_col + 1].clone());
+            let chk = emul(folded, inv_van.clone());
+            builder.assert_zero(tf.clone() * (chk.0 - quot.0));
+            builder.assert_zero(tf.clone() * (chk.1 - quot.1));
+        }
+    }
+
+    /// The narrow-openings wrap AIR (plumbing/compose): the whole monolith (`eval_bci`) with [`OpeningsBci`] — the
+    /// arith fold's `ro`, the epilogue's `folded`, and the recomposed `quot` each witnessed in an O(1) slack column
+    /// pair (the `2·n_terms` `pz` opening columns GONE, `arith_stride` 0). Width = `fused_w + 6`. The columns are
+    /// FREE witnesses (provable but UNSOUND until the sponge-opening bus binds them to the FS-absorbed openings +
+    /// the DeepFold/op-table regions — the assembled increment). Mirrors [`ArithWrapAir`]/[`CapWrapAir`].
+    pub(crate) struct NarrowOpeningsWrapAir {
+        pub(crate) m: MonolithAir,
+    }
+
+    impl NarrowOpeningsWrapAir {
+        pub(crate) fn ro_col(&self) -> usize {
+            self.m.fused_w()
+        }
+        pub(crate) fn folded_col(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        pub(crate) fn quot_col(&self) -> usize {
+            self.m.fused_w() + 4
+        }
+    }
+
+    impl BaseAir<Goldilocks> for NarrowOpeningsWrapAir {
+        fn width(&self) -> usize {
+            self.m.fused_w() + 6
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for NarrowOpeningsWrapAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(
+                builder,
+                &OpeningsBci { ro_col: self.ro_col(), folded_col: self.folded_col(), quot_col: self.quot_col() },
+            );
+        }
+    }
+
     /// **Arith-tile assembly — the sound narrow-tall reduced-opening fold** (the [`AssembledWrapAir`] analog one
     /// region deeper). Where [`ArithWrapAir`] externalizes the DEEP fold's `ro` to a FREE witness column
     /// (provable but UNSOUND — a prover can put any `ro`), this AIR discharges `ro`'s soundness through the
@@ -1615,7 +1734,7 @@ mod wrap_air {
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
     native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledCapWrapCwAir,
-    AssembledWrapAir, CapWrapAir, OpeningBindCwAir, WrapAir, N_GROUPS, OPEN_BASE,
+    AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, OpeningBindCwAir, WrapAir, N_GROUPS, OPEN_BASE,
 };
 
 #[cfg(test)]
@@ -2458,6 +2577,59 @@ mod tests {
             narrow.fused_w(),
             2 * n_terms,
         );
+    }
+
+    /// **AA6 — the narrow_openings wrap COMPOSES (the plumbing/compose step).** The narrow_openings monolith
+    /// (`arith_stride` 0 — the `pz` opening columns GONE) + [`OpeningsBci`] (DeepFold arith ⊕ OpTable epilogue,
+    /// `ro`/`folded`/`quot` as FREE witnesses) builds its symbolic layout with NO degenerate `pz` read and composes
+    /// at `log_nqc ≤ LOG_BLOWUP`, width `fused_w + 6`. The shared `eval_bci` `pz` recompose is gated OFF for
+    /// `narrow_openings` (local/next empty, quot zero — the strategy self-sources from its columns) so nothing
+    /// reads the dropped openings. This is the strategy-plumbing foundation (mirrors `CapWrapAir`); binding the
+    /// three columns to the FS-absorbed openings via the sponge-opening bus + the DeepFold/op-table regions is next.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_openings_wrap_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+        };
+        let fused = m.fused_w();
+        let wrap = NarrowOpeningsWrapAir { m };
+        assert_eq!(BaseAir::<Val>::width(&wrap), fused + 6, "ro + folded + quot free-witness pairs (pz columns gone)");
+        let layout = AirLayout::from_air::<Val>(&wrap); // panics if the narrow_openings layout causes a bad read
+        let log_nqc = get_log_num_quotient_chunks::<Val, _>(&wrap, layout, 0);
+        assert!(log_nqc <= LOG_BLOWUP, "narrow_openings wrap must compose within budget (log_nqc {log_nqc})");
+        println!("narrow_openings wrap composes: log_nqc {log_nqc}, width fused_w {fused} + 6 (the pz opening columns externalized)");
     }
 
     /// **AA5 — the cw=true narrow_caps TRACE builds (openings correct).** `build_symbolic_inner_window` gained a
