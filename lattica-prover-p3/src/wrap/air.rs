@@ -4142,4 +4142,128 @@ mod tests {
         assert!(inline_nqc > LOG_BLOWUP, "the inline monolith must EXPLODE on a monolith-as-inner (the R5 bug)");
         assert!(wrap_nqc <= LOG_BLOWUP, "the wrap must FIX it — witnessed epilogue stays within budget");
     }
+
+    /// **Self-composition B at the NARROWED geometry** (`--release --ignored`, heavy — proves an inner monolith).
+    /// Quantifies how far the deep-tree fixed point B≤1 is AFTER the arith-tile + caps narrow-tall swaps (this
+    /// session's capstone). Builds the R5 self-recursion outer (a monolith verifying a W≈193 inner ConstAir
+    /// monolith) and reads its `fused_w` at the FULL vs the NARROWED (`narrow_arith` + `narrow_caps`) geometry, plus
+    /// the MARGINAL B = `d(fused_w)/d(w_inner)` — the asymptotic fixed-point ratio (the constant base cost
+    /// amortizes as the inner grows, so the SLOPE is what decides convergence). `fused_w` is a pure width function
+    /// ⇒ the narrowed + Δ variants need no re-prove. FINDING: absolute B 44×→8.7×, marginal 19→5 — the narrowing
+    /// cut both, but the marginal B is STILL > 1 (the arith tile `2·n_terms` ≈ `4·w_inner` + the carriers scale
+    /// with the inner) ⇒ CANONICALIZATION (freeze `w_inner`/`nqc`/`cap_height` ⇒ those inner-scaling regions become
+    /// CONSTANT ⇒ marginal B → 0) is the remaining fixed-point lever, not another narrow-tall swap.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy (proves an inner monolith): measures the self-composition B at the narrowed geometry (B 44×→8.7×, marginal 19→5); run `--release --features recursion -j1 -- --ignored`"]
+    fn self_composition_b_narrowed() {
+        use crate::config::Challenge;
+        use crate::recursion::monolith::tests::{build_symbolic_inner_window, sim_full};
+        use crate::recursion::monolith::{monolith_build_trace, MonolithAir};
+        use crate::recursion::native_fri::{
+            gen_const_proof, make_config, query_commit_merkle_all, query_fold_data, query_input_merkle,
+            query_quotient_merkle, query_terms,
+        };
+        use p3_air::BaseAir;
+        use p3_field::{BasedVectorSpace, PrimeField64};
+        use p3_uni_stark::{get_symbolic_constraints, prove, verify, AirLayout};
+
+        // INNER: a small ConstAir monolith, proven — the "inner proof" the OUTER must verify (the R5 setup, the
+        // canonical monolith-verifies-monolith self-recursion). Identical to `wrap_fixes_self_recursion`'s inner.
+        let config = make_config(1, 4);
+        let (proof, pvs) = gen_const_proof(&config, 42, 6);
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let log_global = proof.opening_proof.query_proofs[0].commit_phase_openings.len() + 4;
+        let (mut per_query, mut quot_paths, mut commit_data, mut n_terms) =
+            (Vec::new(), Vec::new(), Vec::new(), 0usize);
+        let (mut final0, mut cap0, mut qcap0) = (Challenge::ZERO, [Val::ZERO; 4], [Val::ZERO; 4]);
+        let mut ccap0 = vec![[Val::ZERO; 4]; proof.opening_proof.commit_phase_commits.len()];
+        for q in 0..4 {
+            let (terms, _x, alpha, ro) = query_terms(&config, &proof, &pvs, q);
+            let (_r, rounds, _f, f0) = query_fold_data(&config, &proof, &pvs, q);
+            let v = proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0][0];
+            let (_l, path, ce) = query_input_merkle(&config, &proof, &pvs, q);
+            let (_ql, qpath, qce, _qw) = query_quotient_merkle(&config, &proof, &pvs, q);
+            let cm = query_commit_merkle_all(&config, &proof, &pvs, q);
+            if q == 0 {
+                final0 = f0;
+                cap0 = ce;
+                qcap0 = qce;
+                for (r, (_g, _l, _p, c)) in cm.iter().enumerate() {
+                    ccap0[r] = *c;
+                }
+            }
+            n_terms = terms.len();
+            let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
+            per_query.push(((index, terms, alpha, ro, rounds), v, path));
+            quot_paths.push(qpath);
+            commit_data.push(cm);
+        }
+        let inner = MonolithAir {
+            counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false,
+            column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![],
+            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false };
+        let mut pis = Vec::new();
+        for ch in &chs {
+            pis.push(ch[0]);
+            pis.push(ch[1]);
+        }
+        for f in &index_felts {
+            pis.push(*f);
+        }
+        let fp: [Val; 2] = final0.as_basis_coefficients_slice().try_into().unwrap();
+        pis.push(fp[0]);
+        pis.push(fp[1]);
+        pis.extend_from_slice(&cap0);
+        pis.extend_from_slice(&qcap0);
+        pis.push(pvs[0]);
+        for ce in &ccap0 {
+            pis.extend_from_slice(ce);
+        }
+        let inner_trace = monolith_build_trace(
+            &inner, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], None,
+        );
+        let inner_prf = prove(&config, &inner, inner_trace, &pis);
+        assert!(verify(&config, &inner, &inner_prf, &pis).is_ok(), "inner ConstAir monolith proves");
+        let (w_in, np_in, nper_in) = (inner.fused_w(), pis.len(), BaseAir::<Val>::num_periodic_columns(&inner));
+        let inner_cs = get_symbolic_constraints::<Val, MonolithAir>(&inner, AirLayout::from_air::<Val>(&inner));
+
+        // OUTER: the monolith verifying the inner (self-recursion). build_symbolic_inner_window builds + self-
+        // validates the outer's witness; we only need its structural params (counts/binds/n_terms) for fused_w.
+        let (_otr, ocounts, obinds, oib, ont, _pv0) =
+            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false);
+        let cap_h = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
+
+        // fused_w is a pure width function of the struct ⇒ read the outer width at FULL vs NARROWED geometry, and
+        // the MARGINAL slope, with NO re-prove. Scale the w_inner-coupled inputs (w_inner + n_terms ≈ 2·w_inner) by
+        // Δ; the FRI structure (nqc/cap_height/n_binds) is held (it scales only ~log with the inner size).
+        let inner_w = w_in;
+        let mk_outer = |w_inner: usize, nt: usize, narrow: bool| MonolithAir {
+            counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: nt,
+            inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
+            constraints: inner_cs.clone(), w_inner_f: w_inner, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
+            cap_height: cap_h, narrow_arith: narrow, narrow_caps: narrow };
+        let outer_w = mk_outer(w_in, ont, false).fused_w();
+        let outer_narrow_w = mk_outer(w_in, ont, true).fused_w();
+        let d = 256usize;
+        let marg = |narrow: bool| {
+            (mk_outer(w_in + d, ont + 2 * d, narrow).fused_w() - mk_outer(w_in, ont, narrow).fused_w()) as f64
+                / d as f64
+        };
+        let (mb_full, mb_narrow) = (marg(false), marg(true));
+        println!(
+            "SELF-COMPOSITION B (R5, inner monolith W={inner_w}): outer fused_w FULL {outer_w} (B {:.1}×) → \
+             NARROWED (arith 9→2/term + caps dropped+FS-anchored) {outer_narrow_w} (B {:.1}×). MARGINAL B = \
+             d(fused_w)/d(w_inner): FULL {mb_full:.2} → NARROWED {mb_narrow:.2} cols/col. The narrowing cut BOTH the \
+             absolute width and the SLOPE, but the narrowed marginal B is STILL > 1 (the arith tile 2·n_terms ≈ \
+             4·w_inner + the carriers scale with the inner) ⇒ the tree still GROWS. CANONICALIZATION (freeze \
+             w_inner/nqc/cap_height ⇒ those inner-scaling regions become CONSTANT ⇒ marginal B → 0) is THE \
+             remaining fixed-point lever.",
+            outer_w as f64 / inner_w as f64,
+            outer_narrow_w as f64 / inner_w as f64,
+        );
+        assert!(outer_narrow_w < outer_w, "the arith+caps narrowing must shrink the R5 outer width ({outer_w} → {outer_narrow_w})");
+        assert!(mb_narrow < mb_full, "narrowing must reduce the marginal (asymptotic) B ({mb_full:.2} → {mb_narrow:.2})");
+        assert!(mb_narrow > 1.0, "un-canonicalized, the narrowed marginal B is STILL > 1 — canonicalization is the fixed-point lever");
+    }
 }
