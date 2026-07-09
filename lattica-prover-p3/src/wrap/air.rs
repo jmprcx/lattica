@@ -1726,7 +1726,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false };
         let layout = AirLayout::from_air::<Val>(&air);
         let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
         println!("WRAP witness seam: real join-split MonolithAir (reused regions A–J) log_nqc = {log_nqc}");
@@ -1837,7 +1837,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: narrow, narrow_caps: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: narrow, narrow_caps: false, narrow_openings: false };
         let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
             epilogue_openings(config, &inner, proof, pvs);
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
@@ -2355,6 +2355,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
             narrow_caps,
+            narrow_openings: false,
         };
         let (full, narrow) = (mk(false), mk(true));
         let cap_felts = 2 * full.cap_stride() + full.commit_caps_len(); // trace + quot + commit caps (is_zk=0)
@@ -2386,6 +2387,76 @@ mod tests {
             narrow.pis_count(),
             full.fused_w(),
             narrow.fused_w()
+        );
+    }
+
+    /// **AA6 — `narrow_openings` shrinks the arith tile to its header (the deep-tree B-lever geometry).** Extends
+    /// `narrow_arith`: the LAST inner-scaling arith columns — the `2·n_terms` per-term OOD openings `pz` (the
+    /// inner proof's `opened_values`) — leave the tile (`arith_stride` 2 → 0), to be re-sourced from the
+    /// FS-absorbed opening stream via the ordered sponge-opening bus ([`crate::wrap::SpongeCapBusAir`]). This
+    /// measures the raw column win against the `narrow_arith` baseline, holding everything else equal: the arith
+    /// tile collapses to `qt_terms` (its DEEP index-bits + acc-chain + α header) and `fused_w` drops by exactly
+    /// `2·n_terms`. Flag-OFF is byte-identical (`pinned_constraint_fingerprints` guards it); this measures the ON
+    /// geometry. (Re-sourcing the openings from the bus + proving the assembled openings-wrap is the next brick.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_openings_shrinks_arith_tile() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        // `narrow_arith` is the baseline (`[pz]` only, stride 2); `narrow_openings` extends it (stride 0). Hold
+        // everything else equal so the ONLY delta is the pz opening columns.
+        let mk = |narrow_openings: bool| MonolithAir {
+            counts: counts.clone(),
+            binds: binds.clone(),
+            index_binds: index_binds.clone(),
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints: constraints.clone(),
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings,
+        };
+        let (base, narrow) = (mk(false), mk(true));
+        let n_terms = terms.len();
+
+        // stride: narrow_arith keeps pz (2 felts/term); narrow_openings drops it (0).
+        assert_eq!(base.arith_stride(), 2, "narrow_arith baseline keeps pz (stride 2)");
+        assert_eq!(narrow.arith_stride(), 0, "narrow_openings drops pz too (stride 0)");
+        // the arith tile collapses to its header (qt_terms: DEEP index bits + acc chain + α), no per-term columns.
+        assert_eq!(narrow.tile_w(), narrow.qt_terms(), "narrow_openings: the arith tile is just its header");
+        assert_eq!(base.tile_w(), base.qt_terms() + 2 * n_terms, "narrow_arith: header + 2·n_terms pz felts");
+        // fused_w drops by exactly the pz columns (2 felts × n_terms); everything downstream shifts down.
+        assert_eq!(narrow.fused_w(), base.fused_w() - 2 * n_terms, "the pz opening columns leave fused_w");
+        assert!(2 * n_terms > 0 && narrow.fused_w() < base.fused_w());
+        println!(
+            "narrow_openings (n_terms {n_terms}): arith tile {} → {} cols, fused_w {} → {} (−{} pz felts; the \
+             last inner-scaling arith columns externalized to the sponge-opening bus)",
+            base.tile_w(),
+            narrow.tile_w(),
+            base.fused_w(),
+            narrow.fused_w(),
+            2 * n_terms,
         );
     }
 
@@ -2435,7 +2506,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true,
+            narrow_caps: true, narrow_openings: false,
         };
         let fw = air.fused_w();
         assert_eq!(tr.len(), air.height() * fw, "narrow cw=true trace has the reduced fused_w width (caps dropped)");
@@ -2489,7 +2560,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true,
+            narrow_caps: true, narrow_openings: false,
         };
         let fw = air.fused_w();
         let wrap = CapWrapAir { m: air };
@@ -2541,7 +2612,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true,
+            narrow_caps: true, narrow_openings: false,
         };
         let (fw, h) = (m.fused_w(), m.height());
         let rate = AssembledCapWrapCwAir::CAP_RATE;
@@ -2710,7 +2781,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true,
+            narrow_caps: true, narrow_openings: false,
         };
         let h = m.height();
         // dummy op_periodics: log_nqc reads the symbolic constraint STRUCTURE (tuple counts/degrees), not the values.
@@ -3522,7 +3593,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false };
         let wrap = WrapAir::new(air);
         let width = <WrapAir as p3_air::BaseAir<Val>>::width(&wrap);
         let layout = AirLayout::from_air::<Val>(&wrap);
@@ -3580,7 +3651,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false };
         let fused_w = air.fused_w();
         let asm = AssembledWrapAir { m: air, folded_addr: 0 }; // any address for the pure composition check
         let width = <AssembledWrapAir as p3_air::BaseAir<Val>>::width(&asm);
@@ -3682,7 +3753,7 @@ mod tests {
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-            narrow_arith: narrow, narrow_caps: false,
+            narrow_arith: narrow, narrow_caps: false, narrow_openings: false,
         };
         let full = mk(false);
         let (full_fused_w, n_terms, w_inner) = (full.fused_w(), full.n_terms, full.w_inner());
@@ -3756,7 +3827,7 @@ mod tests {
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-            narrow_arith: narrow, narrow_caps,
+            narrow_arith: narrow, narrow_caps, narrow_openings: false,
         };
 
         // Decompose fused_w (column_window=false: the arith-wrap regime the whole track measures B in). The regions
@@ -4285,7 +4356,7 @@ mod tests {
         let inner = MonolithAir {
             counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false,
             column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![],
-            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false };
+            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false, narrow_openings: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -4320,7 +4391,7 @@ mod tests {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h, narrow_arith: false, narrow_caps: false };
+            cap_height: cap_h, narrow_arith: false, narrow_caps: false, narrow_openings: false };
         let olayout = AirLayout::from_air::<Val>(&outer);
         let inline_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
         let (inner_w, outer_w) = (inner.fused_w(), outer.fused_w());
@@ -4379,7 +4450,7 @@ mod tests {
             m: MonolithAir {
                 counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false,
                 column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(),
-                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h, narrow_arith: false, narrow_caps: false },
+                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h, narrow_arith: false, narrow_caps: false, narrow_openings: false },
             folded_addr: 0,
         };
         let asm_width = <AssembledWrapAir as BaseAir<Val>>::width(&asm);
@@ -4459,7 +4530,7 @@ mod tests {
         let inner = MonolithAir {
             counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false,
             column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![],
-            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false };
+            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false, narrow_openings: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -4499,7 +4570,7 @@ mod tests {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: nt,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_inner, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h, narrow_arith: narrow, narrow_caps: narrow };
+            cap_height: cap_h, narrow_arith: narrow, narrow_caps: narrow, narrow_openings: false };
         let outer_w = mk_outer(w_in, ont, false).fused_w();
         let outer_narrow_w = mk_outer(w_in, ont, true).fused_w();
         let d = 256usize;

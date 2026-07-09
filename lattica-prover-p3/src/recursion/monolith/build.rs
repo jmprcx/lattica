@@ -122,8 +122,11 @@ pub(crate) fn monolith_build_trace(
                 t[base0 + air.z(k)] = zc[0];
                 t[base0 + air.z(k) + 1] = zc[1];
             }
-            t[base0 + air.pz(k)] = pzc[0];
-            t[base0 + air.pz(k) + 1] = pzc[1];
+            // NARROW-OPENINGS drops `pz` from the tile too (externalized to the sponge-opening bus); FULL/NARROW-ARITH store it.
+            if !air.narrow_openings {
+                t[base0 + air.pz(k)] = pzc[0];
+                t[base0 + air.pz(k) + 1] = pzc[1];
+            }
             // `px`/`inv`/`apow` are FULL-only: NARROW sources px from the ov/qc carrier + externalizes the fold.
             if !air.narrow_arith {
                 t[base0 + air.px(k)] = px;

@@ -101,6 +101,16 @@ pub(crate) struct MonolithAir {
     /// `false` = the exact full-cap-in-pis layout every non-AA5 construction uses, byte-for-byte (the
     /// `pinned_constraint_fingerprints` guard covers it). Set true ONLY by the AA5 caps wrap.
     pub narrow_caps: bool,
+    /// NARROW-OPENINGS mode (the deep-tree wrap's AA6 B-lever — externalize the arith-tile OPENINGS narrow-tall).
+    /// Extends `narrow_arith`: on top of dropping `z`/`px`/`inv`/`apow`, this also drops the per-term OOD opening
+    /// `pz` from the arith tile (`arith_stride` 2 → 0 — the tile collapses to its DEEP/α header). The `2·n_terms`
+    /// `pz` felts (the inner proof's `opened_values`, the last inner-scaling columns) become ROWS bound to the
+    /// FS-absorbed opening stream via the ordered sponge-opening bus (`src/wrap` `SpongeCapBusAir`), and the
+    /// epilogue's `local`/`next`/`quot` recompose + the α-fold are re-sourced from that bus instead of reading
+    /// `cur[pz(k)]` on the single arith-head row (dissolving the 2c degree wall). `false` = the exact layout every
+    /// non-AA6 construction uses, byte-for-byte (`pinned_constraint_fingerprints` guards it). Requires
+    /// `narrow_arith`; set true ONLY by the AA6 openings wrap.
+    pub narrow_openings: bool,
 }
 
 #[allow(dead_code)]
@@ -342,12 +352,15 @@ impl MonolithAir {
     pub(crate) fn qt_terms(&self) -> usize {
         self.qt_alpha() + 2
     }
-    // arith (super-tile block 0) — the QT_* layout. Per-term stride is 9 (FULL: `[z, pz, px, inv, apow]`) or 3
-    // (NARROW: `[pz, px]` — the fold-only `inv`/`apow` AND the DEEP point `z` dropped). `z` is re-derivable (= ζ
-    // or ζ·g_trace, bound to the committed ζ), so the wrap re-derives it rather than storing it; `pz` (the OOD
-    // opening the epilogue folds) + `px` (the authenticated leaf) stay. See `narrow_arith`.
+    // arith (super-tile block 0) — the QT_* layout. Per-term stride is 9 (FULL: `[z, pz, px, inv, apow]`), 2
+    // (NARROW-ARITH: `[pz]` only — `inv`/`apow` externalized to the fold region, `z` re-derived = ζ / ζ·g_trace,
+    // `px` sourced from the authenticated `ov`/`qc` leaf carrier), or 0 (NARROW-OPENINGS: even `pz` — the OOD
+    // opening — leaves the tile, externalized narrow-tall to the sponge-opening bus; the arith tile collapses to
+    // its DEEP/α header). See `narrow_arith` / `narrow_openings`. NARROW-OPENINGS requires NARROW-ARITH.
     pub(crate) fn arith_stride(&self) -> usize {
-        if self.narrow_arith {
+        if self.narrow_openings {
+            0
+        } else if self.narrow_arith {
             2
         } else {
             9
@@ -376,8 +389,10 @@ impl MonolithAir {
         self.qt_terms() + 9 * k
     }
     pub(crate) fn pz(&self, k: usize) -> usize {
-        // NARROW: `pz` is the block start (no `z`); FULL: `z + 2`. (Full: qt+9k+2 = z+2, byte-identical.)
-        self.qt_terms() + self.arith_stride() * k + if self.narrow_arith { 0 } else { 2 }
+        // NARROW-ARITH/OPENINGS: `pz` is the block start (no `z`); FULL: `z + 2`. (Full: qt+9k+2 = z+2,
+        // byte-identical.) NARROW-OPENINGS (stride 0): the offset collapses to `qt_terms` for every term — a
+        // harmless in-tile index that is NEVER read (the epilogue re-sources every opening from the sponge bus).
+        self.qt_terms() + self.arith_stride() * k + if self.narrow_arith || self.narrow_openings { 0 } else { 2 }
     }
     pub(crate) fn px(&self, k: usize) -> usize {
         self.pz(k) + 2
