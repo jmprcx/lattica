@@ -2033,6 +2033,64 @@ mod tests {
         );
     }
 
+    /// **AA5 — the cw=true narrow_caps TRACE builds (openings correct).** `build_symbolic_inner_window` gained a
+    /// `narrow_caps` flag that skips the trace/quotient/commit cap felts from the pis window. At `true` it builds
+    /// a valid cw=true trace with the cap slice DROPPED — and its internal diagnostics still pass: the native
+    /// α-fold == quot(ζ) AND the window holds α/pub/periodic/qwt at the COLLAPSED offsets (`pub_pi`/`periodic_base`
+    /// /`qwt_base` shifted down past the gone caps). So the narrow window openings land correctly and the trace
+    /// has the reduced `fused_w` (963, cap columns gone). This is the trace-side of the width win; proving the
+    /// caps-dropped verifier + wiring the sponge-cap FS-anchor is the remaining assembly.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_caps_cw_trace_builds() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+
+        // narrow_caps=true: the internal α-fold + window (α/pub/periodic/qwt) pre-checks assert INSIDE the builder,
+        // so a successful return means the collapsed-window openings are correct.
+        let (tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+
+        // reconstruct the narrow air the trace was built for; the trace width == its (reduced) fused_w.
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: false,
+            narrow_caps: true,
+        };
+        let fw = air.fused_w();
+        assert_eq!(tr.len(), air.height() * fw, "narrow cw=true trace has the reduced fused_w width (caps dropped)");
+        assert!(fw < 1200, "narrow fused_w {fw} ≈ 963 (cap columns removed)");
+        println!(
+            "narrow_caps cw=true trace: 2^{} rows × fused_w {fw} — the α-fold + window pre-checks passed (the \
+             collapsed-window openings are correct; caps dropped)",
+            air.height().trailing_zeros()
+        );
+    }
+
     /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
     /// The cheap half of the `CapMuxBci` plumbing (the `ArithWrapAir` analog): swapping the cap-mux strategy to
     /// `CapMuxBci` (`emit_capmux` → nothing) drops the `openings·4` product-mux constraints (and their `2^cap_height`
@@ -3430,7 +3488,7 @@ mod tests {
         // (2) OUTER: the monolith verifying the INNER monolith. build_symbolic_inner_window builds + self-
         // validates the outer witness (self-recursion). Measure the outer as MonolithAir (inline) AND WrapAir.
         let (_otr, ocounts, obinds, oib, ont, _pv0) =
-            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in);
+            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false);
         let cap_h = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
         let outer = MonolithAir {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
