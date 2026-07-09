@@ -1206,12 +1206,46 @@ mod wrap_air {
             }
             v
         }
+        /// **AA3** — the openings WITH their committed base `cbase`: `(cap_id, shift, bits, cbase)`. The binding
+        /// provider enumerates every committed cap entry `pis[cbase + entry·4 + k]` from this (fixed pis reads).
+        pub(crate) fn caps_with_base(&self) -> Vec<(usize, usize, usize, usize)> {
+            let mut v = vec![
+                (0, self.m.input_depth(), self.m.cap_height, self.m.cap_base()),
+                (1, self.m.input_depth(), self.m.cap_height, self.m.qcap_base()),
+            ];
+            for r in 0..self.m.cm_rounds() {
+                v.push((2 + r, self.m.commit_shift(r), self.m.commit_bits(r), self.m.commit_cap_base(r)));
+            }
+            v
+        }
+        /// Total committed cap entries to bind (`Σ_openings 2^bits`).
+        pub(crate) fn total_entries(&self) -> usize {
+            self.caps_with_base().iter().map(|&(_, _, bits, _)| 1usize << bits).sum()
+        }
+        /// **AA3** max committed-entry provides per binding channel — the LogUp degree scales with provides/channel
+        /// (the arith 2c ceiling ~15 for log_nqc ≤ 4); 13 + the 1 cap-row read = 14 terms ⇒ degree 15, comfortable.
+        pub(crate) const MAX_PER_CH: usize = 13;
+        /// Binding-bus channels: the `total_entries` committed provides split so each channel carries ≤ MAX_PER_CH.
+        pub(crate) fn n_bind_ch(&self) -> usize {
+            self.total_entries().div_ceil(Self::MAX_PER_CH)
+        }
+        /// The single binder row's marker (PROVIDES all committed entries once; the bus balance forces exactly one
+        /// binder row — 0 ⇒ reads unmatched, ≥2 ⇒ over-provide).
+        pub(crate) fn is_binder(&self) -> usize {
+            self.cr_base() + 9
+        }
+        /// Cap-row read-routing one-hot: `is_rd[g] = 1` iff this cap-row READs its committed binding on channel
+        /// g+1 (where its entry is provided, `global_index % n_bind_ch`). `Σ_g is_rd == cap_sel`.
+        pub(crate) fn is_rd(&self, g: usize) -> usize {
+            self.cr_base() + 10 + g
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledCapWrapAir {
         fn width(&self) -> usize {
-            // cap-row region: cap_id + entry_idx + digest(4) + cap_mult (7) + cap_sel + is_head (2).
-            self.m.fused_w() + 9
+            // AA1 region (9: cap_id + entry_idx + digest[4] + cap_mult + cap_sel + is_head) + AA3 binding
+            // (is_binder + is_rd[0..n_bind_ch]).
+            self.m.fused_w() + 10 + self.n_bind_ch()
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
@@ -1232,32 +1266,49 @@ mod wrap_air {
 
             let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
             let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&v| v.into()).collect();
             let one = AB::Expr::ONE;
             let cr = self.cr_base();
+            let n_ch = self.n_bind_ch();
 
             // (2) Region markers — booleans; `is_head` bound to the periodic `tf` so the bus READ is gated by the
-            // COLUMN, not the periodic. Off-region rows carry `cap_mult = 0` (so they PROVIDE nothing).
+            // COLUMN, not the periodic. Off-region rows carry `cap_mult = 0` (so they PROVIDE nothing). The AA3
+            // read-routing one-hot `is_rd` is boolean + sums to `cap_sel` (each cap-row reads on exactly one
+            // binding channel; non-cap rows read on none).
             let cap_sel = cur[self.cap_sel()].clone();
             let is_head = cur[self.is_head()].clone();
-            for mk in [&cap_sel, &is_head] {
+            let is_binder = cur[self.is_binder()].clone();
+            for mk in [&cap_sel, &is_head, &is_binder] {
                 builder.assert_zero(mk.clone() * (mk.clone() - one.clone()));
             }
             builder.assert_zero(is_head.clone() - p[self.m.m_tf()].clone());
             builder.assert_zero((one.clone() - cap_sel.clone()) * cur[cr + 6].clone());
+            let mut rd_sum = AB::Expr::ZERO;
+            for g in 0..n_ch {
+                let rd = cur[self.is_rd(g)].clone();
+                builder.assert_zero(rd.clone() * (rd.clone() - one.clone()));
+                rd_sum = rd_sum + rd;
+            }
+            builder.assert_zero(rd_sum - cap_sel.clone());
 
-            // (3) The select bus (one channel). The cap-row PROVIDES its entry `[cap_id, entry_idx, digest]` with
-            // mult `cap_mult` (= −count; 0 off-region); each arith head READS, per opening g, `[g, index>>shift_g,
-            // cap_c[g]]` with mult `is_head`. Balance ⇒ `cap_c[g]` == the digest of the addressed cap-row.
-            let mut chan: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::new();
-            let provide = vec![
-                cur[cr].clone(),     // cap_id
-                cur[cr + 1].clone(), // entry_idx
-                cur[cr + 2].clone(), // digest[0..4]
+            // Channels: 0 = the SELECT bus; 1..=n_ch = the committed-cap BINDING.
+            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); n_ch + 1];
+
+            // The cap-row's own entry `[cap_id, entry_idx, digest]` — PROVIDED to the select bus AND READ from the
+            // binding bus (so its digest is forced == the committed cap entry it claims).
+            let cap_tuple = vec![
+                cur[cr].clone(),
+                cur[cr + 1].clone(),
+                cur[cr + 2].clone(),
                 cur[cr + 3].clone(),
                 cur[cr + 4].clone(),
                 cur[cr + 5].clone(),
             ];
-            chan.push((provide, cur[cr + 6].clone()));
+
+            // (3) The SELECT bus (channel 0): cap-row PROVIDES its entry (mult `cap_mult` = −count); each arith
+            // head READS, per opening g, `[g, index>>shift_g, cap_c[g]]` (mult `is_head`). Balance ⇒ `cap_c[g]` ==
+            // the digest of the addressed cap-row.
+            chans[0].push((cap_tuple.clone(), cur[cr + 6].clone()));
             for (cap_id, cg_off, shift, bits) in self.openings() {
                 let mut sel_idx = AB::Expr::ZERO;
                 for j in 0..bits {
@@ -1272,9 +1323,38 @@ mod wrap_air {
                     cur[self.m.cap_c(cg_off + 2)].clone(),
                     cur[self.m.cap_c(cg_off + 3)].clone(),
                 ];
-                chan.push((read, is_head.clone()));
+                chans[0].push((read, is_head.clone()));
             }
-            builder.push_local_interaction(chan);
+
+            // (4) The committed-cap BINDING (channels 1..=n_ch — AA3, the soundness close). The single binder row
+            // PROVIDES every committed cap entry `[cap_id, entry, pis[cbase + entry·4 + k]]` ONCE (mult −is_binder,
+            // routed to channel `global_index % n_ch`); each cap-row READS its own `[cap_id, entry_idx, digest]` on
+            // its `is_rd` channel (mult `is_rd[g]`). Balance ⇒ every cap-row's digest == the committed cap entry it
+            // claims — so the select bus's `cap_c` is bound to the REAL cap, no longer a free witness. The binder
+            // row's provides are FIXED pis reads (`cbase`, `entry` compile-time), split so ≤ MAX_PER_CH per channel.
+            let mut gi = 0usize;
+            for (cap_id, _shift, bits, cbase) in self.caps_with_base() {
+                for e in 0..(1usize << bits) {
+                    let ch = gi % n_ch + 1;
+                    let tuple = vec![
+                        AB::Expr::from(Goldilocks::from_u64(cap_id as u64)),
+                        AB::Expr::from(Goldilocks::from_u64(e as u64)),
+                        pis[cbase + e * 4].clone(),
+                        pis[cbase + e * 4 + 1].clone(),
+                        pis[cbase + e * 4 + 2].clone(),
+                        pis[cbase + e * 4 + 3].clone(),
+                    ];
+                    chans[ch].push((tuple, AB::Expr::ZERO - is_binder.clone()));
+                    gi += 1;
+                }
+            }
+            for g in 0..n_ch {
+                chans[g + 1].push((cap_tuple.clone(), cur[self.is_rd(g)].clone()));
+            }
+
+            for ch in chans {
+                builder.push_local_interaction(ch);
+            }
         }
     }
 }
@@ -1748,18 +1828,21 @@ mod tests {
         let asm = AssembledCapWrapAir { m: air };
         let fw = asm.m.fused_w();
         let width = <AssembledCapWrapAir as BaseAir<Val>>::width(&asm);
-        let n_open = asm.openings().len();
+        let (n_open, n_ch, n_ent) = (asm.openings().len(), asm.n_bind_ch(), asm.total_entries());
         let lookups = Lookups::from_air::<Challenge, _>(&asm);
         let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
         println!(
-            "cap AA1: width {width} = fused_w {fw} + 9 (cap-row region 7 + cap_sel + is_head); {} lookup(s), \
-             {n_open} reads/head, log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Select bus binds cap_c to the slack cap-row \
-             region (columns→rows); the committed-cap binding is AA3.",
-            lookups.len()
+            "cap AA1+AA3: width {width} = fused_w {fw} + 10 + n_bind_ch {n_ch} (cap-row region 9 + is_binder + \
+             is_rd[{n_ch}]); {} lookup channel(s) (1 select + {n_ch} binding), {n_open} reads/head, {n_ent} \
+             committed entries bound (≤{} /channel), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Select bus binds cap_c to \
+             the cap-row region; the AA3 binding bus binds each cap-row digest to the committed cap pis.",
+            lookups.len(),
+            AssembledCapWrapAir::MAX_PER_CH
         );
-        assert_eq!(width, fw + 9, "AA1 adds the 9-col cap-row region");
+        assert_eq!(width, fw + 10 + n_ch, "AA1 region (10) + AA3 is_rd one-hot (n_bind_ch)");
         assert_eq!(n_open, 2 + asm.m.cm_rounds(), "one read per opening (trace + quot + cm_rounds)");
-        assert!(log_nqc <= LOG_BLOWUP, "cap AA1 must compose within the degree budget (got {log_nqc})");
+        assert_eq!(lookups.len(), n_ch + 1, "1 select channel + n_bind_ch binding channels");
+        assert!(log_nqc <= LOG_BLOWUP, "cap AA1+AA3 must compose within the degree budget (got {log_nqc})");
     }
 
     /// **Caps assembly AA2 — build the assembled cap-wrap trace.** Widen the monolith trace to `fused_w + 9`; mark
@@ -1779,8 +1862,8 @@ mod tests {
         let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs, false);
         let (fw, h) = (air.fused_w(), air.height());
         let n_q = air.n_queries;
-        let width = fw + 9;
         let (cr, cap_sel, is_head_col) = (fw, fw + 7, fw + 8);
+        let (is_binder_col, is_rd_base) = (fw + 9, fw + 10);
 
         // The caps WITH their committed base `cbase` (openings() drops it; the trace reads the digest from pis).
         let caps: Vec<(usize, usize, usize, usize)> = {
@@ -1796,13 +1879,16 @@ mod tests {
             v
         };
         let total_rows: usize = caps.iter().map(|&(_, _, bits, _)| 1usize << bits).sum();
+        let n_ch = total_rows.div_ceil(AssembledCapWrapAir::MAX_PER_CH); // AA3 binding channels
+        let width = fw + 10 + n_ch;
 
         // Arith heads = the rows where `m_tf` fires (one per query), same as `assemble_arith_wrap`.
         let tf_col = BaseAir::<Val>::periodic_columns(&air)[air.m_tf()].clone();
         let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
         assert_eq!(heads.len(), n_q, "one arith head per query");
         let used = air.tr() + n_q * air.m_period();
-        assert!(used + total_rows <= h, "cap-row region ({total_rows} rows) must fit the slack ({})", h - used);
+        // cap-rows [used, used+total_rows) + one binder row after them.
+        assert!(used + total_rows + 1 <= h, "cap region + binder ({}) must fit the slack ({})", total_rows + 1, h - used);
 
         let mut wide = vec![Val::ZERO; h * width];
         for r in 0..h {
@@ -1812,8 +1898,11 @@ mod tests {
             wide[head * width + is_head_col] = Val::ONE;
         }
 
-        // Seed the cap-row region: one row per (cap, entry); digest from the committed cap, mult = −(heads selecting it).
+        // Seed the cap-row region: one ROW per (cap, entry) in enumeration order (global index `gi`); digest from
+        // the committed cap, `cap_mult = −(heads selecting it)`, `is_rd` routing the AA3 binding read to channel
+        // `gi % n_ch` (where the binder provides this entry).
         let mut dst = used;
+        let mut gi = 0usize;
         for &(cap_id, shift, bits, cbase) in &caps {
             let n_entries = 1usize << bits;
             let mut count = vec![0u64; n_entries];
@@ -1835,9 +1924,14 @@ mod tests {
                 }
                 wide[b + cr + 6] = Val::ZERO - Val::from_u64(count[e]); // cap_mult = −count
                 wide[b + cap_sel] = Val::ONE;
+                wide[b + is_rd_base + gi % n_ch] = Val::ONE; // AA3 read routing
                 dst += 1;
+                gi += 1;
             }
         }
+        // The single binder row (PROVIDES every committed entry once, in the AIR), right after the cap-rows.
+        wide[dst * width + is_binder_col] = Val::ONE;
+
         (AssembledCapWrapAir { m: air }, RowMajorMatrix::new(wide, width), pis)
     }
 
@@ -1859,24 +1953,31 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_cap_wrap(&config, &proof, &pvs);
+        let (asm, trace, pis) = assemble_cap_wrap(&config, &proof, &pvs);
 
         let (fw, h) = (asm.m.fused_w(), asm.m.height());
-        let width = fw + 9;
-        let (cr, cap_sel, is_head) = (fw, fw + 7, fw + 8);
+        let n_ch = asm.n_bind_ch();
+        let width = fw + 10 + n_ch;
+        let (cr, cap_sel, is_head, is_binder, is_rd_base) = (fw, fw + 7, fw + 8, fw + 9, fw + 10);
         let m = &asm.m;
         let ku = |v: Val| v.as_canonical_u64();
         let openings = asm.openings();
+        let caps = asm.caps_with_base();
 
-        // ONE channel — key by the 6-felt tuple `[cap_id, entry, digest[4]]`; the cap-row PROVIDE (mult −count, a
-        // field element) + the head READs (+1) must net to Val::ZERO per tuple (counts ≪ p ⇒ field-zero == int-zero).
-        let mut bus: HashMap<Vec<u64>, Val> = HashMap::new();
+        // Key by (CHANNEL, tuple): channel 0 = the SELECT bus (cap_c ↔ cap-row); 1..=n_ch = the committed-cap
+        // BINDING (cap-row digest ↔ pis). Each channel must net to Val::ZERO independently (counts ≪ p ⇒
+        // field-zero == int-zero), so a mis-routed binding read is caught, not just a value mismatch.
+        let mut bus: HashMap<(usize, Vec<u64>), Val> = HashMap::new();
         for r in 0..h {
             let b = r * width;
             let g = |c: usize| trace.values[b + c];
             if g(cap_sel) == Val::ONE {
                 let key = vec![ku(g(cr)), ku(g(cr + 1)), ku(g(cr + 2)), ku(g(cr + 3)), ku(g(cr + 4)), ku(g(cr + 5))];
-                *bus.entry(key).or_insert(Val::ZERO) += g(cr + 6); // + cap_mult (= −count)
+                // Channel 0: the cap-row PROVIDES its entry to the select bus (mult cap_mult = −count).
+                *bus.entry((0, key.clone())).or_insert(Val::ZERO) += g(cr + 6);
+                // Channels 1..=n_ch: the cap-row READS its committed binding (+1) on its is_rd channel.
+                let rd = (0..n_ch).find(|&gc| g(is_rd_base + gc) == Val::ONE).expect("cap-row routes to one channel");
+                *bus.entry((rd + 1, key)).or_insert(Val::ZERO) += Val::ONE;
             }
             if g(is_head) == Val::ONE {
                 for &(cap_id, cg_off, shift, bits) in &openings {
@@ -1894,18 +1995,89 @@ mod tests {
                         ku(g(m.cap_c(cg_off + 2))),
                         ku(g(m.cap_c(cg_off + 3))),
                     ];
-                    *bus.entry(key).or_insert(Val::ZERO) += Val::ONE; // + read
+                    *bus.entry((0, key)).or_insert(Val::ZERO) += Val::ONE; // + select read
+                }
+            }
+            if g(is_binder) == Val::ONE {
+                // The binder PROVIDES every committed entry (−1) on channel (global_index % n_ch) + 1.
+                let mut gi = 0usize;
+                for &(cap_id, _shift, bits, cbase) in &caps {
+                    for e in 0..(1usize << bits) {
+                        let key = vec![
+                            cap_id as u64,
+                            e as u64,
+                            ku(pis[cbase + e * 4]),
+                            ku(pis[cbase + e * 4 + 1]),
+                            ku(pis[cbase + e * 4 + 2]),
+                            ku(pis[cbase + e * 4 + 3]),
+                        ];
+                        *bus.entry((gi % n_ch + 1, key)).or_insert(Val::ZERO) -= Val::ONE;
+                        gi += 1;
+                    }
                 }
             }
         }
         let nonzero = bus.values().filter(|&&v| v != Val::ZERO).count();
         let bad: Vec<_> = bus.iter().filter(|(_, &v)| v != Val::ZERO).take(8).collect();
-        assert!(bad.is_empty(), "every cap-select tuple must net to zero; {nonzero} nonzero, e.g. {bad:?}");
+        assert!(bad.is_empty(), "every (channel, tuple) must net to zero; {nonzero} nonzero, e.g. {bad:?}");
         println!(
-            "cap select bus: {} distinct tuples, all net-zero — each head's cap_c is bound to the committed \
-             cap-row its index addresses (cap-rows provide −count, heads read +1)",
+            "cap buses ({} channels: 1 select + {n_ch} binding): {} distinct (channel, tuple) entries, all \
+             net-zero — cap_c bound to the cap-row (select) AND each cap-row digest to the committed cap pis \
+             (binding) ⇒ the cap-select is SOUND at cw=false.",
+            n_ch + 1,
             bus.len()
         );
+    }
+
+    /// **Caps assembly AA4 — the assembled cap-wrap PROVES through `prove_lookup`.** The definitive soundness
+    /// check (the `arith_wrap_assembled_proves` analog for caps): build the full trace (reused monolith with the
+    /// product-mux externalized + the narrow-tall cap-row region + the select bus + the AA3 committed-cap binding
+    /// across `n_bind_ch` channels) and prove + verify it end-to-end through the W1 lookup prover (outer is_zk=1).
+    /// Confirms the SOUND cap-select holds under a REAL prove — the monolith A–J constraints, the select bus
+    /// (`cap_c` ↔ cap-row), and the binding bus (each cap-row digest ↔ the committed cap pis) all hold together as
+    /// a SOUND STARK, replacing the degree-`cap_height` product-mux over `2^cap_height·4` COLUMNS with slack ROWS.
+    /// A corrupted cap-row digest is rejected (the binding bus unbalances). Heavy (64 channels); `--release --ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves the assembled cap-wrap (2^16 rows, 64 channels) through prove_lookup; run `--release --features lookup,recursion -j2 -- --ignored`"]
+    fn cap_wrap_assembled_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::lookup::prover::{prove_lookup, verify_lookup};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_cap_wrap(&config, &proof, &pvs);
+        let width = <AssembledCapWrapAir as BaseAir<Val>>::width(&asm);
+        println!(
+            "proving assembled cap-wrap (select bus + committed-cap binding): width {width}, {} rows, {} channels",
+            asm.m.height(),
+            asm.n_bind_ch() + 1
+        );
+        let lproof = prove_lookup(&asm, trace, &pis);
+        assert!(
+            verify_lookup(&asm, &lproof, &pis).is_ok(),
+            "the assembled cap-wrap must prove + verify through prove_lookup"
+        );
+
+        // Corrupt the first cap-row's digest ⇒ its committed-cap binding read (digest ≠ pis) unbalances the binding
+        // bus ⇒ the corrupted trace must not verify.
+        let (asm2, mut bad, pis2) = assemble_cap_wrap(&config, &proof, &pvs);
+        let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
+        let cr = asm2.m.fused_w();
+        bad.values[used * width + cr + 2] += Val::ONE; // digest[0] of the first cap-row
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = prove_lookup(&asm2, bad, &pis2);
+            verify_lookup(&asm2, &p, &pis2).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted cap-row digest (≠ committed cap) must not produce a valid proof");
     }
 
     /// **Caps plumbing brick — `CapWrapAir` proves with the product-mux externalized** (`--release --ignored`).
