@@ -2968,7 +2968,7 @@ mod tests {
         // narrow_caps=true: the internal α-fold + window (α/pub/periodic/qwt) pre-checks assert INSIDE the builder,
         // so a successful return means the collapsed-window openings are correct.
         let (tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
 
         // reconstruct the narrow air the trace was built for; the trace width == its (reduced) fused_w.
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
@@ -3024,7 +3024,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let air = MonolithAir {
             counts,
@@ -3076,7 +3076,7 @@ mod tests {
 
         // narrow cw=true monolith trace + air (identical setup to narrow_caps_cw_verifier_proves).
         let (mono_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+            build_symbolic_inner_window(config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -3245,7 +3245,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -3317,7 +3317,7 @@ mod tests {
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         // narrow_caps = false: the caps stay in the pis window (isolating the openings work); build the window to match.
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -3364,6 +3364,268 @@ mod tests {
         );
         assert_eq!(lookups.len(), N_GROUPS + 3, "ro + N_GROUPS z/px input-binding + pz bus + sponge FS-anchor");
         assert!(log_nqc <= LOG_BLOWUP, "openings AA1+AA2+AA2b cw=true must compose within the degree budget (got {log_nqc})");
+    }
+
+    /// **AA6 openings AA3 — assemble the cw=true narrow-openings wrap trace** (the [`AssembledOpeningsWrapCwAir`]
+    /// companion of `assemble_arith_wrap` one regime deeper, borrowing `assemble_cap_wrap_cw`'s sponge machinery).
+    /// Builds the narrow cw=true monolith (`narrow_arith` + `narrow_openings`: the `9·n_terms` arith tile GONE),
+    /// then widens it with (a) a per-query DeepFold slack region — `α`/`x` from the head's committed columns, `z`
+    /// re-derived from the window ζ (= `pw(2)`, NOT pis), `px` from `px_source`, `pz` from the FS-absorbed committed
+    /// opening (the tile no longer stores it); (b) the shared opening-row region (one row per DEEP opening term)
+    /// carrying that `pz`, FS-anchored to the sponge + re-provided `−n_queries`; (c) the `2·RATE` periodic-pinned
+    /// sponge tags marking each opening felt's `(block, lane)` with its stream index. A per-query assert that the
+    /// DeepFold `ro` reproduces the committed reduced opening (`QT_E`) validates the z/px/pz sourcing + the
+    /// term↔stream ordering at assembly time (before the heavy prove).
+    #[cfg(feature = "recursion")]
+    fn assemble_openings_wrap_cw(
+        config: &crate::recursion::native_fri::MyConfig,
+        proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
+        pvs: &[Val],
+    ) -> (AssembledOpeningsWrapCwAir, RowMajorMatrix<Val>, Vec<Val>) {
+        use crate::config::Challenge;
+        use crate::joinsplit_air::{JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::poseidon2_air::BLOCK;
+        use crate::recursion::monolith::tests::{build_symbolic_inner_window, sim_opening_positions};
+        use crate::recursion::monolith::MonolithAir;
+        use crate::wrap::deep_fold_trace_from;
+        use p3_field::{BasedVectorSpace, Field, TwoAdicField};
+        use p3_goldilocks::Goldilocks;
+        use p3_matrix::dense::RowMajorMatrix;
+        use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+
+        // narrow cw=true monolith trace + air (narrow_arith + narrow_openings; caps stay in the pis window).
+        let (mono_tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(
+            config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true,
+        );
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+        };
+        let (fw, h) = (m.fused_w(), m.height());
+        let rate = AssembledOpeningsWrapCwAir::RATE;
+
+        // Column bases — MUST match `AssembledOpeningsWrapCwAir`'s accessors.
+        let ro_col = fw;
+        let db = fw + 6; // after ro/folded/quot (6)
+        let (df_sel, df_first, df_end, is_head, term_idx, is_ch0) =
+            (db + 18, db + 19, db + 20, db + 21, db + 22, db + 23);
+        let or_base = db + 23 + N_GROUPS;
+        let (or_gi, or_pz, or_sel, or_k, or_mult) = (or_base, or_base + 1, or_base + 3, or_base + 4, or_base + 5);
+        let st_base = or_base + 6;
+        let w_gi = |l: usize| st_base + 2 * l;
+        let w_sel = |l: usize| st_base + 2 * l + 1;
+        let width = fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * rate;
+
+        // The FS-absorbed opening stream: positions[gi] = (oid, coeff, block, lane); committed[gi] = the felt
+        // (== block_inputs[block][lane], the absorbed rate lane). A DEEP term k's F_p² opening is the pair
+        // (committed[2k], committed[2k+1]) at stream indices (2k, 2k+1) — the `or_gi = 2·term` correspondence.
+        let (_block_inputs, positions, committed) = sim_opening_positions(config, proof, pvs);
+        assert_eq!(committed.len(), 2 * n_terms, "each DEEP term is one F_p² opening (2 felts) in stream order");
+
+        // op_periodics (2·RATE full-height cols): mark each opening felt's (block·BLOCK row, lane) with its gi+sel.
+        let mut op_periodics = vec![vec![Val::ZERO; h]; 2 * rate];
+        for (gi, &(_oid, _coeff, block, lane)) in positions.iter().enumerate() {
+            op_periodics[2 * lane][block * BLOCK] = Val::from_u64(gi as u64);
+            op_periodics[2 * lane + 1][block * BLOCK] = Val::ONE;
+        }
+
+        // arith heads (m_tf rows) — one DeepFold region per query, then the shared opening-row region.
+        let tf_col = BaseAir::<Val>::periodic_columns(&m)[m.m_tf()].clone();
+        let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
+        assert_eq!(heads.len(), m.n_queries, "one arith head per query");
+        let used = m.tr() + m.n_queries * m.m_period();
+        assert!(
+            used + n_terms * m.n_queries + n_terms <= h,
+            "DeepFold regions + opening-rows ({}) must fit the monolith slack ({})",
+            n_terms * m.n_queries + n_terms,
+            h - used
+        );
+
+        let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
+        let mut wide = vec![Val::ZERO; h * width];
+        for r in 0..h {
+            wide[r * width..r * width + fw].copy_from_slice(&mono_tr[r * fw..(r + 1) * fw]);
+        }
+        // the periodic-pinned tag COLUMNS in the trace (MUST equal op_periodics — the AIR binds them).
+        for (gi, &(_oid, _coeff, block, lane)) in positions.iter().enumerate() {
+            let row = block * BLOCK;
+            wide[row * width + w_gi(lane)] = Val::from_u64(gi as u64);
+            wide[row * width + w_sel(lane)] = Val::ONE;
+        }
+
+        let g_trace = Goldilocks::two_adic_generator(m.cm_rounds() - m.is_zk);
+        for (q, &head) in heads.iter().enumerate() {
+            let row = |col: usize| mono_tr[head * fw + col];
+            let alpha = Challenge::from_basis_coefficients_fn(|i| row(m.qt_alpha() + i));
+            let x = Challenge::from(<Goldilocks as Field>::GENERATOR * row(m.qt_acc() + m.lg() - 1));
+            // cw=true: ζ from the committed WINDOW pw(2), NOT pis (empty at cw=true).
+            let zeta = Challenge::from_basis_coefficients_fn(|i| row(m.pw(2 + i)));
+            let terms: Vec<(Challenge, Challenge, Challenge)> = (0..n_terms)
+                .map(|k| {
+                    let z = if k >= m.trm_next_base() && k < m.trm_quot_base() { zeta * g_trace } else { zeta };
+                    let pz = Challenge::from_basis_coefficients_fn(|i| committed[2 * k + i]);
+                    let px = Challenge::from(row(m.px_source(k)));
+                    (z, pz, px)
+                })
+                .collect();
+            let region = deep_fold_trace_from(alpha, x, &terms, 0);
+            let dw = region.width; // 18
+            let ro_last = Challenge::from_basis_coefficients_fn(|i| region.values[(n_terms - 1) * dw + 16 + i]);
+            // The fold ro MUST reproduce the committed reduced opening at QT_E (= column 0) — validates z/px/pz
+            // sourcing AND the term↔stream ordering before the heavy prove.
+            assert_eq!(
+                ro_last,
+                Challenge::from_basis_coefficients_fn(|i| row(i)),
+                "query {q}: DeepFold ro must equal the committed reduced opening (QT_E = col 0)"
+            );
+            wide[head * width + ro_col..head * width + ro_col + 2].copy_from_slice(&cc(ro_last));
+            wide[head * width + is_head] = Val::ONE;
+
+            for k in 0..n_terms {
+                let dst = used + q * n_terms + k;
+                wide[dst * width + db..dst * width + db + 18].copy_from_slice(&region.values[k * dw..k * dw + 18]);
+                wide[dst * width + df_sel] = Val::ONE;
+                wide[dst * width + term_idx] = Val::from_u64(k as u64);
+                wide[dst * width + is_ch0 + k % N_GROUPS] = Val::ONE; // route the read to the term's channel k%N_GROUPS
+                if k == 0 {
+                    wide[dst * width + df_first] = Val::ONE;
+                }
+                if k == n_terms - 1 {
+                    wide[dst * width + df_end] = Val::ONE;
+                }
+            }
+        }
+
+        // the SHARED opening-row region: one row per DEEP opening term k — FS-anchored to the sponge (reads its 2
+        // opening felts) and re-provided `−n_queries` to every query's DeepFold row via the pz bus.
+        let or_start = used + n_terms * m.n_queries;
+        for k in 0..n_terms {
+            let b = (or_start + k) * width;
+            wide[b + or_gi] = Val::from_u64(2 * k as u64);
+            wide[b + or_pz] = committed[2 * k];
+            wide[b + or_pz + 1] = committed[2 * k + 1];
+            wide[b + or_sel] = Val::ONE;
+            wide[b + or_k] = Val::from_u64(k as u64);
+            wide[b + or_mult] = Val::ZERO - Val::from_u64(m.n_queries as u64);
+        }
+
+        (AssembledOpeningsWrapCwAir { m, op_periodics }, RowMajorMatrix::new(wide, width), Vec::new())
+    }
+
+    /// **AA6 openings AA3 — all `N_GROUPS+3` channels balance** (native, cheap — NO prove). Assemble the cw=true
+    /// narrow-openings trace and confirm each bus channel nets to zero as a signed multiset: channel 0 (RO) ⇒ every
+    /// head's `ro_col` == its region's fold `ro`; channels `1..=N_GROUPS` (z/px input-binding) ⇒ each region row's
+    /// `(z, px)` == the committed `(ζ / ζ·g, px_source)` per term; channel `N_GROUPS+1` (pz) ⇒ every region `pz`
+    /// == the shared opening-row's `pz` (provided `−n_queries`, read `+1` per query); channel `N_GROUPS+2`
+    /// (sponge FS-anchor) ⇒ every opening-row felt `(2k+i, pz_i)` cancels the transcript provide `(w_gi_l, cur[l])`
+    /// at its stream position — i.e. the fold's `pz` == the FS-absorbed opening. Localizes any address / placement /
+    /// multiplicity / ordering bug before the heavy `prove_lookup` (as the arith/cap balances did one regime up).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn openings_wrap_cw_assembled_bus_balances() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_field::{Field, PrimeField64, TwoAdicField};
+        use p3_goldilocks::Goldilocks;
+        use p3_uni_stark::prove;
+        use std::collections::HashMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs);
+
+        let m = &asm.m;
+        let (fw, h) = (m.fused_w(), m.height());
+        let rate = AssembledOpeningsWrapCwAir::RATE;
+        let width = fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * rate;
+        let (ro_col, db) = (fw, fw + 6);
+        let (df_sel, df_end, is_head, term_idx, is_ch0) = (db + 18, db + 20, db + 21, db + 22, db + 23);
+        let or_base = db + 23 + N_GROUPS;
+        let (or_gi, or_pz, or_sel, or_k, or_mult) = (or_base, or_base + 1, or_base + 3, or_base + 4, or_base + 5);
+        let st_base = or_base + 6;
+        let (w_gi, w_sel) = (|l: usize| st_base + 2 * l, |l: usize| st_base + 2 * l + 1);
+        let ku = |v: Val| v.as_canonical_u64();
+        let g_trace = Goldilocks::two_adic_generator(m.cm_rounds() - m.is_zk);
+
+        // Field-valued signed multiset per (channel, tuple) — mirrors the eval's field mults exactly (the pz
+        // provide is `−n_queries`, not `±1`, so accumulate in Val like `cap_wrap_cw_assembled_bus_balances`).
+        let mut bus: HashMap<(usize, Vec<u64>), Val> = HashMap::new();
+        let neg1 = Val::ZERO - Val::ONE;
+        for r in 0..h {
+            let b = r * width;
+            let g = |c: usize| trace.values[b + c];
+            // channel 0 — the ro bus: region END provides [x, ro] (−1); head reads [x_head, 0, ro_col] (+1).
+            if g(df_end) == Val::ONE {
+                *bus.entry((0, vec![ku(g(db + 2)), ku(g(db + 3)), ku(g(db + 16)), ku(g(db + 17))])).or_insert(Val::ZERO) += neg1;
+            }
+            if g(is_head) == Val::ONE {
+                let x_head = <Goldilocks as Field>::GENERATOR * g(m.qt_acc() + m.lg() - 1);
+                *bus.entry((0, vec![ku(x_head), 0, ku(g(ro_col)), ku(g(ro_col + 1))])).or_insert(Val::ZERO) += Val::ONE;
+                // channels 1..=N_GROUPS — head PROVIDES committed term k (−1) on channel k%N_GROUPS+1: (x_head, 0,
+                // k, z0, z1, px). cw=true: z from the window ζ (= g(pw(2))); px from px_source.
+                let (z0f, z1f) = (g(m.pw(2)), g(m.pw(3)));
+                for k in 0..m.n_terms {
+                    let (z0, z1) = if k >= m.trm_next_base() && k < m.trm_quot_base() {
+                        (z0f * g_trace, z1f * g_trace)
+                    } else {
+                        (z0f, z1f)
+                    };
+                    let tuple = vec![ku(x_head), 0, k as u64, ku(z0), ku(z1), ku(g(m.px_source(k)))];
+                    *bus.entry((k % N_GROUPS + 1, tuple)).or_insert(Val::ZERO) += neg1;
+                }
+            }
+            // region row READS its (z, px) bundle (+1) on its one-hot is_ch channel AND its pz (+1) on the pz bus.
+            if g(df_sel) == Val::ONE {
+                let gch = (0..N_GROUPS).find(|&gc| g(is_ch0 + gc) == Val::ONE).expect("a region row routes to one channel");
+                let tuple = vec![ku(g(db + 2)), ku(g(db + 3)), ku(g(term_idx)), ku(g(db + 6)), ku(g(db + 7)), ku(g(db + 10))];
+                *bus.entry((gch + 1, tuple)).or_insert(Val::ZERO) += Val::ONE;
+                *bus.entry((N_GROUPS + 1, vec![ku(g(term_idx)), ku(g(db + 8)), ku(g(db + 9))])).or_insert(Val::ZERO) += Val::ONE;
+            }
+            // opening-row — pz bus PROVIDE [or_k, pz] (mult or_mult = −n_queries) + sponge READ [2k+i, pz_i] (+1).
+            if g(or_sel) == Val::ONE {
+                *bus.entry((N_GROUPS + 1, vec![ku(g(or_k)), ku(g(or_pz)), ku(g(or_pz + 1))])).or_insert(Val::ZERO) += g(or_mult);
+                for i in 0..2u64 {
+                    *bus.entry((N_GROUPS + 2, vec![ku(g(or_gi)) + i, ku(g(or_pz + i as usize))])).or_insert(Val::ZERO) += Val::ONE;
+                }
+            }
+            // channel N_GROUPS+2 — each transcript rate lane with an opening felt PROVIDES (w_gi_l, cur[l]) (−1).
+            for l in 0..rate {
+                if g(w_sel(l)) == Val::ONE {
+                    *bus.entry((N_GROUPS + 2, vec![ku(g(w_gi(l))), ku(g(l))])).or_insert(Val::ZERO) += neg1;
+                }
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != Val::ZERO).count();
+        let bad: Vec<_> = bus.iter().filter(|(_, &v)| v != Val::ZERO).take(8).collect();
+        assert!(bad.is_empty(), "every (channel, tuple) must net to zero; {nonzero} nonzero, e.g. {bad:?}");
+        println!(
+            "openings cw=true buses ({} channels: ro + {} z/px input-binding + pz + sponge FS-anchor): {} distinct \
+             entries, all net-zero — the DEEP fold's ro/z/px/pz are ALL bound to the committed columns + the \
+             FS-absorbed opening, with the pz COLUMNS dropped (narrow_openings).",
+            N_GROUPS + 3,
+            N_GROUPS,
+            bus.len()
+        );
     }
 
     /// **Caps AA5 cw=true — both buses balance** (native, cheap — NO prove). Assemble the cw=true trace and confirm
@@ -4945,7 +5207,7 @@ mod tests {
         // (2) OUTER: the monolith verifying the INNER monolith. build_symbolic_inner_window builds + self-
         // validates the outer witness (self-recursion). Measure the outer as MonolithAir (inline) AND WrapAir.
         let (_otr, ocounts, obinds, oib, ont, _pv0) =
-            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false);
+            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false);
         let cap_h = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
         let outer = MonolithAir {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
@@ -5119,7 +5381,7 @@ mod tests {
         // OUTER: the monolith verifying the inner (self-recursion). build_symbolic_inner_window builds + self-
         // validates the outer's witness; we only need its structural params (counts/binds/n_terms) for fused_w.
         let (_otr, ocounts, obinds, oib, ont, _pv0) =
-            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false);
+            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false);
         let cap_h = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
 
         // fused_w is a pure width function of the struct ⇒ read the outer width at FULL vs NARROWED geometry, and
