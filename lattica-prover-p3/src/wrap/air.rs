@@ -1523,12 +1523,99 @@ mod wrap_air {
             builder.push_local_interaction(ch_sponge);
         }
     }
+
+    /// **AA6 brick-3 DE-RISK — does the sponge-opening bus dissolve the 2c degree wall?** The `narrow_openings`
+    /// integration hinges on ONE question: binding the epilogue's `n_terms` openings via the ordered sponge bus
+    /// (provides SPREAD across transcript rows, reads SPREAD across region rows — never all-on-one-row) keeps
+    /// `log_nqc ≤ 4`, unlike the op-table's abandoned 2c binding (the arith HEAD providing ~120 openings on ONE
+    /// row ⇒ log_nqc 6, `28df1b2`). This probe answers it: the cw=true narrow monolith (`eval_bci(&CapMuxBci)` —
+    /// the caps-narrowed verifier at `log_nqc ≤ 4`) + a SINGLE sponge-opening bus channel (`RATE` provides + 2
+    /// reads = 6 tuples/row) binding a 1-opening-per-row region to the FS-absorbed openings. Composes `≤ 4` ⇒ the
+    /// sponge bus dissolves the wall (the whole `narrow_openings` integration is de-risked). `op_periodics` = the
+    /// 2·RATE opening-tag columns; for `combined_constraint_layout` the VALUES are irrelevant (log_nqc reads the
+    /// symbolic constraint STRUCTURE), so the compose probe passes dummies.
+    pub(crate) struct OpeningBindCwAir {
+        pub(crate) m: MonolithAir,
+        pub(crate) op_periodics: Vec<Vec<Goldilocks>>,
+    }
+
+    impl OpeningBindCwAir {
+        /// Sponge rate = the transcript absorbs RATE felts/block (an opening is a 2-felt F_p² run).
+        pub(crate) const RATE: usize = 4;
+        pub(crate) fn cr(&self) -> usize {
+            self.m.fused_w()
+        }
+        /// Openings-region row: `[gi_base, val0, val1, op_sel]` (one OOD opening/row; `gi_base` its FS-stream index).
+        pub(crate) fn op_sel(&self) -> usize {
+            self.cr() + 3
+        }
+        pub(crate) fn w_gi(&self, l: usize) -> usize {
+            self.cr() + 4 + 2 * l
+        }
+        pub(crate) fn w_sel(&self, l: usize) -> usize {
+            self.cr() + 5 + 2 * l
+        }
+        pub(crate) fn op_periodic_base(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+    }
+
+    impl BaseAir<Goldilocks> for OpeningBindCwAir {
+        fn width(&self) -> usize {
+            self.m.fused_w() + 4 + 2 * Self::RATE
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
+            p.extend(self.op_periodics.iter().cloned());
+            p
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for OpeningBindCwAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(builder, &CapMuxBci);
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let one = AB::Expr::ONE;
+            let cr = self.cr();
+            let pbase = self.op_periodic_base();
+            let rate = Self::RATE;
+
+            let op_sel = cur[self.op_sel()].clone();
+            builder.assert_zero(op_sel.clone() * (op_sel.clone() - one.clone()));
+            for l in 0..rate {
+                builder.assert_zero(cur[self.w_gi(l)].clone() - p[pbase + 2 * l].clone());
+                builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 2 * l + 1].clone());
+            }
+
+            // ONE sponge-opening bus channel: per lane PROVIDE (w_gi_l, cur[l]) −w_sel_l; the region row READS its
+            // opening's 2 F_p² felts (gi_base+k, val_k) +op_sel. 6 tuples/row (vs the 2c head's ~120) — the crux.
+            let mut ch: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(rate + 2);
+            for l in 0..rate {
+                ch.push((
+                    vec![cur[self.w_gi(l)].clone(), cur[l].clone()],
+                    AB::Expr::ZERO - cur[self.w_sel(l)].clone(),
+                ));
+            }
+            for k in 0..2 {
+                let gi_k = cur[cr].clone() + AB::Expr::from(Goldilocks::from_u64(k as u64));
+                ch.push((vec![gi_k, cur[cr + 1 + k].clone()], op_sel.clone()));
+            }
+            builder.push_local_interaction(ch);
+        }
+    }
 }
 
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
     native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledCapWrapCwAir,
-    AssembledWrapAir, CapWrapAir, WrapAir, N_GROUPS, OPEN_BASE,
+    AssembledWrapAir, CapWrapAir, OpeningBindCwAir, WrapAir, N_GROUPS, OPEN_BASE,
 };
 
 #[cfg(test)]
@@ -2579,6 +2666,73 @@ mod tests {
         assert_eq!(width, fw + 10 + 2 * AssembledCapWrapCwAir::CAP_RATE, "region 10 + 2·RATE sponge tags");
         assert_eq!(lookups.len(), 2, "2 channels: the select bus + the sponge-cap FS-anchor bus");
         assert!(log_nqc <= LOG_BLOWUP, "cap AA5 cw=true must compose within the degree budget (got {log_nqc})");
+    }
+
+    /// **AA6 brick-3 DE-RISK — the sponge-opening bus DISSOLVES the 2c degree wall** (`--features lookup,recursion`,
+    /// cheap). The `narrow_openings` integration's crux: binding the epilogue's openings via the ordered sponge bus
+    /// must keep `log_nqc ≤ 4` in the ASSEMBLED context, where the op-table's 2c binding (the arith head providing
+    /// ~120 openings on ONE row) blew up to `log_nqc 6` (`28df1b2`). Builds [`OpeningBindCwAir`] — the cw=true
+    /// narrow monolith + ONE sponge-opening bus (6 tuples/row, SPREAD) — and measures `log_nqc` via
+    /// `combined_constraint_layout` (compose-only; the periodics' VALUES don't affect degree, so dummies suffice).
+    /// If ≤ 4, the sponge bus's spread provides/reads dissolve the wall ⇒ the whole `narrow_openings` build (arith
+    /// fold + op-table epilogue + sponge bus, dropping the 2·n_terms pz cols) is de-risked.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn opening_bind_cw_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: false,
+            narrow_caps: true,
+        };
+        let h = m.height();
+        // dummy op_periodics: log_nqc reads the symbolic constraint STRUCTURE (tuple counts/degrees), not the values.
+        let op_periodics = vec![vec![Val::ZERO; h]; 2 * OpeningBindCwAir::RATE];
+        let air = OpeningBindCwAir { m, op_periodics };
+        let width = <OpeningBindCwAir as BaseAir<Val>>::width(&air);
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "AA6 brick-3 DE-RISK: OpeningBindCwAir (cw=true monolith + ONE sponge-opening bus, {} tuples/row) width \
+             {width}, {} channel, log_nqc {log_nqc}. The op-table 2c binding (arith head provides ~120 openings on \
+             ONE row) hit log_nqc 6; the sponge bus's SPREAD provides/reads stay ≤ {LOG_BLOWUP} ⇒ the sponge bus \
+             DISSOLVES the 2c degree wall — the narrow_openings integration is de-risked.",
+            OpeningBindCwAir::RATE + 2,
+            lookups.len()
+        );
+        assert_eq!(lookups.len(), 1, "one sponge-opening bus channel");
+        assert!(
+            log_nqc <= LOG_BLOWUP,
+            "the sponge-opening binding must compose ≤ budget in the assembled context (got {log_nqc}) — else the \
+             2c wall is NOT dissolved and the narrow_openings approach needs a rethink"
+        );
     }
 
     /// **Caps AA5 cw=true — both buses balance** (native, cheap — NO prove). Assemble the cw=true trace and confirm
