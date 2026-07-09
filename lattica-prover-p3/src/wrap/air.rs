@@ -1779,12 +1779,24 @@ mod wrap_air {
         pub(crate) fn is_head(&self) -> usize {
             self.df_base() + 21
         }
+        /// **AA2** — the region row's term index `k` (a constrained counter: 0 at `df_first`, +1 down `df_trans`).
+        /// With the query point `x`, `(x, term_idx)` addresses each region row to its committed term for the
+        /// `z`/`px` input-binding (the per-query discriminator the op-table's ζ-opening binding did not need).
+        pub(crate) fn term_idx(&self) -> usize {
+            self.df_base() + 22
+        }
+        /// **AA2** — one-hot channel selector `g` routing the region row's `(z, px)` read to the channel its
+        /// committed term's provide is on (`k % N_GROUPS`). Booleanity + `Σ == df_sel` pin exactly one per row.
+        pub(crate) fn is_ch(&self, g: usize) -> usize {
+            self.df_base() + 23 + g
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledOpeningsWrapCwAir {
         fn width(&self) -> usize {
-            // ro/folded/quot(6) + DeepFoldAir region(18) + df_sel/df_first/df_end/is_head(4).
-            self.m.fused_w() + 6 + 18 + 4
+            // ro/folded/quot(6) + DeepFoldAir region(18) + df_sel/df_first/df_end/is_head(4) + term_idx(1)
+            // + is_ch(N_GROUPS).
+            self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
@@ -1865,18 +1877,73 @@ mod wrap_air {
             builder.when_transition().assert_zero(df_trans.clone() * (gg(&nxt, 16).0 - (ro.0.clone() + gg(&nxt, 14).0)));
             builder.when_transition().assert_zero(df_trans.clone() * (gg(&nxt, 16).1 - (ro.1.clone() + gg(&nxt, 14).1)));
 
-            // (4) The `ro` bus (channel 0), addressed by the query point `x`: the region's LAST row (`df_end`)
-            // PROVIDES `[x, ro]` (mult −1) and each arith head READS `[x_head, ro_col]` (mult +is_head), where
-            // `x_head = GEN·qt_acc[lg−1]` is the head's committed query point (imaginary 0). Balance ⇒ `ro_col` at
-            // head q == the slack region's fold `ro`.
+            // (4) term_idx counter (0 at df_first, +1 down df_trans) + is_ch one-hot (the input-binding router).
+            let term_idx = cur[self.term_idx()].clone();
+            let is_ch: Vec<AB::Expr> = (0..N_GROUPS).map(|g| cur[self.is_ch(g)].clone()).collect();
+            builder.assert_zero(df_first.clone() * term_idx.clone());
+            builder
+                .when_transition()
+                .assert_zero(df_trans.clone() * (nxt[self.term_idx()].clone() - term_idx.clone() - one.clone()));
+            let mut ch_sum = AB::Expr::ZERO;
+            for c in &is_ch {
+                builder.assert_zero(c.clone() * (c.clone() - one.clone()));
+                ch_sum = ch_sum + c.clone();
+            }
+            builder.assert_zero(ch_sum - df_sel.clone());
+
+            // (5) The buses. **Channel 0 = the `ro` bus** (AA1), addressed by the query point `x`: the region's LAST
+            // row PROVIDES `[x, ro]` (−df_end), each arith head READS `[x_head, ro_col]` (+is_head), where
+            // `x_head = GEN·qt_acc[lg−1]` is the head's committed query point (imaginary 0). Balance ⇒ `ro_col` == the
+            // slack fold. **Channels 1..=N_GROUPS = the AA2 `z`/`px` input-binding:** the head PROVIDES its committed
+            // `(z, px)` per term k (address `(x_head, k)`, −is_head) on channel `k % N_GROUPS`, the region row READS
+            // its bundle (address `(x, term_idx)`, +is_ch) — so the fold's `z`/`px` are the REAL committed values.
+            // At cw=true `z` is re-derived from ζ = the committed WINDOW `cur[pw(2)],cur[pw(3)]` (NOT the empty `pis`
+            // — the cw=false arith wrap read `pis[2]`): `= ζ` (trace-ζ + quotient terms) or `ζ·g_trace` (the trace-ζ_next
+            // block `[trm_next_base, trm_quot_base)`); `px` is SOURCED from the authenticated `ov`/`qc` carrier
+            // (`px_source(k)`). `pz` is NOT bound here (it left the tile) — the opening-row region + the pz/sponge
+            // buses bind the fold's `pz` to the FS-absorbed opening in the next increment (AA2b).
             let x_head =
                 AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[self.m.qt_acc() + self.m.lg() - 1].clone();
             let ro_read = (cur[self.ro_col()].clone(), cur[self.ro_col() + 1].clone());
-            let ch0: Vec<(Vec<AB::Expr>, AB::Expr)> = vec![
-                (vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()),
-                (vec![x_head, AB::Expr::ZERO, ro_read.0, ro_read.1], is_head.clone()),
+            let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(self.m.cm_rounds() - self.m.is_zk));
+            let (zeta0, zeta1) = (cur[self.m.pw(2)].clone(), cur[self.m.pw(3)].clone());
+
+            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); N_GROUPS + 1];
+            // Channel 0 — the ro bus.
+            chans[0].push((vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()));
+            chans[0].push((vec![x_head.clone(), AB::Expr::ZERO, ro_read.0, ro_read.1], is_head.clone()));
+            // Channels 1..=N_GROUPS — the z/px input-binding. Head PROVIDES committed term k on channel k%N_GROUPS.
+            for k in 0..self.m.n_terms {
+                let (z0, z1) = if k >= self.m.trm_next_base() && k < self.m.trm_quot_base() {
+                    (zeta0.clone() * g_trace.clone(), zeta1.clone() * g_trace.clone())
+                } else {
+                    (zeta0.clone(), zeta1.clone())
+                };
+                let head_provide = vec![
+                    x_head.clone(),
+                    AB::Expr::ZERO,
+                    AB::Expr::from(Goldilocks::from_u64(k as u64)),
+                    z0,
+                    z1,
+                    cur[self.m.px_source(k)].clone(),
+                ];
+                chans[k % N_GROUPS + 1].push((head_provide, AB::Expr::ZERO - is_head.clone()));
+            }
+            // The region row READS its (z, px) bundle (region z at db+6, px at db+10) on its is_ch channel.
+            let region_read = vec![
+                x.0.clone(),
+                x.1.clone(),
+                term_idx.clone(),
+                cur[db + 6].clone(),
+                cur[db + 7].clone(),
+                cur[db + 10].clone(),
             ];
-            builder.push_local_interaction(ch0);
+            for g in 0..N_GROUPS {
+                chans[g + 1].push((region_read.clone(), is_ch[g].clone()));
+            }
+            for ch in chans {
+                builder.push_local_interaction(ch);
+            }
         }
     }
 }
@@ -3129,14 +3196,16 @@ mod tests {
         );
     }
 
-    /// **AA6 openings AA1 cw=true — the sound reduced-opening fold COMPOSES** (`--features lookup,recursion`, cheap).
-    /// The [`AssembledOpeningsWrapCwAir`] first brick and the [`AssembledArithWrapAir`] `arith_wrap_assembled_composes`
-    /// sibling one regime deeper: at `column_window = true` + `narrow_openings` (the `2·n_terms` pz opening columns
-    /// DROPPED) the DEEP fold `ro` is externalized to a narrow-tall DeepFold region + bound to the arith head via the
-    /// `ro` bus. Confirms the region + the `ro` bus compose within the degree budget (`log_nqc ≤ LOG_BLOWUP`) at
-    /// cw=true — the deep-tree fixed-point regime, where the pz columns actually scale with the inner width. The
-    /// opening FS-anchor + the `z`/`px` input-binding (which sources ζ from the `pw` window, not the empty pis) are
-    /// the next increment; `folded_col`/`quot_col` stay free.
+    /// **AA6 openings AA1+AA2 cw=true — the sound fold + `z`/`px` input-binding COMPOSE** (`--features
+    /// lookup,recursion`, cheap). The [`AssembledOpeningsWrapCwAir`] compose milestone and the
+    /// [`AssembledArithWrapAir`] `arith_wrap_assembled_composes` sibling one regime deeper: at `column_window = true`
+    /// + `narrow_openings` (the `2·n_terms` pz opening columns DROPPED) the DEEP fold `ro` is externalized to a
+    /// narrow-tall DeepFold region + bound to the arith head via the `ro` bus (AA1, channel 0), and the fold's
+    /// `z`/`px` INPUTS are bound to the committed columns via the input-binding (AA2, channels 1..=N_GROUPS) — `z`
+    /// re-derived from ζ = the cw=true WINDOW `cur[pw(2)]` (NOT the empty pis), `px` from `px_source`. Confirms all
+    /// N_GROUPS+1 channels compose within the degree budget (`log_nqc ≤ LOG_BLOWUP`) at cw=true — de-risking the
+    /// cw=true input-binding (degree-1 window ζ, like the degree-1 `x_head`). Only the fold's `pz` stays region-free
+    /// (the opening-row region + the pz/sponge FS-anchor buses bind it next); `folded_col`/`quot_col` stay free.
     #[cfg(feature = "recursion")]
     #[test]
     fn openings_wrap_cw_assembled_composes() {
@@ -3181,15 +3250,16 @@ mod tests {
         let lookups = Lookups::from_air::<Challenge, _>(&air);
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!(
-            "AA6 openings AA1 cw=true: width {width} = fused_w {fw} + 28 (ro/folded/quot 6 + DeepFold region 18 + \
-             markers 4); {} ro-bus channel, log_nqc {log_nqc} ≤ {LOG_BLOWUP}. The `2·n_terms` pz opening columns are \
-             DROPPED (narrow_openings); `ro` is bound to the narrow-tall slack fold — the cw=true DeepFold binding the \
-             opening FS-anchor builds on next.",
+            "AA6 openings AA1+AA2 cw=true: width {width} = fused_w {fw} + 28 + 1 + N_GROUPS (ro/folded/quot 6 + \
+             DeepFold region 18 + markers 4 + term_idx 1 + is_ch {N_GROUPS}); {} channels (ro + {N_GROUPS} z/px \
+             input-binding), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. The pz columns are DROPPED (narrow_openings); `ro` \
+             bound to the slack fold, the fold's z/px bound to the committed columns (z re-derived from the cw=true \
+             window ζ = pw(2)); only pz stays region-free — the sponge FS-anchor + pz re-provide bind it next.",
             lookups.len()
         );
-        assert_eq!(width, fw + 6 + 18 + 4, "ro/folded/quot 6 + DeepFold region 18 + markers 4");
-        assert_eq!(lookups.len(), 1, "one ro-bus channel (AA1)");
-        assert!(log_nqc <= LOG_BLOWUP, "openings AA1 cw=true must compose within the degree budget (got {log_nqc})");
+        assert_eq!(width, fw + 6 + 18 + 4 + 1 + N_GROUPS, "ro/folded/quot 6 + DeepFold 18 + markers 4 + term_idx 1 + is_ch");
+        assert_eq!(lookups.len(), N_GROUPS + 1, "ro bus + N_GROUPS z/px input-binding channels");
+        assert!(log_nqc <= LOG_BLOWUP, "openings AA1+AA2 cw=true must compose within the degree budget (got {log_nqc})");
     }
 
     /// **Caps AA5 cw=true — both buses balance** (native, cheap — NO prove). Assemble the cw=true trace and confirm
