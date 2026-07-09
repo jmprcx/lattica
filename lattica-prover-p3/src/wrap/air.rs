@@ -2116,6 +2116,66 @@ mod tests {
         );
     }
 
+    /// **AA6 brick 2 — the ordered sponge bus binds the OPENINGS too** (`--features lookup,recursion`, cheap). The
+    /// arith tile's FS-anchor REUSES the proven [`SpongeCapBusAir`]/`sponge_cap_bus_trace` verbatim (the bus is
+    /// generic over the `(gi, value)` enumeration — only `(block,lane)` per felt matters). Fed the OPENING stream
+    /// (`sim_opening_positions`) it COMPOSES `log_nqc ≤ 4` + BALANCES natively (every `(gi, opening felt)` nets to
+    /// zero ⇒ each region opening == the FS-absorbed opening). So the same SOUND FS-anchor (proven end-to-end in
+    /// [`sponge_cap_bus_proves`]) drops the arith tile — no new bus mechanism needed, just a new feed.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn sponge_opening_bus_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::lookup::prover::combined_constraint_layout;
+        use crate::recursion::monolith::tests::sim_opening_positions;
+        use crate::recursion::native_fri::make_config;
+        use crate::wrap::{sponge_cap_bus_trace, SpongeCapBusAir};
+        use p3_field::PrimeField64;
+        use p3_lookup::Lookups;
+        use p3_uni_stark::prove;
+        use std::collections::BTreeMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (block_inputs, opos, committed) = sim_opening_positions(&config, &proof, &pvs);
+        // the ordered bus only reads (block,lane) per felt; carry the opening tags in the (ignored) cap-id/entry slots.
+        let positions: Vec<(usize, usize, usize, usize, usize)> =
+            opos.iter().map(|&(oid, k, b, l)| (0, oid, k, b, l)).collect();
+
+        let trace = sponge_cap_bus_trace(&block_inputs, &positions, &committed);
+        let (width, height) = (trace.width, trace.values.len() / trace.width);
+
+        let air = SpongeCapBusAir;
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        assert_eq!(lookups.len(), 1, "one ordered-bus channel");
+        assert!(log_nqc <= LOG_BLOWUP, "the ordered sponge-opening bus must compose within budget (got {log_nqc})");
+
+        let g = |r: usize, c: usize| trace.values[r * width + c].as_canonical_u64();
+        let (rate, is_reg, rgi, rval) = (4usize, 3 * 4 + 2, 3 * 4, 3 * 4 + 1);
+        let mut bus: BTreeMap<(u64, u64), i64> = BTreeMap::new();
+        for r in 0..height {
+            for l in 0..rate {
+                if trace.values[r * width + 2 * rate + l] == Val::ONE {
+                    *bus.entry((g(r, rate + l), g(r, l))).or_insert(0) -= 1; // provide
+                }
+            }
+            if trace.values[r * width + is_reg] == Val::ONE {
+                *bus.entry((g(r, rgi), g(r, rval))).or_insert(0) += 1; // read
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != 0).count();
+        assert_eq!(nonzero, 0, "ordered sponge-opening bus must net to zero ({nonzero} imbalanced (gi,value) tuples)");
+        assert_eq!(bus.len(), positions.len(), "one balanced (gi,value) tuple per absorbed opening felt");
+        println!(
+            "AA6 sponge-OPENING bus: {} opening felts, width {width}, {height} rows, log_nqc {log_nqc} — COMPOSES \
+             + BALANCES (reuses the proven SpongeCapBusAir; the arith-tile FS-anchor holds exactly like the caps).",
+            positions.len()
+        );
+    }
+
     /// **AA5 — the ordered sponge-cap bus PROVES + tamper-rejects** (`--release --ignored`). The heavy half of
     /// [`sponge_cap_bus_composes`]: the same real-absorb-stream trace PROVES + verifies through `prove_lookup`,
     /// and a corrupted committed felt (≠ the FS-absorbed felt) is REJECTED (the bus unbalances). So the FS-anchor
