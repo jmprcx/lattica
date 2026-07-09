@@ -1744,9 +1744,16 @@ mod wrap_air {
     /// mirroring the AA3 arc). `folded_col`/`quot_col` stay free witnesses (the op-table region binds them later).
     pub(crate) struct AssembledOpeningsWrapCwAir {
         pub(crate) m: MonolithAir,
+        /// The `2·RATE` opening-tag columns (AA2b): at each transcript absorb row `block·BLOCK` lane `l`, `(gi, sel)`
+        /// for the opening felt the FS sponge absorbed there — the `w_gi`/`w_sel` witnessed tags are pinned to these
+        /// (the periodic-out-of-interactions rule). Appended after the monolith periodics. (`AssembledCapWrapCwAir`'s
+        /// `cap_periodics` analog; compose reads structure, so a dummy suffices.)
+        pub(crate) op_periodics: Vec<Vec<Goldilocks>>,
     }
 
     impl AssembledOpeningsWrapCwAir {
+        /// Sponge rate = the transcript absorbs `RATE` felts/block; an OOD opening is a 2-felt F_p² run.
+        pub(crate) const RATE: usize = 4;
         /// The witnessed reduced opening `ro` (F_p² pair) the arith head binds `QT_E` to (the `OpeningsBci` slot).
         pub(crate) fn ro_col(&self) -> usize {
             self.m.fused_w()
@@ -1790,22 +1797,67 @@ mod wrap_air {
         pub(crate) fn is_ch(&self, g: usize) -> usize {
             self.df_base() + 23 + g
         }
+        /// **AA2b** — the SHARED opening-row region base (after the DeepFold region + input-binding router). One row
+        /// per DEEP opening (term k): `[gi_base, pz0, pz1, or_sel, or_k, or_mult]`. It READS its opening felt from
+        /// the sponge FS-anchor (FS→row, 1:1) and RE-PROVIDES `pz` to the N per-query DeepFold rows (row→folds, 1:N).
+        pub(crate) fn or_base(&self) -> usize {
+            self.df_base() + 23 + N_GROUPS
+        }
+        /// The opening-row's `gi` of its `k=0` felt (= `2·term`; the sponge balance forces it).
+        pub(crate) fn or_gi(&self) -> usize {
+            self.or_base()
+        }
+        /// The opening-row's `pz` (F_p² pair) — the OOD opening, bound to the FS-absorbed felt + re-provided.
+        pub(crate) fn or_pz(&self) -> usize {
+            self.or_base() + 1
+        }
+        /// Opening-row region selector (gates the sponge READ + the pz re-provide).
+        pub(crate) fn or_sel(&self) -> usize {
+            self.or_base() + 3
+        }
+        /// The DEEP term index `k` this opening-row represents (the pz-bus address, query-independent).
+        pub(crate) fn or_k(&self) -> usize {
+            self.or_base() + 4
+        }
+        /// The pz re-provide multiplicity (−#queries: every query's DeepFold row reads this opening once).
+        pub(crate) fn or_mult(&self) -> usize {
+            self.or_base() + 5
+        }
+        /// The sponge-tag region base (after the opening-row region): `2·RATE` witnessed tags pinned to `op_periodics`.
+        pub(crate) fn st_base(&self) -> usize {
+            self.or_base() + 6
+        }
+        /// Witnessed sponge `gi` tag for rate lane `l` — pinned to `op_periodics[2l]`.
+        pub(crate) fn w_gi(&self, l: usize) -> usize {
+            self.st_base() + 2 * l
+        }
+        /// Witnessed sponge `sel` tag for rate lane `l` — pinned to `op_periodics[2l+1]` (1 iff lane `l` absorbed
+        /// an opening felt in this transcript block).
+        pub(crate) fn w_sel(&self, l: usize) -> usize {
+            self.st_base() + 2 * l + 1
+        }
+        /// The periodic index where the appended opening-tag columns begin.
+        pub(crate) fn op_periodic_base(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledOpeningsWrapCwAir {
         fn width(&self) -> usize {
             // ro/folded/quot(6) + DeepFoldAir region(18) + df_sel/df_first/df_end/is_head(4) + term_idx(1)
-            // + is_ch(N_GROUPS).
-            self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS
+            // + is_ch(N_GROUPS) + opening-row(6) + 2·RATE sponge tags.
+            self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * Self::RATE
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
         }
         fn num_periodic_columns(&self) -> usize {
-            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
         }
         fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
-            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+            let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
+            p.extend(self.op_periodics.iter().cloned());
+            p
         }
     }
 
@@ -1891,6 +1943,17 @@ mod wrap_air {
             }
             builder.assert_zero(ch_sum - df_sel.clone());
 
+            // (4b) Opening-row markers (AA2b) + the periodic-PINNED sponge tags (the periodic-out-of-interactions
+            // rule: witness the columns, bind them by constraint, then use the COLUMNS in the bus). `w_sel_l` is thus
+            // 0/1 from the periodic, `w_gi_l` the FS-stream index of the opening felt absorbed at (block, lane l).
+            let or_sel = cur[self.or_sel()].clone();
+            builder.assert_zero(or_sel.clone() * (or_sel.clone() - one.clone()));
+            let pbase = self.op_periodic_base();
+            for l in 0..Self::RATE {
+                builder.assert_zero(cur[self.w_gi(l)].clone() - p[pbase + 2 * l].clone());
+                builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 2 * l + 1].clone());
+            }
+
             // (5) The buses. **Channel 0 = the `ro` bus** (AA1), addressed by the query point `x`: the region's LAST
             // row PROVIDES `[x, ro]` (−df_end), each arith head READS `[x_head, ro_col]` (+is_head), where
             // `x_head = GEN·qt_acc[lg−1]` is the head's committed query point (imaginary 0). Balance ⇒ `ro_col` == the
@@ -1908,7 +1971,7 @@ mod wrap_air {
             let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(self.m.cm_rounds() - self.m.is_zk));
             let (zeta0, zeta1) = (cur[self.m.pw(2)].clone(), cur[self.m.pw(3)].clone());
 
-            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); N_GROUPS + 1];
+            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); N_GROUPS + 3];
             // Channel 0 — the ro bus.
             chans[0].push((vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()));
             chans[0].push((vec![x_head.clone(), AB::Expr::ZERO, ro_read.0, ro_read.1], is_head.clone()));
@@ -1941,6 +2004,37 @@ mod wrap_air {
             for g in 0..N_GROUPS {
                 chans[g + 1].push((region_read.clone(), is_ch[g].clone()));
             }
+
+            // **Channel N_GROUPS+1 = the pz bus** (AA2b, query-INDEPENDENT): the shared opening-row PROVIDES `[k, pz]`
+            // (mult `or_mult = −#queries`), each per-query DeepFold region row READS `[term_idx, cur[db+8], cur[db+9]]`
+            // (mult `df_sel`) — so the fold's `pz` (used at `db+8/9`) is the opening-row's `pz`. The 1:N re-provide (a
+            // shared opening folded by every query) that the caps SELECT bus does for a shared cap.
+            let or_pz = (cur[self.or_pz()].clone(), cur[self.or_pz() + 1].clone());
+            chans[N_GROUPS + 1].push((
+                vec![cur[self.or_k()].clone(), or_pz.0.clone(), or_pz.1.clone()],
+                cur[self.or_mult()].clone(),
+            ));
+            chans[N_GROUPS + 1].push((
+                vec![term_idx.clone(), cur[db + 8].clone(), cur[db + 9].clone()],
+                df_sel.clone(),
+            ));
+
+            // **Channel N_GROUPS+2 = the sponge-opening FS-anchor** (AA2b): on each transcript absorb row, per rate
+            // lane `l` PROVIDE `[w_gi_l, cur[l]]` (mult −w_sel_l) — `cur[l]` the real FS-absorbed rate lane; the
+            // opening-row READS its 2 opening felts `[gi_base+i, pz_i]` (mult +or_sel). Balance on `(gi, value)` ⇒
+            // every opening-row `pz` felt == the felt the sponge absorbed at that stream position ⇒ the fold's `pz`
+            // (via the pz bus) == the FS opening. Sound. (The `AssembledCapWrapCwAir` sponge-cap bus, one region over.)
+            for l in 0..Self::RATE {
+                chans[N_GROUPS + 2].push((
+                    vec![cur[self.w_gi(l)].clone(), cur[l].clone()],
+                    AB::Expr::ZERO - cur[self.w_sel(l)].clone(),
+                ));
+            }
+            for i in 0..2 {
+                let gi_i = cur[self.or_gi()].clone() + AB::Expr::from(Goldilocks::from_u64(i as u64));
+                chans[N_GROUPS + 2].push((vec![gi_i, cur[self.or_pz() + i].clone()], or_sel.clone()));
+            }
+
             for ch in chans {
                 builder.push_local_interaction(ch);
             }
@@ -3196,16 +3290,18 @@ mod tests {
         );
     }
 
-    /// **AA6 openings AA1+AA2 cw=true — the sound fold + `z`/`px` input-binding COMPOSE** (`--features
+    /// **AA6 openings AA1+AA2+AA2b cw=true — the FULLY-BOUND reduced-opening fold COMPOSES** (`--features
     /// lookup,recursion`, cheap). The [`AssembledOpeningsWrapCwAir`] compose milestone and the
     /// [`AssembledArithWrapAir`] `arith_wrap_assembled_composes` sibling one regime deeper: at `column_window = true`
     /// + `narrow_openings` (the `2·n_terms` pz opening columns DROPPED) the DEEP fold `ro` is externalized to a
-    /// narrow-tall DeepFold region + bound to the arith head via the `ro` bus (AA1, channel 0), and the fold's
-    /// `z`/`px` INPUTS are bound to the committed columns via the input-binding (AA2, channels 1..=N_GROUPS) — `z`
-    /// re-derived from ζ = the cw=true WINDOW `cur[pw(2)]` (NOT the empty pis), `px` from `px_source`. Confirms all
-    /// N_GROUPS+1 channels compose within the degree budget (`log_nqc ≤ LOG_BLOWUP`) at cw=true — de-risking the
-    /// cw=true input-binding (degree-1 window ζ, like the degree-1 `x_head`). Only the fold's `pz` stays region-free
-    /// (the opening-row region + the pz/sponge FS-anchor buses bind it next); `folded_col`/`quot_col` stay free.
+    /// narrow-tall DeepFold region + bound to the arith head via the `ro` bus (AA1, channel 0); the fold's `z`/`px`
+    /// INPUTS are bound to the committed columns (AA2, channels 1..=N_GROUPS) — `z` re-derived from ζ = the cw=true
+    /// WINDOW `cur[pw(2)]` (NOT the empty pis), `px` from `px_source`; and the fold's `pz` is bound (AA2b) through a
+    /// SHARED opening-row region (2-level offline memory) — FS-anchored to the sponge-absorbed opening (channel
+    /// N_GROUPS+2) and re-provided 1:N to the per-query folds (the pz bus, channel N_GROUPS+1). Confirms all
+    /// N_GROUPS+3 channels compose within the degree budget (`log_nqc ≤ LOG_BLOWUP`) at cw=true — so the reduced
+    /// opening is a fold over the REAL FS-absorbed z/pz/px, with the pz COLUMNS gone. `folded_col`/`quot_col` stay
+    /// free (the op-table region binds the epilogue next).
     #[cfg(feature = "recursion")]
     #[test]
     fn openings_wrap_cw_assembled_composes() {
@@ -3244,22 +3340,30 @@ mod tests {
             narrow_caps: false,
             narrow_openings: true,
         };
-        let air = AssembledOpeningsWrapCwAir { m };
+        let h = m.height();
+        // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values (like opening_bind_cw_composes).
+        let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!(
-            "AA6 openings AA1+AA2 cw=true: width {width} = fused_w {fw} + 28 + 1 + N_GROUPS (ro/folded/quot 6 + \
-             DeepFold region 18 + markers 4 + term_idx 1 + is_ch {N_GROUPS}); {} channels (ro + {N_GROUPS} z/px \
-             input-binding), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. The pz columns are DROPPED (narrow_openings); `ro` \
-             bound to the slack fold, the fold's z/px bound to the committed columns (z re-derived from the cw=true \
-             window ζ = pw(2)); only pz stays region-free — the sponge FS-anchor + pz re-provide bind it next.",
+            "AA6 openings AA1+AA2+AA2b cw=true: width {width} = fused_w {fw} + 35 + N_GROUPS + 2·RATE (ro/folded/quot \
+             6 + DeepFold 18 + markers 4 + term_idx 1 + is_ch {N_GROUPS} + opening-row 6 + sponge tags 8); {} channels \
+             (ro + {N_GROUPS} z/px input-binding + pz bus + sponge FS-anchor), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. The pz \
+             columns are DROPPED (narrow_openings); the fold's z/px/pz ALL bound — z from the cw=true window ζ=pw(2), \
+             px from px_source, pz via the shared opening-row (FS-anchored to the sponge-absorbed opening + re-provided \
+             1:N). folded_col/quot_col stay free (the op-table region binds them next).",
             lookups.len()
         );
-        assert_eq!(width, fw + 6 + 18 + 4 + 1 + N_GROUPS, "ro/folded/quot 6 + DeepFold 18 + markers 4 + term_idx 1 + is_ch");
-        assert_eq!(lookups.len(), N_GROUPS + 1, "ro bus + N_GROUPS z/px input-binding channels");
-        assert!(log_nqc <= LOG_BLOWUP, "openings AA1+AA2 cw=true must compose within the degree budget (got {log_nqc})");
+        assert_eq!(
+            width,
+            fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * AssembledOpeningsWrapCwAir::RATE,
+            "ro/folded/quot 6 + DeepFold 18 + markers 4 + term_idx 1 + is_ch N_GROUPS + opening-row 6 + sponge tags 2·RATE"
+        );
+        assert_eq!(lookups.len(), N_GROUPS + 3, "ro + N_GROUPS z/px input-binding + pz bus + sponge FS-anchor");
+        assert!(log_nqc <= LOG_BLOWUP, "openings AA1+AA2+AA2b cw=true must compose within the degree budget (got {log_nqc})");
     }
 
     /// **Caps AA5 cw=true — both buses balance** (native, cheap — NO prove). Assemble the cw=true trace and confirm
