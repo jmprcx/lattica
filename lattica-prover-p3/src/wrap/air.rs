@@ -2099,7 +2099,7 @@ mod tests {
     /// cw=true verifier proves at fused_w 963, not just composes. (Mirrors `cap_wrap_externalized_proves`, cw=true.)
     #[cfg(feature = "recursion")]
     #[test]
-    #[ignore = "heavy: proves the caps-dropped cw=true verifier (width 963); run `--release --features lookup,recursion -j1 -- --ignored`"]
+    #[ignore = "heavy (CONFIRMED ~55s, 2 runs): proves the caps-dropped cw=true verifier (width 963); run `--release --features lookup,recursion -j1 -- --ignored`"]
     fn narrow_caps_cw_verifier_proves() {
         use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
         use crate::recursion::monolith::tests::build_symbolic_inner_window;
