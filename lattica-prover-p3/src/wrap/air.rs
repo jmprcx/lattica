@@ -1762,6 +1762,152 @@ mod tests {
         assert!(log_nqc <= LOG_BLOWUP, "cap AA1 must compose within the degree budget (got {log_nqc})");
     }
 
+    /// **Caps assembly AA2 — build the assembled cap-wrap trace.** Widen the monolith trace to `fused_w + 9`; mark
+    /// each arith head (`is_head = 1`, the `m_tf` rows); and seed the cap-row region in the trace SLACK — for every
+    /// opening's cap, one ROW per entry `[cap_id, entry_idx, digest = pis[cbase + entry·4 + k], cap_mult = −count]`,
+    /// where `count` = how many heads select that entry (decoded from the committed index bits `sb_b`, exactly the
+    /// AIR's `index>>shift`). The select bus then binds each head's `cap_c[g]` to the addressed cap-row. Returns
+    /// `(air, trace, pis)`. Mirrors `assemble_arith_wrap`, one region over (base-field tuples, no fold recurrence).
+    #[cfg(feature = "recursion")]
+    fn assemble_cap_wrap(
+        config: &crate::recursion::native_fri::MyConfig,
+        proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
+        pvs: &[Val],
+    ) -> (AssembledCapWrapAir, RowMajorMatrix<Val>, Vec<Val>) {
+        use p3_matrix::dense::RowMajorMatrix;
+
+        let (air, mono_trace, pis) = wrap_build_reused(config, proof, pvs, false);
+        let (fw, h) = (air.fused_w(), air.height());
+        let n_q = air.n_queries;
+        let width = fw + 9;
+        let (cr, cap_sel, is_head_col) = (fw, fw + 7, fw + 8);
+
+        // The caps WITH their committed base `cbase` (openings() drops it; the trace reads the digest from pis).
+        let caps: Vec<(usize, usize, usize, usize)> = {
+            // (cap_id, shift, bits, cbase)
+            let m = &air;
+            let mut v = vec![
+                (0, m.input_depth(), m.cap_height, m.cap_base()),
+                (1, m.input_depth(), m.cap_height, m.qcap_base()),
+            ];
+            for r in 0..m.cm_rounds() {
+                v.push((2 + r, m.commit_shift(r), m.commit_bits(r), m.commit_cap_base(r)));
+            }
+            v
+        };
+        let total_rows: usize = caps.iter().map(|&(_, _, bits, _)| 1usize << bits).sum();
+
+        // Arith heads = the rows where `m_tf` fires (one per query), same as `assemble_arith_wrap`.
+        let tf_col = BaseAir::<Val>::periodic_columns(&air)[air.m_tf()].clone();
+        let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
+        assert_eq!(heads.len(), n_q, "one arith head per query");
+        let used = air.tr() + n_q * air.m_period();
+        assert!(used + total_rows <= h, "cap-row region ({total_rows} rows) must fit the slack ({})", h - used);
+
+        let mut wide = vec![Val::ZERO; h * width];
+        for r in 0..h {
+            wide[r * width..r * width + fw].copy_from_slice(&mono_trace.values[r * fw..(r + 1) * fw]);
+        }
+        for &head in &heads {
+            wide[head * width + is_head_col] = Val::ONE;
+        }
+
+        // Seed the cap-row region: one row per (cap, entry); digest from the committed cap, mult = −(heads selecting it).
+        let mut dst = used;
+        for &(cap_id, shift, bits, cbase) in &caps {
+            let n_entries = 1usize << bits;
+            let mut count = vec![0u64; n_entries];
+            for &head in &heads {
+                let mut e = 0usize;
+                for j in 0..bits {
+                    if mono_trace.values[head * fw + air.sb_b(shift + j)] == Val::ONE {
+                        e += 1 << j;
+                    }
+                }
+                count[e] += 1;
+            }
+            for e in 0..n_entries {
+                let b = dst * width;
+                wide[b + cr] = Val::from_u64(cap_id as u64);
+                wide[b + cr + 1] = Val::from_u64(e as u64);
+                for k in 0..4 {
+                    wide[b + cr + 2 + k] = pis[cbase + e * 4 + k];
+                }
+                wide[b + cr + 6] = Val::ZERO - Val::from_u64(count[e]); // cap_mult = −count
+                wide[b + cap_sel] = Val::ONE;
+                dst += 1;
+            }
+        }
+        (AssembledCapWrapAir { m: air }, RowMajorMatrix::new(wide, width), pis)
+    }
+
+    /// **Caps assembly AA2 — the assembled cap-wrap's select bus balances** (native, cheap — NO prove). Assemble
+    /// the trace and confirm the select bus balances as a signed multiset: each cap-row PROVIDES its entry (mult
+    /// −count), each arith head READS its `2 + cm_rounds` index-selected entries (+1); they cancel iff every head's
+    /// `cap_c[g]` == the committed cap-row the query's index addresses. Localizes any address / digest / count bug
+    /// before the heavy prove (as `arith_wrap_assembled_bus_balances` did for the `ro` bus).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_wrap_assembled_bus_balances() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_field::PrimeField64;
+        use p3_uni_stark::prove;
+        use std::collections::HashMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_cap_wrap(&config, &proof, &pvs);
+
+        let (fw, h) = (asm.m.fused_w(), asm.m.height());
+        let width = fw + 9;
+        let (cr, cap_sel, is_head) = (fw, fw + 7, fw + 8);
+        let m = &asm.m;
+        let ku = |v: Val| v.as_canonical_u64();
+        let openings = asm.openings();
+
+        // ONE channel — key by the 6-felt tuple `[cap_id, entry, digest[4]]`; the cap-row PROVIDE (mult −count, a
+        // field element) + the head READs (+1) must net to Val::ZERO per tuple (counts ≪ p ⇒ field-zero == int-zero).
+        let mut bus: HashMap<Vec<u64>, Val> = HashMap::new();
+        for r in 0..h {
+            let b = r * width;
+            let g = |c: usize| trace.values[b + c];
+            if g(cap_sel) == Val::ONE {
+                let key = vec![ku(g(cr)), ku(g(cr + 1)), ku(g(cr + 2)), ku(g(cr + 3)), ku(g(cr + 4)), ku(g(cr + 5))];
+                *bus.entry(key).or_insert(Val::ZERO) += g(cr + 6); // + cap_mult (= −count)
+            }
+            if g(is_head) == Val::ONE {
+                for &(cap_id, cg_off, shift, bits) in &openings {
+                    let mut sel_idx = 0u64;
+                    for j in 0..bits {
+                        if g(m.sb_b(shift + j)) == Val::ONE {
+                            sel_idx += 1 << j;
+                        }
+                    }
+                    let key = vec![
+                        cap_id as u64,
+                        sel_idx,
+                        ku(g(m.cap_c(cg_off))),
+                        ku(g(m.cap_c(cg_off + 1))),
+                        ku(g(m.cap_c(cg_off + 2))),
+                        ku(g(m.cap_c(cg_off + 3))),
+                    ];
+                    *bus.entry(key).or_insert(Val::ZERO) += Val::ONE; // + read
+                }
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != Val::ZERO).count();
+        let bad: Vec<_> = bus.iter().filter(|(_, &v)| v != Val::ZERO).take(8).collect();
+        assert!(bad.is_empty(), "every cap-select tuple must net to zero; {nonzero} nonzero, e.g. {bad:?}");
+        println!(
+            "cap select bus: {} distinct tuples, all net-zero — each head's cap_c is bound to the committed \
+             cap-row its index addresses (cap-rows provide −count, heads read +1)",
+            bus.len()
+        );
+    }
+
     /// **Caps plumbing brick — `CapWrapAir` proves with the product-mux externalized** (`--release --ignored`).
     /// The heavy end-to-end half: the monolith trace already satisfies the full monolith ⊇ `CapWrapAir`
     /// (product-mux dropped), so `CapWrapAir` proves it DIRECTLY (no widening — cap_c is a pre-existing carrier,
