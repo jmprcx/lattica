@@ -186,6 +186,55 @@ pub(crate) fn sim_cap_positions(
     (s.block_inputs, positions)
 }
 
+/// AA6 arith-openings-externalization feasibility seam (the [`sim_cap_positions`] analog for the OOD openings).
+/// The DEEP reduced-opening fold's `pz` (the inner's `opened_values`, the `2·n_terms`-COLUMN arith tile — the
+/// dominant inner-scaling WIDTH region, marginal ~4 of the self-composition B) is absorbed into the FS transcript
+/// right after ζ (before α_fri), EXACTLY like the caps. So the same ordered sponge-cap bus can re-anchor a
+/// narrow-tall openings region to the FS-absorbed openings — the columns→rows swap that drops the arith tile from
+/// `fused_w`. Replays the transcript preamble (→ ζ) then records, per absorbed opening felt, its
+/// `(opening_id, k, block, lane)` — `opening_id` enumerates `trace_local` (w_inner), then `trace_next` (w_inner),
+/// then the flattened `quotient_chunks`; `k` = the F_p² coefficient (0/1); `(block,lane)` captured BEFORE each
+/// observe (the `sample_base` rule). Returns `(block_inputs, positions, committed)` index-aligned
+/// (`committed[gi]` = that felt's value from `opened_values`, for the matches-native check).
+#[allow(clippy::type_complexity)]
+pub(crate) fn sim_opening_positions(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+) -> (Vec<[Val; W]>, Vec<(usize, usize, usize, usize)>, Vec<Val>) {
+    use p3_field::BasedVectorSpace;
+    let (instance, commitment, _, _) = preamble_challenges(config, proof, pvs);
+    let mut s = Sim::new();
+    for &f in &instance {
+        s.observe(f); // instance scalars + trace cap → α
+    }
+    let _ = s.sample_ext(); // α
+    for &f in &commitment {
+        s.observe(f); // quotient cap → ζ
+    }
+    let _ = s.sample_ext(); // ζ
+
+    // The openings absorb (ζ → α_fri), in the native order (native_verify): trace_local, trace_next, quotient.
+    let mut openings: Vec<Challenge> = Vec::new();
+    openings.extend_from_slice(&proof.opened_values.trace_local);
+    if let Some(tn) = &proof.opened_values.trace_next {
+        openings.extend_from_slice(tn);
+    }
+    for chunk in &proof.opened_values.quotient_chunks {
+        openings.extend_from_slice(chunk);
+    }
+    let mut positions: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut committed: Vec<Val> = Vec::new();
+    for (oid, &x) in openings.iter().enumerate() {
+        for (k, &c) in x.as_basis_coefficients_slice().iter().enumerate() {
+            positions.push((oid, k, s.block_inputs.len(), s.input.len()));
+            committed.push(c);
+            s.observe(c);
+        }
+    }
+    (s.block_inputs, positions, committed)
+}
+
 // single-sourced from the module geometry (the tests' historical local names kept via aliasing)
 use super::{CM_CAP_HEIGHT as CAP_HEIGHT, LOG_BLOWUP};
 const LOG_FINAL_POLY_LEN: usize = 0;

@@ -1998,6 +1998,49 @@ mod tests {
         );
     }
 
+    /// **AA6 arith-openings feasibility — the OOD openings are FS-absorbed bit-for-bit** (`--features recursion`,
+    /// ~30s). The [`cap_absorb_stream_matches_committed_caps`] analog for the arith tile: the DEEP fold's `pz` (the
+    /// inner's `opened_values`, the `2·n_terms`-COLUMN arith tile = the dominant inner-scaling WIDTH region, ~4 of
+    /// the marginal-5 self-composition B) is absorbed into the transcript sponge right after ζ. On a REAL
+    /// join-split inner, `sim_opening_positions` records each opening felt's `(opening_id, k, block, lane)`, and
+    /// this asserts `block_inputs[block][lane] == the committed opening felt` for EVERY one (trace_local +
+    /// trace_next + quotient_chunks, ×2 for F_p²). ⇒ the arith tile can be re-anchored to the FS-absorbed openings
+    /// by the SAME ordered sponge bus the caps used — the columns→rows swap that drops it from `fused_w` (marginal
+    /// 5 → ~1). The addressing brick of the AA6 arc (mirrors the caps `743f5b7` feasibility brick).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn opening_absorb_stream_matches_committed_openings() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::monolith::tests::sim_opening_positions;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (block_inputs, positions, committed) = sim_opening_positions(&config, &proof, &pvs);
+
+        assert_eq!(positions.len(), committed.len(), "positions and committed openings are index-aligned");
+        for (gi, &(oid, k, block, lane)) in positions.iter().enumerate() {
+            assert_eq!(
+                block_inputs[block][lane], committed[gi],
+                "opening felt (oid {oid}, k {k}) must == its FS-absorbed rate lane at (block {block}, lane {lane})"
+            );
+        }
+        // coverage: 2 felts per opening; openings = trace_local + trace_next + Σ quotient_chunks.
+        let n_openings = proof.opened_values.trace_local.len()
+            + proof.opened_values.trace_next.as_ref().map_or(0, |t| t.len())
+            + proof.opened_values.quotient_chunks.iter().map(|c| c.len()).sum::<usize>();
+        assert_eq!(positions.len(), 2 * n_openings, "every opening's 2 F_p² felts are recorded");
+        println!(
+            "AA6 feasibility: {} OOD opening felts ({n_openings} openings × 2) FS-absorbed bit-for-bit at their \
+             (block,lane) — the arith tile (2·n_terms pz cols) can be sponge-anchored like the caps, dropping the \
+             dominant inner-scaling WIDTH region from fused_w.",
+            positions.len()
+        );
+    }
+
     /// **AA5 — the in-circuit ordered sponge-cap bus COMPOSES + BALANCES** (`--features lookup,recursion`, cheap).
     /// The FS-anchor mechanism the cw=true width win needs: bind the narrow-tall cap region to the caps the
     /// transcript sponge ACTUALLY absorbed. Builds [`SpongeCapBusAir`]'s trace from the REAL join-split absorb
