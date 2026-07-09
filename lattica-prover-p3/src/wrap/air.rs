@@ -2565,7 +2565,7 @@ mod tests {
     /// corrupted cap-row digest is rejected (both buses unbalance). Heavy; `--release --features lookup,recursion -j1`.
     #[cfg(feature = "recursion")]
     #[test]
-    #[ignore = "heavy: proves the cw=true assembled cap-wrap (width ~981, 2 channels) through prove_lookup; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    #[ignore = "heavy (CONFIRMED ~422s, -j1): proves the cw=true assembled cap-wrap (width 981, 2 channels) through prove_lookup + tamper-rejects a corrupted cap-row digest; run `--release --features lookup,recursion -j1 -- --ignored`"]
     fn cap_wrap_cw_assembled_proves() {
         use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
         use crate::recursion::native_fri::make_config;
