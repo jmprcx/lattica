@@ -2091,6 +2091,56 @@ mod tests {
         );
     }
 
+    /// **AA5 — the caps-dropped cw=true verifier PROVES** (`--release --ignored`, heavy). Builds the narrow_caps
+    /// cw=true trace (width 963, the ~85% cap columns GONE) and proves + verifies `CapWrapAir { m: narrow }`
+    /// through the standard prover — the cap-mux externalized (`CapMuxBci`) so nothing reads the dropped pis caps;
+    /// `cap_c` stays a free carrier bound only to the Merkle terminal (the sponge-cap FS-anchor that binds it to
+    /// the transcript-absorbed caps is the remaining assembly). So the width win HOLDS AS A REAL STARK — the
+    /// cw=true verifier proves at fused_w 963, not just composes. (Mirrors `cap_wrap_externalized_proves`, cw=true.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves the caps-dropped cw=true verifier (width 963); run `--release --features lookup,recursion -j1 -- --ignored`"]
+    fn narrow_caps_cw_verifier_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_matrix::dense::RowMajorMatrix;
+        use p3_uni_stark::{get_symbolic_constraints, prove, verify, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let air = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: false,
+            narrow_caps: true,
+        };
+        let fw = air.fused_w();
+        let wrap = CapWrapAir { m: air };
+        let prf = prove(&config, &wrap, RowMajorMatrix::new(tr, fw), &[]);
+        assert!(verify(&config, &wrap, &prf, &[]).is_ok(), "the caps-dropped cw=true verifier must prove + verify (width {fw})");
+    }
+
     /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
     /// The cheap half of the `CapMuxBci` plumbing (the `ArithWrapAir` analog): swapping the cap-mux strategy to
     /// `CapMuxBci` (`emit_capmux` → nothing) drops the `openings·4` product-mux constraints (and their `2^cap_height`
