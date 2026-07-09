@@ -89,6 +89,18 @@ pub(crate) struct MonolithAir {
     /// input binding). `false` = the exact 9-felt/term layout every non-wrap construction uses, byte-for-byte
     /// (the `pinned_constraint_fingerprints` guard covers is_zk 0/1 at false). Set true ONLY by the wrap.
     pub narrow_arith: bool,
+    /// NARROW-CAPS mode (the deep-tree wrap's AA5 cap-column width win; requires `column_window` + `full_cap`).
+    /// When true the Merkle-commitment CAP slice is DROPPED from the inner-proof `pis` window — the
+    /// `2^cap_height·4·(2+is_zk+cm_rounds)`-felt cap region (85% of `fused_w` in the self-composition regime) is
+    /// no longer mirrored into held OUTER columns. The caps still enter the FS transcript (the sponge absorbs
+    /// them into its own `cur[0..W]` state, independent of `pis`), and the cap-mux is externalized to a
+    /// narrow-tall region anchored to those FS-absorbed caps via the ordered sponge-cap bus (`src/wrap`
+    /// `SpongeCapBusAir`). So the pis-layout functions collapse the cap slice (`pub_pi`/`ccap`/`periodic`/`qwt`/
+    /// `pis_count` shift down; every reader follows via the functions), and the ONLY pis-cap readers — the
+    /// role-1 cap-mux (`emit_capmux`) — are externalized by `CapMuxBci`, so nothing reads the dropped slice.
+    /// `false` = the exact full-cap-in-pis layout every non-AA5 construction uses, byte-for-byte (the
+    /// `pinned_constraint_fingerprints` guard covers it). Set true ONLY by the AA5 caps wrap.
+    pub narrow_caps: bool,
 }
 
 #[allow(dead_code)]
@@ -447,7 +459,7 @@ impl MonolithAir {
     }
     // periodic column values at ζ (2 felts each): a pis region AFTER the commit caps (symbolic mode only).
     pub(crate) fn periodic_base(&self) -> usize {
-        self.ccap_base() + self.commit_caps_len()
+        self.ccap_base() + self.pis_commit_caps_len()
     }
     // quotient recompose weights zps_i (nqc F_p² publics = 2·nqc felts), a pis region AFTER the periodic values.
     // Present ONLY when nqc>1 (nqc=1 recomposes as the single chunk c0+c1·X with implicit weight 1, so no region
@@ -464,7 +476,7 @@ impl MonolithAir {
         }
     }
     pub(crate) fn pis_count(&self) -> usize {
-        self.random_cap_base() + if self.is_zk == 1 { self.cap_stride() } else { 0 }
+        self.random_cap_base() + if self.is_zk == 1 { self.pis_cap_stride() } else { 0 }
     }
     // pis cap layout — the FULL cap (2^cap_height entries) for a non-constant inner (so the cap-mux can select
     // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
@@ -476,14 +488,32 @@ impl MonolithAir {
             4
         }
     }
+    // The pis-WINDOW cap-slice widths — 0 in `narrow_caps` mode (AA5: the caps are dropped from the pis window
+    // and sourced from the FS sponge via the ordered sponge-cap bus), the full cap widths otherwise. ONLY the pis
+    // layout (`qcap_base`/`pub_pi`/`periodic_base`/`pis_count`) uses these; the cap-mux / narrow-tall region use
+    // `cap_stride()`/`commit_cap_size()` directly (the real cap sizes, which `narrow_caps` never shrinks).
+    pub(crate) fn pis_cap_stride(&self) -> usize {
+        if self.narrow_caps {
+            0
+        } else {
+            self.cap_stride()
+        }
+    }
+    pub(crate) fn pis_commit_caps_len(&self) -> usize {
+        if self.narrow_caps {
+            0
+        } else {
+            self.commit_caps_len()
+        }
+    }
     pub(crate) fn cap_base(&self) -> usize {
         2 * self.nb() + self.ni() + 2 // after challenges + index felts + final_poly[0]
     }
     pub(crate) fn qcap_base(&self) -> usize {
-        self.cap_base() + self.cap_stride()
+        self.cap_base() + self.pis_cap_stride()
     }
     pub(crate) fn pub_pi(&self) -> usize {
-        self.qcap_base() + self.cap_stride()
+        self.qcap_base() + self.pis_cap_stride()
     }
     pub(crate) fn ccap_base(&self) -> usize {
         self.pub_pi() + self.n_pub() // after the n_pub inner public values

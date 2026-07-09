@@ -1473,7 +1473,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false };
         let layout = AirLayout::from_air::<Val>(&air);
         let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
         println!("WRAP witness seam: real join-split MonolithAir (reused regions A–J) log_nqc = {log_nqc}");
@@ -1584,7 +1584,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: narrow };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: narrow, narrow_caps: false };
         let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
             epilogue_openings(config, &inner, proof, pvs);
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
@@ -1954,6 +1954,71 @@ mod tests {
         .unwrap_or(true);
         std::panic::set_hook(hook);
         assert!(rejected, "a committed cap felt ≠ the FS-absorbed felt must not produce a valid proof");
+    }
+
+    /// **AA5 — `narrow_caps` shrinks the cw=true pw window (the width-win geometry, cheap).** The foundational
+    /// geometry change: flipping `MonolithAir.narrow_caps` DROPS the Merkle-cap slice from the inner-proof `pis`
+    /// window, so at `column_window=true` the pw window (and thus `fused_w`) shrinks by exactly the cap felts
+    /// (`2·cap_stride + commit_caps_len`, is_zk=0). Builds a real join-split inner's cw=true monolith at
+    /// `narrow_caps` false vs true and asserts the exact reduction — the ~85%-of-`fused_w` cap columns leave the
+    /// trace. Flag-OFF is byte-identical (`pinned_constraint_fingerprints` guards it); this measures the ON win.
+    /// (The caps still enter FS via the sponge + anchor the region via [`crate::wrap::SpongeCapBusAir`]; wiring
+    /// that into the assembled cap-wrap + proving is the next brick.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_caps_shrinks_pis_window() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let mk = |narrow_caps: bool| MonolithAir {
+            counts: counts.clone(),
+            binds: binds.clone(),
+            index_binds: index_binds.clone(),
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints: constraints.clone(),
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: false,
+            narrow_caps,
+        };
+        let (full, narrow) = (mk(false), mk(true));
+        let cap_felts = 2 * full.cap_stride() + full.commit_caps_len(); // trace + quot + commit caps (is_zk=0)
+
+        assert_eq!(narrow.pis_count(), full.pis_count() - cap_felts, "narrow_caps drops the pis cap slice");
+        assert_eq!(narrow.fused_w(), full.fused_w() - cap_felts, "the pw cap columns leave fused_w (cw=true)");
+        // downstream pis regions shift down by the dropped trace+quot caps (then further by the commit caps).
+        assert_eq!(narrow.pub_pi(), full.pub_pi() - 2 * full.cap_stride(), "pub_pi shifts past the dropped trace+quot caps");
+        assert_eq!(narrow.pis_cap_stride(), 0, "narrow: no pis cap slice");
+        assert_eq!(full.pis_cap_stride(), full.cap_stride(), "full: the real cap slice");
+        assert!(cap_felts > 0 && narrow.fused_w() < full.fused_w());
+        println!(
+            "narrow_caps (cap_height {}): pis_count {} → {} (−{cap_felts}), fused_w {} → {} (the cw=true pw \
+             cap columns removed; the caps now live in the FS sponge + the narrow-tall region)",
+            full.cap_height,
+            full.pis_count(),
+            narrow.pis_count(),
+            full.fused_w(),
+            narrow.fused_w()
+        );
     }
 
     /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
@@ -2617,7 +2682,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false };
         let wrap = WrapAir::new(air);
         let width = <WrapAir as p3_air::BaseAir<Val>>::width(&wrap);
         let layout = AirLayout::from_air::<Val>(&wrap);
@@ -2675,7 +2740,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false };
         let fused_w = air.fused_w();
         let asm = AssembledWrapAir { m: air, folded_addr: 0 }; // any address for the pure composition check
         let width = <AssembledWrapAir as p3_air::BaseAir<Val>>::width(&asm);
@@ -2777,7 +2842,7 @@ mod tests {
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-            narrow_arith: narrow,
+            narrow_arith: narrow, narrow_caps: false,
         };
         let full = mk(false);
         let (full_fused_w, n_terms, w_inner) = (full.fused_w(), full.n_terms, full.w_inner());
@@ -2851,7 +2916,7 @@ mod tests {
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-            narrow_arith: narrow,
+            narrow_arith: narrow, narrow_caps: false,
         };
 
         // Decompose fused_w (column_window=false: the arith-wrap regime the whole track measures B in). The regions
@@ -3324,7 +3389,7 @@ mod tests {
         let inner = MonolithAir {
             counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false,
             column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![],
-            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false };
+            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -3359,7 +3424,7 @@ mod tests {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h, narrow_arith: false };
+            cap_height: cap_h, narrow_arith: false, narrow_caps: false };
         let olayout = AirLayout::from_air::<Val>(&outer);
         let inline_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
         let (inner_w, outer_w) = (inner.fused_w(), outer.fused_w());
@@ -3418,7 +3483,7 @@ mod tests {
             m: MonolithAir {
                 counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false,
                 column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(),
-                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h, narrow_arith: false },
+                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h, narrow_arith: false, narrow_caps: false },
             folded_addr: 0,
         };
         let asm_width = <AssembledWrapAir as BaseAir<Val>>::width(&asm);
