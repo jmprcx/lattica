@@ -2010,6 +2010,18 @@ mod tests {
         assert_eq!(narrow.pis_cap_stride(), 0, "narrow: no pis cap slice");
         assert_eq!(full.pis_cap_stride(), full.cap_stride(), "full: the real cap slice");
         assert!(cap_felts > 0 && narrow.fused_w() < full.fused_w());
+
+        // CONSTRAINT-COMPATIBILITY: the narrow_caps geometry works with CapMuxBci (the cap-mux externalized ⇒
+        // nothing reads the dropped pis cap slice). CapWrapAir { m: narrow } builds its symbolic layout with NO
+        // out-of-bounds pis read and COMPOSES within budget, at the reduced width (fused_w 963, cap columns gone).
+        // This is the assembly foundation — the plain monolith (InlineBci) CAN'T (its emit_capmux would read the
+        // collapsed slice); only the cap-mux-externalized wrap can drop the caps.
+        use p3_uni_stark::get_log_num_quotient_chunks;
+        let wrap_narrow = CapWrapAir { m: mk(true) };
+        assert_eq!(BaseAir::<Val>::width(&wrap_narrow), narrow.fused_w(), "CapWrapAir width == narrow fused_w (cap cols gone)");
+        let nlayout = AirLayout::from_air::<Val>(&wrap_narrow); // panics if the collapsed pis layout causes a bad read
+        let log_nqc = get_log_num_quotient_chunks::<Val, _>(&wrap_narrow, nlayout, 0);
+        assert!(log_nqc <= LOG_BLOWUP, "narrow_caps CapWrapAir must compose within budget (log_nqc {log_nqc})");
         println!(
             "narrow_caps (cap_height {}): pis_count {} → {} (−{cap_felts}), fused_w {} → {} (the cw=true pw \
              cap columns removed; the caps now live in the FS sponge + the narrow-tall region)",
