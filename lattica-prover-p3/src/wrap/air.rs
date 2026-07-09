@@ -1767,6 +1767,71 @@ mod tests {
         assert!(openings.len() == 2 + air.cm_rounds() && bits > 0);
     }
 
+    /// **AA5 feasibility (matches-native) — the ordered sponge-cap bus's addressing map.** The FS-anchor that
+    /// AA5 needs (bind the narrow-tall cap region to the caps the transcript ACTUALLY absorbed, so removing the
+    /// pw cap columns keeps inner-auth non-vacuous) requires addressing each committed cap felt inside the
+    /// transcript sponge. This confirms that map on a REAL join-split inner: `sim_cap_positions` records, per
+    /// absorbed cap felt, its `(cap_id, entry, k, block, lane)`, and we assert `block_inputs[block][lane]` ==
+    /// `roots()[entry][k]` BIT-FOR-BIT for all of them — trace, quotient, and every commit round. Coverage: the
+    /// count matches the AIR's cap model (`2·2^cap_height·4 + Σ_r commit_cap_size(r)·4`). And the alignment
+    /// finding that makes the in-circuit bus tractable: only the TRACE cap is misaligned (offset by the 3
+    /// preamble scalars ⇒ entry 0 lands at rate lane 3 and straddles two blocks), while the quotient/commit caps
+    /// each follow a sample-flush and are block-aligned (entry 0 at lane 0). So the ordered bus provides
+    /// `cur[lane]` at row `block·BLOCK` with compile-time `(cap_id, entry, k)` tags — the FT_BIND pattern, one
+    /// region deeper. (The in-circuit bus + region read is the next brick; this de-risks the addressing.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_absorb_stream_matches_committed_caps() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::monolith::tests::sim_cap_positions;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (block_inputs, positions) = sim_cap_positions(&config, &proof, &pvs);
+
+        // The committed cap felt for (cap_id, entry, k): trace (0), quotient (1), commit round r (2+r).
+        let committed = |cap_id: usize, entry: usize, k: usize| -> Val {
+            match cap_id {
+                0 => proof.commitments.trace.roots()[entry][k],
+                1 => proof.commitments.quotient_chunks.roots()[entry][k],
+                _ => proof.opening_proof.commit_phase_commits[cap_id - 2].roots()[entry][k],
+            }
+        };
+
+        // FAITHFULNESS: every absorbed cap felt sits at its recorded sponge (block, lane), == the committed
+        // cap entry. This is exactly what the in-circuit ordered bus provides from `cur[lane]` at row `block·BLOCK`.
+        for &(cap_id, entry, k, block, lane) in &positions {
+            assert!(lane < 4, "cap felt must land in a rate lane (0..RATE)");
+            assert_eq!(
+                block_inputs[block][lane],
+                committed(cap_id, entry, k),
+                "cap_id={cap_id} entry={entry} k={k}: sponge block {block} lane {lane} != committed cap",
+            );
+        }
+
+        // COVERAGE: the mapped felts are exactly the AIR's cap model — trace + quotient at full 2^cap_height,
+        // plus each commit round at its folded height. Cross-checks the AIR model vs the real proof caps.
+        let (air, _tr, _pis) = wrap_build_reused(&config, &proof, &pvs, false);
+        let expected: usize = 2 * (1usize << air.cap_height) * 4
+            + (0..air.cm_rounds()).map(|r| air.commit_cap_size(r) * 4).sum::<usize>();
+        assert_eq!(positions.len(), expected, "every commit-absorbed cap felt mapped exactly once");
+
+        // ALIGNMENT: only the trace cap is misaligned (lane 3, straddling blocks); quotient is block-aligned.
+        let tr0 = positions.iter().find(|&&(c, e, k, ..)| (c, e, k) == (0, 0, 0)).expect("trace cap entry 0");
+        let q0 = positions.iter().find(|&&(c, e, k, ..)| (c, e, k) == (1, 0, 0)).expect("quotient cap entry 0");
+        assert_eq!(tr0.4, 3, "trace cap felt 0 lands at rate lane 3 (after the 3 preamble scalars)");
+        assert_eq!(q0.4, 0, "quotient cap felt 0 is block-aligned (lane 0) after the α flush");
+        println!(
+            "AA5 feasibility: {} FS-absorbed cap felts bind sponge (block,lane) → committed cap bit-for-bit \
+             (trace misaligned @lane 3; quotient/commit block-aligned)",
+            positions.len()
+        );
+    }
+
     /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
     /// The cheap half of the `CapMuxBci` plumbing (the `ArithWrapAir` analog): swapping the cap-mux strategy to
     /// `CapMuxBci` (`emit_capmux` → nothing) drops the `openings·4` product-mux constraints (and their `2^cap_height`

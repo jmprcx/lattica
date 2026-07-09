@@ -128,6 +128,64 @@ pub(crate) fn sim_full( // W2-assemble (research): exposed to the wrap as the in
     (s.block_inputs, s.counts, binds, chs, index_binds, index_felts)
 }
 
+/// AA5 ordered-sponge-cap-bus feasibility seam (non-hiding): replay `sim_full`'s exact transcript schedule
+/// while recording, for every commitment-cap felt the sponge ABSORBS, the `(cap_id, entry, k, block, lane)`
+/// where it lands — `cap_id` 0=trace, 1=quotient, 2+r=commit-round r; `entry`/`k` = the `roots()[entry][k]`
+/// decomposition (entry-major, felt-minor, matching `cap_felts`); `(block, lane)` = the sponge block index
+/// and rate lane (`block_inputs[block][lane]` == the absorbed felt; in the AIR the block's input row is at
+/// `block·BLOCK`, so the ordered bus provides `cur[lane]` there). Captured BEFORE each observe as
+/// `(block_inputs.len(), input.len())` — the same block/lane rule `sample_base` uses. This is the position
+/// map the FS-anchor ordered bus (AA5) reads to bind the narrow-tall cap region to the FS-absorbed caps.
+#[allow(clippy::type_complexity)]
+pub(crate) fn sim_cap_positions(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+) -> (Vec<[Val; W]>, Vec<(usize, usize, usize, usize, usize)>) {
+    let (instance, commitment, _, _) = preamble_challenges(config, proof, pvs);
+    let mut s = Sim::new();
+    let mut positions: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    // instance = [degree_bits, base_degree_bits, preprocessed_width, TRACE CAP (2^ch·4), pvs].
+    let trace_cap_len = cap_felts(&proof.commitments.trace).len();
+    for (i, &f) in instance.iter().enumerate() {
+        if (3..3 + trace_cap_len).contains(&i) {
+            let idx = i - 3;
+            positions.push((0, idx / 4, idx % 4, s.block_inputs.len(), s.input.len()));
+        }
+        s.observe(f);
+    }
+    let _ = s.sample_ext(); // α
+    // commitment = the QUOTIENT CAP felts.
+    for (i, &f) in commitment.iter().enumerate() {
+        positions.push((1, i / 4, i % 4, s.block_inputs.len(), s.input.len()));
+        s.observe(f);
+    }
+    let _ = s.sample_ext(); // ζ
+    for &x in &proof.opened_values.trace_local {
+        s.observe_ext(x);
+    }
+    if let Some(tn) = &proof.opened_values.trace_next {
+        for &x in tn {
+            s.observe_ext(x);
+        }
+    }
+    for c in &proof.opened_values.quotient_chunks {
+        for &x in c {
+            s.observe_ext(x);
+        }
+    }
+    let _ = s.sample_ext(); // α_fri
+    let fri = &proof.opening_proof;
+    for (r, comm) in fri.commit_phase_commits.iter().enumerate() {
+        for (i, &f) in cap_felts(comm).iter().enumerate() {
+            positions.push((2 + r, i / 4, i % 4, s.block_inputs.len(), s.input.len()));
+            s.observe(f);
+        }
+        let _ = s.sample_ext(); // β_r
+    }
+    (s.block_inputs, positions)
+}
+
 // single-sourced from the module geometry (the tests' historical local names kept via aliasing)
 use super::{CM_CAP_HEIGHT as CAP_HEIGHT, LOG_BLOWUP};
 const LOG_FINAL_POLY_LEN: usize = 0;
