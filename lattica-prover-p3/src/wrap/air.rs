@@ -3482,7 +3482,7 @@ mod tests {
         let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
         let constraints =
             get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
-        let mk = |narrow: bool, column_window: bool| MonolithAir {
+        let mk = |narrow: bool, column_window: bool, narrow_caps: bool| MonolithAir {
             counts: counts.clone(),
             binds: binds.clone(),
             index_binds: index_binds.clone(),
@@ -3499,7 +3499,7 @@ mod tests {
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-            narrow_arith: narrow, narrow_caps: false,
+            narrow_arith: narrow, narrow_caps,
         };
 
         // Decompose fused_w (column_window=false: the arith-wrap regime the whole track measures B in). The regions
@@ -3521,8 +3521,8 @@ mod tests {
             ]
         };
 
-        let full = mk(false, false);
-        let narrow = mk(true, false);
+        let full = mk(false, false, false);
+        let narrow = mk(true, false, false);
         let (fw_full, fw) = (full.fused_w(), narrow.fused_w());
         let (n_terms, w_inner, lg, nqc, cap_h) =
             (narrow.n_terms, narrow.w_inner(), narrow.lg(), narrow.nqc(), narrow.cap_height);
@@ -3548,7 +3548,7 @@ mod tests {
         // The column_window regime: the inner proof's pis (challenges/indices/final_poly/PUB/CAPS/periodic/qwt) are
         // mirrored into OUTER columns (+ the fold accumulators). This is where 2^cap_height enters fused_w — the
         // self-composition regime. Isolate its size and the cap portion within it.
-        let narrow_cw = mk(true, true);
+        let narrow_cw = mk(true, true, false);
         let fw_cw = narrow_cw.fused_w();
         let cap_stride = narrow_cw.cap_stride(); // 2^cap_height · 4 (full cap)
         let cap_felts = 2 * cap_stride + narrow_cw.commit_caps_len(); // trace + quot + commit-round caps
@@ -3558,6 +3558,62 @@ mod tests {
              (= {fw} + pis-window {} + fold-acc {fold_acc})\n    of the pis window, CAPS = {cap_felts} felts \
              (cap_stride {cap_stride} = 2^{cap_h}·4; SCALES 2^cap_height with tree depth — small here, cap_height={cap_h})",
             fw_cw - fw - fold_acc
+        );
+
+        // === THE POST-CAPS cw=true REGIME (narrow_caps — the sound capstone `AssembledCapWrapCwAir`) ===
+        // Now that the `2^cap_height` cap COLUMNS are dropped from the pis window + FS-anchored (the sponge-cap
+        // bus, sound + proven), break down what REMAINS of the cw=true fused_w to find the NEW dominant region —
+        // the next size lever toward the W5 fixed point B≤1. The base super-tile/transcript regions are unchanged
+        // (`breakdown`), the pis window now carries NO caps (challenges / indices / final_poly / PUB / periodic+qwt).
+        let nc = mk(true, true, true); // narrow_arith + column_window + narrow_caps
+        let fw_nc = nc.fused_w();
+        let n_binds = nc.binds.len();
+        let mut nc_rows: Vec<(String, usize, &str)> =
+            breakdown(&nc).into_iter().map(|(n, w, s)| (n.to_string(), w, s)).collect();
+        let base_nc: usize = nc_rows.iter().map(|(_, w, _)| w).sum();
+        let fold_acc_nc = 2 * nc.n_fold_acc();
+        // The column_window pis-window is taken as the RESIDUAL `fw_nc − base − fold-acc` (the SAME way the full-cap
+        // regime above measures it) — exact by construction. Carve it into named pis pieces + a residual for the
+        // window's layout/padding (the fused_w window reserves ~24 cols beyond `pis_count` no accessor spans).
+        let pis_win_nc = fw_nc - base_nc - fold_acc_nc;
+        let periodic_qwt = nc.pis_count().saturating_sub(nc.periodic_base());
+        let named_pis = 2 * n_binds + nc.n_queries + 2 + nc.n_pub() + periodic_qwt;
+        nc_rows.push(("pis-win: challenges (2·n_binds)".to_string(), 2 * n_binds, "depth"));
+        nc_rows.push(("pis-win: FRI query indices (n_queries)".to_string(), nc.n_queries, "inner"));
+        nc_rows.push(("pis-win: final_poly".to_string(), 2, "const"));
+        nc_rows.push(("pis-win: PUB (block tx-root / inner pis)".to_string(), nc.n_pub(), "const"));
+        nc_rows.push(("pis-win: eo-periodic + quot-recompose wts".to_string(), periodic_qwt, "inner"));
+        nc_rows.push(("pis-win: window layout/padding (residual)".to_string(), pis_win_nc.saturating_sub(named_pis), "const"));
+        nc_rows.push(("fold-acc (constraint α-Horner chunks, 2·n_fold_acc)".to_string(), fold_acc_nc, "inner"));
+        // SELF-CHECK: base regions + the caps-free pis window + fold-acc reconstruct the narrow cw=true fused_w.
+        let nc_sum: usize = nc_rows.iter().map(|(_, w, _)| w).sum();
+        assert_eq!(nc_sum, fw_nc, "post-caps cw=true region map ({nc_sum}) must sum to narrow_caps fused_w ({fw_nc})");
+        nc_rows.sort_by(|x, y| y.1.cmp(&x.1)); // largest first
+        println!(
+            "\n=== POST-CAPS cw=true fused_w REGION MAP (narrow_caps — the sound capstone; caps DROPPED + FS-anchored) ===\
+             \n  cw=true fused_w: FULL-CAP {fw_cw} → NARROW-CAP {fw_nc} ({} cap felts gone) — the NEW breakdown:",
+            fw_cw - fw_nc
+        );
+        for (name, wdt, scale) in &nc_rows {
+            println!("    {wdt:>4}  ({:>4.1}%)  [{scale:>5}]  {name}", 100.0 * *wdt as f64 / fw_nc as f64);
+        }
+        println!(
+            "  ⇒ NEW dominant region post-caps: '{}' = {} ({:.1}% of {fw_nc})",
+            nc_rows[0].0,
+            nc_rows[0].1,
+            100.0 * nc_rows[0].1 as f64 / fw_nc as f64
+        );
+        // THE HEADLINE: caps were the ONLY exponential (2^cap_height) depth-scaler; dropping them shrinks the
+        // cw=true fused_w >5× AND leaves NO single dominator (top < 25% vs caps' 85%). What remains is a balance of
+        // inner-scaling (arith tile) + constant (index-decomp SB) + LINEAR-depth carriers — so the next lever toward
+        // B≤1 is CANONICALIZATION (fix w_inner/nqc/cap_height ⇒ the inner-scaling regions become constant), not
+        // another narrow-tall swap (diminishing returns: every remaining region is < 20%).
+        assert!(fw_nc * 5 < fw_cw, "dropping the caps must shrink cw=true fused_w >5× ({fw_cw} → {fw_nc})");
+        assert!(
+            nc_rows[0].1 * 4 < fw_nc,
+            "post-caps: NO single dominator (top region {} < 25% of {fw_nc}) — the 2^cap_height exponential \
+             bottleneck is gone (was caps 85%)",
+            nc_rows[0].1
         );
 
         // Assertions that pin the findings so a regression is caught.
