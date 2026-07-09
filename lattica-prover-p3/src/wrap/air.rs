@@ -1357,12 +1357,178 @@ mod wrap_air {
             }
         }
     }
+
+    /// **Caps AA5 — the cw=true SOUND capstone: `AssembledCapWrapCwAir`.** The [`AssembledCapWrapAir`] sibling one
+    /// regime deeper (`column_window=true` + `narrow_caps`): the `2^cap_height·4` cap COLUMNS are DROPPED from the
+    /// pis window (the 4.4× width win), so AA3's committed-cap binding (which anchored each cap-row digest to
+    /// `pis[cbase]`) is GONE. This re-anchors them to the caps the transcript sponge ACTUALLY absorbed, via the
+    /// ordered sponge-cap bus ([`super::SpongeCapBusAir`], proven standalone) — closing the FS⟂auth cap decoupling:
+    ///  - **SELECT bus (channel 0, unchanged from AA1):** each arith head READS `[cap_id, index>>shift, cap_c[g]]`;
+    ///    the cap-row PROVIDES `[cap_id, entry, digest]` (mult −count). Balance ⇒ `cap_c` == the addressed cap-row.
+    ///  - **SPONGE-CAP bus (channel 1, REPLACING AA3):** on the transcript absorb rows, per rate lane `l` a
+    ///    periodic-PINNED `(w_gi_l, w_sel_l)` PROVIDES `(w_gi_l, cur[l])` mult −w_sel_l — `cur[l]` the real
+    ///    FS-absorbed rate lane, `w_gi_l`/`w_sel_l` bound by constraint to the `sim_cap_positions` cap-tag periodics
+    ///    (the FT_BIND pattern, so the order can't be shuffled). Each cap-row READS its 4 digest felts
+    ///    `(gi_base+k, digest[k])` mult +cap_sel. Balance on `(gi, value)` ⇒ every cap-row digest == the felt the
+    ///    sponge absorbed at that stream position ⇒ the auth cap (`cap_c`, via SELECT) == the FS cap. Sound.
+    ///
+    /// Width `fused_w + 18` (region 10: `[cap_id, entry, digest[4], cap_mult, cap_sel, is_head, gi_base]` + 2·RATE
+    /// witnessed tags); 2 lookup channels. `cap_periodics` = the 2·RATE cap-tag columns (carried; appended to the
+    /// monolith periodics). Proven through `prove_lookup` (`cap_wrap_cw_assembled_proves`).
+    pub(crate) struct AssembledCapWrapCwAir {
+        pub(crate) m: MonolithAir,
+        pub(crate) cap_periodics: Vec<Vec<Goldilocks>>,
+    }
+
+    impl AssembledCapWrapCwAir {
+        /// Cap-absorb rate = DIGEST = the sponge `RATE` (a cap entry is a 4-felt run absorbed into 4 rate lanes).
+        pub(crate) const CAP_RATE: usize = 4;
+        /// Cap-row region base (after the monolith's fused columns): `[cap_id, entry_idx, digest[4], cap_mult]`.
+        pub(crate) fn cr_base(&self) -> usize {
+            self.m.fused_w()
+        }
+        /// Region row selector (1 on every cap-row slack row; gates the digest READ + the PROVIDE).
+        pub(crate) fn cap_sel(&self) -> usize {
+            self.cr_base() + 7
+        }
+        /// Witnessed arith-head marker (= the periodic `tf`, bound by a constraint) — gates the select READ.
+        pub(crate) fn is_head(&self) -> usize {
+            self.cr_base() + 8
+        }
+        /// The cap-row's `gi` of its `k=0` felt (free witness; the sponge balance FORCES it — the provide multiset
+        /// is fixed by the periodic tags + the FS-bound rate lanes, so a wrong `gi_base` can't cancel).
+        pub(crate) fn gi_base(&self) -> usize {
+            self.cr_base() + 9
+        }
+        /// Witnessed sponge-cap `gi` tag for rate lane `l` — pinned to the `cap_periodics[2l]` periodic column.
+        pub(crate) fn w_gi(&self, l: usize) -> usize {
+            self.cr_base() + 10 + 2 * l
+        }
+        /// Witnessed sponge-cap `sel` tag for rate lane `l` — pinned to `cap_periodics[2l+1]` (1 iff lane `l` of
+        /// this transcript block absorbed a cap felt).
+        pub(crate) fn w_sel(&self, l: usize) -> usize {
+            self.cr_base() + 11 + 2 * l
+        }
+        /// The periodic index where the appended cap-tag columns begin.
+        pub(crate) fn cap_periodic_base(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        /// The SELECT-bus openings (same as [`AssembledCapWrapAir::openings`] — trace, quotient, `cm_rounds`
+        /// commit): `(cap_id, cg_off, shift, bits)`.
+        pub(crate) fn openings(&self) -> Vec<(usize, usize, usize, usize)> {
+            let mut v = vec![
+                (0, 0, self.m.input_depth(), self.m.cap_height),
+                (1, 4, self.m.input_depth(), self.m.cap_height),
+            ];
+            for r in 0..self.m.cm_rounds() {
+                v.push((2 + r, 8 + 4 * r, self.m.commit_shift(r), self.m.commit_bits(r)));
+            }
+            v
+        }
+    }
+
+    impl BaseAir<Goldilocks> for AssembledCapWrapCwAir {
+        fn width(&self) -> usize {
+            self.m.fused_w() + 10 + 2 * Self::CAP_RATE
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::CAP_RATE
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
+            p.extend(self.cap_periodics.iter().cloned());
+            p
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for AssembledCapWrapCwAir {
+        fn eval(&self, builder: &mut AB) {
+            // (1) The reused monolith regions + the `CapMuxBci` strategy (product-mux externalized); `cap_c` is
+            // bound only to the Merkle terminal (+ held) — the SELECT bus binds it to the region below.
+            self.m.eval_bci(builder, &CapMuxBci);
+
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let one = AB::Expr::ONE;
+            let cr = self.cr_base();
+            let pbase = self.cap_periodic_base();
+            let rate = Self::CAP_RATE;
+
+            // (2) Region markers — boolean; `is_head` bound to the periodic `tf`, `cap_mult = 0` off-region.
+            let cap_sel = cur[self.cap_sel()].clone();
+            let is_head = cur[self.is_head()].clone();
+            for mk in [&cap_sel, &is_head] {
+                builder.assert_zero(mk.clone() * (mk.clone() - one.clone()));
+            }
+            builder.assert_zero(is_head.clone() - p[self.m.m_tf()].clone());
+            builder.assert_zero((one.clone() - cap_sel.clone()) * cur[cr + 6].clone());
+
+            // (3) Sponge-cap tags PINNED to periodic (the periodic-out-of-interactions rule — witness the columns,
+            // bind them by constraint, then use the COLUMNS in the bus). `w_sel_l` is thus 0/1 from the periodic.
+            for l in 0..rate {
+                builder.assert_zero(cur[self.w_gi(l)].clone() - p[pbase + 2 * l].clone());
+                builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 2 * l + 1].clone());
+            }
+
+            // (4) SELECT bus (channel 0): the cap-row PROVIDES its entry (mult `cap_mult` = −count); each arith
+            // head READS, per opening g, `[cap_id, index>>shift_g, cap_c[g]]` (mult `is_head`). Unchanged from AA1.
+            let cap_tuple = vec![
+                cur[cr].clone(),
+                cur[cr + 1].clone(),
+                cur[cr + 2].clone(),
+                cur[cr + 3].clone(),
+                cur[cr + 4].clone(),
+                cur[cr + 5].clone(),
+            ];
+            let mut ch_select: Vec<(Vec<AB::Expr>, AB::Expr)> = vec![(cap_tuple.clone(), cur[cr + 6].clone())];
+            for (cap_id, cg_off, shift, bits) in self.openings() {
+                let mut sel_idx = AB::Expr::ZERO;
+                for j in 0..bits {
+                    sel_idx = sel_idx
+                        + cur[self.m.sb_b(shift + j)].clone() * AB::Expr::from(Goldilocks::from_u64(1u64 << j));
+                }
+                ch_select.push((
+                    vec![
+                        AB::Expr::from(Goldilocks::from_u64(cap_id as u64)),
+                        sel_idx,
+                        cur[self.m.cap_c(cg_off)].clone(),
+                        cur[self.m.cap_c(cg_off + 1)].clone(),
+                        cur[self.m.cap_c(cg_off + 2)].clone(),
+                        cur[self.m.cap_c(cg_off + 3)].clone(),
+                    ],
+                    is_head.clone(),
+                ));
+            }
+
+            // (5) SPONGE-CAP bus (channel 1 — the FS anchor, REPLACING AA3). On the transcript absorb rows, per
+            // rate lane `l` PROVIDE `(w_gi_l, cur[l])` mult −w_sel_l (`cur[l]` the real FS-absorbed felt); each
+            // cap-row READS its 4 digest felts `(gi_base+k, digest[k])` mult +cap_sel. Balance on `(gi, value)` ⇒
+            // every cap-row digest == the felt absorbed at that stream position ⇒ the auth cap == the FS cap.
+            let mut ch_sponge: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(rate + 4);
+            for l in 0..rate {
+                ch_sponge.push((
+                    vec![cur[self.w_gi(l)].clone(), cur[l].clone()],
+                    AB::Expr::ZERO - cur[self.w_sel(l)].clone(),
+                ));
+            }
+            for k in 0..4 {
+                let gi_k = cur[self.gi_base()].clone() + AB::Expr::from(Goldilocks::from_u64(k as u64));
+                ch_sponge.push((vec![gi_k, cur[cr + 2 + k].clone()], cap_sel.clone()));
+            }
+
+            builder.push_local_interaction(ch_select);
+            builder.push_local_interaction(ch_sponge);
+        }
+    }
 }
 
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
-    native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledWrapAir,
-    CapWrapAir, WrapAir, N_GROUPS, OPEN_BASE,
+    native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledCapWrapCwAir,
+    AssembledWrapAir, CapWrapAir, WrapAir, N_GROUPS, OPEN_BASE,
 };
 
 #[cfg(test)]
@@ -2139,6 +2305,303 @@ mod tests {
         let wrap = CapWrapAir { m: air };
         let prf = prove(&config, &wrap, RowMajorMatrix::new(tr, fw), &[]);
         assert!(verify(&config, &wrap, &prf, &[]).is_ok(), "the caps-dropped cw=true verifier must prove + verify (width {fw})");
+    }
+
+    /// **Caps AA5 — build the cw=true assembled cap-wrap trace** (`narrow_caps`: the cap COLUMNS dropped from the
+    /// pis window). Mirrors `assemble_cap_wrap` one regime deeper: build the narrow cw=true monolith trace
+    /// (`build_symbolic_inner_window(.., true)`, as `narrow_caps_cw_verifier_proves`); widen it for the cap-row
+    /// region + the 2·RATE sponge-cap tags; seed each cap entry's row (digest = the FS-absorbed felt
+    /// `block_inputs[block][lane]` == the committed cap, `gi_base` = its stream index, `cap_mult` = −#heads
+    /// selecting it) and the transcript absorb rows' periodic-pinned tags (`w_gi_l = gi`, `w_sel_l = 1` at each cap
+    /// felt's `(block·BLOCK, lane)`). Returns `(air, trace, pis)`; `pis` empty (cw=true — inner pis live in the
+    /// witness window). `cap_periodics` = the 2·RATE cap-tag columns the tags are pinned to.
+    #[cfg(feature = "recursion")]
+    fn assemble_cap_wrap_cw(
+        config: &crate::recursion::native_fri::MyConfig,
+        proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
+        pvs: &[Val],
+    ) -> (AssembledCapWrapCwAir, RowMajorMatrix<Val>, Vec<Val>) {
+        use crate::joinsplit_air::{JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::poseidon2_air::BLOCK;
+        use crate::recursion::monolith::tests::{build_symbolic_inner_window, sim_cap_positions};
+        use crate::recursion::monolith::MonolithAir;
+        use p3_matrix::dense::RowMajorMatrix;
+        use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+        use std::collections::BTreeMap;
+
+        // narrow cw=true monolith trace + air (identical setup to narrow_caps_cw_verifier_proves).
+        let (mono_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: false,
+            narrow_caps: true,
+        };
+        let (fw, h) = (m.fused_w(), m.height());
+        let rate = AssembledCapWrapCwAir::CAP_RATE;
+        let width = fw + 10 + 2 * rate;
+        let (cr, cap_sel_c, is_head_c, gi_base_c) = (fw, fw + 7, fw + 8, fw + 9);
+        let w_gi = |l: usize| fw + 10 + 2 * l;
+        let w_sel = |l: usize| fw + 11 + 2 * l;
+
+        // The FS-absorbed cap stream: positions[gi] = (cap_id, entry, k, block, lane); the committed felt is the
+        // absorbed rate lane block_inputs[block][lane] (== roots()[entry][k], per cap_absorb_stream_matches_committed_caps).
+        let (block_inputs, positions) = sim_cap_positions(config, proof, pvs);
+
+        // cap-tag periodics (2·RATE full-height cols): mark each cap felt's (block·BLOCK row, lane) with its gi+sel.
+        let mut cap_periodics = vec![vec![Val::ZERO; h]; 2 * rate];
+        for (gi, &(_cap_id, _entry, _k, block, lane)) in positions.iter().enumerate() {
+            let row = block * BLOCK;
+            cap_periodics[2 * lane][row] = Val::from_u64(gi as u64);
+            cap_periodics[2 * lane + 1][row] = Val::ONE;
+        }
+
+        // group the stream by (cap_id, entry): gi_base (k=0's gi) + the 4 digest felts (the FS-absorbed cap).
+        let mut entry_gi: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        let mut entry_dig: BTreeMap<(usize, usize), [Val; 4]> = BTreeMap::new();
+        for (gi, &(cap_id, entry, k, block, lane)) in positions.iter().enumerate() {
+            if k == 0 {
+                entry_gi.insert((cap_id, entry), gi);
+            }
+            entry_dig.entry((cap_id, entry)).or_insert([Val::ZERO; 4])[k] = block_inputs[block][lane];
+        }
+
+        // arith heads (m_tf rows) + the caps with their (shift, bits) for the select-bus count.
+        let tf_col = BaseAir::<Val>::periodic_columns(&m)[m.m_tf()].clone();
+        let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
+        assert_eq!(heads.len(), m.n_queries, "one arith head per query");
+        let caps: Vec<(usize, usize, usize)> = {
+            let mut v = vec![(0, m.input_depth(), m.cap_height), (1, m.input_depth(), m.cap_height)];
+            for r in 0..m.cm_rounds() {
+                v.push((2 + r, m.commit_shift(r), m.commit_bits(r)));
+            }
+            v
+        };
+        let n_entries: usize = caps.iter().map(|&(_, _, bits)| 1usize << bits).sum();
+        let used = m.tr() + m.n_queries * m.m_period();
+        assert!(used + n_entries <= h, "cap region ({n_entries}) must fit the slack ({})", h - used);
+
+        let mut wide = vec![Val::ZERO; h * width];
+        for r in 0..h {
+            wide[r * width..r * width + fw].copy_from_slice(&mono_tr[r * fw..(r + 1) * fw]);
+        }
+        for &head in &heads {
+            wide[head * width + is_head_c] = Val::ONE;
+        }
+        // the periodic-pinned tag COLUMNS in the trace (MUST equal cap_periodics — the AIR binds them).
+        for (gi, &(_cap_id, _entry, _k, block, lane)) in positions.iter().enumerate() {
+            let row = block * BLOCK;
+            wide[row * width + w_gi(lane)] = Val::from_u64(gi as u64);
+            wide[row * width + w_sel(lane)] = Val::ONE;
+        }
+        // cap-row region: one row per (cap, entry), in the trace slack.
+        let mut dst = used;
+        for &(cap_id, shift, bits) in &caps {
+            let n = 1usize << bits;
+            let mut count = vec![0u64; n];
+            for &head in &heads {
+                let mut e = 0usize;
+                for j in 0..bits {
+                    if mono_tr[head * fw + m.sb_b(shift + j)] == Val::ONE {
+                        e += 1 << j;
+                    }
+                }
+                count[e] += 1;
+            }
+            for e in 0..n {
+                let b = dst * width;
+                let dig = entry_dig[&(cap_id, e)];
+                wide[b + cr] = Val::from_u64(cap_id as u64);
+                wide[b + cr + 1] = Val::from_u64(e as u64);
+                for k in 0..4 {
+                    wide[b + cr + 2 + k] = dig[k];
+                }
+                wide[b + cr + 6] = Val::ZERO - Val::from_u64(count[e]); // cap_mult = −count
+                wide[b + cap_sel_c] = Val::ONE;
+                wide[b + gi_base_c] = Val::from_u64(entry_gi[&(cap_id, e)] as u64);
+                dst += 1;
+            }
+        }
+
+        (AssembledCapWrapCwAir { m, cap_periodics }, RowMajorMatrix::new(wide, width), Vec::new())
+    }
+
+    /// **Caps AA5 cw=true — the SOUND capstone composes as a LookupAir** (`--features recursion`). The
+    /// [`AssembledCapWrapCwAir`] sibling of `cap_wrap_assembled_composes`: at `column_window=true` + `narrow_caps`
+    /// the `2^cap_height` cap columns are DROPPED (the 4.4× fused_w win), and the two buses — the SELECT bus
+    /// (`cap_c` ↔ cap-row) and the sponge-cap FS-anchor bus (cap-row digest ↔ the transcript-absorbed cap) —
+    /// compose within the degree budget (`log_nqc ≤ LOG_BLOWUP`) at the reduced width.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_wrap_cw_assembled_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, _trace, _pis) = assemble_cap_wrap_cw(&config, &proof, &pvs);
+
+        let fw = asm.m.fused_w();
+        let width = <AssembledCapWrapCwAir as BaseAir<Val>>::width(&asm);
+        let n_open = asm.openings().len();
+        let lookups = Lookups::from_air::<Challenge, _>(&asm);
+        let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
+        println!(
+            "cap AA5 cw=true: width {width} = fused_w {fw} + 10 + 2·RATE (cap-row region 10 + sponge tags); {} \
+             lookup channel(s) (select + sponge-cap FS-anchor), {n_open} select reads/head, log_nqc {log_nqc} ≤ \
+             {LOG_BLOWUP}. The caps are DROPPED from the pis window (4.4× win); the sponge-cap bus re-anchors each \
+             cap-row digest to the FS-absorbed cap (replacing AA3's now-gone pis anchor).",
+            lookups.len()
+        );
+        assert!(fw < 1200, "narrow cw=true fused_w {fw} ≈ 963 (cap columns dropped)");
+        assert_eq!(width, fw + 10 + 2 * AssembledCapWrapCwAir::CAP_RATE, "region 10 + 2·RATE sponge tags");
+        assert_eq!(lookups.len(), 2, "2 channels: the select bus + the sponge-cap FS-anchor bus");
+        assert!(log_nqc <= LOG_BLOWUP, "cap AA5 cw=true must compose within the degree budget (got {log_nqc})");
+    }
+
+    /// **Caps AA5 cw=true — both buses balance** (native, cheap — NO prove). Assemble the cw=true trace and confirm
+    /// each channel nets to zero as a signed multiset: channel 0 (SELECT) ⇒ every head's `cap_c[g]` == the
+    /// addressed cap-row digest; channel 1 (SPONGE-CAP) ⇒ every cap-row digest felt `(gi_base+k, digest[k])` cancels
+    /// the transcript provide `(w_gi_l, cur[l])` at its stream position — i.e. the cap-row digest == the FS-absorbed
+    /// felt. Localizes any tag/gi/digest/count/alignment bug before the heavy prove (as the AA2 balance did).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_wrap_cw_assembled_bus_balances() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_field::PrimeField64;
+        use p3_uni_stark::prove;
+        use std::collections::HashMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_cap_wrap_cw(&config, &proof, &pvs);
+
+        let (fw, h) = (asm.m.fused_w(), asm.m.height());
+        let rate = AssembledCapWrapCwAir::CAP_RATE;
+        let width = fw + 10 + 2 * rate;
+        let (cr, cap_sel, is_head, gi_base) = (fw, fw + 7, fw + 8, fw + 9);
+        let m = &asm.m;
+        let ku = |v: Val| v.as_canonical_u64();
+        let openings = asm.openings();
+
+        let mut bus: HashMap<(usize, Vec<u64>), Val> = HashMap::new();
+        for r in 0..h {
+            let b = r * width;
+            let g = |c: usize| trace.values[b + c];
+            // channel 0 (SELECT): cap-row PROVIDES its entry (mult cap_mult); each head READS its openings (+1).
+            if g(cap_sel) == Val::ONE {
+                let key = vec![ku(g(cr)), ku(g(cr + 1)), ku(g(cr + 2)), ku(g(cr + 3)), ku(g(cr + 4)), ku(g(cr + 5))];
+                *bus.entry((0, key)).or_insert(Val::ZERO) += g(cr + 6);
+                // channel 1 (SPONGE): the cap-row READS its 4 digest felts (gi_base+k, digest[k]) (+1).
+                for k in 0..4u64 {
+                    let sk = vec![ku(g(gi_base)) + k, ku(g(cr + 2 + k as usize))];
+                    *bus.entry((1, sk)).or_insert(Val::ZERO) += Val::ONE;
+                }
+            }
+            if g(is_head) == Val::ONE {
+                for &(cap_id, cg_off, shift, bits) in &openings {
+                    let mut sel_idx = 0u64;
+                    for j in 0..bits {
+                        if g(m.sb_b(shift + j)) == Val::ONE {
+                            sel_idx += 1 << j;
+                        }
+                    }
+                    let key = vec![
+                        cap_id as u64,
+                        sel_idx,
+                        ku(g(m.cap_c(cg_off))),
+                        ku(g(m.cap_c(cg_off + 1))),
+                        ku(g(m.cap_c(cg_off + 2))),
+                        ku(g(m.cap_c(cg_off + 3))),
+                    ];
+                    *bus.entry((0, key)).or_insert(Val::ZERO) += Val::ONE;
+                }
+            }
+            // channel 1 (SPONGE): each transcript rate lane with a cap felt PROVIDES (w_gi_l, cur[l]) (−1).
+            for l in 0..rate {
+                if g(fw + 11 + 2 * l) == Val::ONE {
+                    let sk = vec![ku(g(fw + 10 + 2 * l)), ku(g(l))];
+                    *bus.entry((1, sk)).or_insert(Val::ZERO) -= Val::ONE;
+                }
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != Val::ZERO).count();
+        let bad: Vec<_> = bus.iter().filter(|(_, &v)| v != Val::ZERO).take(8).collect();
+        assert!(bad.is_empty(), "every (channel, tuple) must net to zero; {nonzero} nonzero, e.g. {bad:?}");
+        println!(
+            "cap cw=true buses (2 channels: select + sponge-cap FS-anchor): {} distinct entries, all net-zero — \
+             cap_c bound to the cap-row (select) AND each cap-row digest to the FS-absorbed sponge cap (sponge) ⇒ \
+             the width-win cap-select is SOUND (auth == FS).",
+            bus.len()
+        );
+    }
+
+    /// **Caps AA5 cw=true — the SOUND capstone PROVES through `prove_lookup`.** The definitive check: build the
+    /// cw=true assembled cap-wrap (caps dropped from the pis window, the select bus + the sponge-cap FS-anchor bus)
+    /// and prove + verify it end-to-end through the W1 lookup prover. So the width win (fused_w ≈ 963) holds as a
+    /// SOUND STARK with `cap_c` bound to the FS-absorbed cap — the deep-tree cap bottleneck's B≤1 lever, sound. A
+    /// corrupted cap-row digest is rejected (both buses unbalance). Heavy; `--release --features lookup,recursion -j1`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy: proves the cw=true assembled cap-wrap (width ~981, 2 channels) through prove_lookup; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    fn cap_wrap_cw_assembled_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_cap_wrap_cw(&config, &proof, &pvs);
+        let width = <AssembledCapWrapCwAir as BaseAir<Val>>::width(&asm);
+        println!(
+            "proving cw=true assembled cap-wrap (select + sponge-cap FS-anchor): width {width}, {} rows, 2 channels",
+            asm.m.height()
+        );
+        let lproof = prove_lookup(&asm, trace, &pis);
+        assert!(
+            verify_lookup(&asm, &lproof, &pis).is_ok(),
+            "the cw=true assembled cap-wrap must prove + verify through prove_lookup (width {width})"
+        );
+
+        // Corrupt the first cap-row's digest ⇒ BOTH the select bus (digest ≠ cap_c) and the sponge bus (digest ≠
+        // the FS felt) unbalance ⇒ the corrupted trace must not verify.
+        let (asm2, mut bad, pis2) = assemble_cap_wrap_cw(&config, &proof, &pvs);
+        let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
+        let cr = asm2.m.fused_w();
+        bad.values[used * width + cr + 2] += Val::ONE; // digest[0] of the first cap-row
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let lp = prove_lookup(&asm2, bad, &pis2);
+            verify_lookup(&asm2, &lp, &pis2).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted cap-row digest must be rejected (select + sponge buses unbalance)");
     }
 
     /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
