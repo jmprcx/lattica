@@ -1158,12 +1158,131 @@ mod wrap_air {
             }
         }
     }
+
+    /// **Caps assembly AA1 — the select bus, `cap_c` bound to a slack cap-row region** (the
+    /// [`AssembledArithWrapAir`] analog for caps, the [`CapWrapAir`] soundness close). Where [`CapWrapAir`]
+    /// externalizes the product-mux and leaves each cap carrier `cap_c` a FREE witness (bound only to the Merkle
+    /// terminal), this AIR discharges the cap SELECTION through the LogUp bus. Each opening's `2^bits` cap entries
+    /// become ROWS in the trace SLACK (`[cap_id, entry_idx, digest[4], cap_mult]`, gated by `cap_sel`); the region
+    /// PROVIDES each entry `[cap_id, entry_idx, digest]` (mult `cap_mult = −count`), and each arith head READS, per
+    /// opening g, `[g, index>>shift_g, cap_c[g]]` (mult `is_head`), `index>>shift_g` decoded from the committed
+    /// index bits `sb_b`. Balance ⇒ `cap_c[g]` == the digest of the cap-row the query's index addresses — the
+    /// narrow-tall selection, replacing the degree-`cap_height` product-mux over `2^cap_height·4` COLUMNS with
+    /// 6-felt ROWS.
+    ///
+    /// **AA1 (this): composes.** The region + the select bus (one channel, `2 + cm_rounds` reads/head). AA1 leaves
+    /// the cap-row digests UNBOUND to the transcript-committed cap (that `pis[cbase + entry_idx·4 + k]` binding is
+    /// AA3); here `cap_c` is bound to the slack region, closing the free-witness gap for the SELECTION mechanism +
+    /// fixing the degree. `is_head` is a witnessed column bound to the periodic `tf` (periodic must stay out of
+    /// interactions — the lookup prover's aux gen feeds an empty periodic slice).
+    pub(crate) struct AssembledCapWrapAir {
+        pub(crate) m: MonolithAir,
+    }
+
+    impl AssembledCapWrapAir {
+        /// Cap-row region base (after the monolith's fused columns): `[cap_id, entry_idx, digest[4], cap_mult]`.
+        pub(crate) fn cr_base(&self) -> usize {
+            self.m.fused_w()
+        }
+        /// Region row selector (1 on every cap-row slack row; gates the PROVIDE).
+        pub(crate) fn cap_sel(&self) -> usize {
+            self.cr_base() + 7
+        }
+        /// Witnessed arith-head marker (= the periodic `tf`, bound by a constraint) — gates the bus READ.
+        pub(crate) fn is_head(&self) -> usize {
+            self.cr_base() + 8
+        }
+        /// The openings the head reads: `(cap_id, cg_off, shift, bits)` — trace, quotient, then `cm_rounds` commit
+        /// rounds (is_zk=0). `cap_id` distinguishes the caps in the bus tuple; `cg_off` locates `cap_c`; `shift`/
+        /// `bits` decode `index>>shift` from `sb_b`. (Mirrors `emit_capmux`'s openings, minus `cbase` — AA1 binds
+        /// to the region rows, not the committed pis; that is AA3.)
+        pub(crate) fn openings(&self) -> Vec<(usize, usize, usize, usize)> {
+            let mut v = vec![
+                (0, 0, self.m.input_depth(), self.m.cap_height),
+                (1, 4, self.m.input_depth(), self.m.cap_height),
+            ];
+            for r in 0..self.m.cm_rounds() {
+                v.push((2 + r, 8 + 4 * r, self.m.commit_shift(r), self.m.commit_bits(r)));
+            }
+            v
+        }
+    }
+
+    impl BaseAir<Goldilocks> for AssembledCapWrapAir {
+        fn width(&self) -> usize {
+            // cap-row region: cap_id + entry_idx + digest(4) + cap_mult (7) + cap_sel + is_head (2).
+            self.m.fused_w() + 9
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for AssembledCapWrapAir {
+        fn eval(&self, builder: &mut AB) {
+            // (1) The reused monolith regions + the `CapMuxBci` strategy: the product-mux is externalized, so
+            // `cap_c` is bound only to the Merkle terminal (+ held) — the select bus below binds it to the region.
+            self.m.eval_bci(builder, &CapMuxBci);
+
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let one = AB::Expr::ONE;
+            let cr = self.cr_base();
+
+            // (2) Region markers — booleans; `is_head` bound to the periodic `tf` so the bus READ is gated by the
+            // COLUMN, not the periodic. Off-region rows carry `cap_mult = 0` (so they PROVIDE nothing).
+            let cap_sel = cur[self.cap_sel()].clone();
+            let is_head = cur[self.is_head()].clone();
+            for mk in [&cap_sel, &is_head] {
+                builder.assert_zero(mk.clone() * (mk.clone() - one.clone()));
+            }
+            builder.assert_zero(is_head.clone() - p[self.m.m_tf()].clone());
+            builder.assert_zero((one.clone() - cap_sel.clone()) * cur[cr + 6].clone());
+
+            // (3) The select bus (one channel). The cap-row PROVIDES its entry `[cap_id, entry_idx, digest]` with
+            // mult `cap_mult` (= −count; 0 off-region); each arith head READS, per opening g, `[g, index>>shift_g,
+            // cap_c[g]]` with mult `is_head`. Balance ⇒ `cap_c[g]` == the digest of the addressed cap-row.
+            let mut chan: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::new();
+            let provide = vec![
+                cur[cr].clone(),     // cap_id
+                cur[cr + 1].clone(), // entry_idx
+                cur[cr + 2].clone(), // digest[0..4]
+                cur[cr + 3].clone(),
+                cur[cr + 4].clone(),
+                cur[cr + 5].clone(),
+            ];
+            chan.push((provide, cur[cr + 6].clone()));
+            for (cap_id, cg_off, shift, bits) in self.openings() {
+                let mut sel_idx = AB::Expr::ZERO;
+                for j in 0..bits {
+                    sel_idx = sel_idx
+                        + cur[self.m.sb_b(shift + j)].clone() * AB::Expr::from(Goldilocks::from_u64(1u64 << j));
+                }
+                let read = vec![
+                    AB::Expr::from(Goldilocks::from_u64(cap_id as u64)),
+                    sel_idx,
+                    cur[self.m.cap_c(cg_off)].clone(),
+                    cur[self.m.cap_c(cg_off + 1)].clone(),
+                    cur[self.m.cap_c(cg_off + 2)].clone(),
+                    cur[self.m.cap_c(cg_off + 3)].clone(),
+                ];
+                chan.push((read, is_head.clone()));
+            }
+            builder.push_local_interaction(chan);
+        }
+    }
 }
 
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
-    native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledWrapAir, CapWrapAir, WrapAir,
-    N_GROUPS, OPEN_BASE,
+    native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledWrapAir,
+    CapWrapAir, WrapAir, N_GROUPS, OPEN_BASE,
 };
 
 #[cfg(test)]
@@ -1605,6 +1724,42 @@ mod tests {
         );
         assert!(deg <= mono_deg, "externalizing the product-mux must not raise the constraint degree");
         assert!(cs.len() < mono_cs.len(), "CapWrapAir must be a strict constraint subset (product-mux dropped)");
+    }
+
+    /// **Caps AA1 — `AssembledCapWrapAir` composes as a LookupAir** (`--features recursion`). The sibling of
+    /// `arith_wrap_assembled_composes` for caps: the reused monolith (`eval_bci(&CapMuxBci)`, product-mux
+    /// externalized) + the narrow-tall cap-row region + the select bus form ONE lookup-carrying AIR that composes
+    /// WITHIN the degree budget. `cap_c` is now bound to the slack cap-row region via the bus (not a free witness);
+    /// the region→committed-cap binding (AA3) + the trace + native bus-balance (AA2) + the prove (AA4) follow.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_wrap_assembled_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_lookup::Lookups;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (air, _tr, _pis) = wrap_build_reused(&config, &proof, &pvs, false);
+
+        let asm = AssembledCapWrapAir { m: air };
+        let fw = asm.m.fused_w();
+        let width = <AssembledCapWrapAir as BaseAir<Val>>::width(&asm);
+        let n_open = asm.openings().len();
+        let lookups = Lookups::from_air::<Challenge, _>(&asm);
+        let (_layout, log_nqc) = combined_constraint_layout(&asm, &lookups, 1);
+        println!(
+            "cap AA1: width {width} = fused_w {fw} + 9 (cap-row region 7 + cap_sel + is_head); {} lookup(s), \
+             {n_open} reads/head, log_nqc {log_nqc} ≤ {LOG_BLOWUP}. Select bus binds cap_c to the slack cap-row \
+             region (columns→rows); the committed-cap binding is AA3.",
+            lookups.len()
+        );
+        assert_eq!(width, fw + 9, "AA1 adds the 9-col cap-row region");
+        assert_eq!(n_open, 2 + asm.m.cm_rounds(), "one read per opening (trace + quot + cm_rounds)");
+        assert!(log_nqc <= LOG_BLOWUP, "cap AA1 must compose within the degree budget (got {log_nqc})");
     }
 
     /// **Caps plumbing brick — `CapWrapAir` proves with the product-mux externalized** (`--release --ignored`).
