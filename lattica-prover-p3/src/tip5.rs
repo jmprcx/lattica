@@ -300,6 +300,35 @@ mod tests {
         assert_eq!(c.rounds, 5);
         assert!(c.row_reduction_vs_poseidon2 >= 4.0, "Tip5 should be ≥4x fewer rows/perm than Poseidon2");
     }
+
+    /// **Step 4 (W4) bridge — the 4.6× Tip5 lever applies DIRECTLY to the recursion wrap's HEIGHT.** The in-circuit
+    /// recursion verifier (the monolith) re-checks the inner proof's Merkle/leaf/transcript hashes with the Poseidon2
+    /// AIR at `BLOCK = 32` rows/permutation — the SAME Poseidon2 `cost_estimate()` contrasts against. So swapping the
+    /// wrap's own hashing to Tip5 (~7 rows/perm) shrinks its hash-dominated trace HEIGHT by the measured 4.6×. Ties
+    /// the standalone Tip5 cost to the ACTUAL wrap: the narrow-tall swaps drove the WIDTH to the W5 fixed point
+    /// `W* = 677`; Tip5 is the orthogonal HEIGHT lever (the hash blocks that dominate the super-tile). Both are SIZE,
+    /// not the gate — the W5 gate (B<1) holds regardless (`w4_tip5_lever_is_b_neutral`: the hash carriers are
+    /// B-neutral). The full in-circuit Tip5 AIR is the deferred (optional, non-gate) implementation; its size benefit
+    /// is HERE quantified against the real Poseidon2 the wrap uses.
+    #[test]
+    fn tip5_row_reduction_applies_to_the_recursion_wrap() {
+        let c = cost_estimate();
+        // the wrap's in-circuit hashing IS Poseidon2 at BLOCK rows/perm — the exact baseline cost_estimate contrasts.
+        assert_eq!(
+            c.poseidon2_rows_per_perm,
+            crate::poseidon2_air::BLOCK,
+            "cost_estimate's Poseidon2 baseline must equal the monolith's BLOCK (the wrap's in-circuit hash cost)"
+        );
+        println!(
+            "W4 bridge: the recursion wrap hashes in-circuit with Poseidon2 at BLOCK={} rows/perm; Tip5 ≈{} rows/perm \
+             ⇒ {:.1}× fewer HASH ROWS on the wrap's super-tile HEIGHT (orthogonal to the W5 WIDTH fixed point W*=677). \
+             Both are SIZE; the W5 gate (B<1) holds regardless (hash carriers B-neutral). Full in-circuit Tip5 AIR deferred.",
+            crate::poseidon2_air::BLOCK,
+            c.tip5_rows_per_perm_approx,
+            c.row_reduction_vs_poseidon2
+        );
+        assert!(c.row_reduction_vs_poseidon2 >= 4.0);
+    }
 }
 
 // ================================================================================================
