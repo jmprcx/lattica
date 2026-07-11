@@ -3438,6 +3438,90 @@ mod tests {
         );
     }
 
+    /// **W3 ov externalization brick 2 — the ov carrier IS the input-Merkle leaf-hash preimage** (`--features
+    /// recursion`, cheap; the addressing brick, mirrors the caps `743f5b7` / openings `opening_absorb_stream…`
+    /// feasibility bricks). The `ov` opened-row carrier (`ov_c(c)`) is bound to the input-Merkle leaf hash by
+    /// `eval_bci` (air.rs ~1728/1740: `cur[c%RATE] == cur[ov_c(c)]` at each leaf absorb block, gated `m_leaf`/`ia_in`),
+    /// so the w_inner felts already live in the leaf-hash Poseidon input lanes. This confirms, on a REAL join-split
+    /// inner (w_inner 19, 5 leaf blocks — the multi-block case) built by `build_symbolic_inner_window`, that for
+    /// every query `q` and felt `c`, the carrier value `ov_c(c)` EQUALS the leaf-hash lane at super-tile row
+    /// `tr + q·m_period() + (m_input_leaf()+c/RATE)·BLOCK`, lane `c%RATE`. ⇒ the ov carrier COPY is redundant: the
+    /// sound narrow_ov re-sources `px` (`px_source→ov_c`) from the leaf-hash rows via a LogUp bus (the leaf hash is
+    /// the FS-anchor, Merkle-authenticated → trace cap), eliminating the carrier — the openings sponge-bus pattern
+    /// one region over. (The bus compose + assembled binding + balance/prove are the next bricks.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn ov_carrier_matches_leaf_hash() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::poseidon2_air::BLOCK;
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        // FULL geometry (narrow_arith:false ⇒ px stored + ov carrier bound to it + the leaf-hash binding present).
+        let (tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: false,
+            narrow_caps: false,
+            narrow_openings: false,
+            narrow_ov: false,
+        };
+        let fw = m.fused_w();
+        let h = tr.len() / fw;
+        let rate = 4usize; // RATE
+        let mut checked = 0usize;
+        for q in 0..m.n_queries {
+            let off = m.tr() + q * m.m_period(); // query q's super-tile start
+            for c in 0..WIDTH {
+                // ov carrier value (held constant across the super-tile — read at the first row).
+                let ov_val = tr[off * fw + m.ov_c(c)];
+                // leaf-hash Poseidon input lane: block (m_input_leaf + c/RATE), lane c%RATE.
+                let leaf_row = off + (m.m_input_leaf() + c / rate) * BLOCK;
+                assert!(leaf_row < h, "leaf-hash row in bounds");
+                let leaf_val = tr[leaf_row * fw + (c % rate)];
+                assert_eq!(
+                    ov_val, leaf_val,
+                    "query {q} felt {c}: ov_c({}) must == the leaf-hash lane at block {} lane {}",
+                    m.ov_c(c),
+                    m.m_input_leaf() + c / rate,
+                    c % rate
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, m.n_queries * WIDTH, "every (query, opened-row felt) pair checked");
+        println!(
+            "W3 ov brick 2: {checked} (query, felt) pairs — ov_c(c) == the input-Merkle leaf-hash Poseidon input lane \
+             at (tr + q·m_period() + (m_input_leaf+c/RATE)·BLOCK, c%RATE), on a real join-split inner (w_inner {WIDTH}, \
+             {} leaf blocks). ⇒ px can be re-sourced from the leaf hash via a bus, eliminating the ov carrier copy \
+             (the leaf hash is the Merkle-authenticated FS-anchor — the openings sponge-bus pattern one region over).",
+            m.leaf_blocks()
+        );
+    }
+
     /// **AA6 — the narrow_openings wrap COMPOSES (the plumbing/compose step).** The narrow_openings monolith
     /// (`arith_stride` 0 — the `pz` opening columns GONE) + [`OpeningsBci`] (DeepFold arith ⊕ OpTable epilogue,
     /// `ro`/`folded`/`quot` as FREE witnesses) builds its symbolic layout with NO degenerate `pz` read and composes
