@@ -46,3 +46,15 @@ if [ "${REC:-0}" -ne 0 ]; then
   exit 1
 fi
 echo "OK: zero recursion symbols in the default staticlib (feature-gated out; enable with --features recursion)."
+
+# ZERO deep-tree research symbols (tip5/lookup/wrap/tree — the W3–W7 wrap research, all feature-gated out of
+# the default build). Crate-ANCHORED (`lattica_prover_p3<len><module>`) so a dependency's own `lookup`/`tree`
+# symbol (hashbrown, p3, …) can't false-positive — only THIS crate's gated-out modules are checked. The v0/
+# legacy mangling embeds the crate name then the length-prefixed module, so a gated-out module emits none.
+RES="$(nm "$LIB" 2>/dev/null | grep -icE 'lattica_prover_p3[0-9]+(tip5|lookup|wrap|tree)' || true)"
+if [ "${RES:-0}" -ne 0 ]; then
+  echo "FAIL: $RES deep-tree research symbols in the DEFAULT staticlib (wrap/tree/lookup/tip5 must be feature-gated out):"
+  nm "$LIB" 2>/dev/null | grep -iE 'lattica_prover_p3[0-9]+(tip5|lookup|wrap|tree)' | head
+  exit 1
+fi
+echo "OK: zero deep-tree research symbols in the default staticlib (feature-gated out; enable with --features tree,wrap,lookup,tip5)."

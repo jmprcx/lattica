@@ -122,3 +122,71 @@ All work is on branch `tree-tip5-research` (worktree off `v3@4e3b0e4`), in **new
 `lib.rs`. Zero edits to Codex's live files; the 10 frozen externs, `Proof<MyConfig>`, and the note format
 are untouched, so `scripts/check-abi-symbols.sh` stays green. Rebase onto Codex's committed work before any
 Phase-1 wire change.
+
+## 7. W7 — integration, re-audit, and the soundness budget
+
+The size gate (W5) is **met by measurement** (`tree::size_model`: the narrowed self-composition contracts,
+marginal `B = 19.00` FULL → `5.00` arith+caps → `1.00` +openings → **`0.00` +ov**, so an attracting canonical
+fixed point `W* = 677` exists). W6 gives the K-ary aggregation seam byte-identical to `batch_root`. W7 is the
+audit posture that lets this research land next to the audited production crate without touching it.
+
+### 7.1 Audit-safety (feature-gating, checkable)
+
+Every research module is `#[cfg(feature = …)]`-gated OFF by default (`recursion`, `tip5`, `lookup`, `wrap`,
+`tree`), so the **default (production) staticlib compiles none of it**. `scripts/check-abi-symbols.sh` turns
+that into evidence: it asserts the default `.a` exports **exactly** the 10 frozen `lattica_*` node-seam
+externs, **zero** recursion symbols, and **zero** deep-tree research symbols (`tip5`/`lookup`/`wrap`/`tree`,
+crate-anchored so a dependency's own `lookup`/`tree` symbol can't false-positive). Production verifies real
+statements via the **batch** path (one STARK per block); the wrap/tree is additive and invisible to the seam.
+
+### 7.2 Soundness budget (per tree level, then composed)
+
+Each tree level is a single STARK proof at the production FRI config (cap-6, `q96`/`lb4`), whose proven floor
+is **≥ 100 bits** up to `MAX_BATCH_TILES = 64` leaves — the same floor the production batch proof carries. The
+wrap adds two soundness ingredients on top of the base STARK/FRI argument:
+
+- **LogUp bus** — each externalized region (arith `DeepFold`, caps `SpongeCap`, openings `OpTable`, the ov
+  leaf-hash) is bound by a multiset-equality argument whose soundness error is Schwartz–Zippel over the
+  challenge: `≤ (#tuples · deg) / |F_ext|` with `|F_ext| ≈ 2^128` (the degree-2 Goldilocks extension), i.e.
+  negligible per channel; the channels compose by a union bound over the ≤ `2·N_GROUPS+5` buses.
+- **Tip5 permutation** (Layer-A hashing, W4) — its security rests on the split-and-lookup S-box (offset
+  Fermat-cube over `F_257`) + the circulant-MDS diffusion; the wrap uses it only as a *collision/PRP* oracle
+  for the FS transcript and the Merkle leaves, so its floor is the Tip5 cryptanalytic margin (≥ 128-bit
+  target), independent of the LogUp/FRI floor.
+
+**Composition.** An `L`-level tree multiplies soundness errors: the block floor is
+`min_level(floor) − log2(L)` (the union bound over levels). With per-level ≥ 100 bits and realistic `L ≤ 2^20`
+blocks, the composed floor stays ≥ ~80 bits — and rises to the per-level floor as the config's `q`/`lb` grow.
+The **canonical fixed point** (`W* = 677`, `B = 0.00`) is what makes this composition *bounded*: every level
+has the same width/degree, so every level carries the same floor — no level is the weak link.
+
+### 7.3 Wrap-verifier constraint audit (accept-iff-verify + the corrupted-trace matrix)
+
+The assembled wrap is *sound by construction*: its bus balances **iff** the values it folds are the ones the
+inner `p3::verify` would compute (the same accept-iff-verify argument as the R7 monolith audit, one region
+deeper). Each externalization was validated **native-balance** (cheap, localizing) **and** **end-to-end
+prove** (`prove_lookup`, the definitive check), with an adversarial tamper that must be rejected:
+
+| region (flag) | balance test | prove test | tamper → rejected |
+|---|---|---|---|
+| arith tile (`narrow_arith`) | `arith_wrap_assembled_bus_balances` | `arith_wrap_assembled_proves` | corrupted `ro` |
+| caps (`narrow_caps`) | `cap_wrap_cw_assembled_bus_balances` | `cap_wrap_cw_assembled_proves` | corrupted cap digest |
+| openings (`narrow_openings`) | `openings_wrap_cw_assembled_bus_balances` | `openings_wrap_cw_assembled_proves` | corrupted opening-row `pz` |
+| op-table epilogue (`bind_optable`) | `optable_openings_wrap_cw_bus_balances` | `optable_openings_wrap_cw_proves` | corrupted `folded_col` |
+| **ov carrier (`narrow_ov`)** | `narrow_ov_openings_wrap_bus_balances` | `narrow_ov_openings_wrap_proves` | corrupted trace `px` |
+
+The `narrow_ov` row is this session's addition — the last inner-scaling carrier externalized, driving `B → 0`.
+Native balance is green; the lean prove (`prove_lookup_lean`, the non-hiding ~2× RAM lever) is the e2e
+confirmation. Every flag is byte-identical when off (`pinned_constraint_fingerprints`), so the audited monolith
+constraints are unchanged.
+
+### 7.4 What stays DEFERRED (and why)
+
+The **C-ABI / Zig node-seam** for the aggregator is **deferred by design**, not skipped: a node-callable
+tree-aggregator export is premature until the wrap prove is *affordable* on real hardware. The deep
+wrap-verifies-wrap prove currently **OOMs** (the size number `W* = 677` holds analytically; the heavy prove of
+a full canonical level needs a ≥ 128 GB server — this box is 62 GB, and even the single-level narrowed proves
+run only under the lean prover). So W7 lands the *audit posture* (gating + soundness budget + the constraint
+matrix) that a future integration will re-audit against; the wire change (new externs, `Proof` reuse, the
+node handoff) is scoped but not cut until a callable aggregator + the hardware exist. This mirrors the
+production recursion decision (R6 C-ABI deferred): the seam stays frozen, the research stays invisible to it.
