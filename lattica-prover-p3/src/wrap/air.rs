@@ -6564,6 +6564,49 @@ mod tests {
         assert!(rejected, "a corrupted cap-row digest must be rejected (SELECT + SPONGE-CAP buses unbalance)");
     }
 
+    /// **Tier-1 CAPSTONE — the merged caps ⊕ openings wrap PROVES on the GPU (width 545).** The full integrated
+    /// Tier-1 result: the width-merged wrap (BOTH the `2^cap_height` cap COLUMNS and the `2·n_terms` pz opening
+    /// columns gone — width 545 vs the caps-un-narrowed 3792, ~7× less LDE) proven end-to-end through the
+    /// GPU-accelerated LEAN prover (`GpuDft` LDE + `is_zk=0`) + CPU-lean-verified (wire-compatible). The RAM win
+    /// (width merge) × the speed win (GPU) in one prove — "reduce RAM with GPU support" on the fully-narrowed wrap.
+    /// Reports peak RSS. Heavy; `--release --features gpu,lookup,recursion -j1`.
+    #[cfg(all(feature = "gpu", feature = "recursion"))]
+    #[test]
+    #[ignore = "heavy (GPU-lean): proves the merged caps⊕openings wrap (width 545) on the GPU + reports peak RSS; run `--release --features gpu,lookup,recursion -j1 -- --ignored`"]
+    fn cap_merge_assembled_proves_gpu() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::lookup::prover::prove_lookup_lean_gpu;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let peak_rss_mib = || -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(String::from))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+                .map(|kib| kib / 1024)
+                .unwrap_or(0)
+        };
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false, true);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        let lproof = prove_lookup_lean_gpu(&asm, trace, &pis);
+        assert!(
+            verify_lookup_lean(&asm, &lproof, &pis).is_ok(),
+            "the merged caps ⊕ openings wrap must prove on the GPU (lean) + verify under the CPU lean verifier (width {width})"
+        );
+        println!(
+            "Tier-1 CAPSTONE: merged caps ⊕ openings wrap (width {width}, {} rows — cap COLUMNS + pz COLUMNS gone) \
+             PROVED via prove_lookup_lean_gpu + CPU-lean-verified. Peak RSS {} MiB — the width merge (~7×) × GPU.",
+            asm.m.height(),
+            peak_rss_mib()
+        );
+    }
+
     /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
     /// The cheap half of the `CapMuxBci` plumbing (the `ArithWrapAir` analog): swapping the cap-mux strategy to
     /// `CapMuxBci` (`emit_capmux` → nothing) drops the `openings·4` product-mux constraints (and their `2^cap_height`
