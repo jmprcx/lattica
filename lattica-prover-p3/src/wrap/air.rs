@@ -2199,6 +2199,14 @@ mod wrap_air {
         /// Σ zps_i·chunk_i, appended to the op-table as more rows). The arith head reads `quot_col` here. Unused when
         /// `!bind_optable`.
         pub(crate) quot_addr: u64,
+        /// **Brick 4d** — with the monolith's `narrow_ov`, the ov opened-row carrier is externalized: the z/px bus
+        /// provides px=0 for TRACE terms (their dropped `px_source→ov_c`), and a leaf-hash→px bus binds each trace
+        /// region row's px to the authenticated leaf lane, query-keyed by the held query point `lqk`(=x). Quotient
+        /// terms keep px from `qc`. Flag-off byte-identical.
+        pub(crate) narrow_ov: bool,
+        /// **Brick 4d** — `3·RATE` leaf-hash provide tags (per rate lane: the two shared DEEP term ids
+        /// `trm_trace(c)`/`trm_next(c)` + the committed-felt select bit), pinned to periodics. Unused when `!narrow_ov`.
+        pub(crate) leaf_periodics: Vec<Vec<Goldilocks>>,
     }
 
     impl AssembledOpeningsWrapCwAir {
@@ -2314,25 +2322,58 @@ mod wrap_air {
         pub(crate) fn op_is_ch(&self, g: usize) -> usize {
             self.op_base() + 16 + g
         }
+        /// **Brick 4d** — the narrow_ov column base (after the whole ro/DeepFold/opening/optable layout).
+        pub(crate) fn nov_base(&self) -> usize {
+            self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * Self::RATE
+                + if self.bind_optable { 16 + N_GROUPS } else { 0 }
+        }
+        /// The HELD query point `lqk`(=x): bound to `x_head` at the arith head + held across the super-tile so the
+        /// leaf-hash→px bus keys are query-unique.
+        pub(crate) fn held_lqk(&self) -> usize {
+            self.nov_base()
+        }
+        /// On a DeepFold region row: 1 iff its term is a QUOTIENT term (px kept on the z/px bus from `qc`); 0 for a
+        /// TRACE term (px=0 on the z/px bus, bound via the leaf-hash bus instead).
+        pub(crate) fn df_is_quot(&self) -> usize {
+            self.nov_base() + 1
+        }
+        /// leaf-hash provide tags: per rate lane, the two shared DEEP term ids `trm_trace(c)`/`trm_next(c)` + the
+        /// committed-felt select bit (pinned to `leaf_periodics`).
+        pub(crate) fn w_term0(&self, l: usize) -> usize {
+            self.nov_base() + 2 + 3 * l
+        }
+        pub(crate) fn w_term1(&self, l: usize) -> usize {
+            self.nov_base() + 3 + 3 * l
+        }
+        pub(crate) fn w_lsel(&self, l: usize) -> usize {
+            self.nov_base() + 4 + 3 * l
+        }
+        /// The periodic index where `leaf_periodics` starts (after the monolith periodics + the `2·RATE` op tags).
+        pub(crate) fn leaf_periodic_base(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledOpeningsWrapCwAir {
         fn width(&self) -> usize {
             // ro/folded/quot(6) + DeepFoldAir region(18) + df_sel/df_first/df_end/is_head(4) + term_idx(1)
             // + is_ch(N_GROUPS) + opening-row(6) + 2·RATE sponge tags (+ brick 5d op-table 13 + op_sel + is_tr_leaf
-            // + leaf_key + op_is_ch(N_GROUPS)).
-            let base = self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * Self::RATE;
-            base + if self.bind_optable { 16 + N_GROUPS } else { 0 }
+            // + leaf_key + op_is_ch(N_GROUPS)); (+ brick 4d held_lqk + df_is_quot + 3·RATE leaf tags when narrow_ov).
+            self.nov_base() + if self.narrow_ov { 2 + 3 * Self::RATE } else { 0 }
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
         }
         fn num_periodic_columns(&self) -> usize {
             BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
+                + if self.narrow_ov { 3 * Self::RATE } else { 0 }
         }
         fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
             let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
             p.extend(self.op_periodics.iter().cloned());
+            if self.narrow_ov {
+                p.extend(self.leaf_periodics.iter().cloned());
+            }
             p
         }
     }
@@ -2449,7 +2490,8 @@ mod wrap_air {
 
             // Channels: 0 ro, 1..=N_GROUPS z/px, N_GROUPS+1 pz, N_GROUPS+2 sponge; then brick 5d appends the op-table
             // folded wiring bus (N_GROUPS+3) + the N_GROUPS non-trace-leaf split channels (N_GROUPS+4 .. 2·N_GROUPS+4).
-            let n_chan = N_GROUPS + 3 + if self.bind_optable { N_GROUPS + 1 } else { 0 };
+            let n_chan =
+                N_GROUPS + 3 + if self.bind_optable { N_GROUPS + 1 } else { 0 } + if self.narrow_ov { 1 } else { 0 };
             let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); n_chan];
             // Channel 0 — the ro bus.
             chans[0].push((vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()));
@@ -2461,24 +2503,38 @@ mod wrap_air {
                 } else {
                     (zeta0.clone(), zeta1.clone())
                 };
+                // narrow_ov: TRACE terms (k < trm_quot_base) have their `ov_c` px carrier DROPPED — provide px=0
+                // (bound via the leaf-hash bus below); QUOTIENT terms keep px from the `qc` carrier (px_source valid).
+                let px_slot = if self.narrow_ov && k < self.m.trm_quot_base() {
+                    AB::Expr::ZERO
+                } else {
+                    cur[self.m.px_source(k)].clone()
+                };
                 let head_provide = vec![
                     x_head.clone(),
                     AB::Expr::ZERO,
                     AB::Expr::from(Goldilocks::from_u64(k as u64)),
                     z0,
                     z1,
-                    cur[self.m.px_source(k)].clone(),
+                    px_slot,
                 ];
                 chans[k % N_GROUPS + 1].push((head_provide, AB::Expr::ZERO - is_head.clone()));
             }
             // The region row READS its (z, px) bundle (region z at db+6, px at db+10) on its is_ch channel.
+            // narrow_ov: a TRACE region row (df_is_quot=0) reads px=0 here (its px is bound via the leaf-hash bus);
+            // a QUOTIENT region row (df_is_quot=1) reads its real px `cur[db+10]` (bound to `qc` via the head provide).
+            let region_px = if self.narrow_ov {
+                cur[self.df_is_quot()].clone() * cur[db + 10].clone()
+            } else {
+                cur[db + 10].clone()
+            };
             let region_read = vec![
                 x.0.clone(),
                 x.1.clone(),
                 term_idx.clone(),
                 cur[db + 6].clone(),
                 cur[db + 7].clone(),
-                cur[db + 10].clone(),
+                region_px,
             ];
             for g in 0..N_GROUPS {
                 chans[g + 1].push((region_read.clone(), is_ch[g].clone()));
@@ -2623,6 +2679,38 @@ mod wrap_air {
                     builder.assert_zero(ich.clone() * (ich.clone() - one.clone()));
                     chans[nt + g].push((vec![leaf_key.clone(), lv0.clone(), lv1.clone()], ich * n_heads.clone()));
                 }
+            }
+
+            // **Brick 4d — the leaf-hash→px bus** (last channel, narrow_ov only). The ov opened-row carrier is
+            // externalized: each TRACE term's px is bound to the authenticated input-Merkle leaf lane, query-keyed by
+            // the held query point `lqk`(=x). Leaf-hash rows PROVIDE `[lqk, term, leaf_lane]` under BOTH shared DEEP
+            // terms `trm_trace(c)`/`trm_next(c)` (−w_lsel); each trace region row READS `[x, term_idx, cur[db+10]]`
+            // (+df_sel·(1−df_is_quot)). Balance ⇒ every trace region px == the leaf felt at its (query, column). `pz`
+            // (bound by the sponge/pz buses) is unchanged; only `px` moves off the dropped `ov` carrier.
+            if self.narrow_ov {
+                let lhpx = n_chan - 1;
+                let rate = Self::RATE;
+                let pbase = self.leaf_periodic_base();
+                let dq = cur[self.df_is_quot()].clone();
+                builder.assert_zero(df_sel.clone() * dq.clone() * (dq.clone() - one.clone()));
+                let held = cur[self.held_lqk()].clone();
+                builder.assert_zero(is_head.clone() * (held.clone() - x_head.clone()));
+                let hold = p[self.m.s_query()].clone() * (one.clone() - p[self.m.p_st_last()].clone());
+                builder.when_transition().assert_zero(hold * (nxt[self.held_lqk()].clone() - held.clone()));
+                for l in 0..rate {
+                    builder.assert_zero(cur[self.w_term0(l)].clone() - p[pbase + 3 * l].clone());
+                    builder.assert_zero(cur[self.w_term1(l)].clone() - p[pbase + 3 * l + 1].clone());
+                    builder.assert_zero(cur[self.w_lsel(l)].clone() - p[pbase + 3 * l + 2].clone());
+                }
+                let mut lh: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(2 * rate + 1);
+                for l in 0..rate {
+                    let neg_sel = AB::Expr::ZERO - cur[self.w_lsel(l)].clone();
+                    lh.push((vec![held.clone(), cur[self.w_term0(l)].clone(), cur[l].clone()], neg_sel.clone()));
+                    lh.push((vec![held.clone(), cur[self.w_term1(l)].clone(), cur[l].clone()], neg_sel));
+                }
+                let df_is_trace = df_sel.clone() * (one.clone() - dq);
+                lh.push((vec![x.0.clone(), term_idx.clone(), cur[db + 10].clone()], df_is_trace));
+                chans[lhpx] = lh;
             }
 
             for ch in chans {
@@ -4798,7 +4886,7 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values (like opening_bind_cw_composes).
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
-        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0 };
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0, narrow_ov: false, leaf_periodics: vec![] };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -4880,7 +4968,7 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
-        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: true, folded_addr: 1 << 20, quot_addr: 1 << 21 };
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: true, folded_addr: 1 << 20, quot_addr: 1 << 21, narrow_ov: false, leaf_periodics: vec![] };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -4905,6 +4993,54 @@ mod tests {
             "ro + N_GROUPS z/px + pz + sponge + op-table folded wiring + N_GROUPS non-trace-leaf split"
         );
         assert!(log_nqc <= LOG_BLOWUP, "brick 5d op-table + openings coexistence must compose within budget (got {log_nqc})");
+    }
+
+    /// **Brick 4d (compose) — the narrow_ov openings-wrap composes.** The full assembled openings-wrap (DeepFold + ro
+    /// + z/px + pz + sponge) with `narrow_ov`: the ov opened-row carrier DROPPED, the z/px bus provides px=0 for TRACE
+    /// terms, and the leaf-hash→px bus (held `lqk` + `[lqk, term]` key + 2-provides/lane) binds trace px to the
+    /// authenticated leaf lane. Composes at `log_nqc ≤ LOG_BLOWUP` — the DEGREE de-risk for the assembled narrow_ov
+    /// prove (balance + prove next). Additive; flag-off byte-identical (the proven openings/optable compose untouched).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_openings_wrap_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts, binds, index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(), n_terms,
+            inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
+            constraints, w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true, narrow_caps: false, narrow_openings: true, narrow_ov: true,
+        };
+        let h = m.height();
+        let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
+        let leaf_periodics = vec![vec![Val::ZERO; h]; 3 * AssembledOpeningsWrapCwAir::RATE];
+        let air = AssembledOpeningsWrapCwAir {
+            m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0, narrow_ov: true, leaf_periodics,
+        };
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "Brick 4d (compose): narrow_ov openings-wrap width {width}, {} channels (+ leaf-hash→px), log_nqc \
+             {log_nqc} ≤ {LOG_BLOWUP} — the ov carrier externalized (px=0 for trace on the z/px bus, bound via the \
+             leaf-hash bus keyed by held lqk=x).",
+            lookups.len()
+        );
+        assert_eq!(lookups.len(), N_GROUPS + 4, "ro + N_GROUPS z/px + pz + sponge + leaf-hash→px");
+        assert!(log_nqc <= LOG_BLOWUP, "the narrow_ov openings-wrap must compose within budget (got {log_nqc})");
     }
 
     /// **AA6 openings AA3 — assemble the cw=true narrow-openings wrap trace** (the [`AssembledOpeningsWrapCwAir`]
@@ -5191,7 +5327,7 @@ mod tests {
         }
 
         (
-            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr },
+            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr, narrow_ov: false, leaf_periodics: Vec::new() },
             RowMajorMatrix::new(wide, width),
             Vec::new(),
         )
