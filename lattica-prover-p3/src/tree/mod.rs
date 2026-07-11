@@ -163,8 +163,19 @@ pub mod degree_probe {
 /// wrap must drive `B < 1`; P2 showed a lookup carries **fixed degree (3) and fixed width** independent of
 /// the value looked up, which is precisely the per-column contraction the fixed point requires.
 pub mod size_model {
-    /// Two measured self-verification points `(W_in, W_out)` from the monolith probes.
+    /// Two measured self-verification points `(W_in, W_out)` from the monolith probes — the DIVERGENT baseline
+    /// (`B ≈ 48 ≫ 1`, no fixed point). These stay as the "before"; the narrowed measurement below is the "after".
     pub const MONOLITH_POINTS: [(f64, f64); 2] = [(19.0, 193.0), (193.0, 8520.0)];
+
+    /// The MEASURED narrowed self-composition (`wrap/air.rs::self_composition_b_narrowed`, +openings geometry,
+    /// HEAD `9d231e4`): a monolith verifying a W=193 inner emits `W_out = 870`, with MARGINAL slope `B = 1.00`.
+    /// The arith-tile / caps / openings regions are externalized narrow-tall (columns → rows), so the ONLY region
+    /// still scaling with the inner width is the +1 `ov` opened-row carrier (`input_leaf_felts = w_inner`, the
+    /// authenticated Merkle-leaf preimage). ⇒ the narrowed recurrence `W_out = 677 + 1.00·W_in` sits EXACTLY on the
+    /// fixed-point boundary: NO attracting fixed point yet. Externalizing the `ov` carrier drops the last +1 ⇒
+    /// `B < 1` ⇒ an attracting canonical `W* = A/(1−B)`.
+    pub const NARROWED_POINT: (f64, f64) = (193.0, 870.0);
+    pub const NARROWED_MARGINAL_B: f64 = 1.00;
 
     /// Fit the linear recurrence `W_out = A + B·W_in` from two points → `(A, B)`.
     pub fn fit_recurrence(p0: (f64, f64), p1: (f64, f64)) -> (f64, f64) {
@@ -231,11 +242,27 @@ mod tests {
         assert!(b_m > 1.0, "monolith is an expansion (B = {b_m:.1} ≫ 1)");
         assert!(attracting_fixed_point(a_m, b_m).is_none(), "expansion ⇒ no attracting fixed point ⇒ diverges");
 
-        // WRAP — a lookup-based verifier makes the per-inner-column cost a bounded lookup (P2: fixed
-        // degree 3 + fixed width, independent of the value) ⇒ B < 1 ⇒ an attracting fixed point exists.
-        let (a_w, b_w) = (300.0, 0.5); // illustrative contraction; the real B is the wrap's per-query lookup cost
+        // NARROWED (MEASURED — self_composition_b_narrowed, +openings): the arith / caps / openings regions are
+        // externalized narrow-tall ⇒ the marginal B fell 48 → 1.00, the fixed-point BOUNDARY. Only the +1 `ov`
+        // opened-row carrier still scales, so there is still NO attracting fixed point (B is not strictly < 1).
+        let a_n = NARROWED_POINT.1 - NARROWED_MARGINAL_B * NARROWED_POINT.0; // 677
+        println!(
+            "SIZE-MODEL narrowed (MEASURED, +openings): W_out = {a_n:.0} + {NARROWED_MARGINAL_B:.2}·W_in ⇒ \
+             attracting fixed point = {:?} — B=1.00 is the boundary (the +1 `ov` opened-row carrier)",
+            attracting_fixed_point(a_n, NARROWED_MARGINAL_B)
+        );
+        assert!(NARROWED_MARGINAL_B <= 1.0 && NARROWED_MARGINAL_B >= 1.0, "the narrowing brought the marginal B from ~48 onto the 1.00 boundary");
+        assert!(
+            attracting_fixed_point(a_n, NARROWED_MARGINAL_B).is_none(),
+            "at B=1.00 (the residual `ov` carrier) there is STILL no attracting fixed point — externalize the ov carrier to cross below 1"
+        );
+
+        // POST-OV-EXTERNALIZATION (projected): externalizing the `ov` opened-row carrier narrow-tall drops the last
+        // +1 ⇒ B < 1 (a contraction) ⇒ an attracting canonical fixed point W* exists. (Illustrative B until built —
+        // the real B is the residual after the ov carrier moves to rows on a bus, mirroring narrow_openings.)
+        let (a_w, b_w) = (300.0, 0.5);
         let w_star = attracting_fixed_point(a_w, b_w).expect("a contraction has an attracting fixed point");
-        println!("SIZE-MODEL wrap (contraction B = {b_w}): canonical W* = {w_star:.0}");
+        println!("SIZE-MODEL post-ov (projected contraction B = {b_w}): canonical W* = {w_star:.0}");
         assert!(b_w < 1.0 && w_star.is_finite() && w_star > 0.0);
     }
 
