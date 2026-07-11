@@ -6419,18 +6419,19 @@ mod tests {
     }
 
     /// **Self-composition B at the NARROWED geometry** (`--release --ignored`, heavy — proves an inner monolith).
-    /// Quantifies how far the deep-tree fixed point B≤1 is AFTER the arith-tile + caps narrow-tall swaps (this
-    /// session's capstone). Builds the R5 self-recursion outer (a monolith verifying a W≈193 inner ConstAir
-    /// monolith) and reads its `fused_w` at the FULL vs the NARROWED (`narrow_arith` + `narrow_caps`) geometry, plus
-    /// the MARGINAL B = `d(fused_w)/d(w_inner)` — the asymptotic fixed-point ratio (the constant base cost
-    /// amortizes as the inner grows, so the SLOPE is what decides convergence). `fused_w` is a pure width function
-    /// ⇒ the narrowed + Δ variants need no re-prove. FINDING: absolute B 44×→8.7×, marginal 19→5 — the narrowing
-    /// cut both, but the marginal B is STILL > 1 (the arith tile `2·n_terms` ≈ `4·w_inner` + the carriers scale
-    /// with the inner) ⇒ CANONICALIZATION (freeze `w_inner`/`nqc`/`cap_height` ⇒ those inner-scaling regions become
-    /// CONSTANT ⇒ marginal B → 0) is the remaining fixed-point lever, not another narrow-tall swap.
+    /// Quantifies how far the deep-tree fixed point B≤1 is AFTER the arith-tile + caps + OPENINGS narrow-tall swaps.
+    /// Builds the R5 self-recursion outer (a monolith verifying a W≈193 inner ConstAir monolith) and reads its
+    /// `fused_w` at THREE geometry points — FULL, `narrow_arith`+`narrow_caps`, and +`narrow_openings` — plus the
+    /// MARGINAL B = `d(fused_w)/d(w_inner)` (the asymptotic fixed-point ratio: the constant base cost amortizes as
+    /// the inner grows, so the SLOPE decides convergence). `fused_w` is a pure width function ⇒ the variants need no
+    /// re-prove. FINDING: absolute B 44×→8.7×→(openings) further; marginal **19 → 5 → ~1.00**. The openings
+    /// externalization drops the arith-tile slope (`2·n_terms`) to 0, leaving ONLY the +1 `ov` opened-row/trace-leaf
+    /// carrier (`input_leaf_felts = w_inner`) — so marginal B lands on the fixed-point BOUNDARY ≈ 1.00.
+    /// CANONICALIZATION (freeze `w_inner`/`nqc`/`cap_height` ⇒ the inner-scaling regions become CONSTANT ⇒ slope → 0)
+    /// — or externalizing the `ov` carrier narrow-tall — is the remaining lever to push B strictly < 1.
     #[cfg(feature = "recursion")]
     #[test]
-    #[ignore = "heavy (proves an inner monolith): measures the self-composition B at the narrowed geometry (B 44×→8.7×, marginal 19→5); run `--release --features recursion -j1 -- --ignored`"]
+    #[ignore = "heavy (proves an inner monolith): measures the self-composition B at the narrowed geometry (marginal 19→5→~1.00 across FULL/arith+caps/+openings); run `--release --features recursion -j1 -- --ignored`"]
     fn self_composition_b_narrowed() {
         use crate::config::Challenge;
         use crate::recursion::monolith::tests::{build_symbolic_inner_window, sim_full};
@@ -6513,32 +6514,40 @@ mod tests {
         // the MARGINAL slope, with NO re-prove. Scale the w_inner-coupled inputs (w_inner + n_terms ≈ 2·w_inner) by
         // Δ; the FRI structure (nqc/cap_height/n_binds) is held (it scales only ~log with the inner size).
         let inner_w = w_in;
-        let mk_outer = |w_inner: usize, nt: usize, narrow: bool| MonolithAir {
+        // `narrow` toggles arith(9→2)+caps; `nopen` ADDS the openings externalization (arith_stride→0). The three
+        // geometry points are FULL / arith+caps / +openings. (narrow_openings REQUIRES narrow_arith, so OR it in.)
+        let mk_outer = |w_inner: usize, nt: usize, narrow: bool, nopen: bool| MonolithAir {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: nt,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_inner, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h, narrow_arith: narrow, narrow_caps: narrow, narrow_openings: false };
-        let outer_w = mk_outer(w_in, ont, false).fused_w();
-        let outer_narrow_w = mk_outer(w_in, ont, true).fused_w();
+            cap_height: cap_h, narrow_arith: narrow || nopen, narrow_caps: narrow, narrow_openings: nopen };
+        let outer_w = mk_outer(w_in, ont, false, false).fused_w();
+        let outer_narrow_w = mk_outer(w_in, ont, true, false).fused_w(); // arith 9→2 + caps
+        let outer_open_w = mk_outer(w_in, ont, true, true).fused_w(); // + openings externalized (arith_stride→0)
         let d = 256usize;
-        let marg = |narrow: bool| {
-            (mk_outer(w_in + d, ont + 2 * d, narrow).fused_w() - mk_outer(w_in, ont, narrow).fused_w()) as f64
+        let marg = |narrow: bool, nopen: bool| {
+            (mk_outer(w_in + d, ont + 2 * d, narrow, nopen).fused_w() - mk_outer(w_in, ont, narrow, nopen).fused_w())
+                as f64
                 / d as f64
         };
-        let (mb_full, mb_narrow) = (marg(false), marg(true));
+        let (mb_full, mb_narrow, mb_open) = (marg(false, false), marg(true, false), marg(true, true));
         println!(
-            "SELF-COMPOSITION B (R5, inner monolith W={inner_w}): outer fused_w FULL {outer_w} (B {:.1}×) → \
-             NARROWED (arith 9→2/term + caps dropped+FS-anchored) {outer_narrow_w} (B {:.1}×). MARGINAL B = \
-             d(fused_w)/d(w_inner): FULL {mb_full:.2} → NARROWED {mb_narrow:.2} cols/col. The narrowing cut BOTH the \
-             absolute width and the SLOPE, but the narrowed marginal B is STILL > 1 (the arith tile 2·n_terms ≈ \
-             4·w_inner + the carriers scale with the inner) ⇒ the tree still GROWS. CANONICALIZATION (freeze \
-             w_inner/nqc/cap_height ⇒ those inner-scaling regions become CONSTANT ⇒ marginal B → 0) is THE \
-             remaining fixed-point lever.",
+            "SELF-COMPOSITION B (R5, inner monolith W={inner_w}): outer fused_w FULL {outer_w} (B {:.1}×) → NARROWED \
+             (arith 9→2 + caps) {outer_narrow_w} (B {:.1}×) → +OPENINGS externalized {outer_open_w} (B {:.1}×). \
+             MARGINAL B = d(fused_w)/d(w_inner): FULL {mb_full:.2} → arith+caps {mb_narrow:.2} → +openings \
+             {mb_open:.2} cols/col. The openings externalization drops the arith-tile slope (2·n_terms) to 0, \
+             leaving ONLY the +1 `ov` opened-row/trace-leaf carrier (input_leaf_felts = w_inner) ⇒ marginal B → \
+             ~1.00, the fixed-point BOUNDARY. CANONICALIZATION (freeze w_inner/nqc/cap_height) — or externalizing \
+             the `ov` carrier narrow-tall — drives it strictly < 1.",
             outer_w as f64 / inner_w as f64,
             outer_narrow_w as f64 / inner_w as f64,
+            outer_open_w as f64 / inner_w as f64,
         );
         assert!(outer_narrow_w < outer_w, "the arith+caps narrowing must shrink the R5 outer width ({outer_w} → {outer_narrow_w})");
-        assert!(mb_narrow < mb_full, "narrowing must reduce the marginal (asymptotic) B ({mb_full:.2} → {mb_narrow:.2})");
-        assert!(mb_narrow > 1.0, "un-canonicalized, the narrowed marginal B is STILL > 1 — canonicalization is the fixed-point lever");
+        assert!(outer_open_w < outer_narrow_w, "externalizing the openings must shrink the outer further ({outer_narrow_w} → {outer_open_w}, drops 2·n_terms pz)");
+        assert!(mb_narrow < mb_full, "arith+caps narrowing must reduce the marginal (asymptotic) B ({mb_full:.2} → {mb_narrow:.2})");
+        assert!(mb_narrow > 1.0, "arith+caps ALONE leaves marginal B > 1 ({mb_narrow:.2}) — the openings externalization is the further lever");
+        assert!(mb_open < mb_narrow, "the openings externalization must reduce the marginal B further ({mb_narrow:.2} → {mb_open:.2})");
+        assert!(mb_open <= 1.5, "with openings externalized the marginal B drops to ~1.00 (only the `ov` trace-leaf carrier remains); canonicalization drives it to 0 (got {mb_open:.2})");
     }
 }
