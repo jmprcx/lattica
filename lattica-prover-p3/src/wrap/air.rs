@@ -2495,11 +2495,16 @@ mod wrap_air {
                     let qb = self.m.qwt_base() + 2 * i;
                     chans[nt + route(a)].push((vec![oidv(a), cur[self.m.pw(qb)].clone(), cur[self.m.pw(qb + 1)].clone()], neg_head.clone()));
                 }
-                // Non-trace leaf reads: one is_ch-routed read per split channel (gated; only the matching channel fires).
+                // Non-trace leaf reads: one is_ch-routed read per split channel (gated; only the matching channel
+                // fires). The head PROVIDES each non-trace opening once PER head (−is_head, ×n_heads total from the
+                // constant window), so the single op-table leaf reads `is_ch·n_heads` to balance (the cw=false
+                // `assemble_wrap` scaling). TRACE leaves differ: their opening-row provides ONCE (or_mult absorbs the
+                // single op-table read), so the trace-leaf read above is `is_tr_leaf` (unscaled).
+                let n_heads = AB::Expr::from(Goldilocks::from_u64(self.m.n_queries as u64));
                 for g in 0..N_GROUPS {
                     let ich = cur[self.op_is_ch(g)].clone();
                     builder.assert_zero(ich.clone() * (ich.clone() - one.clone()));
-                    chans[nt + g].push((vec![leaf_key.clone(), lv0.clone(), lv1.clone()], ich));
+                    chans[nt + g].push((vec![leaf_key.clone(), lv0.clone(), lv1.clone()], ich * n_heads.clone()));
                 }
             }
 
@@ -4129,6 +4134,7 @@ mod tests {
         config: &crate::recursion::native_fri::MyConfig,
         proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
         pvs: &[Val],
+        bind_optable: bool,
     ) -> (AssembledOpeningsWrapCwAir, RowMajorMatrix<Val>, Vec<Val>) {
         use crate::config::Challenge;
         use crate::joinsplit_air::{JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
@@ -4180,7 +4186,7 @@ mod tests {
         let st_base = or_base + 6;
         let w_gi = |l: usize| st_base + 2 * l;
         let w_sel = |l: usize| st_base + 2 * l + 1;
-        let width = fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * rate;
+        let width = fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * rate + if bind_optable { 16 + N_GROUPS } else { 0 };
 
         // The FS-absorbed opening stream: positions[gi] = (oid, coeff, block, lane); committed[gi] = the felt
         // (== block_inputs[block][lane], the absorbed rate lane). A DEEP term k's F_p² opening is the pair
@@ -4272,10 +4278,135 @@ mod tests {
             wide[b + or_pz + 1] = committed[2 * k + 1];
             wide[b + or_sel] = Val::ONE;
             wide[b + or_k] = Val::from_u64(k as u64);
-            wide[b + or_mult] = Val::ZERO - Val::from_u64(m.n_queries as u64);
+            // Each term is provided once to the DeepFold (−n_queries reads); when bind_optable the op-table ALSO
+            // reads every term once (trace via a preseed leaf, quot via the recompose), so or_mult absorbs the +1.
+            wide[b + or_mult] = Val::ZERO - Val::from_u64(m.n_queries as u64 + if bind_optable { 1 } else { 0 });
         }
 
-        (AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0 }, RowMajorMatrix::new(wide, width), Vec::new())
+        // Brick 5d.4 — the op-table epilogue region (bind_optable): computes `folded` (the α-fold of the constraint
+        // c_k) + `quot` (Σ zps_i·chunk_i), both bound to folded_col/quot_col via the wiring bus; its opening leaves
+        // bound to the FS opening-rows (trace/quot, at term_idx) or the head's window provide (non-trace/qwt).
+        let (mut folded_addr, mut quot_addr) = (0u64, 0u64);
+        if bind_optable {
+            use crate::recursion::native_fri::{epilogue_openings, quotient_recompose_weights};
+            use crate::wrap::{op_table_f2_trace, QuotChunk};
+            use p3_uni_stark::{BaseEntry, BaseLeaf};
+
+            let op_base = st_base + 2 * rate;
+            let (op_sel_c, is_tr_leaf_c, leaf_key_c) = (op_base + 13, op_base + 14, op_base + 15);
+            let op_is_ch = |g: usize| op_base + 16 + g;
+            let cs = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+            let (wu, npu, nperu) = (m.w_inner() as u64, m.n_pub() as u64, m.n_periodic() as u64);
+
+            // Native OOD openings at ζ (the leaf values) + the nqc quotient-recompose weights zps_i.
+            let (_eo_local, _eo_next, is_first, is_last, is_trans, _iv, _eo_quot, eo_alpha, _z, eo_periodic) =
+                epilogue_openings(config, &JoinSplitAir, proof, pvs);
+            let zps = quotient_recompose_weights(config, &JoinSplitAir, proof, pvs);
+            let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
+            let opening = |term: usize| Challenge::from_basis_coefficients_fn(|i| committed[2 * term + i]);
+
+            // seed: TRACE openings sourced from `committed` (== the opening-rows' pz, so the trace-leaf reads
+            // balance bit-for-bit); non-trace from the native epilogue (== the head's window provides).
+            let seed = |l: &BaseLeaf<Val>| -> Challenge {
+                match l {
+                    BaseLeaf::Constant(c) => Challenge::from(*c),
+                    BaseLeaf::Variable(v) => match v.entry {
+                        BaseEntry::Main { offset } => {
+                            opening(if offset == 0 { m.trm_trace(v.index) } else { m.trm_next(v.index) })
+                        }
+                        BaseEntry::Public => pubs[v.index],
+                        BaseEntry::Periodic => eo_periodic[v.index],
+                        BaseEntry::Preprocessed { .. } => panic!("preprocessed columns unsupported"),
+                    },
+                    BaseLeaf::IsFirstRow => is_first,
+                    BaseLeaf::IsLastRow => is_last,
+                    BaseLeaf::IsTransition => is_trans,
+                }
+            };
+
+            // preseed: TRACE openings at term_idx (open_id = the DEEP term index — a trace leaf bound to the
+            // opening-row); NON-trace at their canonical OPEN_BASE open_id (bound to the head's window provide).
+            let mut preseed: Vec<((u8, u64), Challenge, u64)> = Vec::new();
+            for c in 0..m.w_inner() {
+                let (lt, nt) = (m.trm_trace(c), m.trm_next(c));
+                preseed.push(((0, c as u64), opening(lt), lt as u64));
+                preseed.push(((1, c as u64), opening(nt), nt as u64));
+            }
+            for i in 0..m.n_pub() {
+                preseed.push(((2, i as u64), pubs[i], open_id((2, i as u64), wu, npu, nperu)));
+            }
+            for i in 0..m.n_periodic() {
+                preseed.push(((3, i as u64), eo_periodic[i], open_id((3, i as u64), wu, npu, nperu)));
+            }
+            preseed.push(((4, 0), is_first, open_id((4, 0), wu, npu, nperu)));
+            preseed.push(((5, 0), is_last, open_id((5, 0), wu, npu, nperu)));
+            preseed.push(((6, 0), is_trans, open_id((6, 0), wu, npu, nperu)));
+
+            // quot recompose chunks: d0_i/d1_i from `committed` at trm_quot(i,0/1) (TRACE leaves at term_idx);
+            // zps_i the weight (NON-trace leaf at open_id((7,i))).
+            let chunks: Vec<QuotChunk> = (0..m.nqc())
+                .map(|i| {
+                    let (t0, t1) = (m.trm_quot(i, 0), m.trm_quot(i, 1));
+                    QuotChunk {
+                        d0: opening(t0),
+                        d0_oid: t0 as u64,
+                        d1: opening(t1),
+                        d1_oid: t1 as u64,
+                        zps: zps[i],
+                        zps_oid: open_id((7, i as u64), wu, npu, nperu),
+                    }
+                })
+                .collect();
+
+            let (op_matrix, _roots, folded, leaf_bindings, quot) =
+                op_table_f2_trace(&cs, seed, Some(eo_alpha), &preseed, Some(&chunks));
+            let (folded_val, faddr) = folded.expect("the join-split epilogue folds to a value");
+            let (quot_val, qaddr) = quot.expect("the quot recompose returns a value");
+            folded_addr = faddr;
+            quot_addr = qaddr;
+
+            // Place the op-table in the slack AFTER the opening-rows; the folded/quot output wires are read n_heads
+            // times by the arith heads (not internally), so override their out_mult to −n_heads.
+            let op_start = or_start + n_terms;
+            let op_h = op_matrix.values.len() / 13;
+            assert!(
+                op_start + op_h <= h,
+                "op-table rows ({op_h}) must fit the slack after DeepFold+opening-rows ({})",
+                h.saturating_sub(op_start)
+            );
+            let nheads = m.n_queries as u64;
+            for i in 0..op_h {
+                let dst = op_start + i;
+                let mut cols: [Val; 13] = op_matrix.values[i * 13..i * 13 + 13].try_into().unwrap();
+                if cols[3] == Val::from_u64(folded_addr) || cols[3] == Val::from_u64(quot_addr) {
+                    cols[12] = Val::ZERO - Val::from_u64(nheads);
+                }
+                wide[dst * width + op_base..dst * width + op_base + 13].copy_from_slice(&cols);
+                wide[dst * width + op_sel_c] = Val::ONE;
+            }
+            // Mark the opening-leaf rows: TRACE leaves (open_id < OPEN_BASE = the term index) read at leaf_key on the
+            // pz channel (is_tr_leaf); NON-trace leaves (open_id ≥ OPEN_BASE) read at leaf_key on their split channel.
+            for &(row, oid) in &leaf_bindings {
+                let dst = op_start + row;
+                wide[dst * width + leaf_key_c] = Val::from_u64(oid);
+                if oid < OPEN_BASE {
+                    wide[dst * width + is_tr_leaf_c] = Val::ONE;
+                } else {
+                    wide[dst * width + op_is_ch(((oid - OPEN_BASE) as usize) % N_GROUPS)] = Val::ONE;
+                }
+            }
+            // Fill folded_col (fw+2) / quot_col (fw+4) at the arith heads (read from the wiring bus).
+            for &head in &heads {
+                wide[head * width + fw + 2..head * width + fw + 4].copy_from_slice(&cc(folded_val));
+                wide[head * width + fw + 4..head * width + fw + 6].copy_from_slice(&cc(quot_val));
+            }
+        }
+
+        (
+            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr },
+            RowMajorMatrix::new(wide, width),
+            Vec::new(),
+        )
     }
 
     /// **AA6 openings AA3 — all `N_GROUPS+3` channels balance** (native, cheap — NO prove). Assemble the cw=true
@@ -4300,7 +4431,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false);
 
         let m = &asm.m;
         let (fw, h) = (m.fused_w(), m.height());
@@ -4376,6 +4507,140 @@ mod tests {
         );
     }
 
+    /// **AA6 brick 5d.4 — the op-table + openings assembled trace balances ALL 2·N_GROUPS+4 channels** (native,
+    /// cheap — NO prove). Assemble with `bind_optable`: the op-table region computes `folded` (α-fold of the c_k) +
+    /// `quot` (Σ zps_i·chunk_i) and its opening leaves bind to the FS opening-rows (trace/quot) / the head's window
+    /// provides (non-trace/qwt). Confirms every bus channel nets to zero as a signed multiset — the openings channels
+    /// (ro/z/px/pz/sponge, as `openings_wrap_cw_assembled_bus_balances`, but with `or_mult = −(n_queries+1)` now
+    /// absorbing the op-table's per-term read), PLUS: the folded/quot wiring bus (op-table wires define/read + the
+    /// heads read folded_col/quot_col), the pz channel's op-table trace-leaf reads, and the N_GROUPS non-trace split
+    /// (head provides pub/periodic/sel/is_trans/qwt, op-table leaves read `is_ch·n_heads`). Localizes any addressing /
+    /// multiplicity / leaf-marking / recompose bug before the heavy `prove_lookup`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn optable_openings_wrap_cw_bus_balances() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_field::{Field, PrimeField64, TwoAdicField};
+        use p3_goldilocks::Goldilocks;
+        use p3_uni_stark::prove;
+        use std::collections::HashMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true);
+
+        let m = &asm.m;
+        let (fw, h) = (m.fused_w(), m.height());
+        let rate = AssembledOpeningsWrapCwAir::RATE;
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        let (ro_col, db) = (fw, fw + 6);
+        let (df_sel, df_end, is_head, term_idx, is_ch0) = (db + 18, db + 20, db + 21, db + 22, db + 23);
+        let or_base = db + 23 + N_GROUPS;
+        let (or_gi, or_pz, or_sel, or_k, or_mult) = (or_base, or_base + 1, or_base + 3, or_base + 4, or_base + 5);
+        let st_base = or_base + 6;
+        let (w_gi, w_sel) = (|l: usize| st_base + 2 * l, |l: usize| st_base + 2 * l + 1);
+        // op-table columns.
+        let op_base = st_base + 2 * rate;
+        let (op_sel_c, is_tr_leaf_c, leaf_key_c) = (op_base + 13, op_base + 14, op_base + 15);
+        let op_is_ch = |g: usize| op_base + 16 + g;
+        let (folded_col, quot_col) = (fw + 2, fw + 4);
+        let (wch, nt) = (N_GROUPS + 3, N_GROUPS + 4);
+        let ku = |v: Val| v.as_canonical_u64();
+        let g_trace = Goldilocks::two_adic_generator(m.cm_rounds() - m.is_zk);
+        let g_inv = Goldilocks::two_adic_generator(m.cm_rounds() - m.is_zk).inverse();
+        let nheads = Val::from_u64(m.n_queries as u64);
+        let (wu, npu, nperu) = (m.w_inner() as u64, m.n_pub() as u64, m.n_periodic() as u64);
+        let route = |a: u64| ((a - OPEN_BASE) as usize) % N_GROUPS;
+
+        let mut bus: HashMap<(usize, Vec<u64>), Val> = HashMap::new();
+        let neg1 = Val::ZERO - Val::ONE;
+        for r in 0..h {
+            let b = r * width;
+            let g = |c: usize| trace.values[b + c];
+            // ---- openings channels (as openings_wrap_cw_assembled_bus_balances) ----
+            if g(df_end) == Val::ONE {
+                *bus.entry((0, vec![ku(g(db + 2)), ku(g(db + 3)), ku(g(db + 16)), ku(g(db + 17))])).or_insert(Val::ZERO) += neg1;
+            }
+            if g(is_head) == Val::ONE {
+                let x_head = <Goldilocks as Field>::GENERATOR * g(m.qt_acc() + m.lg() - 1);
+                *bus.entry((0, vec![ku(x_head), 0, ku(g(ro_col)), ku(g(ro_col + 1))])).or_insert(Val::ZERO) += Val::ONE;
+                let (z0f, z1f) = (g(m.pw(2)), g(m.pw(3)));
+                for k in 0..m.n_terms {
+                    let (z0, z1) = if k >= m.trm_next_base() && k < m.trm_quot_base() { (z0f * g_trace, z1f * g_trace) } else { (z0f, z1f) };
+                    let tuple = vec![ku(x_head), 0, k as u64, ku(z0), ku(z1), ku(g(m.px_source(k)))];
+                    *bus.entry((k % N_GROUPS + 1, tuple)).or_insert(Val::ZERO) += neg1;
+                }
+                // wiring reads (folded/quot) + the non-trace provides.
+                *bus.entry((wch, vec![asm.folded_addr, ku(g(folded_col)), ku(g(folded_col + 1))])).or_insert(Val::ZERO) += Val::ONE;
+                *bus.entry((wch, vec![asm.quot_addr, ku(g(quot_col)), ku(g(quot_col + 1))])).or_insert(Val::ZERO) += Val::ONE;
+                for i in 0..m.n_pub() {
+                    let a = open_id((2, i as u64), wu, npu, nperu);
+                    *bus.entry((nt + route(a), vec![a, ku(g(m.pw(m.pub_pi() + i))), 0])).or_insert(Val::ZERO) += neg1;
+                }
+                for i in 0..m.n_periodic() {
+                    let (a, bb) = (open_id((3, i as u64), wu, npu, nperu), m.periodic_base() + 2 * i);
+                    *bus.entry((nt + route(a), vec![a, ku(g(m.pw(bb))), ku(g(m.pw(bb + 1)))])).or_insert(Val::ZERO) += neg1;
+                }
+                for (key, s) in [((4u8, 0u64), m.sel(0)), ((5u8, 0u64), m.sel(2))] {
+                    let a = open_id(key, wu, npu, nperu);
+                    *bus.entry((nt + route(a), vec![a, ku(g(s)), ku(g(s + 1))])).or_insert(Val::ZERO) += neg1;
+                }
+                let a6 = open_id((6, 0), wu, npu, nperu);
+                *bus.entry((nt + route(a6), vec![a6, ku(g(m.pw(2)) - g_inv), ku(g(m.pw(3)))])).or_insert(Val::ZERO) += neg1;
+                for i in 0..m.nqc() {
+                    let (a, qb) = (open_id((7, i as u64), wu, npu, nperu), m.qwt_base() + 2 * i);
+                    *bus.entry((nt + route(a), vec![a, ku(g(m.pw(qb))), ku(g(m.pw(qb + 1)))])).or_insert(Val::ZERO) += neg1;
+                }
+            }
+            if g(df_sel) == Val::ONE {
+                let gch = (0..N_GROUPS).find(|&gc| g(is_ch0 + gc) == Val::ONE).expect("a region row routes to one channel");
+                let tuple = vec![ku(g(db + 2)), ku(g(db + 3)), ku(g(term_idx)), ku(g(db + 6)), ku(g(db + 7)), ku(g(db + 10))];
+                *bus.entry((gch + 1, tuple)).or_insert(Val::ZERO) += Val::ONE;
+                *bus.entry((N_GROUPS + 1, vec![ku(g(term_idx)), ku(g(db + 8)), ku(g(db + 9))])).or_insert(Val::ZERO) += Val::ONE;
+            }
+            if g(or_sel) == Val::ONE {
+                *bus.entry((N_GROUPS + 1, vec![ku(g(or_k)), ku(g(or_pz)), ku(g(or_pz + 1))])).or_insert(Val::ZERO) += g(or_mult);
+                for i in 0..2u64 {
+                    *bus.entry((N_GROUPS + 2, vec![ku(g(or_gi)) + i, ku(g(or_pz + i as usize))])).or_insert(Val::ZERO) += Val::ONE;
+                }
+            }
+            for l in 0..rate {
+                if g(w_sel(l)) == Val::ONE {
+                    *bus.entry((N_GROUPS + 2, vec![ku(g(w_gi(l))), ku(g(l))])).or_insert(Val::ZERO) += neg1;
+                }
+            }
+            // ---- op-table channels (bind_optable) ----
+            if g(op_sel_c) == Val::ONE {
+                let is_op = g(op_base) + g(op_base + 1) + g(op_base + 2); // is_mul+is_add+is_sub (0/1)
+                *bus.entry((wch, vec![ku(g(op_base + 6)), ku(g(op_base + 7)), ku(g(op_base + 8))])).or_insert(Val::ZERO) += is_op; // read a
+                *bus.entry((wch, vec![ku(g(op_base + 9)), ku(g(op_base + 10)), ku(g(op_base + 11))])).or_insert(Val::ZERO) += is_op; // read b
+                *bus.entry((wch, vec![ku(g(op_base + 3)), ku(g(op_base + 4)), ku(g(op_base + 5))])).or_insert(Val::ZERO) += g(op_base + 12); // define out
+                let (lk, lv0, lv1) = (ku(g(leaf_key_c)), ku(g(op_base + 4)), ku(g(op_base + 5)));
+                if g(is_tr_leaf_c) == Val::ONE {
+                    *bus.entry((N_GROUPS + 1, vec![lk, lv0, lv1])).or_insert(Val::ZERO) += Val::ONE; // trace leaf reads on pz
+                }
+                for gc in 0..N_GROUPS {
+                    if g(op_is_ch(gc)) == Val::ONE {
+                        *bus.entry((nt + gc, vec![lk, lv0, lv1])).or_insert(Val::ZERO) += nheads; // non-trace leaf reads
+                    }
+                }
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != Val::ZERO).count();
+        let bad: Vec<_> = bus.iter().filter(|(_, &v)| v != Val::ZERO).take(8).collect();
+        assert!(bad.is_empty(), "every (channel, tuple) must net to zero; {nonzero} nonzero, e.g. {bad:?}");
+        println!(
+            "op-table + openings cw=true buses ({} channels): {} distinct entries, all net-zero — folded_col + \
+             quot_col bound to the op-table's fold/recompose, its opening leaves bound to the FS opening-rows (trace/\
+             quot) + the window (non-trace/qwt). The epilogue folded·inv_van == quot is now over BOUND values.",
+            2 * N_GROUPS + 4,
+            bus.len()
+        );
+    }
+
     /// **AA6 openings AA4 — the assembled openings-wrap PROVES through `prove_lookup`.** The definitive soundness
     /// check (the `arith_wrap_assembled_proves` / `cap_wrap_cw_assembled_proves` analog for the OPENINGS tile):
     /// build the cw=true narrow-openings trace (the `2·n_terms` pz opening COLUMNS gone) and prove + verify it
@@ -4396,7 +4661,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false);
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
         println!(
             "proving cw=true assembled openings-wrap (ro + {} z/px + pz + sponge FS-anchor): width {width}, {} rows, \
@@ -4413,7 +4678,7 @@ mod tests {
 
         // Corrupt the first opening-row's pz ⇒ BOTH the sponge FS-anchor bus (pz ≠ the FS-absorbed felt) and the pz
         // re-provide bus (opening-row pz ≠ the regions' pz) unbalance ⇒ the corrupted trace must not verify.
-        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs);
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false);
         let fw = asm2.m.fused_w();
         let or_pz = (fw + 6) + 23 + N_GROUPS + 1; // db(fw+6) + 23 + N_GROUPS = or_base; or_pz = or_base + 1
         let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
@@ -4973,8 +5238,8 @@ mod tests {
         preseed.push(((5, 0), is_last, open_id((5, 0), wu, npu, nperu)));
         preseed.push(((6, 0), is_trans, open_id((6, 0), wu, npu, nperu)));
 
-        let (op_matrix, _roots, folded, leaf_bindings) =
-            op_table_f2_trace(&constraints, seed, Some(eo_alpha), &preseed);
+        let (op_matrix, _roots, folded, leaf_bindings, _quot) =
+            op_table_f2_trace(&constraints, seed, Some(eo_alpha), &preseed, None);
         let (folded_val, folded_addr) = folded.expect("the join-split epilogue folds to a value");
 
         let (fw, h) = (air.fused_w(), air.height());
@@ -6045,8 +6310,8 @@ mod tests {
         // columns on slack rows, so the 2·n_mul witnessed COLUMNS become slack ROWS and the wrap width
         // contracts to ≈ fused_w (the inline monolith) — only the folded value is an O(1) net-new binding at
         // the arith head. Height grows to fit the op rows (a proving-time cost, not a width cost).
-        let (optab, _r, _f, _lb) =
-            crate::wrap::op_table_f2_trace(&inner_cs, |_| Challenge::ONE, Some(Challenge::ONE), &[]);
+        let (optab, _r, _f, _lb, _quot) =
+            crate::wrap::op_table_f2_trace(&inner_cs, |_| Challenge::ONE, Some(Challenge::ONE), &[], None);
         let op_rows = optab.values.len() / 13;
         let slack = o_inst_h.saturating_sub(o_used);
         let fits = op_rows <= slack;
