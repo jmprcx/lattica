@@ -603,6 +603,85 @@ impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for Tip5SpreadRoundAi
     }
 }
 
+/// Build a SPREAD-round trace: 256 table rows + per input state a round row (`s`, `sb`, `so`, `x2`) + 4 S-box rows
+/// (one per split lane: bytes + L-images + `sval=s[lane]` + `oval=sb[lane]`). Matches [`Tip5SpreadRoundAir`] so its
+/// two channels balance: ch0 (byte-table) ⇒ `oⱼ = L(kⱼ)`; ch1 (connection) ⇒ each S-box row decomposes the round's
+/// real `s[lane]` and provides the real `sb[lane]`.
+#[cfg(feature = "tip5")]
+pub fn tip5_spread_round_trace(states: &[[u64; 16]]) -> RowMajorMatrix<Val> {
+    use crate::tip5::{MDS_FIRST_COLUMN, ROUND_CONSTANTS};
+    let (n, ns, nb, w) =
+        (Tip5SpreadRoundAir::N, Tip5SpreadRoundAir::NS, Tip5SpreadRoundAir::NB, Tip5SpreadRoundAir::W);
+    let pow7 = |x: Val| {
+        let x2 = x * x;
+        x2 * x2 * x2 * x
+    };
+    let mut count = vec![0u64; 256];
+    for st in states {
+        for i in 0..ns {
+            for byte in st[i].to_le_bytes() {
+                count[byte as usize] += 1;
+            }
+        }
+    }
+    let mut rows: Vec<Val> = Vec::new();
+    for b in 0..256u64 {
+        let mut r = vec![Val::ZERO; w];
+        r[Tip5SpreadRoundAir::K] = Val::from_u64(b);
+        r[Tip5SpreadRoundAir::O] = Val::from_u64(tip5_lookup(b));
+        r[Tip5SpreadRoundAir::TM] = -Val::from_u64(count[b as usize]);
+        rows.extend(r);
+    }
+    for st in states {
+        let s: [Val; 16] = core::array::from_fn(|i| Val::from_u64(st[i]));
+        let mut sb = [Val::ZERO; 16];
+        for i in 0..ns {
+            let mut y = 0u64;
+            for (j, byte) in st[i].to_le_bytes().into_iter().enumerate() {
+                y = y.wrapping_add(tip5_lookup(byte as u64) << (8 * j));
+            }
+            sb[i] = Val::from_u64(y);
+        }
+        for i in ns..n {
+            sb[i] = pow7(s[i]);
+        }
+        // round row
+        let mut rr = vec![Val::ZERO; w];
+        for i in 0..n {
+            rr[Tip5SpreadRoundAir::S + i] = s[i];
+            rr[Tip5SpreadRoundAir::SB + i] = sb[i];
+        }
+        for i in ns..n {
+            rr[Tip5SpreadRoundAir::X2 + (i - ns)] = s[i] * s[i];
+        }
+        for i in 0..n {
+            let mut acc = ROUND_CONSTANTS[i];
+            for j in 0..n {
+                acc += Val::from_u64(MDS_FIRST_COLUMN[(i + n - j) % n]) * sb[j];
+            }
+            rr[Tip5SpreadRoundAir::SO + i] = acc;
+        }
+        rr[Tip5SpreadRoundAir::IS_ROUND] = Val::ONE;
+        rows.extend(rr);
+        // 4 S-box rows
+        for l in 0..ns {
+            let mut sr = vec![Val::ZERO; w];
+            for (j, byte) in st[l].to_le_bytes().into_iter().enumerate() {
+                sr[Tip5SpreadRoundAir::K + j] = Val::from_u64(byte as u64);
+                sr[Tip5SpreadRoundAir::O + j] = Val::from_u64(tip5_lookup(byte as u64));
+            }
+            sr[Tip5SpreadRoundAir::LANE] = Val::from_u64(l as u64);
+            sr[Tip5SpreadRoundAir::SVAL] = s[l];
+            sr[Tip5SpreadRoundAir::OVAL] = sb[l];
+            sr[Tip5SpreadRoundAir::IS_SBOX] = Val::ONE;
+            rows.extend(sr);
+        }
+    }
+    let h = (rows.len() / w).next_power_of_two();
+    rows.resize(h * w, Val::ZERO);
+    RowMajorMatrix::new(rows, w)
+}
+
 /// **AA5 — the in-circuit ORDERED SPONGE-CAP BUS** (feasibility, real data). The FS-anchor AA5 needs binds the
 /// narrow-tall cap region to the caps the transcript sponge ACTUALLY absorbed (so removing the pw cap columns in
 /// cw=true keeps inner-auth non-vacuous, and closes the pre-existing FS⟂auth cap decoupling). This proves that
@@ -1639,6 +1718,73 @@ mod tests {
             log_nqc <= LOG_BLOWUP,
             "spreading to ≤8 lookups/row must reach log_nqc ≤ {LOG_BLOWUP} (got {log_nqc}) — the round-on-one-row was 6"
         );
+    }
+
+    /// **W4 (Tip5 in-circuit) — the SPREAD round's two buses BALANCE** (`--features tip5,lookup`, cheap; native
+    /// multiset, NO prove). On a real spread-round trace, both LogUp channels net to zero: ch0 (byte-table) ⇒ every
+    /// S-box byte `oⱼ = L(kⱼ)`; ch1 (connection) ⇒ each S-box row's `sval` == the round's real `s[lane]` AND its
+    /// `oval` == the round's `sb[lane]` (the round PROVIDES `s[lane]` / READS `sb[lane]`, the S-box row READS /
+    /// PROVIDES). So the spread S-boxes are correctly wired to the round arithmetic — the AA3 balance brick for the
+    /// spread design (compose de-risked by `tip5_spread_round_composes`; the threaded 5-round assembly + prove next).
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_spread_round_balances() {
+        use p3_field::PrimeField64;
+        use std::collections::BTreeMap;
+        const P: u64 = 0xFFFF_FFFF_0000_0001;
+        let signed = |v: u64| -> i64 { if v > P / 2 { (v as i128 - P as i128) as i64 } else { v as i64 } };
+        let states: Vec<[u64; 16]> = vec![core::array::from_fn(|i| (i as u64) * 7 + 1), [3u64; 16]];
+        let trace = tip5_spread_round_trace(&states);
+        let (w, nb, ns, n) =
+            (Tip5SpreadRoundAir::W, Tip5SpreadRoundAir::NB, Tip5SpreadRoundAir::NS, Tip5SpreadRoundAir::N);
+        let h = trace.values.len() / w;
+        let g = |r: usize, cc: usize| trace.values[r * w + cc].as_canonical_u64();
+        let (mut ch0, mut ch1): (BTreeMap<(u64, u64), i64>, BTreeMap<(u64, u64), i64>) = (BTreeMap::new(), BTreeMap::new());
+        for r in 0..h {
+            let is_sbox = signed(g(r, Tip5SpreadRoundAir::IS_SBOX));
+            let is_round = signed(g(r, Tip5SpreadRoundAir::IS_ROUND));
+            let tm = signed(g(r, Tip5SpreadRoundAir::TM));
+            for j in 0..nb {
+                let mult = is_sbox + if j == 0 { tm } else { 0 };
+                if mult != 0 {
+                    *ch0.entry((g(r, Tip5SpreadRoundAir::K + j), g(r, Tip5SpreadRoundAir::O + j))).or_insert(0) += mult;
+                }
+            }
+            if is_round != 0 {
+                for l in 0..ns {
+                    *ch1.entry((l as u64, g(r, Tip5SpreadRoundAir::S + l))).or_insert(0) -= is_round; // provide s[lane]
+                    *ch1.entry(((n + l) as u64, g(r, Tip5SpreadRoundAir::SB + l))).or_insert(0) += is_round; // read sb[lane]
+                }
+            }
+            if is_sbox != 0 {
+                let lane = g(r, Tip5SpreadRoundAir::LANE);
+                *ch1.entry((lane, g(r, Tip5SpreadRoundAir::SVAL))).or_insert(0) += is_sbox; // read s[lane]
+                *ch1.entry((lane + n as u64, g(r, Tip5SpreadRoundAir::OVAL))).or_insert(0) -= is_sbox; // provide sb[lane]
+            }
+        }
+        let (nz0, nz1) = (ch0.values().filter(|&&v| v != 0).count(), ch1.values().filter(|&&v| v != 0).count());
+        assert_eq!(nz0, 0, "byte-table channel must net to zero ({nz0} imbalanced)");
+        assert_eq!(nz1, 0, "connection channel must net to zero ({nz1} imbalanced)");
+        println!(
+            "Tip5 SPREAD round BALANCES: ch0 (byte-table) {} tuples + ch1 (connection) {} tuples, all net-zero — the \
+             spread S-boxes bind to L(byte) AND to the round's real s[lane]/sb[lane]. The spread design is wired.",
+            ch0.len(),
+            ch1.len()
+        );
+    }
+
+    /// **W4 (Tip5 in-circuit) — the SPREAD round PROVES + verifies as a STARK** (`--features tip5,lookup`). Because
+    /// spreading brought the round to `log_nqc 4` (`tip5_spread_round_composes`) and its two buses balance
+    /// (`tip5_spread_round_balances`), the spread round proves end-to-end through the W1 lookup prover — where the
+    /// whole-round-on-one-row (32 lookups, log_nqc 6) did NOT verify. ⇒ the spread design is a PROVEN in-circuit
+    /// gadget: the full 5-round Tip5 permutation is these rows threaded by the state chain (the remaining assembly).
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_spread_round_proves() {
+        let states: Vec<[u64; 16]> = vec![core::array::from_fn(|i| (i as u64) * 7 + 1), [3u64; 16]];
+        let air = Tip5SpreadRoundAir;
+        let proof = prove_lookup(&air, tip5_spread_round_trace(&states), &[]);
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "the spread Tip5 round must prove + verify (log_nqc 4)");
     }
 
     /// **W2-C (size)** — the narrow-tall running eval proves + verifies through the W1 lookup prover, which
