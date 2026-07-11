@@ -2068,6 +2068,13 @@ mod wrap_air {
         /// (the periodic-out-of-interactions rule). Appended after the monolith periodics. (`AssembledCapWrapCwAir`'s
         /// `cap_periodics` analog; compose reads structure, so a dummy suffices.)
         pub(crate) op_periodics: Vec<Vec<Goldilocks>>,
+        /// **Brick 5d** — when set, ALSO bind the epilogue: append the op-table region (13 `OpTableF2Air` cols +
+        /// `op_sel`) computing `folded`, and a folded wiring bus binding `folded_col` to the op-table's fold. Flag-off
+        /// (byte-identical) keeps the proven ro/z/px/pz-only assembly; flag-on adds the op-table epilogue binding.
+        pub(crate) bind_optable: bool,
+        /// The op-table wiring-bus address of the `folded` output wire (the arith head reads `folded_col` there);
+        /// from `op_table_f2_trace` in the assembler, any distinct value for compose. Unused when `!bind_optable`.
+        pub(crate) folded_addr: u64,
     }
 
     impl AssembledOpeningsWrapCwAir {
@@ -2159,13 +2166,22 @@ mod wrap_air {
         pub(crate) fn op_periodic_base(&self) -> usize {
             BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
         }
+        /// **Brick 5d** — the op-table region base (13 `OpTableF2Air` cols + `op_sel`), appended after the sponge
+        /// tags (only present when `bind_optable`). Mirrors [`OpTableBindCwAir`]'s region one assembly deeper.
+        pub(crate) fn op_base(&self) -> usize {
+            self.st_base() + 2 * Self::RATE
+        }
+        pub(crate) fn op_sel(&self) -> usize {
+            self.op_base() + 13
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledOpeningsWrapCwAir {
         fn width(&self) -> usize {
             // ro/folded/quot(6) + DeepFoldAir region(18) + df_sel/df_first/df_end/is_head(4) + term_idx(1)
-            // + is_ch(N_GROUPS) + opening-row(6) + 2·RATE sponge tags.
-            self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * Self::RATE
+            // + is_ch(N_GROUPS) + opening-row(6) + 2·RATE sponge tags (+ brick 5d op-table 13 + op_sel).
+            let base = self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * Self::RATE;
+            base + if self.bind_optable { 14 } else { 0 }
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
@@ -2290,7 +2306,10 @@ mod wrap_air {
             let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(self.m.cm_rounds() - self.m.is_zk));
             let (zeta0, zeta1) = (cur[self.m.pw(2)].clone(), cur[self.m.pw(3)].clone());
 
-            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); N_GROUPS + 3];
+            // Channels: 0 ro, 1..=N_GROUPS z/px, N_GROUPS+1 pz, N_GROUPS+2 sponge; +1 (N_GROUPS+3) for the brick-5d
+            // op-table folded wiring bus.
+            let n_chan = N_GROUPS + 3 + if self.bind_optable { 1 } else { 0 };
+            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); n_chan];
             // Channel 0 — the ro bus.
             chans[0].push((vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()));
             chans[0].push((vec![x_head.clone(), AB::Expr::ZERO, ro_read.0, ro_read.1], is_head.clone()));
@@ -2352,6 +2371,47 @@ mod wrap_air {
             for i in 0..2 {
                 let gi_i = cur[self.or_gi()].clone() + AB::Expr::from(Goldilocks::from_u64(i as u64));
                 chans[N_GROUPS + 2].push((vec![gi_i, cur[self.or_pz() + i].clone()], or_sel.clone()));
+            }
+
+            // (6) **Brick 5d — the op-table epilogue binding.** The `OpTableF2Air` region (op_sel-gated) computes
+            // `folded` (the α-fold of the constraint values c_k) on slack rows; a folded wiring bus (channel
+            // N_GROUPS+3) binds `folded_col` to the op-table's fold wire, so the epilogue's `folded·inv_van == quot`
+            // (checked by `OpeningsBci`) reads a fold actually computed in the op-table — not a free witness. The
+            // op-table's OPENING LEAVES (its c_k inputs) stay free here (5d.1 compose); the opening-leaf binding
+            // (trace leaves at term_idx, non-trace via the N_GROUPS split) + the quot recompose are the next bricks.
+            if self.bind_optable {
+                let ob = self.op_base();
+                let (is_mul, is_add, is_sub) = (cur[ob].clone(), cur[ob + 1].clone(), cur[ob + 2].clone());
+                let (out_addr, o0, o1) = (cur[ob + 3].clone(), cur[ob + 4].clone(), cur[ob + 5].clone());
+                let (a_addr, a0, a1) = (cur[ob + 6].clone(), cur[ob + 7].clone(), cur[ob + 8].clone());
+                let (b_addr, b0, b1) = (cur[ob + 9].clone(), cur[ob + 10].clone(), cur[ob + 11].clone());
+                let out_mult = cur[ob + 12].clone();
+                let op_sel = cur[self.op_sel()].clone();
+                builder.assert_zero(op_sel.clone() * (op_sel.clone() - one.clone()));
+                for s in [&is_mul, &is_add, &is_sub] {
+                    builder.assert_zero(op_sel.clone() * s.clone() * (s.clone() - one.clone()));
+                }
+                let is_op = is_mul.clone() + is_add.clone() + is_sub.clone();
+                builder.assert_zero(op_sel.clone() * is_op.clone() * (is_op.clone() - one.clone()));
+                builder.assert_zero(op_sel.clone() * is_mul.clone() * (o0.clone() - (a0.clone() * b0.clone() + we.clone() * a1.clone() * b1.clone())));
+                builder.assert_zero(op_sel.clone() * is_mul.clone() * (o1.clone() - (a0.clone() * b1.clone() + a1.clone() * b0.clone())));
+                builder.assert_zero(op_sel.clone() * is_add.clone() * (o0.clone() - (a0.clone() + b0.clone())));
+                builder.assert_zero(op_sel.clone() * is_add.clone() * (o1.clone() - (a1.clone() + b1.clone())));
+                builder.assert_zero(op_sel.clone() * is_sub.clone() * (o0.clone() - (a0.clone() - b0.clone())));
+                builder.assert_zero(op_sel.clone() * is_sub.clone() * (o1.clone() - (a1.clone() - b1.clone())));
+                // The folded wiring bus (channel N_GROUPS+3): the op-table reads its 2 operands (+op_sel·is_op) and
+                // DEFINES its output (op_sel·out_mult, −fanout INCLUDING the head's folded read); the arith head READS
+                // folded_col at folded_addr (+is_head). Balance ⇒ folded_col == the op-table's computed folded wire.
+                let read_mult = op_sel.clone() * is_op;
+                let folded = (cur[self.folded_col()].clone(), cur[self.folded_col() + 1].clone());
+                let wch = N_GROUPS + 3;
+                chans[wch].push((vec![a_addr, a0, a1], read_mult.clone()));
+                chans[wch].push((vec![b_addr, b0, b1], read_mult));
+                chans[wch].push((vec![out_addr, o0, o1], op_sel * out_mult));
+                chans[wch].push((
+                    vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1],
+                    is_head.clone(),
+                ));
             }
 
             for ch in chans {
@@ -3856,7 +3916,7 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values (like opening_bind_cw_composes).
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
-        let air = AssembledOpeningsWrapCwAir { m, op_periodics };
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0 };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -3877,6 +3937,77 @@ mod tests {
         );
         assert_eq!(lookups.len(), N_GROUPS + 3, "ro + N_GROUPS z/px input-binding + pz bus + sponge FS-anchor");
         assert!(log_nqc <= LOG_BLOWUP, "openings AA1+AA2+AA2b cw=true must compose within the degree budget (got {log_nqc})");
+    }
+
+    /// **AA6 brick 5d.1 — the op-table folded binding COEXISTS with the openings fold at cw=true** (`--features
+    /// lookup,recursion`, cheap). Extends `openings_wrap_cw_assembled_composes` with `bind_optable`: the
+    /// [`AssembledOpeningsWrapCwAir`] now ALSO appends the op-table region ([`OpTableF2Air`] relations, op_sel-gated)
+    /// computing `folded` + a folded wiring bus (channel N_GROUPS+3) binding `folded_col` to the op-table's fold — so
+    /// the epilogue `folded·inv_van == quot` ([`OpeningsBci`]) reads a fold actually computed in slack, not a free
+    /// witness. Confirms the DeepFold arith region + the op-table region + all N_GROUPS+4 channels COEXIST within the
+    /// degree budget (`log_nqc ≤ LOG_BLOWUP`) at cw=true — the DeepFold/op-table coexistence the handoff flagged as
+    /// the key open question. The op-table's opening LEAVES (its `c_k` inputs) stay free here; the opening-leaf
+    /// binding (trace leaves at term_idx, non-trace via the N_GROUPS split) + the quot recompose are the next bricks.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn optable_openings_wrap_cw_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        // narrow_caps = false: the caps stay in the pis window (isolating the openings work); build the window to match.
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+        };
+        let h = m.height();
+        // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
+        let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: true, folded_addr: 1 << 20 };
+        let fw = air.m.fused_w();
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "AA6 brick 5d.1 (op-table folded binding): width {width} = fused_w {fw} + 35 + N_GROUPS + 2·RATE + 14 \
+             (op-table 13 + op_sel); {} channels (ro + {N_GROUPS} z/px + pz + sponge + folded wiring), log_nqc \
+             {log_nqc} ≤ {LOG_BLOWUP}. The DeepFold arith region + the op-table region COEXIST; folded_col bound to \
+             the op-table's fold. Opening leaves + quot recompose next.",
+            lookups.len()
+        );
+        assert_eq!(
+            width,
+            fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * AssembledOpeningsWrapCwAir::RATE + 14,
+            "base openings width + op-table 13 + op_sel"
+        );
+        assert_eq!(lookups.len(), N_GROUPS + 4, "ro + N_GROUPS z/px + pz bus + sponge FS-anchor + op-table folded wiring");
+        assert!(log_nqc <= LOG_BLOWUP, "brick 5d op-table + openings coexistence must compose within budget (got {log_nqc})");
     }
 
     /// **AA6 openings AA3 — assemble the cw=true narrow-openings wrap trace** (the [`AssembledOpeningsWrapCwAir`]
@@ -4040,7 +4171,7 @@ mod tests {
             wide[b + or_mult] = Val::ZERO - Val::from_u64(m.n_queries as u64);
         }
 
-        (AssembledOpeningsWrapCwAir { m, op_periodics }, RowMajorMatrix::new(wide, width), Vec::new())
+        (AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0 }, RowMajorMatrix::new(wide, width), Vec::new())
     }
 
     /// **AA6 openings AA3 — all `N_GROUPS+3` channels balance** (native, cheap — NO prove). Assemble the cw=true
