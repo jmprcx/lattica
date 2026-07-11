@@ -3628,6 +3628,60 @@ mod tests {
         );
     }
 
+    /// **AA6 openings AA4 — the assembled openings-wrap PROVES through `prove_lookup`.** The definitive soundness
+    /// check (the `arith_wrap_assembled_proves` / `cap_wrap_cw_assembled_proves` analog for the OPENINGS tile):
+    /// build the cw=true narrow-openings trace (the `2·n_terms` pz opening COLUMNS gone) and prove + verify it
+    /// end-to-end through the W1 lookup prover. So the reduced-opening fold holds as a SOUND STARK with the fold's
+    /// `pz` re-sourced from the FS-absorbed opening (the shared opening-row + the sponge FS-anchor bus + the pz
+    /// re-provide) rather than a committed column — the deep-tree B lever's openings arc, sound. A corrupted
+    /// opening-row `pz` is rejected (the sponge FS-anchor + the pz bus both unbalance). Heavy;
+    /// `--release --features lookup,recursion -j1 -- --ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy (-j1): proves the cw=true assembled openings-wrap through prove_lookup + tamper-rejects a corrupted opening-row pz; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    fn openings_wrap_cw_assembled_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        println!(
+            "proving cw=true assembled openings-wrap (ro + {} z/px + pz + sponge FS-anchor): width {width}, {} rows, \
+             {} channels — the 2·n_terms pz opening columns externalized",
+            N_GROUPS,
+            asm.m.height(),
+            N_GROUPS + 3
+        );
+        let lproof = prove_lookup(&asm, trace, &pis);
+        assert!(
+            verify_lookup(&asm, &lproof, &pis).is_ok(),
+            "the cw=true assembled openings-wrap must prove + verify through prove_lookup (width {width})"
+        );
+
+        // Corrupt the first opening-row's pz ⇒ BOTH the sponge FS-anchor bus (pz ≠ the FS-absorbed felt) and the pz
+        // re-provide bus (opening-row pz ≠ the regions' pz) unbalance ⇒ the corrupted trace must not verify.
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs);
+        let fw = asm2.m.fused_w();
+        let or_pz = (fw + 6) + 23 + N_GROUPS + 1; // db(fw+6) + 23 + N_GROUPS = or_base; or_pz = or_base + 1
+        let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
+        let or_start = used + asm2.m.n_terms * asm2.m.n_queries;
+        bad.values[or_start * width + or_pz] += Val::ONE; // opening-row 0's pz.0
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let lp = prove_lookup(&asm2, bad, &pis2);
+            verify_lookup(&asm2, &lp, &pis2).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted opening-row pz must be rejected (sponge FS-anchor + pz buses unbalance)");
+    }
+
     /// **Caps AA5 cw=true — both buses balance** (native, cheap — NO prove). Assemble the cw=true trace and confirm
     /// each channel nets to zero as a signed multiset: channel 0 (SELECT) ⇒ every head's `cap_c[g]` == the
     /// addressed cap-row digest; channel 1 (SPONGE-CAP) ⇒ every cap-row digest felt `(gi_base+k, digest[k])` cancels
