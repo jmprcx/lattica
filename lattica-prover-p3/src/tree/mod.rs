@@ -371,6 +371,40 @@ pub mod fold {
     }
 }
 
+/// **Tier-3 — the NIFS (non-interactive folding scheme) core model.** A folding node folds two committed leaf
+/// INSTANCES into one at O(1) commitment work + NO opening, so the tree stacks at bounded per-node cost; only the
+/// root DECIDER opens (once, GPU). Two algebraic properties make that sound, both modelled + tested here:
+///   1. **commitment homomorphism** — `commit(w₁ + r·w₂) = commit(w₁) + r·commit(w₂)`, so the verifier folds
+///      commitments by the SAME RLC as the witnesses, never opening;
+///   2. **relation linearity** — for a linear instance map `A`, `A·(w₁ + r·w₂) = A·w₁ + r·A·w₂`, so the folded
+///      witness satisfies the folded instance IFF both originals do.
+/// Together: `fold((C₁,w₁),(C₂,w₂),r)` is a valid instance iff both inputs are (soundness error `≤ deg/|F|` over
+/// the FS challenge `r`). **The honest fork:** real FRI (Merkle) commitments are NOT additively homomorphic, so a
+/// no-opening FRI accumulation needs a homomorphic commitment layer (Pedersen/inner-product) OR a random-eval
+/// reduction (which the DECIDER absorbs). This module models the NIFS core with a homomorphic LINEAR commitment;
+/// wiring it to the FRI-committed wrap is the remaining research construction (the `FoldAir` decider is proven).
+pub mod nifs {
+    use crate::config::Val;
+    use p3_field::PrimeCharacteristicRing;
+
+    /// A homomorphic LINEAR commitment `commit(w) = Σ wᵢ·keyᵢ` (additive: `commit(a) + r·commit(b) = commit(a +
+    /// r·b)`) — the property a NIFS folds committed instances by. `key` is a fixed commitment key (|key| ≥ |w|).
+    pub fn commit(w: &[Val], key: &[Val]) -> Val {
+        w.iter().zip(key).map(|(&wi, &ki)| wi * ki).fold(Val::ZERO, |a, b| a + b)
+    }
+
+    /// Fold two witnesses by the FS challenge `r`: `w = w₁ + r·w₂` (the verifier folds the commitments by the SAME
+    /// RLC — O(1) per node, no opening). `w₁`,`w₂` same length.
+    pub fn fold_witness(w1: &[Val], w2: &[Val], r: Val) -> Vec<Val> {
+        w1.iter().zip(w2).map(|(&a, &b)| a + r * b).collect()
+    }
+
+    /// Apply a linear instance map `A` (row-major, `rows × |w|`) to a witness: `A·w` (the instance's linear part).
+    pub fn apply(a: &[Vec<Val>], w: &[Val]) -> Vec<Val> {
+        a.iter().map(|row| commit(row, w)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +635,39 @@ mod tests {
         assert!(verify(&config, &FoldAir, &proof, &pis).is_ok(), "the GPU-proved fold gadget (decider) must verify");
         let bad = vec![r, acc + Val::ONE];
         assert!(verify(&config, &FoldAir, &proof, &bad).is_err(), "a corrupted accumulator must be rejected");
+    }
+
+    /// **Tier-3 — the NIFS core is sound: folding commits + relations commute with the RLC.** (1) commitment
+    /// homomorphism: `commit(w₁ + r·w₂) == commit(w₁) + r·commit(w₂)` — the verifier folds committed instances by
+    /// the same RLC WITHOUT opening; (2) relation linearity: `A·(w₁ + r·w₂) == A·w₁ + r·A·w₂` — the folded witness
+    /// satisfies the folded instance iff both do. Together the fold is a sound instance reduction (the per-node
+    /// O(1) step; the root `FoldAir` decider opens once). Models the NIFS the FRI integration will realize.
+    #[test]
+    fn nifs_fold_is_sound() {
+        use crate::config::Val;
+        use crate::tree::nifs::{apply, commit, fold_witness};
+        use p3_field::PrimeCharacteristicRing;
+
+        let r = Val::from_u64(0xd1b54a32d192ed03);
+        let w1: Vec<Val> = (0..6).map(|i| Val::from_u64(3 + 7 * i)).collect();
+        let w2: Vec<Val> = (0..6).map(|i| Val::from_u64(11 + 5 * i)).collect();
+        let key: Vec<Val> = (0..6).map(|i| Val::from_u64(101 + i)).collect();
+
+        // (1) commitment homomorphism: commit(fold) == commit(w1) + r·commit(w2).
+        let folded = fold_witness(&w1, &w2, r);
+        assert_eq!(
+            commit(&folded, &key),
+            commit(&w1, &key) + r * commit(&w2, &key),
+            "the folded commitment must equal the RLC of the commitments (no opening needed)"
+        );
+
+        // (2) relation linearity: A·fold == A·w1 + r·A·w2 (a random 3×6 linear instance map A).
+        let a: Vec<Vec<Val>> =
+            (0..3).map(|row| (0..6).map(|c| Val::from_u64(1 + row * 6 + c)).collect()).collect();
+        let lhs = apply(&a, &folded);
+        let (aw1, aw2) = (apply(&a, &w1), apply(&a, &w2));
+        for i in 0..3 {
+            assert_eq!(lhs[i], aw1[i] + r * aw2[i], "A·fold must equal the RLC of A·w1, A·w2 (row {i})");
+        }
     }
 }
