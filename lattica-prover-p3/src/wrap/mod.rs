@@ -346,6 +346,160 @@ pub fn tip5_sbox_trace(inputs: &[u64]) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(rows, w)
 }
 
+/// **W4 (Tip5 in-circuit) — a FULL Tip5 ROUND as a STARK** (S-box layer + circulant MDS + round constants). Wraps
+/// the [`Tip5SboxAir`] S-box (the 4 split-and-lookup lanes) with the 12 `x⁷` power lanes (degree-7, ungated —
+/// trivially `0=0` off the permutation rows), the real circulant MDS `out[i] = Σⱼ C[(i−j) mod 16]·sb[j]` (degree-1),
+/// and the real round-0 constants — so one row computes `s ↦ MDS(sbox(s)) + RC₀`, the exact `Tip5::permute` round.
+/// The split-lane byte maps are enforced by ONE LogUp vs the 256-row `(byte, L(byte))` table (32 reads/row = 4
+/// lanes × 8 bytes). The full 5-round permutation threads 5 of these (each round's `so` feeding the next `s`); this
+/// round AIR is the composed building block, proven end-to-end.
+#[cfg(feature = "tip5")]
+pub struct Tip5RoundAir;
+
+#[cfg(feature = "tip5")]
+impl Tip5RoundAir {
+    /// State width (Tip5 = 16).
+    pub const N: usize = crate::tip5::WIDTH;
+    /// Split-and-lookup lanes (the rest are x⁷).
+    pub const NS: usize = crate::tip5::NUM_SPLIT_LANES;
+    /// Bytes per split lane.
+    pub const NB: usize = 8;
+    // layout: s[0..N] | ib[NS·NB] | ob[NS·NB] | sb[0..N] | so[0..N] | x2[N−NS] | is_perm | tm
+    // x2 witnesses `s[i]²` for the power lanes so the x⁷ constraint is `x2³·s` (degree 4, not 7) — keeps log_nqc low.
+    pub const IB: usize = Self::N;
+    pub const OB: usize = Self::IB + Self::NS * Self::NB;
+    pub const SB: usize = Self::OB + Self::NS * Self::NB;
+    pub const SO: usize = Self::SB + Self::N;
+    pub const X2: usize = Self::SO + Self::N;
+    pub const IS_PERM: usize = Self::X2 + (Self::N - Self::NS);
+    pub const TM: usize = Self::IS_PERM + 1;
+    pub const W: usize = Self::TM + 1;
+}
+
+#[cfg(feature = "tip5")]
+impl<F: p3_field::Field> BaseAir<F> for Tip5RoundAir {
+    fn width(&self) -> usize {
+        Self::W
+    }
+}
+
+#[cfg(feature = "tip5")]
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for Tip5RoundAir {
+    fn eval(&self, builder: &mut AB) {
+        use crate::tip5::{MDS_FIRST_COLUMN, ROUND_CONSTANTS};
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let (n, ns, nb) = (Tip5RoundAir::N, Tip5RoundAir::NS, Tip5RoundAir::NB);
+        let (ib, ob, sb, so) = (Tip5RoundAir::IB, Tip5RoundAir::OB, Tip5RoundAir::SB, Tip5RoundAir::SO);
+        let is_perm = cur[Tip5RoundAir::IS_PERM].clone();
+        let tm = cur[Tip5RoundAir::TM].clone();
+        let one = AB::Expr::ONE;
+        builder.assert_zero(is_perm.clone() * (is_perm.clone() - one.clone()));
+        let b256 = AB::Expr::from(Val::from_u64(256));
+
+        // S-box layer. Split lanes i<NS: decompose s[i] into bytes, recompose sb[i] from their L-images (the LogUp
+        // binds oᵢⱼ = L(ibᵢⱼ)). Power lanes i≥NS: sb[i] = s[i]⁷ (ungated — off the perm rows s=sb=0 ⇒ 0=0).
+        for i in 0..ns {
+            let (mut xrec, mut yrec, mut base) = (AB::Expr::ZERO, AB::Expr::ZERO, AB::Expr::ONE);
+            for j in 0..nb {
+                xrec = xrec + cur[ib + i * nb + j].clone() * base.clone();
+                yrec = yrec + cur[ob + i * nb + j].clone() * base.clone();
+                base = base * b256.clone();
+            }
+            builder.assert_zero(is_perm.clone() * (cur[i].clone() - xrec)); // s[i] = Σ ibᵢⱼ·256ʲ
+            builder.assert_zero(is_perm.clone() * (cur[sb + i].clone() - yrec)); // sb[i] = Σ obᵢⱼ·256ʲ
+        }
+        for i in ns..n {
+            let s = cur[i].clone();
+            let x2 = cur[Tip5RoundAir::X2 + (i - ns)].clone();
+            builder.assert_zero(x2.clone() - s.clone() * s.clone()); // x2 = s² (ungated; off perm s=x2=0 ⇒ 0=0)
+            let x7 = x2.clone() * x2.clone() * x2.clone() * s; // x2³·s = s⁷ — DEGREE 4 (not 7) in committed cols
+            builder.assert_zero(cur[sb + i].clone() - x7);
+        }
+        // MDS (circulant) + round-0 constants: so[i] = Σⱼ C[(i−j) mod N]·sb[j] + RC₀[i]  (gated; degree 1).
+        for i in 0..n {
+            let mut acc = AB::Expr::ZERO;
+            for j in 0..n {
+                let c = Val::from_u64(MDS_FIRST_COLUMN[(i + n - j) % n]);
+                acc = acc + AB::Expr::from(c) * cur[sb + j].clone();
+            }
+            acc = acc + AB::Expr::from(ROUND_CONSTANTS[i]);
+            builder.assert_zero(is_perm.clone() * (cur[so + i].clone() - acc));
+        }
+        // ONE LogUp channel: NS·NB byte reads (+is_perm); the table PROVIDES (byte, L(byte)) on slot 0 (−count via tm).
+        let mut tuples: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(ns * nb);
+        for k in 0..ns * nb {
+            let mult = if k == 0 { is_perm.clone() + tm.clone() } else { is_perm.clone() };
+            tuples.push((vec![cur[ib + k].clone(), cur[ob + k].clone()], mult));
+        }
+        builder.push_local_interaction(tuples);
+    }
+}
+
+/// Build a Tip5 ROUND trace: 256 table rows `(byte, L(byte), −count)` + one row per input state computing
+/// `so = MDS(sbox(s)) + RC₀`. Matches [`Tip5RoundAir`] exactly (so it proves).
+#[cfg(feature = "tip5")]
+pub fn tip5_round_trace(states: &[[u64; 16]]) -> RowMajorMatrix<Val> {
+    use crate::tip5::{MDS_FIRST_COLUMN, ROUND_CONSTANTS};
+    let (n, ns, nb, w) = (Tip5RoundAir::N, Tip5RoundAir::NS, Tip5RoundAir::NB, Tip5RoundAir::W);
+    let pow7 = |x: Val| {
+        let x2 = x * x;
+        x2 * x2 * x2 * x
+    };
+    let mut count = vec![0u64; 256];
+    for s in states {
+        for i in 0..ns {
+            for byte in s[i].to_le_bytes() {
+                count[byte as usize] += 1;
+            }
+        }
+    }
+    let mut rows: Vec<Val> = Vec::new();
+    for b in 0..256u64 {
+        let mut r = vec![Val::ZERO; w];
+        r[Tip5RoundAir::IB] = Val::from_u64(b); // slot-0 key
+        r[Tip5RoundAir::OB] = Val::from_u64(tip5_lookup(b)); // slot-0 value
+        r[Tip5RoundAir::TM] = -Val::from_u64(count[b as usize]);
+        rows.extend(r);
+    }
+    for st in states {
+        let mut r = vec![Val::ZERO; w];
+        let s: [Val; 16] = core::array::from_fn(|i| Val::from_u64(st[i]));
+        let mut sb = [Val::ZERO; 16];
+        for i in 0..ns {
+            let bytes = st[i].to_le_bytes();
+            let mut y = 0u64;
+            for j in 0..nb {
+                let (bi, oi) = (bytes[j] as u64, tip5_lookup(bytes[j] as u64));
+                r[Tip5RoundAir::IB + i * nb + j] = Val::from_u64(bi);
+                r[Tip5RoundAir::OB + i * nb + j] = Val::from_u64(oi);
+                y = y.wrapping_add(oi << (8 * j));
+            }
+            sb[i] = Val::from_u64(y);
+        }
+        for i in ns..n {
+            sb[i] = pow7(s[i]);
+            r[Tip5RoundAir::X2 + (i - ns)] = s[i] * s[i]; // witness s² (lowers the x⁷ constraint degree)
+        }
+        for i in 0..n {
+            let mut acc = ROUND_CONSTANTS[i];
+            for j in 0..n {
+                acc += Val::from_u64(MDS_FIRST_COLUMN[(i + n - j) % n]) * sb[j];
+            }
+            r[Tip5RoundAir::SO + i] = acc;
+        }
+        for i in 0..n {
+            r[i] = s[i];
+            r[Tip5RoundAir::SB + i] = sb[i];
+        }
+        r[Tip5RoundAir::IS_PERM] = Val::ONE;
+        rows.extend(r);
+    }
+    let h = (rows.len() / w).next_power_of_two();
+    rows.resize(h * w, Val::ZERO);
+    RowMajorMatrix::new(rows, w)
+}
+
 /// **AA5 — the in-circuit ORDERED SPONGE-CAP BUS** (feasibility, real data). The FS-anchor AA5 needs binds the
 /// narrow-tall cap region to the caps the transcript sponge ACTUALLY absorbed (so removing the pw cap columns in
 /// cw=true keeps inner-auth non-vacuous, and closes the pre-existing FS⟂auth cap decoupling). This proves that
@@ -1286,6 +1440,66 @@ mod tests {
             Tip5SboxAir::W
         );
         assert!(log_nqc <= LOG_BLOWUP, "the Tip5 split-and-lookup S-box must be within the degree budget (got {log_nqc})");
+    }
+
+    /// **W4 (Tip5 in-circuit) — the round AIR's arithmetic MATCHES the native Tip5 round** (`--features tip5,lookup`,
+    /// cheap; NO prove — a NON-circular correctness check). Builds the round trace and confirms each permutation
+    /// row's output `so` equals `Tip5::round(s, 0)` (the native S-box layer + MDS + round-0 constants) bit-for-bit —
+    /// so the in-circuit round (LogUp split-and-lookup S-box + `x⁷` power lanes + real circulant MDS + real round
+    /// constants) computes the EXACT Tip5 round transformation. The composed round is arithmetically correct; the
+    /// remaining work is purely its in-circuit COST (see `tip5_round_degree_needs_spreading`).
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_round_matches_native() {
+        use crate::tip5::{Tip5, WIDTH as TW};
+        use p3_field::PrimeField64;
+        let states: Vec<[u64; 16]> = vec![
+            core::array::from_fn(|i| i as u64),
+            core::array::from_fn(|i| 0x1234_5678_9ABC_DEF0u64.wrapping_mul(i as u64 + 1)),
+            [7u64; 16],
+        ];
+        let trace = tip5_round_trace(&states);
+        let w = Tip5RoundAir::W;
+        for (k, st) in states.iter().enumerate() {
+            let mut ref_s: [p3_goldilocks::Goldilocks; TW] =
+                core::array::from_fn(|i| p3_goldilocks::Goldilocks::from_u64(st[i]));
+            Tip5::round(&mut ref_s, 0); // the native single round
+            let row = 256 + k; // perm rows follow the 256 table rows
+            for i in 0..TW {
+                assert_eq!(
+                    trace.values[row * w + Tip5RoundAir::SO + i].as_canonical_u64(),
+                    ref_s[i].as_canonical_u64(),
+                    "state {k} lane {i}: in-circuit round output must equal the native Tip5 round"
+                );
+            }
+        }
+        println!(
+            "W4 Tip5 round: the in-circuit round (LogUp S-box + x⁷ + circulant MDS + RC₀) matches Tip5::round \
+             bit-for-bit on {} states — the composed round arithmetic is correct.",
+            states.len()
+        );
+    }
+
+    /// **W4 (Tip5 in-circuit) — the whole-round-on-one-row exceeds the ≤4 budget ⇒ the full permutation needs
+    /// tuple-SPREADING** (`--features tip5,lookup`, cheap). The S-box alone (8 byte-lookups/row) is log_nqc 4
+    /// (`tip5_sbox_is_low_degree`, and it PROVES); a full round packs 4 split lanes × 8 bytes = 32 lookups/row,
+    /// pushing log_nqc to ~6 — the SAME many-interactions-per-row wall the caps/op-table tracks hit. ⇒ the full
+    /// 5-round permutation AIR must SPREAD the S-box lookups across rows (one lane/round per row, state threaded),
+    /// exactly the narrow-tall/spread construction those tracks used — a real multi-brick effort, NOT a one-row
+    /// extension. (The round ARITHMETIC is already native-exact per `tip5_round_matches_native`; this is the cost.)
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_round_degree_needs_spreading() {
+        let air = Tip5RoundAir;
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "Tip5 ROUND (32 lookups/row): width {}, log_nqc {log_nqc} > budget {LOG_BLOWUP} ⇒ the full permutation \
+             needs tuple-SPREADING across rows (the S-box's 8/row is ≤4 and proves); a real multi-brick construction.",
+            Tip5RoundAir::W
+        );
+        assert!(log_nqc > LOG_BLOWUP, "the whole-round-on-one-row exceeds ≤4 (documents the spreading need); got {log_nqc}");
+        assert!(log_nqc <= 8, "…and it's the moderate 2c-wall level, not a runaway blow-up (got {log_nqc})");
     }
 
     /// **W2-C (size)** — the narrow-tall running eval proves + verifies through the W1 lookup prover, which

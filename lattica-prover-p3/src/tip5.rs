@@ -53,7 +53,7 @@ const LOOKUP_TABLE: [u8; 256] = {
 };
 
 /// The **real** Tip5 circulant MDS matrix first column (the byte-form of SHA-256("Tip5")).
-const MDS_FIRST_COLUMN: [u64; WIDTH] = [
+pub(crate) const MDS_FIRST_COLUMN: [u64; WIDTH] = [
     61402, 1108, 28750, 33823, 7454, 43244, 53865, 12034, 56951, 27521, 41351, 40901, 12021, 59689,
     26798, 17845,
 ];
@@ -66,7 +66,7 @@ const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
 /// Montgomery storage; that `R⁻¹` is a representation artifact of Triton's non-canonical field and is
 /// omitted for this canonical-Goldilocks variant — the underlying nothing-up-my-sleeve Blake3 stream is
 /// the same.)
-static ROUND_CONSTANTS: std::sync::LazyLock<[Goldilocks; NUM_ROUNDS * WIDTH]> =
+pub(crate) static ROUND_CONSTANTS: std::sync::LazyLock<[Goldilocks; NUM_ROUNDS * WIDTH]> =
     std::sync::LazyLock::new(|| {
         core::array::from_fn(|i| {
             let mut input = b"Tip5".to_vec();
@@ -143,12 +143,20 @@ impl Tip5 {
     }
 }
 
+impl Tip5 {
+    /// ONE Tip5 round: S-box layer → MDS → add round constants. The reference the in-circuit `Tip5RoundAir` must
+    /// reproduce (exposed so `wrap::tip5_round_trace` can be checked against it — non-circular validation).
+    pub(crate) fn round(state: &mut [Goldilocks; WIDTH], round: usize) {
+        Self::sbox_layer(state);
+        Self::mds_layer(state);
+        Self::add_round_constants(state, round);
+    }
+}
+
 impl Permutation<[Goldilocks; WIDTH]> for Tip5 {
     fn permute_mut(&self, state: &mut [Goldilocks; WIDTH]) {
         for round in 0..NUM_ROUNDS {
-            Self::sbox_layer(state);
-            Self::mds_layer(state);
-            Self::add_round_constants(state, round);
+            Self::round(state, round);
         }
     }
 }
