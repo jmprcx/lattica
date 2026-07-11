@@ -274,6 +274,43 @@ pub mod dag {
     }
 }
 
+/// **Tier-3 — accumulation / folding (the low-per-node-RAM recursion architecture).**
+///
+/// Full STARK-recursion (the wrap) verifies each child proof IN-CIRCUIT — the FRI re-check is what makes the
+/// per-node width/height (hence RAM) large. An **accumulation scheme** (Nova / ProtoStar family) instead FOLDS
+/// each child's claim into a running accumulator with O(K) field work per node — NO per-node in-circuit FRI —
+/// deferring the single expensive opening check to ONE **decider** at the root (GPU-accelerated). Per-node RAM
+/// becomes ~the fold; only the decider is heavy, run once. Maps onto the W6 DAG (each node folds K children).
+///
+/// This module is the NATIVE soundness scaffold for that fold (the architecture + the folding-soundness argument —
+/// the `dag` analog for Tier 3; the in-circuit fold gadget + the real FRI decider are the deferred prover work). A
+/// verifying leaf contributes a ZERO claim (its constraint / opening residual); a node folds its children's claims
+/// by a Fiat–Shamir random linear combination `acc = Σ rⁱ·claimᵢ`. The decider checks `acc == 0`. **Soundness:** if
+/// any leaf's claim ≠ 0 (a bad child), `acc` is a nonzero degree-<K polynomial in `r`, so `acc = 0` with probability
+/// ≤ (K−1)/|F| (Schwartz–Zippel) — negligible over Goldilocks. So the accumulated claim is 0 IFF every leaf verifies.
+pub mod fold {
+    use crate::config::Val;
+    use p3_field::PrimeCharacteristicRing;
+
+    /// Fold K child claims into one accumulator by the RLC `acc = Σ rⁱ·claimᵢ` (Horner), `r` the FS challenge. A
+    /// node's per-fold work is O(K) field ops — no FRI, no in-circuit verification (the Tier-3 per-node RAM win).
+    pub fn fold_claims(claims: &[Val], r: Val) -> Val {
+        claims.iter().rev().fold(Val::ZERO, |acc, &c| acc * r + c)
+    }
+
+    /// A K-ary fold TREE over the leaf claims: recursively fold groups of ≤ K, a distinct challenge per level (here
+    /// `r`, `r²`, … derived by depth for the model). The root accumulator is 0 iff every leaf claim is 0.
+    pub fn fold_tree(claims: &[Val], k: usize, r: Val) -> Val {
+        assert!(k >= 2, "a fold tree needs arity ≥ 2");
+        if claims.len() <= k {
+            return fold_claims(claims, r);
+        }
+        let group = claims.len().div_ceil(k);
+        let acc: Vec<Val> = claims.chunks(group).map(|g| fold_tree(g, k, r)).collect();
+        fold_claims(&acc, r * r)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +463,33 @@ mod tests {
             batch_root(&ws),
             "a balanced-Merkle-of-subroots must NOT equal the linear batch_root — the accumulator must be threaded"
         );
+    }
+
+    /// **Tier-3 — the accumulation fold is sound: the accumulator is 0 IFF every leaf verifies.** A verifying leaf
+    /// contributes a zero claim; the flat fold and the K-ary fold tree are both zero iff ALL leaf claims are zero,
+    /// and a single corrupted (nonzero-claim) leaf makes the accumulator nonzero. Models the folding-soundness the
+    /// Tier-3 decider relies on (per-node O(K) field work, no in-circuit FRI — the low-per-node-RAM architecture).
+    #[test]
+    fn accumulation_fold_is_sound() {
+        use crate::config::Val;
+        use crate::tree::fold::{fold_claims, fold_tree};
+        use p3_field::PrimeCharacteristicRing;
+
+        let r = Val::from_u64(0x9e3779b97f4a7c15); // a fixed non-trivial FS-challenge stand-in
+        // All leaves verify (zero claims) ⇒ acc == 0, for any count + arity.
+        for &n in &[1usize, 2, 5, 8, 16, 64] {
+            let zeros = vec![Val::ZERO; n];
+            assert_eq!(fold_claims(&zeros, r), Val::ZERO, "all-verifying ⇒ flat acc 0 (n={n})");
+            for &k in &[2usize, 4, 8] {
+                assert_eq!(fold_tree(&zeros, k, r), Val::ZERO, "all-verifying ⇒ fold-tree acc 0 (n={n}, k={k})");
+            }
+        }
+        // A single bad leaf (nonzero claim) ⇒ acc ≠ 0 (the fold is a nonzero polynomial in r).
+        let mut claims = vec![Val::ZERO; 8];
+        claims[3] = Val::ONE; // leaf 3 fails to verify
+        assert_ne!(fold_claims(&claims, r), Val::ZERO, "a bad leaf ⇒ nonzero flat accumulator");
+        for &k in &[2usize, 4, 8] {
+            assert_ne!(fold_tree(&claims, k, r), Val::ZERO, "a bad leaf ⇒ nonzero fold-tree root (k={k})");
+        }
     }
 }
