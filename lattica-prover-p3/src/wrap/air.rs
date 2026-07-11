@@ -3991,6 +3991,61 @@ mod tests {
         );
     }
 
+    /// **W3 ov externalization brick 4c (soundness rationale) — the held query key is NECESSARY** (`--features
+    /// recursion`, trivial; pure multiset arithmetic, NO AIR/prove). Proves WHY the leaf-hash→px bus must be keyed by
+    /// `[lqk, felt]` (lqk = the per-query point) and not the periodic-only `[felt]` tag: because px is
+    /// QUERY-DEPENDENT (each query opens a DIFFERENT row), but the leaf-hash provider rows are TILED (the periodic
+    /// felt-tag REPEATS every query super-tile). A negative control on a synthetic 2-query, 2-felt multiset:
+    /// a COLUMN-SWAP attack (query 0 reads query 1's authenticated felt at the same felt index, and vice-versa) is
+    /// INVISIBLE to the periodic-only `[felt]` bus (the swapped reads are the SAME signed multiset ⇒ still nets zero
+    /// ⇒ the fold binds px to the WRONG query's opening, unsound), but is CAUGHT by the sound `[lqk, felt]` bus (no
+    /// provider exists at `(this-query, felt)` with the other query's value ⇒ the multiset does NOT net zero). ⇒ the
+    /// resolved crux — `lqk` HELD = x — is exactly what makes the ov externalization sound; brick 4c's compose proves
+    /// that key's degree, this proves its necessity.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_query_key_is_necessary() {
+        use std::collections::BTreeMap;
+        // 2 queries, 2 committed felts each: query q's opened row = [q·10, q·10+1] (distinct per query).
+        let px = |q: u64, c: u64| q * 10 + c;
+        // The signed bus multiset over tuples (key, felt, value): providers −1 (each query's leaf-hash row provides
+        // its AUTHENTICATED px(q,c)), readers +1 (each query's fold reads the value it USES). `key` = q for the sound
+        // [lqk,felt] bus, or a SENTINEL (query dropped) for the unsound periodic-only [felt] bus (the tiled tag).
+        // HONEST: the reader uses its own px(q,c). ATTACK (query/column swap): query q's fold uses px(1-q,c) — the
+        // OTHER query's authenticated opening — a real soundness break the bus must catch.
+        let net = |keyed_by_query: bool, attack: bool| -> usize {
+            let mut bus: BTreeMap<(u64, u64, u64), i64> = BTreeMap::new();
+            let kq = |q: u64| if keyed_by_query { q } else { u64::MAX };
+            for q in 0..2u64 {
+                for c in 0..2u64 {
+                    *bus.entry((kq(q), c, px(q, c))).or_insert(0) -= 1; // provider: authenticated px(q,c)
+                }
+            }
+            for q in 0..2u64 {
+                for c in 0..2u64 {
+                    let src = if attack { 1 - q } else { q }; // attack: fold the OTHER query's felt value
+                    *bus.entry((kq(q), c, px(src, c))).or_insert(0) += 1; // reader: the value the fold uses
+                }
+            }
+            bus.values().filter(|&&v| v != 0).count()
+        };
+        // HONEST: both keys balance (a correct proof passes either way).
+        assert_eq!(net(true, false), 0, "sound [lqk,felt] key: honest reads balance");
+        assert_eq!(net(false, false), 0, "periodic-only [felt] key: honest reads balance");
+        // ATTACK (column/query swap): the sound key CATCHES it (nonzero), the periodic-only key MISSES it (zero).
+        assert_eq!(net(false, true), 0, "periodic-only [felt] key: the query-SWAP attack is INVISIBLE (unsound) — the \
+             tiled periodic tag can't tell the queries apart, so the swapped reads net to zero");
+        assert!(net(true, true) > 0, "sound [lqk,felt] key: the query-SWAP attack is CAUGHT — no provider exists at \
+             (this-query, felt) with the other query's value, so the multiset does NOT net zero");
+        println!(
+            "W3 ov brick 4c (soundness rationale): the held query key `lqk` is NECESSARY — a query-swap attack on the \
+             leaf-hash→px bus is INVISIBLE to the periodic-only [felt] key (net 0, unsound: px binds to the WRONG \
+             query's opening) but CAUGHT by the sound [lqk, felt] key (net {} ≠ 0). ⇒ the resolved crux (lqk HELD = x) \
+             is exactly what makes the ov externalization sound.",
+            net(true, true)
+        );
+    }
+
     /// **AA5 — the cw=true narrow_caps TRACE builds (openings correct).** `build_symbolic_inner_window` gained a
     /// `narrow_caps` flag that skips the trace/quotient/commit cap felts from the pis window. At `true` it builds
     /// a valid cw=true trace with the cap slice DROPPED — and its internal diagnostics still pass: the native
