@@ -576,4 +576,30 @@ mod tests {
         let bad = vec![r, acc + Val::ONE];
         assert!(verify(&config, &FoldAir, &proof, &bad).is_err(), "a corrupted accumulator must be rejected");
     }
+
+    /// **Tier-3 GPU decider — the accumulation gadget PROVES on the GPU.** `FoldAir` (the folding verifier /
+    /// decider core) proven end-to-end through the GPU-accelerated lean config (`GpuDft` LDE) — the "Tier-3 with
+    /// GPU support" decider: the root check over the accumulated instance runs GPU-accelerated, and a corrupted
+    /// accumulator is rejected. (Verify runs under the same config; `GpuDft` is a unit struct touched only during
+    /// the LDE, so verify does no GPU work — the proof is the standard wire format, `Dft`-independent.) `--features
+    /// gpu,tree`.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn fold_gadget_proves_gpu() {
+        use crate::config::gpu::make_config_lean_gpu;
+        use crate::config::Val;
+        use crate::tree::fold::{fold_claims, fold_trace, FoldAir};
+        use p3_field::PrimeCharacteristicRing;
+        use p3_uni_stark::{prove, verify};
+
+        let r = Val::from_u64(0x9e3779b97f4a7c15);
+        let claims: Vec<Val> = (0..16).map(|i| Val::from_u64(1000 + i)).collect();
+        let acc = fold_claims(&claims, r);
+        let config = make_config_lean_gpu();
+        let pis = vec![r, acc];
+        let proof = prove(&config, &FoldAir, fold_trace(&claims, r), &pis);
+        assert!(verify(&config, &FoldAir, &proof, &pis).is_ok(), "the GPU-proved fold gadget (decider) must verify");
+        let bad = vec![r, acc + Val::ONE];
+        assert!(verify(&config, &FoldAir, &proof, &bad).is_err(), "a corrupted accumulator must be rejected");
+    }
 }
