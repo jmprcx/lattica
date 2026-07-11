@@ -6683,6 +6683,61 @@ mod tests {
         assert!(w_inner > 0 && cap_h < lg);
     }
 
+    /// **Step 4 (W4 — Tip5 for size): the lever is B-NEUTRAL — Tip5 shrinks the CONSTANT A, not the gate B**
+    /// (`--features recursion`, cheap; NO prove). W4 (swap Poseidon2 → Tip5 in the Merkle/leaf hashing, ~4.6× fewer
+    /// hash rows) is now an OPTIMIZATION, not a gate: Step 2/W5 already met marginal B = 0.00 < 1, so an attracting
+    /// `W* = A/(1−B)` EXISTS without it. This sizes the lever + confirms it's B-safe at the fully-narrowed
+    /// (arith+caps+openings+ov) cw=true geometry: the Merkle-HASH carriers (commit fold-group `4·cm_rounds` Merkle
+    /// siblings + cap-ENTRY digests) are FRI-DEPTH-scaled — they do NOT depend on `w_inner`, so their marginal
+    /// `d(fused_w)/d(w_inner) = 0` (measured) ⇒ Tip5 reduces the CONSTANT A, NOT the slope B ⇒ the W5 gate (B<1) is
+    /// UNAFFECTED (the Tip5 gate criterion "B<1 on the hashing term" holds trivially — with marginal B = 0.00 EVERY
+    /// term, including hashing, is B-neutral). Tip5's larger win is on hash ROWS (trace HEIGHT — the leaf/merge
+    /// blocks), orthogonal to the width fixed point `W*`. ⇒ Tip5 is a safe, OPTIONAL size optimization; the full
+    /// hash-gadget swap is deferred (multi-session, non-gate).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn w4_tip5_lever_is_b_neutral() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let cap_h = proof.commitments.trace.roots().len().trailing_zeros() as usize;
+        // the fully-narrowed cw=true monolith (arith + caps + openings + ov all externalized — the converged geometry).
+        let mk = |w_inner: usize, nt: usize| MonolithAir {
+            counts: counts.clone(), binds: binds.clone(), index_binds: index_binds.clone(),
+            n_queries: proof.opening_proof.query_proofs.len(), n_terms: nt,
+            inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
+            constraints: constraints.clone(), w_inner_f: w_inner, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
+            cap_height: cap_h, narrow_arith: true, narrow_caps: true, narrow_openings: true, narrow_ov: true };
+        // the Merkle-HASH carriers Tip5 shrinks: commit fold-group (4·cm_rounds siblings) + cap-ENTRY (cap digests).
+        let hash_w = |m: &MonolithAir| 4 * m.cm_rounds() + m.n_cap_c();
+        let (w0, nt0, d) = (WIDTH, n_terms, 256usize);
+        let (base, wide) = (mk(w0, nt0), mk(w0 + d, nt0 + 2 * d));
+        let (fw, hw) = (base.fused_w(), hash_w(&base));
+        // B-NEUTRALITY: the hash carriers are FRI-depth-scaled (cm_rounds/cap_height held) ⇒ identical at both inner
+        // widths ⇒ marginal d(hash)/d(w_inner) = 0. (Subsumed by mb_ov = 0.00: EVERY region is B-neutral now.)
+        let hash_marg = (hash_w(&wide) as f64 - hw as f64) / d as f64;
+        println!(
+            "W4 Tip5 lever (fully-narrowed cw=true, w_inner {w0}): Merkle-hash carriers (commit fold-group \
+             4·cm_rounds + cap-ENTRY) = {hw} cols ({:.1}% of fused_w {fw}); marginal d(hash)/d(w_inner) = \
+             {hash_marg:.2} = 0 ⇒ B-NEUTRAL. Tip5 shrinks the CONSTANT A (W* = A/(1−B)), NOT the slope B ⇒ the W5 \
+             gate (B<1) is UNAFFECTED. Tip5's larger win is on hash ROWS (trace HEIGHT — leaf/merge blocks), \
+             orthogonal to the width fixed point. ⇒ Tip5 is a safe, OPTIONAL size optimization (full swap deferred).",
+            100.0 * hw as f64 / fw as f64
+        );
+        assert_eq!(hash_marg, 0.0, "the Merkle-hash carriers must be B-NEUTRAL (marginal d/d(w_inner) = 0) — Tip5 shrinks A, not B");
+        assert!(hw > 0 && fw > 0);
+    }
+
     /// **Arith-tile assembly increment AA2 — assemble the full arith-wrap trace.** Widen the reused monolith
     /// trace to `fused_w + 24`; for each query's arith head, seed a narrow-tall `DeepFoldAir` region from THAT
     /// head's committed openings (`α = qt_alpha`, `x = GEN·qt_acc[lg−1]`, per-term `(z, pz, px)` — the exact
