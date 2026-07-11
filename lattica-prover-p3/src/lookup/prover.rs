@@ -21,7 +21,7 @@
 //! aux. (ZK note: hiding is retained via the salted-Merkle + random-column PCS; the extra opt-randomization
 //! FRI-batch poly is omitted — ZK-only, not soundness — the sole deferred hardening.)
 
-use crate::config::{make_config, Challenge, MyConfig, Val};
+use crate::config::{make_config, make_config_lean, Challenge, MyConfig, MyConfigLean, Val};
 use p3_air::symbolic::{AirLayout, ConstraintLayout};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::{CanObserve, FieldChallenger};
@@ -35,7 +35,7 @@ use p3_lookup::folder::VerifierConstraintFolderWithLookups;
 use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView};
 use p3_matrix::stack::VerticalPair;
 use p3_matrix::Matrix;
-use p3_uni_stark::{recompose_quotient_from_chunks, StarkGenericConfig, VerifierConstraintFolder};
+use p3_uni_stark::{recompose_quotient_from_chunks, StarkConfig, StarkGenericConfig, VerifierConstraintFolder};
 
 /// The production config's PCS + Challenger (pinned so the generic `Pcs` methods resolve).
 type Cha = <MyConfig as StarkGenericConfig>::Challenger;
@@ -46,21 +46,30 @@ type Com = <MyPcs as Pcs<Challenge, Cha>>::Commitment;
 type Dom = <MyPcs as Pcs<Challenge, Cha>>::Domain;
 /// The batched FRI opening proof type of the production PCS.
 type PcsProof = <MyPcs as Pcs<Challenge, Cha>>::Proof;
+/// The **lean (non-hiding)** research PCS + its proof type — shares `Com`/`Dom`/`Cha` with the production PCS
+/// (same MMCS/challenger), differing only in `ZK = false` (commits at `N`, not `2N`). Used for the heavy
+/// recursion-wrap proves that OOM under hiding (Brick 4d, Step 6): ~2× less quotient-domain LDE RAM.
+type MyPcsLean = <MyConfigLean as StarkGenericConfig>::Pcs;
+type PcsProofLean = <MyPcsLean as Pcs<Challenge, Cha>>::Proof;
 
 /// The AIR capabilities the lookup prover needs: a base AIR (width), symbolic evaluation (for the combined
 /// constraint layout + lookup extraction), and folding through the lookup-aware verifier folder (shared by
 /// the quotient and the ζ-check). Any interaction AIR generic over its builder satisfies this via the blanket
 /// impl below. (Not yet threaded: public values + periodic columns — see `batched_constraints_at_point`.)
-pub trait LookupAir:
+pub trait LookupAir<SC = MyConfig>:
     BaseAir<Val>
     + Air<InteractionSymbolicBuilder<Val, Challenge>>
-    + for<'a> Air<VerifierConstraintFolderWithLookups<'a, MyConfig>>
+    + for<'a> Air<VerifierConstraintFolderWithLookups<'a, SC>>
+where
+    SC: StarkGenericConfig,
 {
 }
-impl<A> LookupAir for A where
+impl<A, SC> LookupAir<SC> for A
+where
+    SC: StarkGenericConfig,
     A: BaseAir<Val>
         + Air<InteractionSymbolicBuilder<Val, Challenge>>
-        + for<'a> Air<VerifierConstraintFolderWithLookups<'a, MyConfig>>
+        + for<'a> Air<VerifierConstraintFolderWithLookups<'a, SC>>,
 {
 }
 
@@ -316,7 +325,7 @@ pub struct LookupQuotientProof {
 /// fold constraints identically. The extension-field aux trace is reconstructed from its `flatten_to_base`
 /// layout: Challenge column `c` ← base columns `c*D .. c*D+D`.
 #[allow(clippy::too_many_arguments)]
-pub fn lookup_quotient_values<A: LookupAir, Mt, Ma>(
+pub fn lookup_quotient_values<A, SC, Mt, Ma>(
     air: &A,
     lookups: &Lookups<Val>,
     trace_domain: Dom,
@@ -328,9 +337,12 @@ pub fn lookup_quotient_values<A: LookupAir, Mt, Ma>(
     lookup_challenges: &[Challenge],
     permutation_values: &[Challenge],
     public_values: &[Val],
-    pcs: &MyPcs,
+    pcs: &SC::Pcs,
 ) -> Vec<Challenge>
 where
+    SC: StarkGenericConfig<Challenge = Challenge, Challenger = Cha>,
+    SC::Pcs: Pcs<Challenge, Cha, Domain = Dom>,
+    A: LookupAir,
     Mt: Matrix<Val>,
     Ma: Matrix<Val>,
 {
@@ -342,7 +354,7 @@ where
     // The periodic-column LDE on the quotient domain (None for AIRs with no periodic columns).
     let periodic_cols = air.periodic_columns();
     let periodic_table = (!periodic_cols.is_empty()).then(|| {
-        <MyPcs as Pcs<Challenge, Cha>>::build_periodic_lde_table(
+        <SC::Pcs as Pcs<Challenge, Cha>>::build_periodic_lde_table(
             pcs,
             &periodic_cols,
             trace_domain,
@@ -451,7 +463,7 @@ pub fn prove_lookup_with_quotient<A: LookupAir>(
         <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &trace_data, 0, quotient_domain);
     let aux_on_qd =
         <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &aux_data, 0, quotient_domain);
-    let quotient_values = lookup_quotient_values(
+    let quotient_values = lookup_quotient_values::<_, MyConfig, _, _>(
         air,
         &lookups,
         trace_domain,
@@ -506,13 +518,13 @@ pub struct LookupOpenedValues {
 /// of trace + aux + quotient, and the single batched FRI opening proof. (ZK note: per-commit salted-Merkle +
 /// random-column hiding is retained via the production hiding PCS; the extra opt-randomization FRI-batch poly
 /// `p3_uni_stark` adds is omitted — it is ZK-only, not soundness, and is the sole deferred ZK-hardening.)
-pub struct LookupProof {
+pub struct LookupProof<Prf = PcsProof> {
     pub trace_commit: Com,
     pub aux_commit: Com,
     pub quotient_commit: Com,
     pub terminal: LookupTerminal<Challenge>,
     pub opened: LookupOpenedValues,
-    pub opening_proof: PcsProof,
+    pub opening_proof: Prf,
     pub degree_bits: usize,
     pub aux_width: usize,
 }
@@ -537,18 +549,36 @@ pub enum LookupVerifyError {
 /// of trace + aux + quotient (one batched FRI proof). Completes the W1 milestone (`prove` → `verify` end to
 /// end); see `verify_lookup` for the matching verifier.
 pub fn prove_lookup<A: LookupAir>(air: &A, main: RowMajorMatrix<Val>, pis: &[Val]) -> LookupProof {
-    prove_lookup_inner(air, main, pis, false)
+    prove_lookup_inner(air, main, pis, false, &make_config())
 }
 
-/// The prover core. `forge_aux` (test-only) corrupts one committed aux fraction so the batched constraints no
-/// longer vanish on `H`, driving the verifier's OOD rejection path.
-fn prove_lookup_inner<A: LookupAir>(
+/// **Lower-RAM prover for heavy research proves.** Identical to [`prove_lookup`] but commits under the LEAN
+/// (non-hiding, `is_zk = 0`) config — ~2× less quotient-domain LDE RAM (the OOM term), so the recursion-wrap
+/// proves (Brick 4d, Step 6) that OOM the box under hiding fit. Not zero-knowledge; sound (proves a verifier ran).
+/// Verify with [`verify_lookup_lean`].
+pub fn prove_lookup_lean<A: LookupAir>(
+    air: &A,
+    main: RowMajorMatrix<Val>,
+    pis: &[Val],
+) -> LookupProof<PcsProofLean> {
+    prove_lookup_inner(air, main, pis, false, &make_config_lean())
+}
+
+/// The prover core — generic over the PCS (production hiding or the lean non-hiding config). `forge_aux`
+/// (test-only) corrupts one committed aux fraction so the batched constraints no longer vanish on `H`.
+fn prove_lookup_inner<A, SC>(
     air: &A,
     main: RowMajorMatrix<Val>,
     pis: &[Val],
     forge_aux: bool,
-) -> LookupProof {
-    let config = make_config();
+    config: &SC,
+) -> LookupProof<<SC::Pcs as Pcs<Challenge, Cha>>::Proof>
+where
+    SC: StarkGenericConfig<Challenge = Challenge, Challenger = Cha>,
+    SC::Pcs: Pcs<Challenge, Cha, Domain = Dom, Commitment = Com>,
+    for<'a> <SC::Pcs as Pcs<Challenge, Cha>>::EvaluationsOnDomain<'a>: Matrix<Val>,
+    A: LookupAir,
+{
     let pcs = config.pcs();
     let mut challenger = config.initialise_challenger();
 
@@ -561,13 +591,13 @@ fn prove_lookup_inner<A: LookupAir>(
     let (_layout, log_num_quotient_chunks) = combined_constraint_layout(air, &lookups, is_zk);
     let num_quotient_chunks = 1 << (log_num_quotient_chunks + is_zk);
 
-    let trace_domain = <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree);
+    let trace_domain = <SC::Pcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree);
     let ext_trace_domain =
-        <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree * (is_zk + 1));
+        <SC::Pcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree * (is_zk + 1));
 
     // Round 1 — main trace.
     let (trace_commit, trace_data) =
-        <MyPcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, main.clone())]);
+        <SC::Pcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, main.clone())]);
     challenger.observe(trace_commit.clone());
     challenger.observe_slice(pis);
     // LogUp draws `num_challenges = 2` (denominator α_L + tuple-combine β) PER lookup.
@@ -585,7 +615,7 @@ fn prove_lookup_inner<A: LookupAir>(
     let aux_width = aux.width();
     let aux_base = aux.flatten_to_base();
     let (aux_commit, aux_data) =
-        <MyPcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, aux_base)]);
+        <SC::Pcs as Pcs<Challenge, Cha>>::commit(pcs, [(ext_trace_domain, aux_base)]);
     challenger.observe(aux_commit.clone());
     let alpha: Challenge = challenger.sample_algebra_element();
 
@@ -593,15 +623,15 @@ fn prove_lookup_inner<A: LookupAir>(
     let quotient_domain =
         ext_trace_domain.create_disjoint_domain(1 << (log_ext_degree + log_num_quotient_chunks));
     let trace_on_qd =
-        <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &trace_data, 0, quotient_domain);
+        <SC::Pcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &trace_data, 0, quotient_domain);
     let aux_on_qd =
-        <MyPcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &aux_data, 0, quotient_domain);
-    let quotient_values = lookup_quotient_values(
+        <SC::Pcs as Pcs<Challenge, Cha>>::get_evaluations_on_domain(pcs, &aux_data, 0, quotient_domain);
+    let quotient_values = lookup_quotient_values::<_, SC, _, _>(
         air, &lookups, trace_domain, quotient_domain, &trace_on_qd, &aux_on_qd, aux_width, alpha,
         &lookup_challenges, &[terminal.0], pis, pcs,
     );
     let quotient_flat = RowMajorMatrix::new_col(quotient_values).flatten_to_base();
-    let (quotient_commit, quotient_data) = <MyPcs as Pcs<Challenge, Cha>>::commit_quotient(
+    let (quotient_commit, quotient_data) = <SC::Pcs as Pcs<Challenge, Cha>>::commit_quotient(
         pcs,
         quotient_domain,
         quotient_flat,
@@ -618,7 +648,7 @@ fn prove_lookup_inner<A: LookupAir>(
         (&aux_data, vec![vec![zeta, zeta_next]]),
         (&quotient_data, vec![vec![zeta]; num_quotient_chunks]),
     ];
-    let (opened_values, opening_proof) = <MyPcs as Pcs<Challenge, Cha>>::open(pcs, rounds, &mut challenger);
+    let (opened_values, opening_proof) = <SC::Pcs as Pcs<Challenge, Cha>>::open(pcs, rounds, &mut challenger);
 
     let opened = LookupOpenedValues {
         trace_local: opened_values[0][0][0].clone(),
@@ -649,7 +679,30 @@ pub fn verify_lookup<A: LookupAir>(
     proof: &LookupProof,
     pis: &[Val],
 ) -> Result<(), LookupVerifyError> {
-    let config = make_config();
+    verify_lookup_inner(air, proof, pis, &make_config())
+}
+
+/// The matching verifier for [`prove_lookup_lean`] — same soundness checks under the lean (non-hiding) config.
+pub fn verify_lookup_lean<A: LookupAir>(
+    air: &A,
+    proof: &LookupProof<PcsProofLean>,
+    pis: &[Val],
+) -> Result<(), LookupVerifyError> {
+    verify_lookup_inner(air, proof, pis, &make_config_lean())
+}
+
+/// The verifier core — generic over the PCS (production hiding or the lean non-hiding config).
+fn verify_lookup_inner<A, SC>(
+    air: &A,
+    proof: &LookupProof<<SC::Pcs as Pcs<Challenge, Cha>>::Proof>,
+    pis: &[Val],
+    config: &SC,
+) -> Result<(), LookupVerifyError>
+where
+    SC: StarkGenericConfig<Challenge = Challenge, Challenger = Cha>,
+    SC::Pcs: Pcs<Challenge, Cha, Domain = Dom, Commitment = Com>,
+    A: LookupAir,
+{
     let pcs = config.pcs();
     let is_zk = config.is_zk();
     let degree_bits = proof.degree_bits;
@@ -661,16 +714,16 @@ pub fn verify_lookup<A: LookupAir>(
     let num_quotient_chunks = 1 << (log_num_quotient_chunks + is_zk);
 
     // Domains: ext (2N) for the committed trace/aux; init (N) for selectors + vanishing; quotient (disjoint).
-    let ext_trace_domain = <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree);
+    let ext_trace_domain = <SC::Pcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree);
     let init_trace_domain =
-        <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree >> is_zk);
+        <SC::Pcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, degree >> is_zk);
     let quotient_domain =
         ext_trace_domain.create_disjoint_domain(1 << (degree_bits + log_num_quotient_chunks));
     let quotient_chunks_domains = quotient_domain.split_domains(num_quotient_chunks);
     // The hiding `commit_quotient` randomizes each chunk to a doubled domain; verify on those.
     let randomized_quotient_chunks_domains: Vec<Dom> = quotient_chunks_domains
         .iter()
-        .map(|d| <MyPcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, d.size() << is_zk))
+        .map(|d| <SC::Pcs as Pcs<Challenge, Cha>>::natural_domain_for_degree(pcs, d.size() << is_zk))
         .collect();
 
     // Shape checks.
@@ -737,7 +790,7 @@ pub fn verify_lookup<A: LookupAir>(
                 .collect(),
         ),
     ];
-    <MyPcs as Pcs<Challenge, Cha>>::verify(pcs, coms, &proof.opening_proof, &mut challenger)
+    <SC::Pcs as Pcs<Challenge, Cha>>::verify(pcs, coms, &proof.opening_proof, &mut challenger)
         .map_err(|e| LookupVerifyError::Pcs(format!("{e:?}")))?;
 
     // Reconstruct Q(ζ) from the chunk openings, and the aux rows from their extension-basis coefficients.
@@ -1050,7 +1103,7 @@ mod tests {
     #[test]
     fn lookup_verify_rejects_forged_aux() {
         let air = RangeCheckAir;
-        let proof = prove_lookup_inner(&air, balanced_main(1 << 5), &[], true);
+        let proof = prove_lookup_inner(&air, balanced_main(1 << 5), &[], true, &make_config());
         assert!(
             matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::OodMismatch)),
             "a forged aux must fail the OOD constraint identity"

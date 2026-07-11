@@ -46,6 +46,27 @@ pub type Dft = Radix2DitParallel<Val>;
 pub type MyPcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ChaCha20Rng>;
 pub type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
 
+/// **Lean (non-hiding) PCS/config for RESEARCH proves — ~2× less prover RAM.** `TwoAdicFriPcs` has `ZK = false`,
+/// so it commits the trace at `N` rows, not the hiding PCS's `2N` (`is_zk` interleaves random rows). The dominant
+/// prover allocation is the trace re-evaluated on the quotient domain (`width × 2^(degree_bits + is_zk + log_nqc)`);
+/// dropping `is_zk` from 1 to 0 HALVES it (and the committed trace/quotient LDEs). Zero-knowledge is NOT needed for
+/// the recursion-wrap SOUNDNESS proves (they prove a verifier ran, not a private witness), so this is safe there.
+/// Same MMCS (salted Merkle) + FRI parameters as production — only the ZK trace-doubling is dropped.
+pub type MyPcsLean = p3_fri::TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
+pub type MyConfigLean = StarkConfig<MyPcsLean, Challenge, Challenger>;
+
+/// A lean (non-hiding, `is_zk = 0`) config for heavy research proves — halves the quotient-domain LDE vs
+/// [`make_config`]. Use for the recursion-wrap proves (Brick 4d, Step 6) that OOM under hiding.
+pub fn make_config_lean() -> MyConfigLean {
+    let perm = default_goldilocks_poseidon2_8();
+    let val_mmcs =
+        ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    let fri = production_fri(challenge_mmcs);
+    let pcs = MyPcsLean::new(Dft::default(), val_mmcs, fri);
+    MyConfigLean::new(pcs, Challenger::new(perm))
+}
+
 // --- production parameters (C-04; consensus + wire pinned) --------------------------------------
 /// FRI rate: LDE blowup 2^4 (supports formal constraint degree ≤ 16 + 1 hiding).
 pub const LOG_BLOWUP: usize = 4;

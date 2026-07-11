@@ -1656,7 +1656,10 @@ mod tests {
     use super::*;
     use crate::config::{Challenge, LOG_BLOWUP};
     use crate::joinsplit_air::JoinSplitAir;
-    use crate::lookup::prover::{combined_constraint_layout, prove_lookup, verify_lookup, LookupVerifyError};
+    use crate::lookup::prover::{
+        combined_constraint_layout, prove_lookup, prove_lookup_lean, verify_lookup, verify_lookup_lean,
+        LookupVerifyError,
+    };
     use crate::poseidon2_air::Poseidon2RowsAir;
     use p3_air::symbolic::{get_symbolic_constraints, SymbolicExpr, SymbolicExpression};
     use p3_lookup::Lookups;
@@ -1824,6 +1827,35 @@ mod tests {
             Tip5SboxAir::W
         );
         assert!(log_nqc <= LOG_BLOWUP, "the Tip5 split-and-lookup S-box must be within the degree budget (got {log_nqc})");
+    }
+
+    /// **LOWER-RAM proving — the LEAN (non-hiding) config halves the quotient-domain LDE** (`--features tip5,lookup`).
+    /// The heavy recursion-wrap proves (Brick 4d, Step 6) OOM the box on `trace_on_quotient_domain`
+    /// (`width × 2^(degree_bits + log_nqc) × 8 B`); the hiding PCS's `is_zk = 1` DOUBLES that domain. Proving under
+    /// [`prove_lookup_lean`] (`TwoAdicFriPcs`, `is_zk = 0`) commits at `N` not `2N` — the same AIR, still verifies,
+    /// but the dominant LDE is ~2× smaller. This confirms both the hiding and lean proofs verify AND that the lean
+    /// proof's `degree_bits` is exactly one LOWER (the halved domain) — the 2× RAM lever, universal to every wrap prove.
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn lean_prove_halves_the_domain() {
+        let inputs = vec![0u64, 1, 255, 0xDEAD_BEEF, 0x0123_4567_89AB_CDEF];
+        let air = Tip5SboxAir;
+        let hiding = prove_lookup(&air, tip5_sbox_trace(&inputs), &[]);
+        let lean = prove_lookup_lean(&air, tip5_sbox_trace(&inputs), &[]);
+        assert!(verify_lookup(&air, &hiding, &[]).is_ok(), "the hiding (production) proof verifies");
+        assert!(verify_lookup_lean(&air, &lean, &[]).is_ok(), "the lean (non-hiding) proof verifies");
+        // is_zk 1 → 0 ⇒ the committed + quotient domains halve (degree_bits −1), so the trace-on-quotient-domain LDE
+        // (the OOM term, ∝ 2^degree_bits) is ~2× smaller under the lean config.
+        assert_eq!(
+            lean.degree_bits + 1,
+            hiding.degree_bits,
+            "the lean config (is_zk=0) commits at N not 2N ⇒ degree_bits one lower ⇒ ~2× less quotient-domain LDE"
+        );
+        println!(
+            "LEAN prove: hiding degree_bits {} → lean {} (is_zk 1→0) — the quotient-domain LDE (the wrap-prove OOM \
+             term) is ~2× smaller under the lean config; BOTH proofs verify. Brick 4d / Step 6 use prove_lookup_lean.",
+            hiding.degree_bits, lean.degree_bits
+        );
     }
 
     /// **W4 (Tip5 in-circuit) — the round AIR's arithmetic MATCHES the native Tip5 round** (`--features tip5,lookup`,
