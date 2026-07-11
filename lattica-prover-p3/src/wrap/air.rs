@@ -5399,21 +5399,23 @@ mod tests {
         pvs: &[Val],
         bind_optable: bool,
         narrow_ov: bool,
+        bind_caps: bool,
     ) -> (AssembledOpeningsWrapCwAir, RowMajorMatrix<Val>, Vec<Val>) {
         use crate::config::Challenge;
         use crate::joinsplit_air::{JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
         use crate::poseidon2_air::BLOCK;
-        use crate::recursion::monolith::tests::{build_symbolic_inner_window, sim_opening_positions};
+        use crate::recursion::monolith::tests::{build_symbolic_inner_window, sim_cap_positions, sim_opening_positions};
         use crate::recursion::monolith::MonolithAir;
         use crate::wrap::deep_fold_trace_from;
         use p3_field::{BasedVectorSpace, Field, TwoAdicField};
         use p3_goldilocks::Goldilocks;
         use p3_matrix::dense::RowMajorMatrix;
         use p3_uni_stark::{get_symbolic_constraints, AirLayout};
+        use std::collections::BTreeMap;
 
-        // narrow cw=true monolith trace + air (narrow_arith + narrow_openings; caps stay in the pis window).
+        // narrow cw=true monolith trace + air (narrow_arith + narrow_openings [+ narrow_caps when bind_caps]).
         let (mono_tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(
-            config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, narrow_ov,
+            config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, bind_caps, true, true, narrow_ov,
         );
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
@@ -5434,11 +5436,12 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
-            narrow_caps: false,
+            narrow_caps: bind_caps,
             narrow_openings: true, narrow_ov,
         };
         let (fw, h) = (m.fused_w(), m.height());
         let rate = AssembledOpeningsWrapCwAir::RATE;
+        let caprate = AssembledOpeningsWrapCwAir::CAP_RATE;
 
         // Column bases — MUST match `AssembledOpeningsWrapCwAir`'s accessors.
         let ro_col = fw;
@@ -5456,7 +5459,12 @@ mod tests {
         let w_term0 = |l: usize| nov_base + 2 + 3 * l;
         let w_term1 = |l: usize| nov_base + 3 + 3 * l;
         let w_lsel = |l: usize| nov_base + 4 + 3 * l;
-        let width = nov_base + if narrow_ov { 2 + 3 * rate } else { 0 };
+        // Tier-1 merge: the cap-region base (after nov + narrow_ov cols) — cap-row(7) + cap_sel + gi_base + 2·caprate.
+        let cap_base = nov_base + if narrow_ov { 2 + 3 * rate } else { 0 };
+        let (cr, cap_sel_c, cap_gi_base) = (cap_base, cap_base + 7, cap_base + 8);
+        let cap_w_gi = |l: usize| cap_base + 9 + 2 * l;
+        let cap_w_sel = |l: usize| cap_base + 9 + 2 * l + 1;
+        let width = cap_base + if bind_caps { 9 + 2 * caprate } else { 0 };
 
         // The FS-absorbed opening stream: positions[gi] = (oid, coeff, block, lane); committed[gi] = the felt
         // (== block_inputs[block][lane], the absorbed rate lane). A DEEP term k's F_p² opening is the pair
@@ -5497,10 +5505,21 @@ mod tests {
         let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
         assert_eq!(heads.len(), m.n_queries, "one arith head per query");
         let used = m.tr() + m.n_queries * m.m_period();
+        // Tier-1 merge: the cap-region (bind_caps) takes 2·2^cap_height (trace+quot) + Σ 2^commit_bits(r) slack rows
+        // AFTER the DeepFold regions + opening-rows.
+        let n_cap_rows = if bind_caps {
+            let mut n = 2 * (1usize << m.cap_height);
+            for r in 0..m.cm_rounds() {
+                n += 1usize << m.commit_bits(r);
+            }
+            n
+        } else {
+            0
+        };
         assert!(
-            used + n_terms * m.n_queries + n_terms <= h,
-            "DeepFold regions + opening-rows ({}) must fit the monolith slack ({})",
-            n_terms * m.n_queries + n_terms,
+            used + n_terms * m.n_queries + n_terms + n_cap_rows <= h,
+            "DeepFold regions + opening-rows + cap-region ({}) must fit the monolith slack ({})",
+            n_terms * m.n_queries + n_terms + n_cap_rows,
             h - used
         );
 
@@ -5612,6 +5631,67 @@ mod tests {
             // Each term is provided once to the DeepFold (−n_queries reads); when bind_optable the op-table ALSO
             // reads every term once (trace via a preseed leaf, quot via the recompose), so or_mult absorbs the +1.
             wide[b + or_mult] = Val::ZERO - Val::from_u64(m.n_queries as u64 + if bind_optable { 1 } else { 0 });
+        }
+
+        // Tier-1 merge — the cap-region (bind_caps): mirror `assemble_cap_wrap_cw`, placed in the slack AFTER the
+        // opening-rows. `cap_c` (freed by `CapMuxBci`) is re-bound by the SELECT + SPONGE-CAP buses. `is_head` is
+        // SHARED with the openings region (already set at head rows), so only the cap-row region + tags are filled.
+        let mut cap_periodics: Vec<Vec<Val>> = Vec::new();
+        if bind_caps {
+            let (block_inputs, positions) = sim_cap_positions(config, proof, pvs);
+            cap_periodics = vec![vec![Val::ZERO; h]; 2 * caprate];
+            for (gi, &(_cap_id, _entry, _k, block, lane)) in positions.iter().enumerate() {
+                let row = block * BLOCK;
+                cap_periodics[2 * lane][row] = Val::from_u64(gi as u64);
+                cap_periodics[2 * lane + 1][row] = Val::ONE;
+                // the periodic-pinned tag COLUMNS in the trace (MUST equal cap_periodics — the AIR binds them).
+                wide[row * width + cap_w_gi(lane)] = Val::from_u64(gi as u64);
+                wide[row * width + cap_w_sel(lane)] = Val::ONE;
+            }
+            // group the stream by (cap_id, entry): gi_base (k=0's gi) + the 4 digest felts (the FS-absorbed cap).
+            let mut entry_gi: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+            let mut entry_dig: BTreeMap<(usize, usize), [Val; 4]> = BTreeMap::new();
+            for (gi, &(cap_id, entry, k, block, lane)) in positions.iter().enumerate() {
+                if k == 0 {
+                    entry_gi.insert((cap_id, entry), gi);
+                }
+                entry_dig.entry((cap_id, entry)).or_insert([Val::ZERO; 4])[k] = block_inputs[block][lane];
+            }
+            let caps: Vec<(usize, usize, usize)> = {
+                let mut v = vec![(0, m.input_depth(), m.cap_height), (1, m.input_depth(), m.cap_height)];
+                for r in 0..m.cm_rounds() {
+                    v.push((2 + r, m.commit_shift(r), m.commit_bits(r)));
+                }
+                v
+            };
+            // cap-row region: one row per (cap, entry), in the slack AFTER the opening-rows.
+            let mut dst = or_start + n_terms;
+            for &(cap_id, shift, bits) in &caps {
+                let n = 1usize << bits;
+                let mut count = vec![0u64; n];
+                for &head in &heads {
+                    let mut e = 0usize;
+                    for j in 0..bits {
+                        if mono_tr[head * fw + m.sb_b(shift + j)] == Val::ONE {
+                            e += 1 << j;
+                        }
+                    }
+                    count[e] += 1;
+                }
+                for e in 0..n {
+                    let b = dst * width;
+                    let dig = entry_dig[&(cap_id, e)];
+                    wide[b + cr] = Val::from_u64(cap_id as u64);
+                    wide[b + cr + 1] = Val::from_u64(e as u64);
+                    for k in 0..4 {
+                        wide[b + cr + 2 + k] = dig[k];
+                    }
+                    wide[b + cr + 6] = Val::ZERO - Val::from_u64(count[e]); // cap_mult = −count
+                    wide[b + cap_sel_c] = Val::ONE;
+                    wide[b + cap_gi_base] = Val::from_u64(entry_gi[&(cap_id, e)] as u64);
+                    dst += 1;
+                }
+            }
         }
 
         // Brick 5d.4 — the op-table epilogue region (bind_optable): computes `folded` (the α-fold of the constraint
@@ -5734,7 +5814,7 @@ mod tests {
         }
 
         (
-            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr, narrow_ov, leaf_periodics, bind_caps: false, cap_periodics: vec![] },
+            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr, narrow_ov, leaf_periodics, bind_caps, cap_periodics },
             RowMajorMatrix::new(wide, width),
             Vec::new(),
         )
@@ -5762,7 +5842,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false, false);
 
         let m = &asm.m;
         let (fw, h) = (m.fused_w(), m.height());
@@ -5861,7 +5941,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false, false);
 
         let m = &asm.m;
         let (fw, h) = (m.fused_w(), m.height());
@@ -5992,7 +6072,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true, false);
 
         let m = &asm.m;
         let (fw, h) = (m.fused_w(), m.height());
@@ -6093,7 +6173,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true, false);
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
         println!(
             "proving cw=true narrow_ov openings-wrap (ro + {} z/px + pz + sponge + leaf-hash→px): width {width}, {} \
@@ -6111,7 +6191,7 @@ mod tests {
 
         // Corrupt a TRACE region's px (cur[db+10] on a df_sel row with df_is_quot=0) ⇒ its leaf-hash read no longer
         // matches the authenticated-leaf provide ⇒ the leaf-hash bus unbalances (and the fold ro breaks) ⇒ rejected.
-        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true);
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true, false);
         let db = asm2.m.fused_w() + 6;
         let (df_sel, dq) = (db + 18, asm2.df_is_quot());
         let row = (0..asm2.m.height())
@@ -6149,7 +6229,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false, false);
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
         println!(
             "proving cw=true assembled openings-wrap (ro + {} z/px + pz + sponge FS-anchor): width {width}, {} rows, \
@@ -6168,7 +6248,7 @@ mod tests {
 
         // Corrupt the first opening-row's pz ⇒ BOTH the sponge FS-anchor bus (pz ≠ the FS-absorbed felt) and the pz
         // re-provide bus (opening-row pz ≠ the regions' pz) unbalance ⇒ the corrupted trace must not verify.
-        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false);
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false, false);
         let fw = asm2.m.fused_w();
         let or_pz = (fw + 6) + 23 + N_GROUPS + 1; // db(fw+6) + 23 + N_GROUPS = or_base; or_pz = or_base + 1
         let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
@@ -6206,7 +6286,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false, false);
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
         println!(
             "proving cw=true op-table+openings assembled wrap (ro + {} z/px + pz + sponge + folded/quot wiring + {} \
@@ -6225,7 +6305,7 @@ mod tests {
 
         // Corrupt folded_col at an arith head ⇒ the folded wiring bus (head's folded_col read ≠ the op-table's folded
         // provide) unbalances AND the epilogue folded·inv_van == quot breaks ⇒ the corrupted trace must not verify.
-        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false);
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false, false);
         let fw = asm2.m.fused_w();
         let is_head = (fw + 6) + 21; // db(fw+6) + 21
         let head = (0..asm2.m.height())
@@ -6367,6 +6447,121 @@ mod tests {
         .unwrap_or(true);
         std::panic::set_hook(hook);
         assert!(rejected, "a corrupted cap-row digest must be rejected (select + sponge buses unbalance)");
+    }
+
+    /// **Tier-1 RAM+GPU (integrated) — the caps-narrowed wrap PROVES on the GPU under the lean config, RSS measured.**
+    /// The dominant width lever (caps ≈ 85% of the un-narrowed cw=true `fused_w`) proven end-to-end through the
+    /// GPU-accelerated LEAN lookup prover: assemble the cw=true cap-wrap (width 981, the `2^cap_height` cap COLUMNS
+    /// gone), prove via [`prove_lookup_lean_gpu`] (`GpuDft` LDE + `is_zk=0`), and verify under the CPU lean verifier
+    /// (wire-compatible). Reports peak RSS (VmHWM) — the caps narrowing + lean + GPU stack, the "reduce RAM with GPU
+    /// support" demonstration on the biggest single lever. Heavy; `--release --features gpu,lookup,recursion -j1`.
+    #[cfg(all(feature = "gpu", feature = "recursion"))]
+    #[test]
+    #[ignore = "heavy (GPU-lean): proves the caps-narrowed cw=true wrap (width 981) on the GPU + reports peak RSS; run `--release --features gpu,lookup,recursion -j1 -- --ignored`"]
+    fn cap_wrap_cw_assembled_proves_gpu() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::lookup::prover::prove_lookup_lean_gpu;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let peak_rss_mib = || -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(String::from))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+                .map(|kib| kib / 1024)
+                .unwrap_or(0)
+        };
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_cap_wrap_cw(&config, &proof, &pvs);
+        let width = <AssembledCapWrapCwAir as BaseAir<Val>>::width(&asm);
+        let lproof = prove_lookup_lean_gpu(&asm, trace, &pis);
+        assert!(
+            verify_lookup_lean(&asm, &lproof, &pis).is_ok(),
+            "the caps-narrowed cw=true wrap must prove on the GPU (lean) + verify under the CPU lean verifier (width {width})"
+        );
+        println!(
+            "Tier-1 RAM+GPU: caps-narrowed cw=true wrap (width {width}, {} rows) PROVED via prove_lookup_lean_gpu \
+             (GpuDft LDE + is_zk=0) + CPU-lean-verified. Peak RSS {} MiB — the caps narrowing (85% lever) + lean + GPU.",
+            asm.m.height(),
+            peak_rss_mib()
+        );
+    }
+
+    /// **Tier-1 merge M1c (assemble) — the merged caps ⊕ openings trace assembles.** `assemble_openings_wrap_cw` with
+    /// `bind_caps`: the `narrow_caps` monolith window + the openings fill (its internal ro-assert validates the
+    /// z/px/pz sourcing at the COLLAPSED offsets, so narrow_caps + narrow_openings coexist) + the cap-region fill
+    /// (SELECT/SPONGE-CAP) in the slack AFTER the opening-rows. A successful assemble (no offset panic) + the expected
+    /// width + populated cap-rows confirm the fill; the prove is `cap_merge_assembled_proves`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_merge_assembled_builds() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false, true);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        assert_eq!(trace.values.len(), asm.m.height() * width, "the merged trace has the assembled width");
+        let cap_sel_c = asm.cap_sel_c();
+        let n_cap_rows = (0..asm.m.height()).filter(|&r| trace.values[r * width + cap_sel_c] == Val::ONE).count();
+        assert!(n_cap_rows > 0, "the cap-region must be filled (cap_sel rows)");
+        println!(
+            "Tier-1 MERGE M1c (assemble): merged caps ⊕ openings trace width {width} (narrow_caps fused_w {} + \
+             regions), {n_cap_rows} cap-rows — the openings fill (ro-assert passed) + the cap-region coexist in one trace.",
+            asm.m.fused_w()
+        );
+    }
+
+    /// **Tier-1 merge M1c/M3 — the merged caps ⊕ openings wrap PROVES (lean).** The 9.2× width merge as a SOUND
+    /// STARK: assemble the `narrow_caps` + `narrow_openings` + `narrow_arith` wrap (width ~545 — BOTH the
+    /// `2^cap_height` cap COLUMNS and the `2·n_terms` pz opening columns GONE) and prove + verify end-to-end through
+    /// the LEAN prover — the host-RAM win (width ~545 vs the caps-un-narrowed 3792, ~7× less quotient-domain LDE). A
+    /// corrupted cap-row digest is rejected (the SELECT + SPONGE-CAP buses unbalance). Heavy; `--release -j1`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy (LEAN, -j1): proves the merged caps⊕openings wrap (width ~545) + tamper-rejects; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    fn cap_merge_assembled_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false, true);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        println!("proving the merged caps ⊕ openings wrap: width {width}, {} rows", asm.m.height());
+        let lproof = prove_lookup_lean(&asm, trace, &pis);
+        assert!(
+            verify_lookup_lean(&asm, &lproof, &pis).is_ok(),
+            "the merged caps ⊕ openings wrap must prove + verify through the LEAN prover (width {width})"
+        );
+
+        // Corrupt the first cap-row's digest ⇒ the SELECT + SPONGE-CAP buses unbalance ⇒ rejected.
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false, true);
+        let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
+        let cap_start = used + asm2.m.n_terms * asm2.m.n_queries + asm2.m.n_terms; // after DeepFold regions + opening-rows
+        let cr = asm2.cap_base();
+        bad.values[cap_start * width + cr + 2] += Val::ONE; // digest[0] of the first cap-row
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let lp = prove_lookup_lean(&asm2, bad, &pis2);
+            verify_lookup_lean(&asm2, &lp, &pis2).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted cap-row digest must be rejected (SELECT + SPONGE-CAP buses unbalance)");
     }
 
     /// **Caps plumbing brick — `CapWrapAir` composes with the product-mux externalized** (`--features recursion`).
