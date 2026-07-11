@@ -500,6 +500,109 @@ pub fn tip5_round_trace(states: &[[u64; 16]]) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(rows, w)
 }
 
+/// **W4 (Tip5 in-circuit) — the SPREAD round (feasibility de-risk of the full permutation).** The round-on-one-row
+/// packs 32 byte-lookups ⇒ log_nqc 6 and does NOT verify (`tip5_round_degree_needs_spreading`). This SPREADS them:
+/// each split-lane S-box goes on its OWN row (8 byte-lookups/row = the proven `Tip5SboxAir` level, ch0), and a
+/// per-round "round row" does the `x⁷` power lanes (witnessed x², degree 4) + circulant MDS + round constants. The
+/// two are connected by ONE ordered bus (ch1): the round row PROVIDES its `s[lane]` (key `lane`) + READS the
+/// S-box output `sb[lane]` (key `16+lane`); each S-box row READS the `s[lane]` it decomposes + PROVIDES its `sb`.
+/// Balance ⇒ each S-box row decomposes the round's real `s[lane]` and feeds back the real `sb[lane]`. This measures
+/// that the SPREAD design composes at `log_nqc ≤ LOG_BLOWUP` — the feasibility the round-on-one-row could not reach
+/// (the caps/openings "compose de-risk before assembly" pattern; the full 5-round permutation threads these rows +
+/// the state chain, the remaining multi-brick assembly). `x⁷`/MDS reuse [`Tip5RoundAir`]; the S-box reuses [`Tip5SboxAir`].
+#[cfg(feature = "tip5")]
+pub struct Tip5SpreadRoundAir;
+
+#[cfg(feature = "tip5")]
+impl Tip5SpreadRoundAir {
+    pub const N: usize = crate::tip5::WIDTH; // 16
+    pub const NS: usize = crate::tip5::NUM_SPLIT_LANES; // 4
+    pub const NB: usize = 8;
+    pub const S: usize = 0; // round input state
+    pub const SB: usize = Self::S + Self::N; // sbox-layer output
+    pub const SO: usize = Self::SB + Self::N; // round output
+    pub const K: usize = Self::SO + Self::N; // sbox row: 8 input bytes
+    pub const O: usize = Self::K + Self::NB; // sbox row: 8 L-image bytes
+    pub const X2: usize = Self::O + Self::NB; // round row: power-lane squares (N−NS)
+    pub const LANE: usize = Self::X2 + (Self::N - Self::NS); // sbox row: which split lane
+    pub const SVAL: usize = Self::LANE + 1; // sbox row: the decomposed value (= s[lane])
+    pub const OVAL: usize = Self::SVAL + 1; // sbox row: the recomposed value (= sb[lane])
+    pub const IS_SBOX: usize = Self::OVAL + 1;
+    pub const IS_ROUND: usize = Self::IS_SBOX + 1;
+    pub const TM: usize = Self::IS_ROUND + 1; // byte-table mult
+    pub const W: usize = Self::TM + 1;
+}
+
+#[cfg(feature = "tip5")]
+impl<F: p3_field::Field> BaseAir<F> for Tip5SpreadRoundAir {
+    fn width(&self) -> usize {
+        Self::W
+    }
+}
+
+#[cfg(feature = "tip5")]
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for Tip5SpreadRoundAir {
+    fn eval(&self, builder: &mut AB) {
+        use crate::tip5::{MDS_FIRST_COLUMN, ROUND_CONSTANTS};
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let (n, ns, nb) = (Tip5SpreadRoundAir::N, Tip5SpreadRoundAir::NS, Tip5SpreadRoundAir::NB);
+        let c = |x: usize| cur[x].clone();
+        let (is_sbox, is_round, tm) =
+            (c(Tip5SpreadRoundAir::IS_SBOX), c(Tip5SpreadRoundAir::IS_ROUND), c(Tip5SpreadRoundAir::TM));
+        let one = AB::Expr::ONE;
+        builder.assert_zero(is_sbox.clone() * (is_sbox.clone() - one.clone()));
+        builder.assert_zero(is_round.clone() * (is_round.clone() - one.clone()));
+        let b256 = AB::Expr::from(Val::from_u64(256));
+        // S-box row: sval = Σ kⱼ·256ʲ, oval = Σ oⱼ·256ʲ (the LogUp ch0 binds oⱼ = L(kⱼ)).
+        let (mut kr, mut or_, mut base) = (AB::Expr::ZERO, AB::Expr::ZERO, AB::Expr::ONE);
+        for j in 0..nb {
+            kr = kr + c(Tip5SpreadRoundAir::K + j) * base.clone();
+            or_ = or_ + c(Tip5SpreadRoundAir::O + j) * base.clone();
+            base = base * b256.clone();
+        }
+        builder.assert_zero(is_sbox.clone() * (c(Tip5SpreadRoundAir::SVAL) - kr));
+        builder.assert_zero(is_sbox.clone() * (c(Tip5SpreadRoundAir::OVAL) - or_));
+        // Round row: power lanes sb[i] = s[i]⁷ (via witnessed x2, degree 4), MDS + round constants.
+        for i in ns..n {
+            let s = c(Tip5SpreadRoundAir::S + i);
+            let x2 = c(Tip5SpreadRoundAir::X2 + (i - ns));
+            builder.assert_zero(x2.clone() - s.clone() * s.clone());
+            builder.assert_zero(c(Tip5SpreadRoundAir::SB + i) - x2.clone() * x2.clone() * x2.clone() * s);
+        }
+        for i in 0..n {
+            let mut acc = AB::Expr::ZERO;
+            for j in 0..n {
+                acc = acc + AB::Expr::from(Val::from_u64(MDS_FIRST_COLUMN[(i + n - j) % n])) * c(Tip5SpreadRoundAir::SB + j);
+            }
+            acc = acc + AB::Expr::from(ROUND_CONSTANTS[i]);
+            builder.assert_zero(is_round.clone() * (c(Tip5SpreadRoundAir::SO + i) - acc));
+        }
+        // Channel 0 — the byte-table (8 lookups/row = the proven S-box level). Table PROVIDES (byte, L(byte)) on slot 0.
+        let mut ch0: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(nb);
+        for j in 0..nb {
+            let mult = if j == 0 { is_sbox.clone() + tm.clone() } else { is_sbox.clone() };
+            ch0.push((vec![c(Tip5SpreadRoundAir::K + j), c(Tip5SpreadRoundAir::O + j)], mult));
+        }
+        builder.push_local_interaction(ch0);
+        // Channel 1 — the s/sb CONNECTION bus. Round row: PROVIDE (lane, s[lane]) −is_round + READ (16+lane, sb[lane])
+        // +is_round for each split lane. S-box row: READ (lane, sval) +is_sbox + PROVIDE (16+lane, oval) −is_sbox.
+        let mut ch1: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(2 * ns + 2);
+        for l in 0..ns {
+            ch1.push((vec![AB::Expr::from(Val::from_u64(l as u64)), c(Tip5SpreadRoundAir::S + l)], AB::Expr::ZERO - is_round.clone()));
+        }
+        for l in 0..ns {
+            ch1.push((vec![AB::Expr::from(Val::from_u64((n + l) as u64)), c(Tip5SpreadRoundAir::SB + l)], is_round.clone()));
+        }
+        ch1.push((vec![c(Tip5SpreadRoundAir::LANE), c(Tip5SpreadRoundAir::SVAL)], is_sbox.clone()));
+        ch1.push((
+            vec![c(Tip5SpreadRoundAir::LANE) + AB::Expr::from(Val::from_u64(n as u64)), c(Tip5SpreadRoundAir::OVAL)],
+            AB::Expr::ZERO - is_sbox.clone(),
+        ));
+        builder.push_local_interaction(ch1);
+    }
+}
+
 /// **AA5 — the in-circuit ORDERED SPONGE-CAP BUS** (feasibility, real data). The FS-anchor AA5 needs binds the
 /// narrow-tall cap region to the caps the transcript sponge ACTUALLY absorbed (so removing the pw cap columns in
 /// cw=true keeps inner-auth non-vacuous, and closes the pre-existing FS⟂auth cap decoupling). This proves that
@@ -1508,6 +1611,33 @@ mod tests {
              (OodMismatch) ⇒ the full permutation MUST SPREAD the S-box lookups to ≤8/row (the proven S-box level) — \
              a real multi-brick construction, not a one-row extension.",
             Tip5RoundAir::W
+        );
+    }
+
+    /// **W4 (Tip5 in-circuit) — the SPREAD round COMPOSES at ≤4** (`--features tip5,lookup`, cheap; the feasibility
+    /// de-risk the round-on-one-row could NOT reach). By moving each split-lane S-box to its own row (8 byte-lookups/
+    /// row = the proven `Tip5SboxAir` level, ch0) and connecting the round arithmetic via one ordered bus (ch1), the
+    /// SPREAD round composes at `log_nqc ≤ LOG_BLOWUP` — vs the whole-round-on-one-row's log_nqc 6 (which does not
+    /// verify). ⇒ the SPREAD design is degree-FEASIBLE: the full 5-round permutation (threading these rows + the
+    /// state chain, the remaining multi-brick assembly) has a provable path. (The caps/openings "compose de-risk
+    /// before the full assembly" step, now for the Tip5 permutation.)
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_spread_round_composes() {
+        let air = Tip5SpreadRoundAir;
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "Tip5 SPREAD round: width {}, {} channels (byte-table 8/row + s/sb connection), log_nqc {log_nqc} ≤ \
+             {LOG_BLOWUP} — spreading the S-box lookups to ≤8/row makes the round degree-FEASIBLE (the one-row form \
+             was log_nqc 6 + un-provable). The full permutation threads these rows + the state chain.",
+            Tip5SpreadRoundAir::W,
+            lookups.len()
+        );
+        assert_eq!(lookups.len(), 2, "the byte-table + the s/sb connection channels");
+        assert!(
+            log_nqc <= LOG_BLOWUP,
+            "spreading to ≤8 lookups/row must reach log_nqc ≤ {LOG_BLOWUP} (got {log_nqc}) — the round-on-one-row was 6"
         );
     }
 
