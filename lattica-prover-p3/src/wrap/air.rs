@@ -510,8 +510,10 @@ mod wrap_air {
     pub(crate) const N_GROUPS: usize = 8;
 
     /// The canonical `open_id` for an opening, from its `opening_key` `(tag, index)` (tag: 0/1 = Main{0/1} =
-    /// local/next, 2 = Public, 3 = Periodic, 4/5/6 = is_first/last/trans) + the inner geometry. Used by BOTH the
-    /// arith-head provides (AIR) and the op-table opening-leaf seed (trace), so they address the same opening.
+    /// local/next, 2 = Public, 3 = Periodic, 4/5/6 = is_first/last/trans, 7 = qwt quotient-recompose weight `i`)
+    /// + the inner geometry. Used by BOTH the arith-head provides (AIR) and the op-table opening-leaf seed (trace),
+    /// so they address the same opening. (Tag 7 = qwt is distinct from `op_table_f2_trace`'s `opening_key` tag-7 =
+    /// Constant: constants are pinned by the epilogue identity, never bus-bound, so they never reach `open_id`.)
     pub(crate) fn open_id(key: (u8, u64), w: u64, np: u64, nper: u64) -> u64 {
         OPEN_BASE
             + match key.0 {
@@ -522,7 +524,8 @@ mod wrap_air {
                 4 => 2 * w + np + nper,
                 5 => 2 * w + np + nper + 1,
                 6 => 2 * w + np + nper + 2,
-                _ => unreachable!("opening tag in 0..=6"),
+                7 => 2 * w + np + nper + 3 + key.1, // qwt quotient-recompose weight i (brick 5d.3)
+                _ => unreachable!("opening tag in 0..=7"),
             }
     }
 
@@ -2075,6 +2078,10 @@ mod wrap_air {
         /// The op-table wiring-bus address of the `folded` output wire (the arith head reads `folded_col` there);
         /// from `op_table_f2_trace` in the assembler, any distinct value for compose. Unused when `!bind_optable`.
         pub(crate) folded_addr: u64,
+        /// **Brick 5d.3** — the op-table wiring-bus address of the `quot` output wire (the recomposed quotient(ζ) =
+        /// Σ zps_i·chunk_i, appended to the op-table as more rows). The arith head reads `quot_col` here. Unused when
+        /// `!bind_optable`.
+        pub(crate) quot_addr: u64,
     }
 
     impl AssembledOpeningsWrapCwAir {
@@ -2429,6 +2436,15 @@ mod wrap_air {
                     vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1],
                     is_head.clone(),
                 ));
+                // Brick 5d.3: the head ALSO reads quot_col at quot_addr (the op-table's recomposed quotient(ζ) =
+                // Σ zps_i·chunk_i output wire, appended to the op-table as more rows). Balance ⇒ quot_col == the
+                // op-table's quot, so the epilogue `folded·inv_van == quot` checks a recompose actually computed in
+                // the op-table from BOUND quot-chunk openings + qwt weights (not a free witness).
+                let quot = (cur[self.quot_col()].clone(), cur[self.quot_col() + 1].clone());
+                chans[wch].push((
+                    vec![AB::Expr::from(Goldilocks::from_u64(self.quot_addr)), quot.0, quot.1],
+                    is_head.clone(),
+                ));
 
                 // --- Brick 5d.2: the op-table OPENING-LEAF binding (the op-table's `c_k` inputs bound to the real
                 // FS-absorbed openings). Every op-table leaf reads its opening on a bus; the head/opening-row provides
@@ -2468,8 +2484,17 @@ mod wrap_air {
                 let a6 = open_id((6, 0), wu, npu, nperu);
                 chans[nt + route(a6)].push((
                     vec![oidv(a6), cur[self.m.pw(2)].clone() - g_inv, cur[self.m.pw(3)].clone()],
-                    neg_head,
+                    neg_head.clone(),
                 ));
+                // Brick 5d.3: the nqc qwt quotient-recompose weights zps_i (window pw(qwt_base+2i)) — non-trace
+                // openings the op-table's recompose reads as leaves; provided from the cw=true window, split like the
+                // rest. (The quot-chunk openings d0_i/d1_i are TRACE leaves at term_idx = trm_quot(i,j) — the same
+                // is_tr_leaf mechanism as the trace openings, bound to the FS-anchored opening-rows.)
+                for i in 0..self.m.nqc() {
+                    let a = open_id((7, i as u64), wu, npu, nperu);
+                    let qb = self.m.qwt_base() + 2 * i;
+                    chans[nt + route(a)].push((vec![oidv(a), cur[self.m.pw(qb)].clone(), cur[self.m.pw(qb + 1)].clone()], neg_head.clone()));
+                }
                 // Non-trace leaf reads: one is_ch-routed read per split channel (gated; only the matching channel fires).
                 for g in 0..N_GROUPS {
                     let ich = cur[self.op_is_ch(g)].clone();
@@ -3980,7 +4005,7 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values (like opening_bind_cw_composes).
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
-        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0 };
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0 };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -4003,8 +4028,9 @@ mod tests {
         assert!(log_nqc <= LOG_BLOWUP, "openings AA1+AA2+AA2b cw=true must compose within the degree budget (got {log_nqc})");
     }
 
-    /// **AA6 brick 5d.1+5d.2 — the op-table folded + opening-leaf binding COEXIST with the openings fold at cw=true**
-    /// (`--features lookup,recursion`, cheap). Extends `openings_wrap_cw_assembled_composes` with `bind_optable`: the
+    /// **AA6 brick 5d.1+5d.2+5d.3 — the op-table folded + opening-leaf + quot binding COEXIST with the openings fold
+    /// at cw=true** (`--features lookup,recursion`, cheap). Extends `openings_wrap_cw_assembled_composes` with
+    /// `bind_optable`: the
     /// [`AssembledOpeningsWrapCwAir`] now ALSO appends the op-table region ([`OpTableF2Air`] relations, op_sel-gated)
     /// computing `folded` + a folded wiring bus (channel N_GROUPS+3) binding `folded_col` to the op-table's fold — so
     /// the epilogue `folded·inv_van == quot` ([`OpeningsBci`]) reads a fold actually computed in slack, not a free
@@ -4014,8 +4040,12 @@ mod tests {
     /// canonical `open_id` off the arith head's cw=true-window provide, SPLIT across N_GROUPS channels (the brick-5c
     /// pattern — all ~62 on one channel would recur the 2c wall). Confirms the DeepFold arith region + the op-table
     /// region + the opening-leaf buses + all 2·N_GROUPS+4 channels COEXIST within the degree budget (`log_nqc ≤
-    /// LOG_BLOWUP`) at cw=true — the DeepFold/op-table coexistence the handoff flagged as the key open question. Only
-    /// `quot_col` stays free (the quotient-chunk recompose is the next brick); the balance/prove are AA3/AA4.
+    /// LOG_BLOWUP`) at cw=true — the DeepFold/op-table coexistence the handoff flagged as the key open question.
+    /// **5d.3** binds `quot_col` too: the quotient recompose `quot(ζ) = Σ zps_i·(d0_i + X·d1_i)` is appended to the
+    /// op-table as more rows (X·d1 = emul((0,1),d1), all mul/add), so the head reads `quot_col` at `quot_addr` on the
+    /// wiring bus; the quot-chunk openings d0/d1 are TRACE leaves at `term_idx = trm_quot(i,j)`, the nqc qwt weights
+    /// zps_i are non-trace leaves off the cw=true window (`pw(qwt_base+2i)`). So BOTH free witnesses (`folded_col`,
+    /// `quot_col`) that made the epilogue vacuous are now bound — the AIR is complete; the trace/balance/prove follow.
     #[cfg(feature = "recursion")]
     #[test]
     fn optable_openings_wrap_cw_composes() {
@@ -4057,18 +4087,18 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
-        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: true, folded_addr: 1 << 20 };
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: true, folded_addr: 1 << 20, quot_addr: 1 << 21 };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!(
-            "AA6 brick 5d.1+5d.2 (op-table folded + opening-leaf binding): width {width} = fused_w {fw} + 35 + \
-             N_GROUPS + 2·RATE + 16 + N_GROUPS (op-table 13 + op_sel + is_tr_leaf + leaf_key + op_is_ch N_GROUPS); {} \
-             channels (ro + {N_GROUPS} z/px + pz + sponge + folded wiring + {N_GROUPS} non-trace-leaf split), log_nqc \
-             {log_nqc} ≤ {LOG_BLOWUP}. The DeepFold arith region + the op-table region COEXIST; folded_col bound to \
-             the op-table's fold; trace leaves read at term_idx (shared pz provide), non-trace via the N_GROUPS split. \
-             quot recompose next.",
+            "AA6 brick 5d.1+5d.2+5d.3 (op-table folded + opening-leaf + quot binding): width {width} = fused_w {fw} \
+             + 35 + N_GROUPS + 2·RATE + 16 + N_GROUPS (op-table 13 + op_sel + is_tr_leaf + leaf_key + op_is_ch \
+             N_GROUPS); {} channels (ro + {N_GROUPS} z/px + pz + sponge + folded/quot wiring + {N_GROUPS} non-trace \
+             split), log_nqc {log_nqc} ≤ {LOG_BLOWUP}. The DeepFold arith region + the op-table region COEXIST; \
+             folded_col AND quot_col bound to the op-table's fold/recompose; trace + quot-chunk leaves read at \
+             term_idx (shared pz provide), non-trace + qwt weights via the N_GROUPS split. Trace/balance/prove next.",
             lookups.len()
         );
         assert_eq!(
@@ -4245,7 +4275,7 @@ mod tests {
             wide[b + or_mult] = Val::ZERO - Val::from_u64(m.n_queries as u64);
         }
 
-        (AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0 }, RowMajorMatrix::new(wide, width), Vec::new())
+        (AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0 }, RowMajorMatrix::new(wide, width), Vec::new())
     }
 
     /// **AA6 openings AA3 — all `N_GROUPS+3` channels balance** (native, cheap — NO prove). Assemble the cw=true
