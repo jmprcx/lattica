@@ -290,7 +290,9 @@ pub mod dag {
 /// ≤ (K−1)/|F| (Schwartz–Zippel) — negligible over Goldilocks. So the accumulated claim is 0 IFF every leaf verifies.
 pub mod fold {
     use crate::config::Val;
+    use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
     use p3_field::PrimeCharacteristicRing;
+    use p3_matrix::dense::RowMajorMatrix;
 
     /// Fold K child claims into one accumulator by the RLC `acc = Σ rⁱ·claimᵢ` (Horner), `r` the FS challenge. A
     /// node's per-fold work is O(K) field ops — no FRI, no in-circuit verification (the Tier-3 per-node RAM win).
@@ -308,6 +310,64 @@ pub mod fold {
         let group = claims.len().div_ceil(k);
         let acc: Vec<Val> = claims.chunks(group).map(|g| fold_tree(g, k, r)).collect();
         fold_claims(&acc, r * r)
+    }
+
+    /// **Tier-3 in-circuit fold gadget** — a STARK AIR proving the accumulation `acc = Σ claimᵢ·rⁱ` was computed
+    /// correctly (the folding VERIFIER's core check). Width 3: `[claim, r_pow, acc]`; public inputs `[r, final_acc]`.
+    /// Each row folds one child claim at O(1)/row + degree 2 (one `·r` multiply) — the low-cost, NO-in-circuit-FRI
+    /// per-node work an accumulation node does (vs the wrap re-running the inner FRI verifier). The DECIDER (opening
+    /// the final accumulated instance via ONE GPU FRI at the root) is the remaining Tier-3 prover piece.
+    pub struct FoldAir;
+
+    impl<F: p3_field::Field> BaseAir<F> for FoldAir {
+        fn width(&self) -> usize {
+            3
+        }
+        fn num_public_values(&self) -> usize {
+            2
+        }
+    }
+
+    impl<AB: AirBuilder<F = Val>> Air<AB> for FoldAir {
+        fn eval(&self, builder: &mut AB) {
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let nxt: Vec<AB::Expr> = builder.main().next_slice().iter().map(|&x| x.into()).collect();
+            let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
+            let (r, final_acc) = (pis[0].clone(), pis[1].clone());
+            let (claim, r_pow, acc) = (cur[0].clone(), cur[1].clone(), cur[2].clone());
+            let (claim_n, r_pow_n, acc_n) = (nxt[0].clone(), nxt[1].clone(), nxt[2].clone());
+            let one = AB::Expr::ONE;
+            // first row: r_pow = 1, acc = claim (the k=0 term claim·r⁰).
+            builder.when_first_row().assert_zero(r_pow.clone() - one);
+            builder.when_first_row().assert_zero(acc.clone() - claim);
+            // transition: r_pow' = r_pow·r ; acc' = acc + claim'·r_pow' (degree 2 — one multiply by r).
+            builder.when_transition().assert_zero(r_pow_n.clone() - r_pow * r);
+            builder.when_transition().assert_zero(acc_n - (acc.clone() + claim_n * r_pow_n));
+            // last row: acc == the public folded accumulator.
+            builder.when_last_row().assert_zero(acc - final_acc);
+        }
+    }
+
+    /// Build the [`FoldAir`] trace for `claims` (padded to a power of two with zero claims) under challenge `r`:
+    /// row `i` = `[claimᵢ, rⁱ, Σ_{j≤i} claimⱼ·rʲ]`. The last row's `acc` is `fold_claims(claims, r)`.
+    pub fn fold_trace(claims: &[Val], r: Val) -> RowMajorMatrix<Val> {
+        let n = claims.len().next_power_of_two().max(2);
+        let mut vals = vec![Val::ZERO; n * 3];
+        let (mut r_pow, mut acc) = (Val::ONE, Val::ZERO);
+        for i in 0..n {
+            let claim = if i < claims.len() { claims[i] } else { Val::ZERO };
+            if i == 0 {
+                r_pow = Val::ONE;
+                acc = claim;
+            } else {
+                r_pow *= r;
+                acc += claim * r_pow;
+            }
+            vals[i * 3] = claim;
+            vals[i * 3 + 1] = r_pow;
+            vals[i * 3 + 2] = acc;
+        }
+        RowMajorMatrix::new(vals, 3)
     }
 }
 
@@ -491,5 +551,29 @@ mod tests {
         for &k in &[2usize, 4, 8] {
             assert_ne!(fold_tree(&claims, k, r), Val::ZERO, "a bad leaf ⇒ nonzero fold-tree root (k={k})");
         }
+    }
+
+    /// **Tier-3 in-circuit fold gadget — the fold PROVES as a STARK.** `FoldAir` proves `acc = Σ claimᵢ·rⁱ` over
+    /// the trace end-to-end (p3 prove/verify under the lean config); a corrupted claimed accumulator is rejected.
+    /// The folding VERIFIER's core check as a real STARK — per-row degree 2, NO in-circuit FRI (the low-per-node
+    /// Tier-3 primitive; the GPU FRI decider over the accumulated instance is the remaining prover piece).
+    #[test]
+    fn fold_gadget_proves() {
+        use crate::config::make_config_lean;
+        use crate::config::Val;
+        use crate::tree::fold::{fold_claims, fold_trace, FoldAir};
+        use p3_field::PrimeCharacteristicRing;
+        use p3_uni_stark::{prove, verify};
+
+        let r = Val::from_u64(0x9e3779b97f4a7c15);
+        let claims: Vec<Val> = (0..8).map(|i| Val::from_u64(1000 + i)).collect();
+        let acc = fold_claims(&claims, r);
+        let config = make_config_lean();
+        let pis = vec![r, acc];
+        let proof = prove(&config, &FoldAir, fold_trace(&claims, r), &pis);
+        assert!(verify(&config, &FoldAir, &proof, &pis).is_ok(), "the fold gadget must prove + verify");
+        // a wrong claimed accumulator is rejected (the in-circuit fold binds acc to the claims).
+        let bad = vec![r, acc + Val::ONE];
+        assert!(verify(&config, &FoldAir, &proof, &bad).is_err(), "a corrupted accumulator must be rejected");
     }
 }
