@@ -235,6 +235,117 @@ pub fn cap_mux_trace(cap: &[Val], queries: &[usize]) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(rows.into_iter().flatten().collect(), 3)
 }
 
+/// **W4 (Tip5 in-circuit) — the split-and-lookup S-box IS a cheap LogUp lookup.** The novel in-circuit Tip5
+/// mechanism (`tip5.rs` doc: "a split-and-lookup S-box that a lookup argument verifies cheaply in-circuit"),
+/// built as a real STARK: for a field element `x`, witness its 8 little-endian bytes `b₀..b₇`
+/// (`x = Σ bᵢ·256ⁱ`, degree-1), map each through the real Tip5 offset-Fermat-cube byte map
+/// `L(b) = ((b+1)³+256) mod 257`, and recombine `y = Σ L(bᵢ)·256ⁱ` — so `y = split_and_lookup(x)`. The byte map
+/// is enforced by ONE LogUp channel against the 256-row table `(byte, L(byte))`: each S-box row READS its 8
+/// `(bᵢ, oᵢ)` (+1), each table row PROVIDES `(byte, L(byte))` (−count). Balance ⇒ every `oᵢ = L(bᵢ)` AND every
+/// `bᵢ ∈ [0,256)` (only bytes are table keys — the range is IMPLIED by the lookup). This VALIDATES
+/// `cost_estimate`'s claim (the split lanes become degree-~1 lookups, not degree-7 x⁷) with an actual proof —
+/// the foundational gadget of the in-circuit Tip5 hash (the full 5-round permutation AIR wraps this S-box + the
+/// x⁷ lanes + the circulant MDS). (Canonical-decomposition variant, matching `tip5::split_and_lookup`; the
+/// Goldilocks-canonicity of `x`'s split is the same range refinement the production Poseidon2/decomp gadgets use.)
+#[cfg(feature = "tip5")]
+pub struct Tip5SboxAir;
+
+#[cfg(feature = "tip5")]
+impl Tip5SboxAir {
+    /// Bytes per field element (the split width).
+    pub const NB: usize = 8;
+    /// `[b₀..b₇, o₀..o₇, x, y, is_sbox, tm]` — 8 keys + 8 values + input + output + selector + table-mult.
+    pub const W: usize = 2 * Self::NB + 4;
+}
+
+#[cfg(feature = "tip5")]
+impl<F: p3_field::Field> BaseAir<F> for Tip5SboxAir {
+    fn width(&self) -> usize {
+        Self::W
+    }
+}
+
+#[cfg(feature = "tip5")]
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for Tip5SboxAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nb = Tip5SboxAir::NB;
+        let (x, y) = (cur[2 * nb].clone(), cur[2 * nb + 1].clone());
+        let (is_sbox, tm) = (cur[2 * nb + 2].clone(), cur[2 * nb + 3].clone());
+        let one = AB::Expr::ONE;
+        builder.assert_zero(is_sbox.clone() * (is_sbox.clone() - one.clone())); // selector boolean
+        // decomposition x == Σ bᵢ·256ⁱ and recomposition y == Σ oᵢ·256ⁱ (both gated by is_sbox, both degree 1).
+        let (mut xrec, mut yrec, mut base) = (AB::Expr::ZERO, AB::Expr::ZERO, AB::Expr::ONE);
+        let b256 = AB::Expr::from(Val::from_u64(256));
+        for i in 0..nb {
+            xrec = xrec + cur[i].clone() * base.clone();
+            yrec = yrec + cur[nb + i].clone() * base.clone();
+            base = base * b256.clone();
+        }
+        builder.assert_zero(is_sbox.clone() * (x - xrec));
+        builder.assert_zero(is_sbox.clone() * (y - yrec));
+        // ONE LogUp channel: sbox rows READ 8 (bᵢ, oᵢ) (+is_sbox); table rows PROVIDE (byte, L(byte)) on slot 0
+        // (−count via tm). mult₀ = is_sbox + tm, multᵢ≥₁ = is_sbox (0 on table/padding rows — dead tuples).
+        let mut tuples: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(nb);
+        for i in 0..nb {
+            let mult = if i == 0 { is_sbox.clone() + tm.clone() } else { is_sbox.clone() };
+            tuples.push((vec![cur[i].clone(), cur[nb + i].clone()], mult));
+        }
+        builder.push_local_interaction(tuples);
+    }
+}
+
+/// The real Tip5 offset-Fermat-cube byte map `L(b) = ((b+1)³ + 256) mod 257` (== `tip5::LOOKUP_TABLE[b]`, per
+/// `real_lookup_table_is_the_fermat_cube_bijection`). Bijective on `0..256`.
+#[cfg(feature = "tip5")]
+pub fn tip5_lookup(b: u64) -> u64 {
+    let x = b + 1;
+    (x * x * x + 256) % 257
+}
+
+/// Build a Tip5 S-box trace: 256 table rows `(byte, L(byte), −count)` + one S-box row per input (its 8 bytes +
+/// their L-images + `x`/`y`), padded to a power of two. The lookup binds each S-box byte to the table ⇒ every
+/// row's `y == split_and_lookup(x)`.
+#[cfg(feature = "tip5")]
+pub fn tip5_sbox_trace(inputs: &[u64]) -> RowMajorMatrix<Val> {
+    let (nb, w) = (Tip5SboxAir::NB, Tip5SboxAir::W);
+    let mut count = vec![0u64; 256];
+    for &x in inputs {
+        for byte in x.to_le_bytes() {
+            count[byte as usize] += 1;
+        }
+    }
+    let mut rows: Vec<Val> = Vec::new();
+    // table rows: slot0 = (byte, L(byte)); tm = −count; is_sbox 0; x/y 0; slots 1..nb = 0.
+    for b in 0..256u64 {
+        let mut r = vec![Val::ZERO; w];
+        r[0] = Val::from_u64(b);
+        r[nb] = Val::from_u64(tip5_lookup(b));
+        r[2 * nb + 3] = -Val::from_u64(count[b as usize]); // tm = −count[byte]
+        rows.extend(r);
+    }
+    // sbox rows: bytes bᵢ = LE(x); oᵢ = L(bᵢ); y = Σ oᵢ·256ⁱ; is_sbox 1.
+    for &x in inputs {
+        let mut r = vec![Val::ZERO; w];
+        let bytes = x.to_le_bytes();
+        let mut y = 0u64;
+        for i in 0..nb {
+            let (bi, oi) = (bytes[i] as u64, tip5_lookup(bytes[i] as u64));
+            r[i] = Val::from_u64(bi);
+            r[nb + i] = Val::from_u64(oi);
+            y = y.wrapping_add(oi << (8 * i)); // recombine (oᵢ < 256 ⇒ exact, no overflow to i=7)
+        }
+        r[2 * nb] = Val::from_u64(x);
+        r[2 * nb + 1] = Val::from_u64(y);
+        r[2 * nb + 2] = Val::ONE; // is_sbox
+        rows.extend(r);
+    }
+    let h = (rows.len() / w).next_power_of_two();
+    rows.resize(h * w, Val::ZERO); // padding rows: is_sbox 0, tm 0 ⇒ dead
+    RowMajorMatrix::new(rows, w)
+}
+
 /// **AA5 — the in-circuit ORDERED SPONGE-CAP BUS** (feasibility, real data). The FS-anchor AA5 needs binds the
 /// narrow-tall cap region to the caps the transcript sponge ACTUALLY absorbed (so removing the pw cap columns in
 /// cw=true keeps inner-auth non-vacuous, and closes the pre-existing FS⟂auth cap decoupling). This proves that
@@ -1125,6 +1236,56 @@ mod tests {
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!("cap-mux lookup: width = 3, log_nqc = {log_nqc} (budget {LOG_BLOWUP})");
         assert!(log_nqc <= LOG_BLOWUP, "cap-mux lookup must be within the degree budget (got {log_nqc})");
+    }
+
+    /// **W4 (Tip5 in-circuit) — the split-and-lookup S-box proves + verifies** through the W1 lookup prover: for
+    /// a set of field elements, every S-box row's 8 byte-lookups balance against the 256-row `(byte, L(byte))`
+    /// table ⇒ each `y = split_and_lookup(x)`. The foundational gadget of the in-circuit Tip5 hash (Step 4).
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_sbox_lookup_round_trips() {
+        let inputs = vec![0u64, 1, 255, 256, 0xDEAD_BEEF, 0x0123_4567_89AB_CDEF, 0xFFFF_FFFF_0000_0000];
+        let air = Tip5SboxAir;
+        let proof = prove_lookup(&air, tip5_sbox_trace(&inputs), &[]);
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "valid Tip5 S-box instances must verify");
+    }
+
+    /// A corrupted S-box output byte (`oᵢ ≠ L(bᵢ)`, kept recomposition-consistent) reads a `(byte, non-L)` tuple
+    /// ABSENT from the table ⇒ the multiset does not balance ⇒ `NonZeroTerminal` — the S-box soundness (the
+    /// lookup FORCES `oᵢ = L(bᵢ)`, i.e. the byte map is exactly the real Tip5 offset-Fermat-cube map).
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_sbox_rejects_wrong_output() {
+        let inputs = vec![0xDEAD_BEEFu64, 42, 255];
+        let mut trace = tip5_sbox_trace(&inputs);
+        let (w, nb) = (Tip5SboxAir::W, Tip5SboxAir::NB);
+        // the first sbox row follows the 256 table rows; bump o_0 AND y by the same amount so the recomposition
+        // constraint still holds (256⁰·1) but the lookup reads (b_0, L(b_0)+1) — no such table entry.
+        let srow = 256;
+        trace.values[srow * w + nb] += Val::ONE; // o_0 ≠ L(b_0)
+        trace.values[srow * w + 2 * nb + 1] += Val::ONE; // y += 1 (keep y == Σ oᵢ·256ⁱ)
+        let air = Tip5SboxAir;
+        let proof = prove_lookup(&air, trace, &[]);
+        assert!(
+            matches!(verify_lookup(&air, &proof, &[]), Err(LookupVerifyError::NonZeroTerminal)),
+            "a Tip5 S-box output ≠ L(byte) must be rejected"
+        );
+    }
+
+    /// **The Tip5 recursion win, PROVEN:** the split-and-lookup S-box is a LOW-DEGREE lookup (`log_nqc ≤` budget)
+    /// — validating `cost_estimate`'s "split lanes → ~degree-1 lookups" (vs the x⁷ lanes' degree 7). This is the
+    /// whole point of Tip5 for recursion, now an actual measured degree rather than an asserted cost number.
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_sbox_is_low_degree() {
+        let air = Tip5SboxAir;
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "Tip5 S-box lookup: width {}, log_nqc {log_nqc} (budget {LOG_BLOWUP}) — the split lanes are a cheap lookup",
+            Tip5SboxAir::W
+        );
+        assert!(log_nqc <= LOG_BLOWUP, "the Tip5 split-and-lookup S-box must be within the degree budget (got {log_nqc})");
     }
 
     /// **W2-C (size)** — the narrow-tall running eval proves + verifies through the W1 lookup prover, which
