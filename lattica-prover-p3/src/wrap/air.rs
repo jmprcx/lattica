@@ -3562,7 +3562,7 @@ mod tests {
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         // FULL geometry (narrow_arith:false ⇒ px stored + ov carrier bound to it + the leaf-hash binding present).
         let (tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -3616,6 +3616,94 @@ mod tests {
              {} leaf blocks). ⇒ px can be re-sourced from the leaf hash via a bus, eliminating the ov carrier copy \
              (the leaf hash is the Merkle-authenticated FS-anchor — the openings sponge-bus pattern one region over).",
             m.leaf_blocks()
+        );
+    }
+
+    /// **W3 ov externalization brick 4b — the narrow_ov TRACE matches native** (`--features recursion`, cheap; NO
+    /// prove). The trace builder (`build_symbolic_inner_window` → `monolith_build_trace`) now threads `narrow_ov`:
+    /// with it on, the ov opened-row carrier fill is skipped (`monolith/build.rs`, gated on `!narrow_ov`) while the
+    /// leaf-preimage still feeds `leaf_hash`. This confirms, byte-for-byte on a real join-split inner, that the
+    /// narrow_ov trace EQUALS the baseline (narrow_openings) trace with EXACTLY the ov-carrier column block
+    /// `[ov() .. ov()+input_leaf_felts())` excised — every other column (the leaf-hash Poseidon lanes, the Merkle
+    /// merges, the qc/commit carriers, the pis window) is identical. ⇒ the narrowing DROPS the carrier and nothing
+    /// else: the input-Merkle leaf/cap are unchanged (still authenticated), so the narrow_ov trace satisfies the
+    /// narrow_ov AIR (whose only delta is the gated-off ov reads, brick 4a). The prerequisite the assembled px
+    /// binding (brick 4d) needs: a real narrowed trace whose px is re-sourced from the (unchanged) leaf-hash lanes.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_trace_matches_native() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        // the assembler's regime: narrow_arith + narrow_openings on, caps in the window; toggle ONLY narrow_ov.
+        let mk = |narrow_ov: bool| -> (Vec<Val>, MonolithAir) {
+            let (tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(
+                &config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, narrow_ov,
+            );
+            let m = MonolithAir {
+                counts,
+                binds,
+                index_binds,
+                n_queries: proof.opening_proof.query_proofs.len(),
+                n_terms,
+                inner_counter: false,
+                column_window: true,
+                k_instances: 1,
+                fold: false,
+                fold_txstmt: false,
+                constraints: constraints.clone(),
+                w_inner_f: WIDTH,
+                n_pub_f: N_PUBLIC,
+                n_periodic_f: N_PERIODIC,
+                is_zk: 0,
+                cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+                narrow_arith: true,
+                narrow_caps: false,
+                narrow_openings: true,
+                narrow_ov,
+            };
+            (tr, m)
+        };
+        let (base_tr, base) = mk(false);
+        let (narrow_tr, narrow) = mk(true);
+        let (bfw, nfw) = (base.fused_w(), narrow.fused_w());
+        let ilf = base.input_leaf_felts();
+        let p = base.ov(); // the ov-carrier block start (== narrow.ov(): only its WIDTH changes)
+        assert_eq!(base.ov(), narrow.ov(), "the ov-carrier block start is unchanged (only its width → 0)");
+        assert_eq!(nfw, bfw - ilf, "narrow_ov drops exactly input_leaf_felts (= w_inner) columns");
+        let h = base_tr.len() / bfw;
+        assert_eq!(narrow_tr.len() / nfw, h, "same height");
+
+        // byte-for-byte: narrow[r][c] == base[r][c] for c < p; == base[r][c+ilf] for c ≥ p (the block excised).
+        let mut checked = 0usize;
+        for r in 0..h {
+            for c in 0..nfw {
+                let base_c = if c < p { c } else { c + ilf };
+                assert_eq!(
+                    narrow_tr[r * nfw + c],
+                    base_tr[r * bfw + base_c],
+                    "row {r} narrow col {c} must equal baseline col {base_c} (ov block [{p}..{}) excised)",
+                    p + ilf
+                );
+                checked += 1;
+            }
+        }
+        // and the excised block in the baseline is exactly the held ov carrier (== the leaf-hash lanes, brick 2) —
+        // so what we dropped is the redundant copy, not any authenticating data.
+        println!(
+            "W3 ov brick 4b: narrow_ov trace matches native — {checked} cells byte-identical to the baseline with the \
+             {ilf}-col ov carrier [{p}..{}) excised (fused_w {bfw} → {nfw}). The leaf-hash lanes + Merkle merges + \
+             qc/commit carriers + pis window are UNCHANGED (only the redundant opened-row copy is gone), so the \
+             narrow_ov trace satisfies the narrow_ov AIR. Ready for the assembled px re-source (brick 4d).",
+            p + ilf
         );
     }
 
@@ -3839,7 +3927,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -3903,7 +3991,7 @@ mod tests {
         // narrow_caps=true: the internal α-fold + window (α/pub/periodic/qwt) pre-checks assert INSIDE the builder,
         // so a successful return means the collapsed-window openings are correct.
         let (tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false, false);
 
         // reconstruct the narrow air the trace was built for; the trace width == its (reduced) fused_w.
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
@@ -3959,7 +4047,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let air = MonolithAir {
             counts,
@@ -4011,7 +4099,7 @@ mod tests {
 
         // narrow cw=true monolith trace + air (identical setup to narrow_caps_cw_verifier_proves).
         let (mono_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
+            build_symbolic_inner_window(config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -4180,7 +4268,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, false, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -4247,7 +4335,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -4309,7 +4397,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -4375,7 +4463,7 @@ mod tests {
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -4445,7 +4533,7 @@ mod tests {
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         // narrow_caps = false: the caps stay in the pis window (isolating the openings work); build the window to match.
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -4527,7 +4615,7 @@ mod tests {
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         // narrow_caps = false: the caps stay in the pis window (isolating the openings work); build the window to match.
         let (_tr, counts, binds, index_binds, n_terms, _pv0) =
-            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
             counts,
@@ -4610,7 +4698,7 @@ mod tests {
 
         // narrow cw=true monolith trace + air (narrow_arith + narrow_openings; caps stay in the pis window).
         let (mono_tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(
-            config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true,
+            config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, false,
         );
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
@@ -6793,7 +6881,7 @@ mod tests {
         // (2) OUTER: the monolith verifying the INNER monolith. build_symbolic_inner_window builds + self-
         // validates the outer witness (self-recursion). Measure the outer as MonolithAir (inline) AND WrapAir.
         let (_otr, ocounts, obinds, oib, ont, _pv0) =
-            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false);
+            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false, false);
         let cap_h = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
         let outer = MonolithAir {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
@@ -6968,7 +7056,7 @@ mod tests {
         // OUTER: the monolith verifying the inner (self-recursion). build_symbolic_inner_window builds + self-
         // validates the outer's witness; we only need its structural params (counts/binds/n_terms) for fused_w.
         let (_otr, ocounts, obinds, oib, ont, _pv0) =
-            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false);
+            build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false, false);
         let cap_h = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
 
         // fused_w is a pure width function of the struct ⇒ read the outer width at FULL vs NARROWED geometry, and

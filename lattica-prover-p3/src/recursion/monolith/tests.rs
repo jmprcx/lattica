@@ -1224,6 +1224,7 @@ pub(crate) fn build_symbolic_inner_window<A>( // exposed for the deep-tree wrap'
     narrow_caps: bool, // AA5: drop the Merkle-cap slice from the pis window (caps sourced from the FS sponge)
     narrow_arith: bool, // AA6: narrow the arith tile (drop inline z/inv/apow — the wrap externalizes the DEEP fold)
     narrow_openings: bool, // AA6: drop pz too (the OOD openings leave the tile, sourced from the sponge-opening bus)
+    narrow_ov: bool, // W3 brick 4b: drop the ov opened-row carrier (px re-sourced from the leaf-hash rows via a bus)
 ) -> (Vec<Val>, Vec<u8>, Vec<usize>, Vec<(usize, usize)>, usize, Val)
 where
     A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
@@ -1275,7 +1276,7 @@ where
         n_pub_f: n_pub,
         n_periodic_f: n_periodic,
         is_zk: 0,
-        cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith, narrow_caps, narrow_openings, narrow_ov: false };
+        cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith, narrow_caps, narrow_openings, narrow_ov };
     let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) = epilogue_openings(config, inner, proof, pvs);
     let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
     // pis (identical order to run_symbolic_monolith; here they fill the WINDOW instead of public_values).
@@ -1739,7 +1740,7 @@ fn run_symbolic_aggregator(k: usize, n_queries: usize, cap_h: usize) -> (u32, u6
     for _i in 0..k {
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
         let cap_height = proof.commitments.trace.roots().len().trailing_zeros() as usize;
-        let (tr, counts, binds, ib, nt, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+        let (tr, counts, binds, ib, nt, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
         insts.push(tr);
         if _i == 0 {
             params = Some((counts, binds, ib, nt, cap_height));
@@ -1848,7 +1849,7 @@ fn phase8_joinsplit_window_monolith() {
     let w = demo_witness();
     let pvs = public_values(&w);
     let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-    let (tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+    let (tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
     let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
     let air = MonolithAir {
         counts, binds, index_binds, n_queries: 4, n_terms,
@@ -1871,7 +1872,7 @@ where
     use super::MonolithAir;
     use p3_matrix::dense::RowMajorMatrix;
     use p3_uni_stark::{get_symbolic_constraints, AirLayout};
-    let (tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(config, inner, proof, pvs, w, np, nper, false, false, false);
+    let (tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(config, inner, proof, pvs, w, np, nper, false, false, false, false);
     let constraints = get_symbolic_constraints::<Val, A>(inner, AirLayout::from_air::<Val>(inner));
     let air = MonolithAir {
         counts, binds, index_binds, n_queries: proof.opening_proof.query_proofs.len(), n_terms,
@@ -1942,7 +1943,7 @@ fn phase8_joinsplit_aggregator_probe() {
     let pvs = public_values(&w);
     let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
     let (counts, binds, index_binds, n_terms, cap_height) = {
-        let (_tr, counts, binds, ib, nt, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false);
+        let (_tr, counts, binds, ib, nt, _pv0) = build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
         (counts, binds, ib, nt, proof.commitments.trace.roots().len().trailing_zeros() as usize)
     };
     let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
@@ -2089,7 +2090,7 @@ fn phase9_self_recursion_probe() {
     // (2) OUTER: the monolith verifying the INNER monolith proof. build_symbolic_inner_window does the witness
     // AND validates it (full-fold pre-check + window/pz/cap binds); if it returns, the self-recursion mechanism
     // works over MonolithAir-as-inner. NO outer prove — we only measure its geometry.
-    let (_otr, ocounts, obinds, oib, ont, _pv0) = build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false);
+    let (_otr, ocounts, obinds, oib, ont, _pv0) = build_symbolic_inner_window(&config, &inner, &inner_prf, &pis, w_in, np_in, nper_in, false, false, false, false);
     let cap_height = inner_prf.commitments.trace.roots().len().trailing_zeros() as usize;
     let outer = MonolithAir { counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(), w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false };
     let olayout = AirLayout::from_air::<Val>(&outer);

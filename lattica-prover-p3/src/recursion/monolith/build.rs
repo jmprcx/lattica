@@ -264,8 +264,14 @@ pub(crate) fn monolith_build_trace(
         // carriers held within this super-tile: the input/random/quot leaf preimages + the fold groups (+ the
         // per-query cap-entry carriers, including the random cap, when verifying a non-constant/hiding inner).
         for r in 0..air.m_period() {
-            for (cc, &v) in input_preimage.iter().enumerate() {
-                t[(off + r) * w + air.ov_c(cc)] = v;
+            // NARROW-OV: the ov opened-row carrier is externalized (`ov_carrier_w()→0`), so `ov_c(cc)` now aliases
+            // the `qc`/carrier region — skip the fill (the wrap re-sources px from the leaf-hash rows via a bus). The
+            // leaf preimage still feeds `leaf_hash` above, so the input-Merkle leaf/cap are byte-identical. Byte-for-
+            // byte when `!narrow_ov`.
+            if !air.narrow_ov {
+                for (cc, &v) in input_preimage.iter().enumerate() {
+                    t[(off + r) * w + air.ov_c(cc)] = v;
+                }
             }
             if air.is_zk == 1 {
                 for (cc, &v) in random_preimage.iter().enumerate() {
