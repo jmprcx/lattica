@@ -37,6 +37,17 @@ if [ "$GOT" != "$EXPECTED" ]; then
 fi
 echo "OK: exactly $(echo "$GOT" | grep -c .) lattica_* externs (the frozen node seam)."
 
+# The research tree-aggregation extern `lattica_tree_root` (W7 C-ABI) is feature-gated (`tree`) OUT of the
+# default build. It lives in a DISTINCT namespace (`lattica_tree*`) the frozen-seam grep above ignores, so
+# assert its absence explicitly — a future accidental un-gating must fail here, not slip through.
+TREE_EXT="$(nm -g --defined-only "$LIB" 2>/dev/null | grep -cE 'lattica_tree[a-z_]*' || true)"
+if [ "${TREE_EXT:-0}" -ne 0 ]; then
+  echo "FAIL: $TREE_EXT lattica_tree* research externs in the DEFAULT staticlib (must be behind --features tree):"
+  nm -g --defined-only "$LIB" 2>/dev/null | grep -E 'lattica_tree' | head
+  exit 1
+fi
+echo "OK: zero lattica_tree* research externs in the default staticlib (feature-gated; enable with --features tree)."
+
 # ZERO recursion symbols (the module is feature-gated out of the default build). Rust mangling embeds the
 # module path, so gated-out recursion code contributes no `..recursion..`/`..monolith..` symbols.
 REC="$(nm "$LIB" 2>/dev/null | grep -icE '[0-9a-z_]recursion|[0-9]monolith|_aggregat' || true)"

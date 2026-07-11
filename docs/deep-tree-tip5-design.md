@@ -135,9 +135,11 @@ audit posture that lets this research land next to the audited production crate 
 Every research module is `#[cfg(feature = …)]`-gated OFF by default (`recursion`, `tip5`, `lookup`, `wrap`,
 `tree`), so the **default (production) staticlib compiles none of it**. `scripts/check-abi-symbols.sh` turns
 that into evidence: it asserts the default `.a` exports **exactly** the 10 frozen `lattica_*` node-seam
-externs, **zero** recursion symbols, and **zero** deep-tree research symbols (`tip5`/`lookup`/`wrap`/`tree`,
-crate-anchored so a dependency's own `lookup`/`tree` symbol can't false-positive). Production verifies real
-statements via the **batch** path (one STARK per block); the wrap/tree is additive and invisible to the seam.
+externs, **zero** `lattica_tree*` research externs (the W7 C-ABI below, in a distinct namespace the frozen
+grep ignores — asserted absent explicitly), **zero** recursion symbols, and **zero** deep-tree research
+symbols (`tip5`/`lookup`/`wrap`/`tree`, crate-anchored so a dependency's own `lookup`/`tree` symbol can't
+false-positive). Production verifies real statements via the **batch** path (one STARK per block); the
+wrap/tree is additive and invisible to the seam.
 
 ### 7.2 Soundness budget (per tree level, then composed)
 
@@ -180,13 +182,24 @@ Native balance is green; the lean prove (`prove_lookup_lean`, the non-hiding ~2�
 confirmation. Every flag is byte-identical when off (`pinned_constraint_fingerprints`), so the audited monolith
 constraints are unchanged.
 
-### 7.4 What stays DEFERRED (and why)
+### 7.4 The C-ABI seam — the runnable part is BUILT; the deep-prove part is hardware-deferred
 
-The **C-ABI / Zig node-seam** for the aggregator is **deferred by design**, not skipped: a node-callable
-tree-aggregator export is premature until the wrap prove is *affordable* on real hardware. The deep
-wrap-verifies-wrap prove currently **OOMs** (the size number `W* = 677` holds analytically; the heavy prove of
-a full canonical level needs a ≥ 128 GB server — this box is 62 GB, and even the single-level narrowed proves
-run only under the lean prover). So W7 lands the *audit posture* (gating + soundness budget + the constraint
-matrix) that a future integration will re-audit against; the wire change (new externs, `Proof` reuse, the
-node handoff) is scoped but not cut until a callable aggregator + the hardware exist. This mirrors the
-production recursion decision (R6 C-ABI deferred): the seam stays frozen, the research stays invisible to it.
+The tree aggregation splits cleanly into what runs today and what waits on hardware, and the C-ABI reflects
+that split honestly:
+
+- **BUILT + callable (this session):** `lattica_tree_root` — a `#[no_mangle] extern "C"` (feature-gated
+  `tree`, OFF by default) that computes the block **tx-root** of `n_tx` serialized join-split witnesses via
+  the K-ary aggregation tree (`arity` children/node), **byte-identical to `lattica_batch_prove`'s root**
+  (`tree_root_abi_matches_batch_root`: sizes {1,3,8} × arities {2,4,8}). This is the consensus-critical value
+  a DAG/tree-aware node derives from a block — fail-closed, panic-isolated, batch-bounded (`≤ MAX_BATCH_TILES`),
+  exactly like the frozen batch externs. It is provably OUT of the audited staticlib: `check-abi-symbols.sh`
+  asserts **zero** `lattica_tree*` externs in the default build, and a positive control confirms the symbol
+  appears only under `--features tree`.
+- **Hardware-deferred (a limit, not a skip):** the deep **wrap-verifies-wrap PROVE** — a node-callable
+  aggregator that emits ONE proof attesting it verified K child proofs — currently **OOMs**. The size number
+  (`W* = 677`, `B = 0.00`) holds analytically and the single-level narrowed proves pass under the lean prover,
+  but a full canonical level needs a ≥ 128 GB server (this box is 62 GB). So the *proof-emitting* extern
+  (`lattica_tree_prove` / the Zig handoff) is scoped but not cut until that hardware exists; the root-computing
+  extern is the part that is genuinely callable now. This mirrors the production recursion decision (R6 C-ABI
+  deferred): the frozen seam is untouched, the research stays invisible to it, and W7 lands the audit posture
+  (gating + soundness budget + the constraint matrix) the proof-emitting integration will re-audit against.

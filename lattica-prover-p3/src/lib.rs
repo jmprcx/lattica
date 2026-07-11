@@ -628,6 +628,63 @@ pub unsafe extern "C" fn lattica_batch_prove(
     write_out2(&proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len)
 }
 
+/// C ABI (**research**, `--features tree`, OFF by default — feature-gated OUT of the audited production
+/// staticlib): compute the block **tx-root** of `n_tx` concatenated join-split witnesses via a **K-ary
+/// aggregation tree** (`arity` children per node), writing the 32-byte root. **Byte-identical to
+/// `lattica_batch_prove`'s root** — the W6 seam `tree::dag::tree_root == batch_root` — so this is the
+/// consensus-critical value a DAG/tree-aware node computes from a block. The deep wrap-verifies-wrap PROVE
+/// is hardware-deferred (≥128 GB); the root computation is the part callable today. Returns 0 on success,
+/// 1 on bad input / oversize batch (> `MAX_BATCH_TILES`) / arity < 2 / panic, 2 if the buffer is too small.
+/// Fail-closed + panic-isolated + batch-bounded, exactly like `lattica_batch_prove`.
+///
+/// # Safety
+/// `witness_ptr` must point to `witness_len` readable bytes; `root_out` must point to `root_cap` writable
+/// bytes; `root_len` must be writable (or all may be null ⇒ fail-closed).
+#[cfg(feature = "tree")]
+#[no_mangle]
+pub unsafe extern "C" fn lattica_tree_root(
+    witness_ptr: *const u8,
+    witness_len: usize,
+    n_tx: usize,
+    arity: usize,
+    root_out: *mut u8,
+    root_cap: usize,
+    root_len: *mut usize,
+) -> i32 {
+    if witness_ptr.is_null() || root_out.is_null() || root_len.is_null() {
+        return 1; // fail-closed on any null pointer (audit M-01)
+    }
+    // Same bound as the batch path (`padded_tiles(n) ≤ 64 ⟺ n ≤ 64`; also prevents the next_power_of_two
+    // overflow), plus a tree needs arity ≥ 2.
+    if n_tx == 0 || n_tx > batch_common::MAX_BATCH_TILES || arity < 2 {
+        return 1;
+    }
+    if witness_len != n_tx.checked_mul(JS_WITNESS_LEN).unwrap_or(usize::MAX) {
+        return 1; // exactly n_tx concatenated join-split witness records
+    }
+    let wb = slice::from_raw_parts(witness_ptr, witness_len);
+    let mut ws = Vec::with_capacity(n_tx);
+    for i in 0..n_tx {
+        match parse_joinsplit_witness(&wb[i * JS_WITNESS_LEN..(i + 1) * JS_WITNESS_LEN]) {
+            Some(w) => ws.push(w),
+            None => return 1,
+        }
+    }
+    // public_values asserts the per-tile relation; isolate any panic as a clean error.
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tree::dag::tree_root(&ws, arity)));
+    let root = match built {
+        Ok(x) => x,
+        Err(_) => return 1,
+    };
+    let rb = encode_digest(&root);
+    if rb.len() > root_cap {
+        return 2;
+    }
+    core::ptr::copy_nonoverlapping(rb.as_ptr(), root_out, rb.len());
+    *root_len = rb.len();
+    0
+}
+
 // --- HTLC batch aggregation C ABI (mirrors the join-split batch; HTLC witnesses + tx-root) ----
 
 /// C ABI: verify a serialized **HTLC batch** proof against the 32-byte block tx-root. Fail-closed +
@@ -844,6 +901,50 @@ pub unsafe extern "C" fn lattica_htlc_prove(
 mod tests {
     use super::*;
     use p3_field::PrimeCharacteristicRing;
+
+    /// **W7 C-ABI** (`--features tree`) — the K-ary tree-root extern is **byte-identical to the batch
+    /// root**. The DAG/tree-aware node path: serialize n join-split witnesses, compute the block tx-root via
+    /// the C-ABI K-ary aggregation tree (`lattica_tree_root`), and confirm it equals `batch_root` for
+    /// several block sizes × arities (the W6 seam through the fail-closed, panic-isolated, batch-bounded
+    /// extern). Invalid input (null / arity<2 / oversize / truncated) fails closed; a small buffer ⇒ 2.
+    #[cfg(feature = "tree")]
+    #[test]
+    fn tree_root_abi_matches_batch_root() {
+        let variant = |tag: u64| {
+            let mut w = crate::joinsplit_air::demo_witness();
+            w.tx_binding[0] += Goldilocks::from_u64(tag);
+            w
+        };
+        for &n in &[1usize, 3, 8] {
+            let ws: Vec<_> = (0..n).map(|i| variant(1000 + i as u64)).collect();
+            let mut wb = Vec::new();
+            for w in &ws {
+                wb.extend_from_slice(&encode_joinsplit_witness(w));
+            }
+            let expect = encode_digest(&crate::batch_joinsplit_air::batch_root(&ws));
+            for &k in &[2usize, 4, 8] {
+                let (mut root, mut rl) = ([0u8; 32], 0usize);
+                let rc = unsafe {
+                    lattica_tree_root(wb.as_ptr(), wb.len(), n, k, root.as_mut_ptr(), root.len(), &mut rl)
+                };
+                assert_eq!(rc, 0, "tree_root ABI must succeed (n={n}, k={k})");
+                assert_eq!(rl, 32);
+                assert_eq!(&root[..], &expect[..], "K={k} tree root must byte-match batch_root (n={n})");
+            }
+        }
+        // Fail-closed matrix (mirrors lattica_batch_prove's hardening).
+        let wb = encode_joinsplit_witness(&variant(7));
+        let (mut root, mut rl) = ([0u8; 32], 0usize);
+        assert_eq!(unsafe { lattica_tree_root(core::ptr::null(), 0, 1, 4, root.as_mut_ptr(), 32, &mut rl) }, 1, "null");
+        assert_eq!(unsafe { lattica_tree_root(wb.as_ptr(), wb.len(), 1, 1, root.as_mut_ptr(), 32, &mut rl) }, 1, "arity<2");
+        assert_eq!(
+            unsafe { lattica_tree_root(wb.as_ptr(), wb.len(), batch_common::MAX_BATCH_TILES + 1, 4, root.as_mut_ptr(), 32, &mut rl) },
+            1,
+            "oversize n_tx"
+        );
+        assert_eq!(unsafe { lattica_tree_root(wb.as_ptr(), wb.len() - 1, 1, 4, root.as_mut_ptr(), 32, &mut rl) }, 1, "truncated witness");
+        assert_eq!(unsafe { lattica_tree_root(wb.as_ptr(), wb.len(), 1, 4, root.as_mut_ptr(), 8, &mut rl) }, 2, "buffer too small");
+    }
 
     #[test]
     fn wire_format_kats() {
