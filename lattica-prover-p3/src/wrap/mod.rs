@@ -1493,13 +1493,22 @@ mod tests {
         let air = Tip5RoundAir;
         let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
-        println!(
-            "Tip5 ROUND (32 lookups/row): width {}, log_nqc {log_nqc} > budget {LOG_BLOWUP} ⇒ the full permutation \
-             needs tuple-SPREADING across rows (the S-box's 8/row is ≤4 and proves); a real multi-brick construction.",
-            Tip5RoundAir::W
-        );
         assert!(log_nqc > LOG_BLOWUP, "the whole-round-on-one-row exceeds ≤4 (documents the spreading need); got {log_nqc}");
         assert!(log_nqc <= 8, "…and it's the moderate 2c-wall level, not a runaway blow-up (got {log_nqc})");
+        // DEFINITIVE: the 32-lookups/row round does NOT verify (the many-tuples-per-row LogUp quotient is
+        // mis-sized ⇒ OodMismatch) — whereas the 8-lookups/row S-box PROVES (tip5_sbox_lookup_round_trips). So the
+        // full permutation MUST spread the S-box lookups to ≤8/row (the multi-brick narrow-tall construction).
+        let proof = prove_lookup(&air, tip5_round_trace(&[core::array::from_fn(|i| (i as u64) * 5 + 1)]), &[]);
+        assert!(
+            verify_lookup(&air, &proof, &[]).is_err(),
+            "the whole-round-on-one-row (32 lookups) must NOT verify — proving the spreading need"
+        );
+        println!(
+            "Tip5 ROUND (32 lookups/row): width {}, log_nqc {log_nqc} > {LOG_BLOWUP}, AND the prove does NOT verify \
+             (OodMismatch) ⇒ the full permutation MUST SPREAD the S-box lookups to ≤8/row (the proven S-box level) — \
+             a real multi-brick construction, not a one-row extension.",
+            Tip5RoundAir::W
+        );
     }
 
     /// **W2-C (size)** — the narrow-tall running eval proves + verifies through the W1 lookup prover, which
