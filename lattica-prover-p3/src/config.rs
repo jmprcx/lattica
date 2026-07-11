@@ -203,6 +203,26 @@ pub mod gpu {
         MyConfigGpu::new(pcs, Challenger::new(perm))
     }
 
+    /// **The LEAN (non-hiding) config with GPU LDE** — the Tier-1 "with GPU support" research-prove path. It is
+    /// `super::make_config_lean` with ONLY the `Dft` swapped to [`GpuDft`]: the ~2× lean RAM saving (`is_zk = 0`,
+    /// `TwoAdicFriPcs`) PLUS the GPU LDE compute offload. The `Dft` appears in neither the wire `Proof` nor `verify`,
+    /// so `TwoAdicFriPcs::Proof` is Dft-independent ⇒ a GPU-lean proof has the SAME type as a CPU-lean one and
+    /// verifies under the CPU `verify_lookup_lean` (byte-identical). Note the GPU DFT accelerates LDE *compute*; the
+    /// host-RAM win comes from the lean `is_zk=0` + the narrow-tall width merge, orthogonal to the DFT backend.
+    pub type MyPcsLeanGpu = p3_fri::TwoAdicFriPcs<Val, GpuDft, ValMmcs, ChallengeMmcs>;
+    pub type MyConfigLeanGpu = StarkConfig<MyPcsLeanGpu, Challenge, Challenger>;
+
+    /// A lean (non-hiding) config with GPU LDE — mirror of [`super::make_config_lean`], `GpuDft` for `Dft`.
+    pub fn make_config_lean_gpu() -> MyConfigLeanGpu {
+        let perm = default_goldilocks_poseidon2_8();
+        let val_mmcs =
+            ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+        let fri = production_fri(challenge_mmcs);
+        let pcs = MyPcsLeanGpu::new(GpuDft, val_mmcs, fri);
+        MyConfigLeanGpu::new(pcs, Challenger::new(perm))
+    }
+
     /// Prove `air` over `trace` with `pis`, GPU-accelerated LDE. Returns wire-compatible postcard bytes
     /// — verify with the standard `<circuit>::verify_bytes` / the C-ABI verifier, unchanged.
     pub fn proof_to_bytes<A>(air: &A, trace: RowMajorMatrix<Val>, pis: &[Val]) -> Vec<u8>

@@ -564,6 +564,20 @@ pub fn prove_lookup_lean<A: LookupAir>(
     prove_lookup_inner(air, main, pis, false, &make_config_lean())
 }
 
+/// **GPU-accelerated lean prover** (Tier-1 "with GPU support"). Identical to [`prove_lookup_lean`] but commits
+/// under the lean-GPU config ([`crate::config::gpu::make_config_lean_gpu`]) — the trace/quotient LDEs run on the
+/// GPU (`GpuDft`), the ~2× lean RAM saving is kept, and the `Dft` is absent from the wire, so the proof type
+/// UNIFIES with [`PcsProofLean`] and verifies under the CPU [`verify_lookup_lean`] (byte-identical). Requires an
+/// OpenCL runtime + GPU at prove time (the GPU DFT has no CPU fallback). `--features gpu,lookup`.
+#[cfg(feature = "gpu")]
+pub fn prove_lookup_lean_gpu<A: LookupAir>(
+    air: &A,
+    main: RowMajorMatrix<Val>,
+    pis: &[Val],
+) -> LookupProof<PcsProofLean> {
+    prove_lookup_inner(air, main, pis, false, &crate::config::gpu::make_config_lean_gpu())
+}
+
 /// The prover core — generic over the PCS (production hiding or the lean non-hiding config). `forge_aux`
 /// (test-only) corrupts one committed aux fraction so the batched constraints no longer vanish on `H`.
 fn prove_lookup_inner<A, SC>(
@@ -847,6 +861,29 @@ mod tests {
     use crate::config::Dft;
     use p3_dft::TwoAdicSubgroupDft;
     use p3_lookup::{LogUpGadget, LookupProtocol, Lookups};
+
+    /// **Tier-1 "with GPU support"** — the lean-GPU prover ([`prove_lookup_lean_gpu`], `GpuDft` LDE) produces a
+    /// wire-compatible proof that VERIFIES under the CPU lean verifier (the DFT is absent from the wire/verifier, so
+    /// the proof type unifies and the CPU verifier accepts it), and a corrupted proof is rejected cross-backend.
+    /// Requires an OpenCL runtime + GPU at prove time (the GPU DFT has no CPU fallback). `--features gpu,lookup`.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_lean_prove_verifies_under_cpu_lean() {
+        let air = RangeCheckAir;
+        let proof = prove_lookup_lean_gpu(&air, balanced_main(1 << 6), &[]);
+        assert!(
+            verify_lookup_lean(&air, &proof, &[]).is_ok(),
+            "a GPU-lean proof must verify under the CPU lean verifier (wire-compatible GPU support)"
+        );
+        // Tamper the committed degree ⇒ the CPU verifier must reject (soundness holds across the GPU/CPU backends).
+        let mut bad = proof;
+        bad.degree_bits += 1;
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_lookup_lean(&air, &bad, &[]).is_err()
+        }))
+        .unwrap_or(true);
+        assert!(rejected, "a GPU-lean proof with a corrupted degree must be rejected");
+    }
 
     /// Lift a base-field trace row into the extension field (the folder evaluates over F_p²).
     fn lift(row: &[Val]) -> Vec<Challenge> {
