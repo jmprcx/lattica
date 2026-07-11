@@ -207,6 +207,73 @@ pub mod size_model {
     }
 }
 
+/// **W6 — K-ary tree / DAG aggregation seam** (the native byte-match oracle).
+///
+/// The block tx-root [`crate::batch_joinsplit_air::batch_root`] is a LEFT-FOLD hash chain
+/// `root_k = merge(root_{k-1}, s_k)` (IV = 0, padded to a power of two with `dummy_sk`). A K-ary
+/// aggregation TREE re-emits that block tx-root **byte-identically** iff each node threads the running
+/// accumulator through its children IN ORDER: the class-J fold seam (`fold_txstmt`'s `rootin`/`rootupd`
+/// periodics) computes exactly `merge(prev_root, s_k)` per instance, so a node re-emits the same chain
+/// over its subtree's leaves — a K-ary node is just the flat aggregator applied to K child contributions.
+///
+/// This module is the NATIVE oracle for that seam (the AIR self-composition PROVE is deferred — the deep
+/// wrap-verifies-wrap prove OOMs, like R5 and the openings prove; the W5 size gate is met by the
+/// `size_model` measurement, `B = 0.00`). It proves the byte-match the wrap must preserve for any arity K,
+/// and guards against a balanced-Merkle-of-subroots regression (which does NOT reproduce the linear chain).
+/// The tree buys **bounded per-node RAM** (each node aggregates only K children) and **parallelism** (the
+/// heavy per-node proof work fans out; only the cheap O(1)-digit accumulator chain is sequential).
+pub mod dag {
+    use crate::batch_joinsplit_air::{dummy_sk, tx_statement_digest};
+    use crate::batch_common::padded_tiles;
+    use crate::config::Val;
+    use crate::joinsplit_air::{public_values, Witness};
+    use crate::spend_common::{merge, DIGEST};
+    use p3_field::PrimeCharacteristicRing;
+
+    /// A node in a chained K-ary aggregation tree: fold `root_in` through the ordered `leaves`, returning
+    /// `root_out`. A node with ≤ K leaves folds them directly (`merge(prev, leaf)` — the class-J seam); an
+    /// internal node splits the leaves into ≤ K balanced groups and threads `root_in` through each child
+    /// subtree in order. In-order threading ⇒ the traversal reproduces the flat left-fold over the subtree.
+    pub fn k_ary_fold(root_in: [Val; DIGEST], leaves: &[[Val; DIGEST]], k: usize) -> [Val; DIGEST] {
+        assert!(k >= 2, "a K-ary tree needs arity ≥ 2");
+        if leaves.len() <= k {
+            return leaves.iter().fold(root_in, |r, d| merge(r, *d));
+        }
+        // ceil-divide so the tree has ≤ K children per node (depth ⌈log_K n⌉); thread the accumulator.
+        let group = leaves.len().div_ceil(k);
+        leaves.chunks(group).fold(root_in, |r, chunk| k_ary_fold(r, chunk, k))
+    }
+
+    /// The block's ordered leaf digests as `batch_root` folds them: each tx's `s_k = tx_statement_digest`,
+    /// then `dummy_sk` padding to the next power of two (`padded_tiles`).
+    pub fn padded_leaves(ws: &[Witness]) -> Vec<[Val; DIGEST]> {
+        let mut leaves: Vec<[Val; DIGEST]> =
+            ws.iter().map(|w| tx_statement_digest(&public_values(w))).collect();
+        leaves.resize(padded_tiles(ws.len()), dummy_sk());
+        leaves
+    }
+
+    /// The block tx-root computed via a K-ary aggregation tree over the block's transactions, folded from
+    /// `root_in = IV = 0`. **Byte-identical to `batch_root` for any arity `k ≥ 2`.**
+    pub fn tree_root(ws: &[Witness], k: usize) -> [Val; DIGEST] {
+        k_ary_fold([Val::ZERO; DIGEST], &padded_leaves(ws), k)
+    }
+
+    /// A NAIVE balanced-Merkle combine (merge sibling SUB-ROOTS pairwise up the tree). It does NOT thread
+    /// an accumulator, so it does NOT reproduce the linear `batch_root` chain — kept to DOCUMENT why the
+    /// aggregation must thread `root_in` (reuse the class-J seam), not combine sub-roots like a Merkle cap.
+    pub fn naive_merkle_combine(leaves: &[[Val; DIGEST]]) -> [Val; DIGEST] {
+        let mut level = leaves.to_vec();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|c| if c.len() == 2 { merge(c[0], c[1]) } else { c[0] })
+                .collect();
+        }
+        level[0]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +389,42 @@ mod tests {
         let levers = WrapLevers { residual_hash_sbox_degree: LEVERS.logup_constraint_degree, ..LEVERS };
         let v = evaluate(BASELINE, levers);
         assert!(v.modelled_max_degree <= 3 && v.degree_converges);
+    }
+
+    /// **W6 — the K-ary tree / DAG aggregation root is byte-identical to `batch_root`.** For arities
+    /// K ∈ {2,4,8} and several block sizes, the chained K-ary tree fold reproduces the flat block tx-root
+    /// bit-for-bit — the seam the self-composing wrap reuses (the class-J `fold_txstmt` `rootin`/`rootupd`
+    /// emits `merge(prev_root, s_k)` per instance). A naive balanced-Merkle combine of sub-roots does NOT
+    /// match, documenting why the accumulator must be threaded in-order, not Merkle-combined.
+    #[test]
+    fn k_ary_tree_root_is_byte_identical_to_batch_root() {
+        use crate::batch_joinsplit_air::batch_root;
+        use crate::config::Val;
+        use crate::joinsplit_air::demo_witness;
+        use crate::tree::dag::{naive_merkle_combine, padded_leaves, tree_root};
+        use p3_field::PrimeCharacteristicRing;
+
+        let variant = |tag: u64| {
+            let mut w = demo_witness();
+            w.tx_binding[0] += Val::from_u64(tag);
+            w
+        };
+        // Byte-match across block sizes (incl. non-powers-of-two ⇒ dummy padding) and arities (DAG-ready).
+        for &n in &[1usize, 2, 3, 5, 8, 13, 16] {
+            let ws: Vec<_> = (0..n).map(|i| variant(1000 + i as u64)).collect();
+            let flat = batch_root(&ws);
+            for &k in &[2usize, 4, 8] {
+                assert_eq!(tree_root(&ws, k), flat, "K={k}-ary tree root must byte-match batch_root for n={n} txs");
+            }
+        }
+
+        // The naive balanced-Merkle combine over the SAME padded leaves does NOT reproduce the linear chain
+        // (n > 1) — the reason aggregation threads root_in (class-J seam) instead of Merkle-combining sub-roots.
+        let ws: Vec<_> = (0..8).map(|i| variant(2000 + i as u64)).collect();
+        assert_ne!(
+            naive_merkle_combine(&padded_leaves(&ws)),
+            batch_root(&ws),
+            "a balanced-Merkle-of-subroots must NOT equal the linear batch_root — the accumulator must be threaded"
+        );
     }
 }
