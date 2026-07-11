@@ -6549,5 +6549,22 @@ mod tests {
         assert!(mb_narrow > 1.0, "arith+caps ALONE leaves marginal B > 1 ({mb_narrow:.2}) — the openings externalization is the further lever");
         assert!(mb_open < mb_narrow, "the openings externalization must reduce the marginal B further ({mb_narrow:.2} → {mb_open:.2})");
         assert!(mb_open <= 1.5, "with openings externalized the marginal B drops to ~1.00 (only the `ov` trace-leaf carrier remains); canonicalization drives it to 0 (got {mb_open:.2})");
+
+        // PROJECTED +OV externalization (the last lever): the `ov` opened-row carrier (`input_leaf_felts` = w_inner)
+        // is the ONLY region still scaling with the inner width. Moving it narrow-tall (columns → rows on a bus,
+        // like `narrow_openings` did for `pz`) removes its +1 slope. The projected width `fused_w − input_leaf_felts`
+        // has marginal → 0.00 ⇒ a STRICT contraction (B < 1) ⇒ an attracting canonical fixed point W* exists.
+        let proj_ov = |w_inner: usize, nt: usize| {
+            let m = mk_outer(w_inner, nt, true, true);
+            (m.fused_w() - m.input_leaf_felts()) as f64
+        };
+        let mb_ov = (proj_ov(w_in + d, ont + 2 * d) - proj_ov(w_in, ont)) / d as f64;
+        println!(
+            "PROJECTED +ov externalization: marginal B (fused_w − ov carrier) = {mb_ov:.2} cols/col ⇒ B < 1, a \
+             STRICT contraction ⇒ the tree CONVERGES to an attracting W* (the ov carrier is the LAST inner-scaling \
+             region; externalizing it narrow-tall is the W3-completing lever — a 4th narrow flag, Merkle-entangled).",
+        );
+        assert!(mb_ov < 1.0, "externalizing the ov carrier must drop the marginal B strictly below 1 (got {mb_ov:.2}) ⇒ a fixed point exists");
+        assert!(mb_ov < mb_open, "the ov externalization must reduce the marginal further ({mb_open:.2} → {mb_ov:.2})");
     }
 }
