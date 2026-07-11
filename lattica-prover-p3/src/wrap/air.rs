@@ -1733,6 +1733,103 @@ mod wrap_air {
         }
     }
 
+    /// **W3 ov externalization brick 4c (compose de-risk) — the narrow_ov monolith + the leaf-hash→px bus COMPOSE.**
+    /// The [`OpeningBindCwAir`] analog for the ov carrier: the narrow_ov monolith ([`OpeningsBci`]; the ov-carrier
+    /// reads gated on `!narrow_ov` by brick 4a) + ONE ordered leaf-hash→px bus (the leaf-hash Poseidon input lanes
+    /// PROVIDE `px`, a px-region row READS it — the SAME generic FS-anchor shape as the sponge-opening bus / the
+    /// proven [`crate::wrap::SpongeCapBusAir`]). Confirms the bus + the narrow_ov monolith compose TOGETHER at
+    /// `log_nqc ≤ LOG_BLOWUP` — the DEGREE de-risk for the assembled px binding (the balance/assemble brick binds
+    /// `px` to the real leaf-hash rows with the query-keyed provider). Additive: does NOT touch the proven wrap.
+    pub(crate) struct NarrowOvBindCwAir {
+        pub(crate) m: MonolithAir,
+        pub(crate) leaf_periodics: Vec<Vec<Goldilocks>>,
+    }
+
+    impl NarrowOvBindCwAir {
+        pub(crate) const RATE: usize = 4;
+        pub(crate) fn ro_col(&self) -> usize {
+            self.m.fused_w()
+        }
+        pub(crate) fn folded_col(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        pub(crate) fn quot_col(&self) -> usize {
+            self.m.fused_w() + 4
+        }
+        /// px-region row: `[gi_base, px0, px1, px_sel]` (one trace px/row; `gi_base` its leaf-hash-stream index).
+        pub(crate) fn pr(&self) -> usize {
+            self.m.fused_w() + 6
+        }
+        pub(crate) fn px_sel(&self) -> usize {
+            self.pr() + 3
+        }
+        pub(crate) fn w_gi(&self, l: usize) -> usize {
+            self.pr() + 4 + 2 * l
+        }
+        pub(crate) fn w_sel(&self, l: usize) -> usize {
+            self.pr() + 5 + 2 * l
+        }
+        pub(crate) fn leaf_periodic_base(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+    }
+
+    impl BaseAir<Goldilocks> for NarrowOvBindCwAir {
+        fn width(&self) -> usize {
+            // ro/folded/quot(6) + px-region [gi,px0,px1,px_sel](4) + 2·RATE leaf-hash tags.
+            self.m.fused_w() + 10 + 2 * Self::RATE
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
+            p.extend(self.leaf_periodics.iter().cloned());
+            p
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for NarrowOvBindCwAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(
+                builder,
+                &OpeningsBci { ro_col: self.ro_col(), folded_col: self.folded_col(), quot_col: self.quot_col() },
+            );
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let one = AB::Expr::ONE;
+            let pr = self.pr();
+            let pbase = self.leaf_periodic_base();
+            let rate = Self::RATE;
+
+            let px_sel = cur[self.px_sel()].clone();
+            builder.assert_zero(px_sel.clone() * (px_sel.clone() - one.clone()));
+            for l in 0..rate {
+                builder.assert_zero(cur[self.w_gi(l)].clone() - p[pbase + 2 * l].clone());
+                builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 2 * l + 1].clone());
+            }
+
+            // ONE leaf-hash→px bus: per lane PROVIDE (w_gi_l, cur[l]) −w_sel_l (the leaf-hash absorbs the px lanes into
+            // cur[0..RATE]); the px-region row READS its px `(gi_base+k, px_k)` +px_sel (k=0,1 the F_p² px). SPREAD
+            // (RATE+2 tuples/row, mirrors the sponge-opening bus) — the degree stays ≤ budget.
+            let mut ch: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(rate + 2);
+            for l in 0..rate {
+                ch.push((
+                    vec![cur[self.w_gi(l)].clone(), cur[l].clone()],
+                    AB::Expr::ZERO - cur[self.w_sel(l)].clone(),
+                ));
+            }
+            for k in 0..2 {
+                let gi_k = cur[pr].clone() + AB::Expr::from(Goldilocks::from_u64(k as u64));
+                ch.push((vec![gi_k, cur[pr + 1 + k].clone()], px_sel.clone()));
+            }
+            builder.push_local_interaction(ch);
+        }
+    }
+
     /// **AA6 op-table binding brick 5a — the cw=true op-table epilogue COMPOSES** (`--features lookup,recursion`,
     /// cheap). The [`AssembledWrapAir`] op-table region + `folded` binding, ported to `column_window = true` +
     /// `narrow_openings` (the openings-wrap regime) and re-based on [`OpeningsBci`] — the crux the cw=false
@@ -2518,7 +2615,7 @@ mod wrap_air {
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
     native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledCapWrapCwAir,
-    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, OpeningBindCwAir, OpTableBindCwAir,
+    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, NarrowOvBindCwAir, OpeningBindCwAir, OpTableBindCwAir,
     OpTableLeafBindCwAir, WrapAir,
     N_GROUPS, OPEN_BASE,
 };
@@ -3720,6 +3817,65 @@ mod tests {
              free witness (bound via the leaf-hash→px bus in the assembled brick 4c). Additive: the proven \
              AssembledOpeningsWrapCwAir is untouched.",
             ov_fused + 6
+        );
+    }
+
+    /// **W3 ov externalization brick 4c (compose) — the narrow_ov monolith + the leaf-hash→px bus COMPOSE together**
+    /// (`--features lookup,recursion`, cheap). The [`OpeningBindCwAir`] analog for px: [`NarrowOvBindCwAir`] = the
+    /// narrow_ov monolith (`OpeningsBci`) + ONE leaf-hash→px bus (same generic FS-anchor shape as the sponge-opening
+    /// bus). Confirms both compose TOGETHER at `log_nqc ≤ LOG_BLOWUP` — the DEGREE de-risk for the assembled px
+    /// binding (the query-keyed leaf-hash provider + native-balance is the next brick). Additive: proven wrap untouched.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_bind_cw_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+            narrow_ov: true,
+        };
+        let h = m.height();
+        let leaf_periodics = vec![vec![Val::ZERO; h]; 2 * NarrowOvBindCwAir::RATE];
+        let air = NarrowOvBindCwAir { m, leaf_periodics };
+        let width = <NarrowOvBindCwAir as BaseAir<Val>>::width(&air);
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        assert_eq!(lookups.len(), 1, "one leaf-hash→px bus channel");
+        assert!(log_nqc <= LOG_BLOWUP, "the narrow_ov monolith + leaf-hash→px bus must compose (got {log_nqc})");
+        println!(
+            "W3 ov brick 4c (compose): NarrowOvBindCwAir (narrow_ov monolith + ONE leaf-hash→px bus) width {width}, \
+             {} channel, log_nqc {log_nqc} ≤ {LOG_BLOWUP} — the bus + the ov-dropped monolith compose TOGETHER (the \
+             OpeningBindCwAir analog for px). The assembled px binding (query-keyed leaf-hash provider + balance) next.",
+            lookups.len()
         );
     }
 
