@@ -3660,6 +3660,69 @@ mod tests {
         println!("narrow_openings wrap composes: log_nqc {log_nqc}, width fused_w {fused} + 6 (the pz opening columns externalized)");
     }
 
+    /// **W3 ov externalization brick 4b — the narrow_ov monolith COMPOSES (plumbing).** With brick 4a gating the
+    /// ov-carrier reads on `!narrow_ov`, and [`OpeningsBci`] externalizing the fold (so the monolith itself reads no
+    /// `px`), the narrow_ov monolith — the `ov` opened-row carrier DROPPED (`fused_w` smaller by `w_inner`) —
+    /// composes through the EXISTING [`NarrowOpeningsWrapAir`] at `log_nqc ≤ LOG_BLOWUP`, width `fused_w + 6`. `px` is
+    /// a free witness here (the leaf-hash→px bus binds it in the assembled brick, brick 4c). Additive: does NOT touch
+    /// the proven `AssembledOpeningsWrapCwAir`. So the ov-dropped verifier layout is well-formed + low-degree — the
+    /// plumbing step (mirrors `narrow_openings_wrap_composes` / the `ArithWrapAir`/`CapWrapAir` free-witness compose).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_wrap_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_log_num_quotient_chunks, get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let mk = |narrow_ov: bool| MonolithAir {
+            counts: counts.clone(),
+            binds: binds.clone(),
+            index_binds: index_binds.clone(),
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints: constraints.clone(),
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+            narrow_ov,
+        };
+        let (m_open, m_ov) = (mk(false), mk(true));
+        let (open_fused, ov_fused) = (m_open.fused_w(), m_ov.fused_w());
+        // the ov opened-row carrier (w_inner felts) leaves fused_w.
+        assert_eq!(ov_fused, open_fused - WIDTH, "narrow_ov drops the w_inner ov carrier from fused_w");
+        let wrap = NarrowOpeningsWrapAir { m: m_ov };
+        assert_eq!(BaseAir::<Val>::width(&wrap), ov_fused + 6, "ro/folded/quot free-witness pairs; the ov carrier gone");
+        let layout = AirLayout::from_air::<Val>(&wrap); // panics if the narrow_ov layout causes a dropped-column read
+        let log_nqc = get_log_num_quotient_chunks::<Val, _>(&wrap, layout, 0);
+        assert!(log_nqc <= LOG_BLOWUP, "the narrow_ov wrap must compose within budget (log_nqc {log_nqc})");
+        println!(
+            "W3 ov brick 4b: the narrow_ov monolith COMPOSES — log_nqc {log_nqc}, fused_w {ov_fused} (−w_inner {WIDTH} \
+             vs narrow_openings {open_fused}), width {} = fused_w + 6. The ov opened-row carrier externalized, px a \
+             free witness (bound via the leaf-hash→px bus in the assembled brick 4c). Additive: the proven \
+             AssembledOpeningsWrapCwAir is untouched.",
+            ov_fused + 6
+        );
+    }
+
     /// **AA5 — the cw=true narrow_caps TRACE builds (openings correct).** `build_symbolic_inner_window` gained a
     /// `narrow_caps` flag that skips the trace/quotient/commit cap felts from the pis window. At `true` it builds
     /// a valid cw=true trace with the cap slice DROPPED — and its internal diagnostics still pass: the native
