@@ -2631,7 +2631,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false };
         let layout = AirLayout::from_air::<Val>(&air);
         let log_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&air, layout, 0);
         println!("WRAP witness seam: real join-split MonolithAir (reused regions A–J) log_nqc = {log_nqc}");
@@ -2742,7 +2742,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: narrow, narrow_caps: false, narrow_openings: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: narrow, narrow_caps: false, narrow_openings: false, narrow_ov: false };
         let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
             epilogue_openings(config, &inner, proof, pvs);
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
@@ -3260,7 +3260,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
             narrow_caps,
-            narrow_openings: false,
+            narrow_openings: false, narrow_ov: false,
         };
         let (full, narrow) = (mk(false), mk(true));
         let cap_felts = 2 * full.cap_stride() + full.commit_caps_len(); // trace + quot + commit caps (is_zk=0)
@@ -3341,6 +3341,7 @@ mod tests {
             narrow_arith: true,
             narrow_caps: false,
             narrow_openings,
+            narrow_ov: false,
         };
         let (base, narrow) = (mk(false), mk(true));
         let n_terms = terms.len();
@@ -3362,6 +3363,78 @@ mod tests {
             base.fused_w(),
             narrow.fused_w(),
             2 * n_terms,
+        );
+    }
+
+    /// **W3 — `narrow_ov` shrinks the OPENED-ROW carrier to rows (the B<1-completing geometry).** After
+    /// `narrow_openings` the LAST region still scaling with the inner width is the `ov` opened-row carrier
+    /// (`input_leaf_felts = w_inner`, the authenticated input-Merkle LEAF PREIMAGE) — it holds the marginal
+    /// self-composition B at EXACTLY 1.00 (`self_composition_b_narrowed`). `narrow_ov` drops its `w_inner` felts
+    /// from the carrier region (`ov_carrier_w() → 0` in `carriers_base`/`qc`), to be re-sourced narrow-tall from the
+    /// input-Merkle leaf hash + `px_source` (the sound-brick work). This measures the raw column win vs the
+    /// `narrow_openings` baseline: `fused_w` drops by EXACTLY `input_leaf_felts` (= `w_inner`) — the last
+    /// inner-scaling region — while the leaf-HASH width (`leaf_blocks`) is unchanged (only the carrier columns move).
+    /// Flag-OFF is byte-identical (`pinned_constraint_fingerprints` guards it); ⇒ the projected marginal B → 0
+    /// (`self_composition_b_narrowed`) is realized by this geometry (a strict contraction ⇒ an attracting `W*`).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_shrinks_carrier() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::sim_full;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::{make_config, multicol_query_terms};
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro, _wt) = multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        // baseline = narrow_openings (the ov carrier still WIDE); narrow_ov extends it (ov carrier → rows).
+        let mk = |narrow_ov: bool| MonolithAir {
+            counts: counts.clone(),
+            binds: binds.clone(),
+            index_binds: index_binds.clone(),
+            n_queries: index_felts.len(),
+            n_terms: terms.len(),
+            inner_counter: false,
+            column_window: false,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints: constraints.clone(),
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+            narrow_ov,
+        };
+        let (base, narrow) = (mk(false), mk(true));
+
+        // the ov opened-row carrier: input_leaf_felts (= w_inner) felts → 0 columns.
+        assert_eq!(base.input_leaf_felts(), WIDTH, "is_zk=0: the ov carrier is the w_inner opened trace row");
+        assert_eq!(base.ov_carrier_w(), base.input_leaf_felts(), "narrow_openings baseline keeps the ov carrier WIDE");
+        assert_eq!(narrow.ov_carrier_w(), 0, "narrow_ov externalizes the ov opened-row carrier (0 columns)");
+        // fused_w drops by EXACTLY input_leaf_felts (= w_inner) — the LAST inner-scaling region.
+        assert_eq!(narrow.fused_w(), base.fused_w() - base.input_leaf_felts(), "the ov opened-row carrier leaves fused_w");
+        // the leaf-HASH width is UNCHANGED — only the carrier COLUMNS move to rows (the preimage is still hashed).
+        assert_eq!(narrow.leaf_blocks(), base.leaf_blocks(), "the leaf-hash preimage width is unchanged (only the carrier columns move)");
+        assert!(narrow.fused_w() < base.fused_w());
+        println!(
+            "narrow_ov (w_inner {WIDTH}): ov opened-row carrier {} → 0 cols, fused_w {} → {} (−{} = w_inner; the LAST \
+             inner-scaling region externalized ⇒ marginal self-composition B 1.00 → 0, a strict contraction). The \
+             leaf-hash width (leaf_blocks {}) is unchanged — only the carrier columns move to rows.",
+            base.ov_carrier_w(),
+            base.fused_w(),
+            narrow.fused_w(),
+            base.input_leaf_felts(),
+            base.leaf_blocks(),
         );
     }
 
@@ -3407,7 +3480,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true,
+            narrow_openings: true, narrow_ov: false,
         };
         let fused = m.fused_w();
         let wrap = NarrowOpeningsWrapAir { m };
@@ -3464,7 +3537,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true, narrow_openings: false,
+            narrow_caps: true, narrow_openings: false, narrow_ov: false,
         };
         let fw = air.fused_w();
         assert_eq!(tr.len(), air.height() * fw, "narrow cw=true trace has the reduced fused_w width (caps dropped)");
@@ -3518,7 +3591,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true, narrow_openings: false,
+            narrow_caps: true, narrow_openings: false, narrow_ov: false,
         };
         let fw = air.fused_w();
         let wrap = CapWrapAir { m: air };
@@ -3570,7 +3643,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true, narrow_openings: false,
+            narrow_caps: true, narrow_openings: false, narrow_ov: false,
         };
         let (fw, h) = (m.fused_w(), m.height());
         let rate = AssembledCapWrapCwAir::CAP_RATE;
@@ -3739,7 +3812,7 @@ mod tests {
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: false,
-            narrow_caps: true, narrow_openings: false,
+            narrow_caps: true, narrow_openings: false, narrow_ov: false,
         };
         let h = m.height();
         // dummy op_periodics: log_nqc reads the symbolic constraint STRUCTURE (tuple counts/degrees), not the values.
@@ -3807,7 +3880,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true,
+            narrow_openings: true, narrow_ov: false,
         };
         let air = OpTableBindCwAir { m, folded_addr: 1 << 20 };
         let fw = air.m.fused_w();
@@ -3869,7 +3942,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true,
+            narrow_openings: true, narrow_ov: false,
         };
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
@@ -3935,7 +4008,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true,
+            narrow_openings: true, narrow_ov: false,
         };
         let (h, n_pub, n_periodic) = (m.height(), m.n_pub(), m.n_periodic());
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * OpTableLeafBindCwAir::RATE];
@@ -4005,7 +4078,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true,
+            narrow_openings: true, narrow_ov: false,
         };
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values (like opening_bind_cw_composes).
@@ -4087,7 +4160,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true,
+            narrow_openings: true, narrow_ov: false,
         };
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
@@ -4171,7 +4244,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true,
+            narrow_openings: true, narrow_ov: false,
         };
         let (fw, h) = (m.fused_w(), m.height());
         let rate = AssembledOpeningsWrapCwAir::RATE;
@@ -5540,7 +5613,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false };
         let wrap = WrapAir::new(air);
         let width = <WrapAir as p3_air::BaseAir<Val>>::width(&wrap);
         let layout = AirLayout::from_air::<Val>(&wrap);
@@ -5598,7 +5671,7 @@ mod tests {
             n_pub_f: N_PUBLIC,
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
-            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false };
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false };
         let fused_w = air.fused_w();
         let asm = AssembledWrapAir { m: air, folded_addr: 0 }; // any address for the pure composition check
         let width = <AssembledWrapAir as p3_air::BaseAir<Val>>::width(&asm);
@@ -5700,7 +5773,7 @@ mod tests {
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-            narrow_arith: narrow, narrow_caps: false, narrow_openings: false,
+            narrow_arith: narrow, narrow_caps: false, narrow_openings: false, narrow_ov: false,
         };
         let full = mk(false);
         let (full_fused_w, n_terms, w_inner) = (full.fused_w(), full.n_terms, full.w_inner());
@@ -5774,7 +5847,7 @@ mod tests {
             n_periodic_f: N_PERIODIC,
             is_zk: 0,
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
-            narrow_arith: narrow, narrow_caps, narrow_openings: false,
+            narrow_arith: narrow, narrow_caps, narrow_openings: false, narrow_ov: false,
         };
 
         // Decompose fused_w (column_window=false: the arith-wrap regime the whole track measures B in). The regions
@@ -6303,7 +6376,7 @@ mod tests {
         let inner = MonolithAir {
             counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false,
             column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![],
-            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false, narrow_openings: false };
+            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6338,7 +6411,7 @@ mod tests {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: ont,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h, narrow_arith: false, narrow_caps: false, narrow_openings: false };
+            cap_height: cap_h, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false };
         let olayout = AirLayout::from_air::<Val>(&outer);
         let inline_nqc = get_log_num_quotient_chunks::<Val, MonolithAir>(&outer, olayout, 0);
         let (inner_w, outer_w) = (inner.fused_w(), outer.fused_w());
@@ -6397,7 +6470,7 @@ mod tests {
             m: MonolithAir {
                 counts: ocounts, binds: obinds, index_binds: oib, n_queries: 4, n_terms: ont, inner_counter: false,
                 column_window: true, k_instances: 1, fold: false, fold_txstmt: false, constraints: inner_cs.clone(),
-                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h, narrow_arith: false, narrow_caps: false, narrow_openings: false },
+                w_inner_f: w_in, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0, cap_height: cap_h, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false },
             folded_addr: 0,
         };
         let asm_width = <AssembledWrapAir as BaseAir<Val>>::width(&asm);
@@ -6478,7 +6551,7 @@ mod tests {
         let inner = MonolithAir {
             counts: counts.clone(), binds, index_binds, n_queries: 4, n_terms, inner_counter: false,
             column_window: false, k_instances: 1, fold: false, fold_txstmt: false, constraints: vec![],
-            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false, narrow_openings: false };
+            w_inner_f: 1, n_pub_f: 1, n_periodic_f: 0, is_zk: 0, cap_height: 6, narrow_arith: false, narrow_caps: false, narrow_openings: false, narrow_ov: false };
         let mut pis = Vec::new();
         for ch in &chs {
             pis.push(ch[0]);
@@ -6520,7 +6593,7 @@ mod tests {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: nt,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_inner, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h, narrow_arith: narrow || nopen, narrow_caps: narrow, narrow_openings: nopen };
+            cap_height: cap_h, narrow_arith: narrow || nopen, narrow_caps: narrow, narrow_openings: nopen, narrow_ov: false };
         let outer_w = mk_outer(w_in, ont, false, false).fused_w();
         let outer_narrow_w = mk_outer(w_in, ont, true, false).fused_w(); // arith 9→2 + caps
         let outer_open_w = mk_outer(w_in, ont, true, true).fused_w(); // + openings externalized (arith_stride→0)

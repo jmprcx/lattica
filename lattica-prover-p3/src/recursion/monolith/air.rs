@@ -111,6 +111,16 @@ pub(crate) struct MonolithAir {
     /// non-AA6 construction uses, byte-for-byte (`pinned_constraint_fingerprints` guards it). Requires
     /// `narrow_arith`; set true ONLY by the AA6 openings wrap.
     pub narrow_openings: bool,
+    /// NARROW-OV mode (the W3-completing B<1 lever — externalize the OPENED-ROW carrier narrow-tall). After
+    /// `narrow_openings` the ONLY region still scaling with the inner width is the `ov` opened-row carrier
+    /// (`input_leaf_felts = w_inner`, the authenticated input-Merkle LEAF PREIMAGE), which keeps the marginal
+    /// self-composition B at exactly 1.00 (the fixed-point boundary). This drops its `w_inner` felts from the
+    /// carrier region (`ov_carrier_w() → 0` in `carriers_base`/`qc`) — the last inner-scaling columns become ROWS
+    /// bound to the input-Merkle leaf hash + re-source `px` (`px_source`). The leaf-HASH width (`leaf_blocks`,
+    /// still `input_leaf_felts` felts) is UNCHANGED — only the carrier COLUMNS move. `false` = byte-for-byte the
+    /// existing layout (`pinned_constraint_fingerprints` guards it). Requires `narrow_openings`; the flag-on trace
+    /// (px re-source + the Merkle bus re-anchor) is the sound-brick work — this flag is the geometry/measurement.
+    pub narrow_ov: bool,
 }
 
 #[allow(dead_code)]
@@ -144,6 +154,17 @@ impl MonolithAir {
     // is_zk=1 = the COMMITTED row (w_inner ‖ codewords) ‖ salt — the salted hiding leaf (hiding_commit_layout).
     pub(crate) fn input_leaf_felts(&self) -> usize {
         self.w_inner() + if self.is_zk == 1 { HIDING_NUM_CW + HIDING_SALT } else { 0 }
+    }
+    /// The opened-row (`ov`) carrier WIDTH in `fused_w`: `input_leaf_felts()` normally, or 0 when `narrow_ov`
+    /// (the `w_inner` leaf felts are externalized narrow-tall). DISTINCT from `input_leaf_felts()`, which stays the
+    /// leaf-HASH preimage width (`leaf_blocks`) regardless — only the CARRIER columns move to rows. Byte-identical
+    /// when `!narrow_ov`.
+    pub(crate) fn ov_carrier_w(&self) -> usize {
+        if self.narrow_ov {
+            0
+        } else {
+            self.input_leaf_felts()
+        }
     }
     pub(crate) fn leaf_blocks(&self) -> usize {
         self.input_leaf_felts().div_ceil(RATE)
@@ -308,7 +329,7 @@ impl MonolithAir {
     }
     // HIDING (is_zk=1) random-round leaf-preimage carrier felt c, after the trace-leaf carriers.
     pub(crate) fn ov_random(&self, c: usize) -> usize {
-        self.ov() + self.input_leaf_felts() + c
+        self.ov() + self.ov_carrier_w() + c
     }
     // width of the random-round carrier region (0 for is_zk=0).
     pub(crate) fn random_carriers(&self) -> usize {
@@ -323,7 +344,7 @@ impl MonolithAir {
     // (nqc multi-matrix ‖ salt) preimages. (input_leaf_felts/quot_leaf_felts equal w_inner/2·nqc at is_zk=0,
     // so this is byte-for-byte there.)
     pub(crate) fn carriers_base(&self) -> usize {
-        self.ov() + self.input_leaf_felts() + self.random_carriers() + self.quot_leaf_felts()
+        self.ov() + self.ov_carrier_w() + self.random_carriers() + self.quot_leaf_felts()
     }
     pub(crate) fn nb(&self) -> usize {
         self.binds.len()
@@ -428,7 +449,7 @@ impl MonolithAir {
     pub(crate) fn qc(&self, i: usize) -> usize {
         // quotient-leaf-preimage carriers, after the trace-leaf (+ random-leaf when is_zk=1) carriers. is_zk=0:
         // ov + w_inner + i (2·nqc felts, unchanged); is_zk=1: after the trace + random leaf preimages.
-        self.ov() + self.input_leaf_felts() + self.random_carriers() + i
+        self.ov() + self.ov_carrier_w() + self.random_carriers() + i
     }
     pub(crate) fn cg(&self, r: usize, k: usize) -> usize {
         self.carriers_base() + 4 * r + k // commit-phase group carriers: 6 rounds × 4 felts (the fold group {e_r, sib_r})
