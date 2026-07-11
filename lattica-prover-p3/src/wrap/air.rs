@@ -1856,6 +1856,10 @@ mod wrap_air {
         pub(crate) m: MonolithAir,
         pub(crate) op_periodics: Vec<Vec<Goldilocks>>,
         pub(crate) folded_addr: u64,
+        /// When set, ALSO provide the NON-trace opening leaves (pubs/periodic/selectors) from the cw=true
+        /// window/sel columns on the arith head (channel 1) — the measurement of whether the ~n_pub+n_periodic+2
+        /// non-trace provides fit on ONE row/channel (else they need the `N_GROUPS` split, like AssembledWrapAir).
+        pub(crate) bind_window_leaves: bool,
     }
 
     impl OpTableLeafBindCwAir {
@@ -1983,7 +1987,10 @@ mod wrap_air {
                 builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 2 * l + 1].clone());
             }
 
-            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); 3];
+            // Channels: 0 wiring/folded, 1 op-table-opening (sponge-fed trace leaves), 2 sponge FS-anchor; +N_GROUPS
+            // for the SPLIT non-trace (pubs/periodic/sel) provides when bind_window_leaves (else they'd concentrate).
+            let n_chan = if self.bind_window_leaves { 3 + N_GROUPS } else { 3 };
+            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); n_chan];
             // Channel 0 — op-table wiring + the folded read (as OpTableBindCwAir).
             let read_mult = op_sel.clone() * is_op;
             let folded = (cur[self.folded_col()].clone(), cur[self.folded_col() + 1].clone());
@@ -1998,6 +2005,32 @@ mod wrap_air {
                 cur[self.or_mult()].clone(),
             ));
             chans[1].push((vec![cur[self.leaf_key()].clone(), o0, o1], is_leaf));
+            // The NON-trace opening leaves (pubs/periodic/selectors) are in the TRACE (window/sel columns), not the
+            // sponge stream — so the arith head PROVIDES them from cur[pw(..)]/cur[sel(..)] (−is_head). This
+            // MEASURES whether the ~n_pub+n_periodic+2 provides fit on channel 1 (else they need the N_GROUPS split).
+            if self.bind_window_leaves {
+                let neg_head = AB::Expr::ZERO - cur[self.is_head()].clone();
+                let oid = |x: u64| AB::Expr::from(Goldilocks::from_u64(x));
+                // SPLIT the non-trace provides across N_GROUPS channels (key % N_GROUPS) so each carries ~n/N_GROUPS
+                // (≤ budget), NOT all ~61 on one channel (log_nqc 6). The op-table leaf reads on its opening's
+                // channel via is_ch in the full assembly; here we measure the PROVIDE degree the split achieves.
+                let mut key = 1u64 << 30; // distinct address block for the non-trace openings (compose: any distinct)
+                for i in 0..self.m.n_pub() {
+                    let g = 3 + (key % N_GROUPS as u64) as usize;
+                    chans[g].push((vec![oid(key), cur[self.m.pw(self.m.pub_pi() + i)].clone(), AB::Expr::ZERO], neg_head.clone()));
+                    key += 1;
+                }
+                for i in 0..self.m.n_periodic() {
+                    let (g, b) = (3 + (key % N_GROUPS as u64) as usize, self.m.periodic_base() + 2 * i);
+                    chans[g].push((vec![oid(key), cur[self.m.pw(b)].clone(), cur[self.m.pw(b + 1)].clone()], neg_head.clone()));
+                    key += 1;
+                }
+                for s in [self.m.sel(0), self.m.sel(2)] {
+                    let g = 3 + (key % N_GROUPS as u64) as usize;
+                    chans[g].push((vec![oid(key), cur[s].clone(), cur[s + 1].clone()], neg_head.clone()));
+                    key += 1;
+                }
+            }
             // Channel 2 — the sponge FS-anchor: transcript PROVIDES `[w_gi_l, cur[l]]` (−w_sel_l), the opening-row
             // READS its 2 opening felts `[gi_base+i, pz_i]` (+or_sel). (The AA2b sponge bus, one reader over.)
             for l in 0..Self::RATE {
@@ -3687,7 +3720,7 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * OpTableLeafBindCwAir::RATE];
-        let air = OpTableLeafBindCwAir { m, op_periodics, folded_addr: 1 << 20 };
+        let air = OpTableLeafBindCwAir { m, op_periodics, folded_addr: 1 << 20, bind_window_leaves: false };
         let fw = air.m.fused_w();
         let width = <OpTableLeafBindCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -3702,6 +3735,72 @@ mod tests {
         assert_eq!(width, fw + 6 + 13 + 4 + 6 + 2 * OpTableLeafBindCwAir::RATE, "op-table + markers + opening-row + sponge");
         assert_eq!(lookups.len(), 3, "wiring/folded + op-table-opening + sponge FS-anchor");
         assert!(log_nqc <= LOG_BLOWUP, "the cw=true op-table + leaf binding must compose within the degree budget (got {log_nqc})");
+    }
+
+    /// **AA6 op-table binding brick 5c — the NON-trace leaves bind via the N_GROUPS split at cw=true** (`--features
+    /// lookup,recursion`, cheap). Extends the 5b [`OpTableLeafBindCwAir`] with `bind_window_leaves`: the pubs/
+    /// periodic/selector opening leaves are in the TRACE (cw=true window/sel columns), NOT the sponge stream, so
+    /// the arith head PROVIDES them reading `cur[pw(..)]`/`cur[sel(..)]` (−is_head). Measured: all 61 (n_pub 26 +
+    /// n_periodic 33 + 2 sel) on ONE channel → `log_nqc 6` (the 2c wall recurs — the AssembledWrapAir problem);
+    /// SPLIT across `N_GROUPS` channels (~8/channel) → `log_nqc 4`. So the sponge spreads the ~108 TRACE openings
+    /// (brick 5b) and the `N_GROUPS` split handles the 61 NON-trace ⇒ the WHOLE op-table opening-leaf binding
+    /// composes cw=true within budget. (The op-table leaf's `is_ch` read-routing + the exact `open_id` addressing
+    /// land in the full assembly.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn optable_window_leaves_split_cw_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+        };
+        let (h, n_pub, n_periodic) = (m.height(), m.n_pub(), m.n_periodic());
+        let op_periodics = vec![vec![Val::ZERO; h]; 2 * OpTableLeafBindCwAir::RATE];
+        let air = OpTableLeafBindCwAir { m, op_periodics, folded_addr: 1 << 20, bind_window_leaves: true };
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "AA6 op-table binding brick 5c: the {} non-trace openings (n_pub {n_pub} + n_periodic {n_periodic} + 2 \
+             selectors) — which on ONE channel hit log_nqc 6 (the 2c wall) — SPLIT across N_GROUPS={N_GROUPS} \
+             channels (~{}/channel) ⇒ {} channels, log_nqc {log_nqc} ≤ {LOG_BLOWUP}. So the sponge spreads the ~108 \
+             TRACE openings (brick 5b) and the N_GROUPS split handles the {} NON-trace ⇒ the WHOLE op-table \
+             opening-leaf binding composes at cw=true.",
+            n_pub + n_periodic + 2,
+            (n_pub + n_periodic + 2).div_ceil(N_GROUPS),
+            lookups.len(),
+            n_pub + n_periodic + 2,
+        );
+        assert_eq!(lookups.len(), 3 + N_GROUPS, "wiring/folded + op-table-opening + sponge + N_GROUPS non-trace split");
+        assert!(log_nqc <= LOG_BLOWUP, "the N_GROUPS-split non-trace leaf provides must compose within budget (got {log_nqc})");
     }
 
     /// **AA6 openings AA1+AA2+AA2b cw=true — the FULLY-BOUND reduced-opening fold COMPOSES** (`--features
