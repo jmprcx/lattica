@@ -2644,7 +2644,10 @@ pub(crate) use wrap_air::{
 mod tests {
     use super::*;
     use crate::config::{Challenge, LOG_BLOWUP};
-    use crate::lookup::prover::{combined_constraint_layout, prove_lookup, verify_lookup, LookupVerifyError};
+    use crate::lookup::prover::{
+        combined_constraint_layout, prove_lookup, prove_lookup_lean, verify_lookup, verify_lookup_lean,
+        LookupVerifyError,
+    };
     use p3_lookup::Lookups;
 
     fn demo_cap() -> Vec<Val> {
@@ -5455,10 +5458,12 @@ mod tests {
             asm.m.height(),
             N_GROUPS + 3
         );
-        let lproof = prove_lookup(&asm, trace, &pis);
+        // LEAN (non-hiding, is_zk=0) prover ⇒ the quotient-domain LDE (the OOM term) is ~2× smaller than the hiding
+        // path — this wide openings-wrap (width 3792) is exactly the Brick-4d/Step-6 prove that OOMs under hiding.
+        let lproof = prove_lookup_lean(&asm, trace, &pis);
         assert!(
-            verify_lookup(&asm, &lproof, &pis).is_ok(),
-            "the cw=true assembled openings-wrap must prove + verify through prove_lookup (width {width})"
+            verify_lookup_lean(&asm, &lproof, &pis).is_ok(),
+            "the cw=true assembled openings-wrap must prove + verify through the LEAN prover (width {width})"
         );
 
         // Corrupt the first opening-row's pz ⇒ BOTH the sponge FS-anchor bus (pz ≠ the FS-absorbed felt) and the pz
@@ -5472,8 +5477,8 @@ mod tests {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let lp = prove_lookup(&asm2, bad, &pis2);
-            verify_lookup(&asm2, &lp, &pis2).is_err()
+            let lp = prove_lookup_lean(&asm2, bad, &pis2);
+            verify_lookup_lean(&asm2, &lp, &pis2).is_err()
         }))
         .unwrap_or(true);
         std::panic::set_hook(hook);
@@ -5512,9 +5517,9 @@ mod tests {
             asm.m.height(),
             2 * N_GROUPS + 4
         );
-        let lproof = prove_lookup(&asm, trace, &pis);
+        let lproof = prove_lookup_lean(&asm, trace, &pis);
         assert!(
-            verify_lookup(&asm, &lproof, &pis).is_ok(),
+            verify_lookup_lean(&asm, &lproof, &pis).is_ok(),
             "the cw=true op-table+openings assembled wrap must prove + verify through prove_lookup (width {width})"
         );
 
@@ -5530,8 +5535,8 @@ mod tests {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let lp = prove_lookup(&asm2, bad, &pis2);
-            verify_lookup(&asm2, &lp, &pis2).is_err()
+            let lp = prove_lookup_lean(&asm2, bad, &pis2);
+            verify_lookup_lean(&asm2, &lp, &pis2).is_err()
         }))
         .unwrap_or(true);
         std::panic::set_hook(hook);
