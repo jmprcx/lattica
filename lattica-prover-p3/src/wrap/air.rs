@@ -2316,6 +2316,14 @@ mod wrap_air {
         /// **Brick 4d** — `3·RATE` leaf-hash provide tags (per rate lane: the two shared DEEP term ids
         /// `trm_trace(c)`/`trm_next(c)` + the committed-felt select bit), pinned to periodics. Unused when `!narrow_ov`.
         pub(crate) leaf_periodics: Vec<Vec<Goldilocks>>,
+        /// **Tier-1 width merge** — when set, ALSO externalize the Merkle-cap product-mux (the biggest cw=true region):
+        /// swap `OpeningsBci`→[`CapOpeningsBci`] (`CapMuxBci` emits nothing, `cap_c` freed), add the cap-row region +
+        /// the SELECT bus (`cap_c[g]` == addressed cap-row) + the SPONGE-CAP bus (cap-row digest == FS-absorbed felt),
+        /// with the monolith at `narrow_caps` (the `2^cap_height·4` cap COLUMNS gone). Flag-off byte-identical.
+        pub(crate) bind_caps: bool,
+        /// **Tier-1 width merge** — `2·CAP_RATE` sponge-cap provide tags (per rate lane: the cap digest felt's `gi`
+        /// stream index + select bit), pinned to periodics. The `AssembledCapWrapCwAir` `cap_periodics`. Unused when off.
+        pub(crate) cap_periodics: Vec<Vec<Goldilocks>>,
     }
 
     impl AssembledOpeningsWrapCwAir {
@@ -2461,27 +2469,72 @@ mod wrap_air {
         pub(crate) fn leaf_periodic_base(&self) -> usize {
             BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
         }
+
+        // --- Tier-1 width merge: the cap-region (bind_caps) — appended after ALL prior regions (incl. ov). ---
+        /// Cap-absorb rate = the sponge `RATE` (a cap entry is a 4-felt run absorbed into 4 rate lanes).
+        pub(crate) const CAP_RATE: usize = 4;
+        /// The cap-region base: the cap-row `[cap_id, entry_idx, digest[4], cap_mult]` (7) + `cap_sel` (1) + `gi_base`
+        /// (1) + `2·CAP_RATE` sponge-cap tags. The arith-head marker is REUSED from the openings `is_head` (df_base+21).
+        pub(crate) fn cap_base(&self) -> usize {
+            self.nov_base() + if self.narrow_ov { 2 + 3 * Self::RATE } else { 0 }
+        }
+        /// Cap-row region selector (1 on every cap-row slack row; gates the digest READ + the entry PROVIDE).
+        pub(crate) fn cap_sel_c(&self) -> usize {
+            self.cap_base() + 7
+        }
+        /// The cap-row's `gi` of its `k=0` digest felt (free witness; the SPONGE-CAP balance forces it).
+        pub(crate) fn cap_gi_base(&self) -> usize {
+            self.cap_base() + 8
+        }
+        /// Sponge-cap tags PINNED to `cap_periodics`: per rate lane, the FS-stream `gi` index + the select bit.
+        pub(crate) fn cap_w_gi(&self, l: usize) -> usize {
+            self.cap_base() + 9 + 2 * l
+        }
+        pub(crate) fn cap_w_sel(&self, l: usize) -> usize {
+            self.cap_base() + 9 + 2 * l + 1
+        }
+        /// The periodic index where `cap_periodics` starts (after monolith + op tags + [narrow_ov leaf tags]).
+        pub(crate) fn cap_periodic_base(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
+                + if self.narrow_ov { 3 * Self::RATE } else { 0 }
+        }
+        /// The per-opening `(cap_id, cap_c offset, index shift, index bits)` for the SELECT bus (trace, quot, then
+        /// each commit round) — the `AssembledCapWrapCwAir::openings` map. `cap_c` is the pre-existing carrier bound
+        /// to the Merkle terminal; the SELECT bus re-binds it to the addressed committed cap entry.
+        pub(crate) fn cap_openings(&self) -> Vec<(usize, usize, usize, usize)> {
+            let mut v = vec![
+                (0, 0, self.m.input_depth(), self.m.cap_height),
+                (1, 4, self.m.input_depth(), self.m.cap_height),
+            ];
+            for r in 0..self.m.cm_rounds() {
+                v.push((2 + r, 8 + 4 * r, self.m.commit_shift(r), self.m.commit_bits(r)));
+            }
+            v
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledOpeningsWrapCwAir {
         fn width(&self) -> usize {
             // ro/folded/quot(6) + DeepFoldAir region(18) + df_sel/df_first/df_end/is_head(4) + term_idx(1)
             // + is_ch(N_GROUPS) + opening-row(6) + 2·RATE sponge tags (+ brick 5d op-table 13 + op_sel + is_tr_leaf
-            // + leaf_key + op_is_ch(N_GROUPS)); (+ brick 4d held_lqk + df_is_quot + 3·RATE leaf tags when narrow_ov).
-            self.nov_base() + if self.narrow_ov { 2 + 3 * Self::RATE } else { 0 }
+            // + leaf_key + op_is_ch(N_GROUPS)); (+ brick 4d held_lqk + df_is_quot + 3·RATE leaf tags when narrow_ov);
+            // (+ Tier-1 merge cap-row 7 + cap_sel + gi_base + 2·CAP_RATE tags when bind_caps).
+            self.cap_base() + if self.bind_caps { 9 + 2 * Self::CAP_RATE } else { 0 }
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
         }
         fn num_periodic_columns(&self) -> usize {
-            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
-                + if self.narrow_ov { 3 * Self::RATE } else { 0 }
+            self.cap_periodic_base() + if self.bind_caps { 2 * Self::CAP_RATE } else { 0 }
         }
         fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
             let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
             p.extend(self.op_periodics.iter().cloned());
             if self.narrow_ov {
                 p.extend(self.leaf_periodics.iter().cloned());
+            }
+            if self.bind_caps {
+                p.extend(self.cap_periodics.iter().cloned());
             }
             p
         }
@@ -2492,11 +2545,14 @@ mod wrap_air {
             // (1) The narrow monolith: `OpeningsBci` externalizes the arith fold's `ro` (bound below), the epilogue's
             // `folded`, and the recomposed `quot` to slack columns — the `2·n_terms` pz opening columns are GONE. At
             // cw=true `eval_bci` sources the inner-pis from the committed window (`cur[pw(i)]`), so the delegated
-            // `InlineBci` cap-mux reads the window, not the empty `public_values()`.
-            self.m.eval_bci(
-                builder,
-                &OpeningsBci { ro_col: self.ro_col(), folded_col: self.folded_col(), quot_col: self.quot_col() },
-            );
+            // `InlineBci` cap-mux reads the window, not the empty `public_values()`. Tier-1 merge: when `bind_caps`,
+            // `CapOpeningsBci` ALSO externalizes the cap-mux (`cap_c` freed; re-bound by the cap-region buses below).
+            let (ro_col, folded_col, quot_col) = (self.ro_col(), self.folded_col(), self.quot_col());
+            if self.bind_caps {
+                self.m.eval_bci(builder, &CapOpeningsBci { ro_col, folded_col, quot_col });
+            } else {
+                self.m.eval_bci(builder, &OpeningsBci { ro_col, folded_col, quot_col });
+            }
 
             let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
             let nxt: Vec<AB::Expr> = builder.main().next_slice().iter().map(|&x| x.into()).collect();
@@ -2598,9 +2654,11 @@ mod wrap_air {
             let (zeta0, zeta1) = (cur[self.m.pw(2)].clone(), cur[self.m.pw(3)].clone());
 
             // Channels: 0 ro, 1..=N_GROUPS z/px, N_GROUPS+1 pz, N_GROUPS+2 sponge; then brick 5d appends the op-table
-            // folded wiring bus (N_GROUPS+3) + the N_GROUPS non-trace-leaf split channels (N_GROUPS+4 .. 2·N_GROUPS+4).
-            let n_chan =
-                N_GROUPS + 3 + if self.bind_optable { N_GROUPS + 1 } else { 0 } + if self.narrow_ov { 1 } else { 0 };
+            // folded wiring bus (N_GROUPS+3) + the N_GROUPS non-trace-leaf split channels (N_GROUPS+4 .. 2·N_GROUPS+4);
+            // then the Tier-1 merge caps SELECT + SPONGE-CAP (2), then narrow_ov's leaf-hash (LAST — so `n_chan−1`
+            // stays the leaf-hash index regardless of bind_caps). caps base = right after the op-table channels.
+            let caps_sel_ch = N_GROUPS + 3 + if self.bind_optable { N_GROUPS + 1 } else { 0 };
+            let n_chan = caps_sel_ch + if self.bind_caps { 2 } else { 0 } + if self.narrow_ov { 1 } else { 0 };
             let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); n_chan];
             // Channel 0 — the ro bus.
             chans[0].push((vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()));
@@ -2820,6 +2878,58 @@ mod wrap_air {
                 let df_is_trace = df_sel.clone() * (one.clone() - dq);
                 lh.push((vec![x.0.clone(), term_idx.clone(), cur[db + 10].clone()], df_is_trace));
                 chans[lhpx] = lh;
+            }
+
+            // (Tier-1 width merge) The cap-region + SELECT/SPONGE-CAP buses (bind_caps) — the `AssembledCapWrapCwAir`
+            // eval one region deeper. `cap_c` (freed by `CapMuxBci`) is re-bound: SELECT ⇒ `cap_c[g]` == the
+            // index-addressed committed cap entry; SPONGE-CAP ⇒ the cap-row digest == the FS-absorbed felt (auth == FS).
+            if self.bind_caps {
+                let cap_sponge_ch = caps_sel_ch + 1;
+                let cr = self.cap_base();
+                let cpb = self.cap_periodic_base();
+                let caprate = Self::CAP_RATE;
+                let cap_sel = cur[self.cap_sel_c()].clone();
+                builder.assert_zero(cap_sel.clone() * (cap_sel.clone() - one.clone()));
+                builder.assert_zero((one.clone() - cap_sel.clone()) * cur[cr + 6].clone());
+                for l in 0..caprate {
+                    builder.assert_zero(cur[self.cap_w_gi(l)].clone() - p[cpb + 2 * l].clone());
+                    builder.assert_zero(cur[self.cap_w_sel(l)].clone() - p[cpb + 2 * l + 1].clone());
+                }
+                // SELECT (caps_sel_ch): the cap-row PROVIDES its entry (mult `cap_mult` = −count); each arith head
+                // READS, per opening g, `[cap_id, index>>shift_g, cap_c[g]]` (mult `is_head`).
+                chans[caps_sel_ch].push((
+                    vec![cur[cr].clone(), cur[cr + 1].clone(), cur[cr + 2].clone(), cur[cr + 3].clone(), cur[cr + 4].clone(), cur[cr + 5].clone()],
+                    cur[cr + 6].clone(),
+                ));
+                for (cap_id, cg_off, shift, bits) in self.cap_openings() {
+                    let mut sel_idx = AB::Expr::ZERO;
+                    for j in 0..bits {
+                        sel_idx = sel_idx + cur[self.m.sb_b(shift + j)].clone() * AB::Expr::from(Goldilocks::from_u64(1u64 << j));
+                    }
+                    chans[caps_sel_ch].push((
+                        vec![
+                            AB::Expr::from(Goldilocks::from_u64(cap_id as u64)),
+                            sel_idx,
+                            cur[self.m.cap_c(cg_off)].clone(),
+                            cur[self.m.cap_c(cg_off + 1)].clone(),
+                            cur[self.m.cap_c(cg_off + 2)].clone(),
+                            cur[self.m.cap_c(cg_off + 3)].clone(),
+                        ],
+                        is_head.clone(),
+                    ));
+                }
+                // SPONGE-CAP (cap_sponge_ch): per rate lane PROVIDE `(gi, cur[l])` mult −sel; each cap-row READS its 4
+                // digest felts `(gi_base+k, digest[k])` mult +cap_sel ⇒ the cap-row digest == the FS-absorbed felt.
+                for l in 0..caprate {
+                    chans[cap_sponge_ch].push((
+                        vec![cur[self.cap_w_gi(l)].clone(), cur[l].clone()],
+                        AB::Expr::ZERO - cur[self.cap_w_sel(l)].clone(),
+                    ));
+                }
+                for k in 0..4 {
+                    let gi_k = cur[self.cap_gi_base()].clone() + AB::Expr::from(Goldilocks::from_u64(k as u64));
+                    chans[cap_sponge_ch].push((vec![gi_k, cur[cr + 2 + k].clone()], cap_sel.clone()));
+                }
             }
 
             for ch in chans {
@@ -4995,7 +5105,7 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values (like opening_bind_cw_composes).
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
-        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0, narrow_ov: false, leaf_periodics: vec![] };
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0, narrow_ov: false, leaf_periodics: vec![], bind_caps: false, cap_periodics: vec![] };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -5077,7 +5187,7 @@ mod tests {
         let h = m.height();
         // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
         let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
-        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: true, folded_addr: 1 << 20, quot_addr: 1 << 21, narrow_ov: false, leaf_periodics: vec![] };
+        let air = AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable: true, folded_addr: 1 << 20, quot_addr: 1 << 21, narrow_ov: false, leaf_periodics: vec![], bind_caps: false, cap_periodics: vec![] };
         let fw = air.m.fused_w();
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -5138,6 +5248,7 @@ mod tests {
         let leaf_periodics = vec![vec![Val::ZERO; h]; 3 * AssembledOpeningsWrapCwAir::RATE];
         let air = AssembledOpeningsWrapCwAir {
             m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0, narrow_ov: true, leaf_periodics,
+            bind_caps: false, cap_periodics: vec![],
         };
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
@@ -5150,6 +5261,57 @@ mod tests {
         );
         assert_eq!(lookups.len(), N_GROUPS + 4, "ro + N_GROUPS z/px + pz + sponge + leaf-hash→px");
         assert!(log_nqc <= LOG_BLOWUP, "the narrow_ov openings-wrap must compose within budget (got {log_nqc})");
+    }
+
+    /// **Tier-1 width merge M1b — the ASSEMBLED caps ⊕ openings wrap composes.** The full assembled AIR with
+    /// `bind_caps` (the `narrow_caps` monolith + [`CapOpeningsBci`] + the cap-row region + the SELECT and SPONGE-CAP
+    /// buses) COMBINED with the openings externalization (DeepFold `ro` + z/px + pz + sponge) — the assembled-eval
+    /// integration of the 9.2× width merge. `narrow_ov` stays off here (it enters via the leaf-hash bus, LAST channel,
+    /// separately). Composes at `log_nqc ≤ LOG_BLOWUP` with `N_GROUPS+5` channels (openings `N_GROUPS+3` + caps SELECT
+    /// + SPONGE-CAP), so the cap-mux externalization (cap COLUMNS gone) bus-binds in the SAME AIR as the openings.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_merge_openings_wrap_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        // narrow_caps + narrow_arith + narrow_openings (narrow_ov off — bind_caps ⊕ openings merge only).
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, true, true, true, false);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts, binds, index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(), n_terms,
+            inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
+            constraints, w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true, narrow_caps: true, narrow_openings: true, narrow_ov: false,
+        };
+        let h = m.height();
+        let op_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::RATE];
+        let cap_periodics = vec![vec![Val::ZERO; h]; 2 * AssembledOpeningsWrapCwAir::CAP_RATE];
+        let air = AssembledOpeningsWrapCwAir {
+            m, op_periodics, bind_optable: false, folded_addr: 0, quot_addr: 0, narrow_ov: false, leaf_periodics: vec![],
+            bind_caps: true, cap_periodics,
+        };
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&air);
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "Tier-1 MERGE M1b (assembled compose): caps ⊕ openings wrap width {width}, {} channels (openings + caps \
+             SELECT + SPONGE-CAP), log_nqc {log_nqc} ≤ {LOG_BLOWUP} — the cap-mux externalized (narrow_caps, cap \
+             COLUMNS gone) AND bus-bound in the SAME assembled AIR as the openings externalization.",
+            lookups.len()
+        );
+        assert_eq!(lookups.len(), N_GROUPS + 5, "openings (ro + N_GROUPS z/px + pz + sponge) + caps SELECT + SPONGE-CAP");
+        assert!(log_nqc <= LOG_BLOWUP, "the assembled caps ⊕ openings merge must compose within budget (got {log_nqc})");
     }
 
     /// **Tier-1 width merge M1a — the caps ⊕ openings externalizations coexist under budget.** The combined
@@ -5572,7 +5734,7 @@ mod tests {
         }
 
         (
-            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr, narrow_ov, leaf_periodics },
+            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr, narrow_ov, leaf_periodics, bind_caps: false, cap_periodics: vec![] },
             RowMajorMatrix::new(wide, width),
             Vec::new(),
         )
