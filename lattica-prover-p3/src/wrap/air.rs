@@ -4142,6 +4142,67 @@ mod tests {
         );
     }
 
+    /// **Step 5 (W5 GATE 2) — the self-composition marginal B < 1 with narrow_ov, MEASURED cheaply** (`--features
+    /// recursion`, cheap; NO inner-monolith prove — `fused_w` is a deterministic width function, so the SLOPE is
+    /// inner-independent). The make-or-break SIZE gate: does the fully-narrowed (arith + caps + openings + ov)
+    /// self-composing verifier CONTRACT (marginal `B = d(fused_w)/d(w_inner) < 1`) so the recursion tree converges to
+    /// an attracting fixed point `W* = A/(1−B)` instead of exploding (the R5 44× blow-up)? Builds the OUTER's
+    /// structural params over a real join-split inner (cheap prove), then reads `fused_w` at synthetic widths and
+    /// measures the marginal at the four geometries. Asserts the +ov point (brick 4b — the REAL narrow_ov geometry,
+    /// not a projection) crosses strictly below 1. The heavy end-to-end prove of the canonical wrap OOMs this box
+    /// (`self_composition_b_narrowed`, `#[ignore]`, the R5-authentic cross-check); this is the CHEAP, CI-runnable gate.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn w5_gate_narrow_ov_marginal_b_below_one() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        // the OUTER verifying this inner — its structural params (counts/binds/n_terms) drive fused_w.
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, false, false, false);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let cap_h = proof.commitments.trace.roots().len().trailing_zeros() as usize;
+        // narrow toggles arith(9→2)+caps; nopen ADDS openings (arith_stride→0); nov ADDS the ov carrier (brick 4b).
+        let mk = |w_inner: usize, nt: usize, narrow: bool, nopen: bool, nov: bool| MonolithAir {
+            counts: counts.clone(), binds: binds.clone(), index_binds: index_binds.clone(),
+            n_queries: proof.opening_proof.query_proofs.len(), n_terms: nt,
+            inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
+            constraints: constraints.clone(), w_inner_f: w_inner, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
+            cap_height: cap_h, narrow_arith: narrow || nopen, narrow_caps: narrow, narrow_openings: nopen, narrow_ov: nov };
+        let (w0, nt0, d) = (WIDTH, n_terms, 256usize);
+        // scale the w_inner-coupled inputs (w_inner + the 2·w_inner trace-ζ/ζ_next terms) by Δ; hold the FRI
+        // structure (nqc/cap_height/n_binds — they scale only ~log with the inner size).
+        let marg = |narrow: bool, nopen: bool, nov: bool| {
+            (mk(w0 + d, nt0 + 2 * d, narrow, nopen, nov).fused_w() - mk(w0, nt0, narrow, nopen, nov).fused_w()) as f64
+                / d as f64
+        };
+        let (mb_full, mb_narrow, mb_open, mb_ov) =
+            (marg(false, false, false), marg(true, false, false), marg(true, true, false), marg(true, true, true));
+        // the attracting fixed point W* = A/(1−B) exists iff B < 1 (a contraction).
+        let (a_ov, w_star) = {
+            let wlo = mk(w0, nt0, true, true, true).fused_w() as f64;
+            let a = wlo - mb_ov * w0 as f64;
+            (a, a / (1.0 - mb_ov))
+        };
+        println!(
+            "W5 GATE (cheap, MEASURED): self-composition marginal B = d(fused_w)/d(w_inner): FULL {mb_full:.2} → \
+             arith+caps {mb_narrow:.2} → +openings {mb_open:.2} → +ov {mb_ov:.2} cols/col. The ov externalization \
+             (brick 4b) drops the LAST inner-scaling +1 ⇒ B < 1 ⇒ a STRICT CONTRACTION ⇒ the self-composition \
+             W_out = {a_ov:.0} + {mb_ov:.2}·W_in converges to an attracting fixed point W* = {w_star:.0} (no \
+             explosion). The heavy end-to-end prove OOMs this 62 GB box; the SIZE gate is met by MEASUREMENT.",
+        );
+        assert!(mb_full > 1.0, "the FULL (un-narrowed) self-composition must be an expansion (B = {mb_full:.2} > 1) — the R5 explosion");
+        assert!(mb_open > mb_ov, "the ov externalization must reduce the marginal B ({mb_open:.2} → {mb_ov:.2})");
+        assert!(mb_ov < 1.0, "W5 GATE: the narrow_ov marginal B must be strictly < 1 (got {mb_ov:.2}) ⇒ an attracting fixed point W* exists");
+    }
+
     /// **AA5 — the cw=true narrow_caps TRACE builds (openings correct).** `build_symbolic_inner_window` gained a
     /// `narrow_caps` flag that skips the trace/quotient/commit cap felts from the pis window. At `true` it builds
     /// a valid cw=true trace with the cap slice DROPPED — and its internal diagnostics still pass: the native
@@ -7240,55 +7301,68 @@ mod tests {
         let inner_w = w_in;
         // `narrow` toggles arith(9→2)+caps; `nopen` ADDS the openings externalization (arith_stride→0). The three
         // geometry points are FULL / arith+caps / +openings. (narrow_openings REQUIRES narrow_arith, so OR it in.)
-        let mk_outer = |w_inner: usize, nt: usize, narrow: bool, nopen: bool| MonolithAir {
+        // `narrow` toggles arith(9→2)+caps; `nopen` ADDS the openings externalization (arith_stride→0); `nov` ADDS
+        // the ov opened-row carrier externalization (brick 4b — the REAL 4th narrow flag, no longer a projection).
+        let mk_outer = |w_inner: usize, nt: usize, narrow: bool, nopen: bool, nov: bool| MonolithAir {
             counts: ocounts.clone(), binds: obinds.clone(), index_binds: oib.clone(), n_queries: 4, n_terms: nt,
             inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
             constraints: inner_cs.clone(), w_inner_f: w_inner, n_pub_f: np_in, n_periodic_f: nper_in, is_zk: 0,
-            cap_height: cap_h, narrow_arith: narrow || nopen, narrow_caps: narrow, narrow_openings: nopen, narrow_ov: false };
-        let outer_w = mk_outer(w_in, ont, false, false).fused_w();
-        let outer_narrow_w = mk_outer(w_in, ont, true, false).fused_w(); // arith 9→2 + caps
-        let outer_open_w = mk_outer(w_in, ont, true, true).fused_w(); // + openings externalized (arith_stride→0)
+            cap_height: cap_h, narrow_arith: narrow || nopen, narrow_caps: narrow, narrow_openings: nopen, narrow_ov: nov };
+        let outer_w = mk_outer(w_in, ont, false, false, false).fused_w();
+        let outer_narrow_w = mk_outer(w_in, ont, true, false, false).fused_w(); // arith 9→2 + caps
+        let outer_open_w = mk_outer(w_in, ont, true, true, false).fused_w(); // + openings externalized (arith_stride→0)
+        let outer_ov_w = mk_outer(w_in, ont, true, true, true).fused_w(); // + ov carrier externalized (brick 4b, REAL)
         let d = 256usize;
-        let marg = |narrow: bool, nopen: bool| {
-            (mk_outer(w_in + d, ont + 2 * d, narrow, nopen).fused_w() - mk_outer(w_in, ont, narrow, nopen).fused_w())
-                as f64
+        let marg = |narrow: bool, nopen: bool, nov: bool| {
+            (mk_outer(w_in + d, ont + 2 * d, narrow, nopen, nov).fused_w()
+                - mk_outer(w_in, ont, narrow, nopen, nov).fused_w()) as f64
                 / d as f64
         };
-        let (mb_full, mb_narrow, mb_open) = (marg(false, false), marg(true, false), marg(true, true));
+        let (mb_full, mb_narrow, mb_open) = (marg(false, false, false), marg(true, false, false), marg(true, true, false));
         println!(
             "SELF-COMPOSITION B (R5, inner monolith W={inner_w}): outer fused_w FULL {outer_w} (B {:.1}×) → NARROWED \
-             (arith 9→2 + caps) {outer_narrow_w} (B {:.1}×) → +OPENINGS externalized {outer_open_w} (B {:.1}×). \
-             MARGINAL B = d(fused_w)/d(w_inner): FULL {mb_full:.2} → arith+caps {mb_narrow:.2} → +openings \
-             {mb_open:.2} cols/col. The openings externalization drops the arith-tile slope (2·n_terms) to 0, \
-             leaving ONLY the +1 `ov` opened-row/trace-leaf carrier (input_leaf_felts = w_inner) ⇒ marginal B → \
-             ~1.00, the fixed-point BOUNDARY. CANONICALIZATION (freeze w_inner/nqc/cap_height) — or externalizing \
-             the `ov` carrier narrow-tall — drives it strictly < 1.",
+             (arith 9→2 + caps) {outer_narrow_w} (B {:.1}×) → +OPENINGS externalized {outer_open_w} (B {:.1}×) → +OV \
+             externalized {outer_ov_w} (B {:.1}×). MARGINAL B = d(fused_w)/d(w_inner): FULL {mb_full:.2} → arith+caps \
+             {mb_narrow:.2} → +openings {mb_open:.2} cols/col. The openings externalization drops the arith-tile slope \
+             (2·n_terms) to 0, leaving ONLY the +1 `ov` opened-row/trace-leaf carrier (input_leaf_felts = w_inner) ⇒ \
+             marginal B → ~1.00, the fixed-point BOUNDARY. Externalizing the `ov` carrier narrow-tall (brick 4b) \
+             removes that last +1 slope — measured next.",
             outer_w as f64 / inner_w as f64,
             outer_narrow_w as f64 / inner_w as f64,
             outer_open_w as f64 / inner_w as f64,
+            outer_ov_w as f64 / inner_w as f64,
         );
         assert!(outer_narrow_w < outer_w, "the arith+caps narrowing must shrink the R5 outer width ({outer_w} → {outer_narrow_w})");
         assert!(outer_open_w < outer_narrow_w, "externalizing the openings must shrink the outer further ({outer_narrow_w} → {outer_open_w}, drops 2·n_terms pz)");
+        assert!(outer_ov_w < outer_open_w, "externalizing the ov carrier must shrink the outer further ({outer_open_w} → {outer_ov_w}, drops w_inner)");
         assert!(mb_narrow < mb_full, "arith+caps narrowing must reduce the marginal (asymptotic) B ({mb_full:.2} → {mb_narrow:.2})");
         assert!(mb_narrow > 1.0, "arith+caps ALONE leaves marginal B > 1 ({mb_narrow:.2}) — the openings externalization is the further lever");
         assert!(mb_open < mb_narrow, "the openings externalization must reduce the marginal B further ({mb_narrow:.2} → {mb_open:.2})");
-        assert!(mb_open <= 1.5, "with openings externalized the marginal B drops to ~1.00 (only the `ov` trace-leaf carrier remains); canonicalization drives it to 0 (got {mb_open:.2})");
+        assert!(mb_open <= 1.5, "with openings externalized the marginal B drops to ~1.00 (only the `ov` trace-leaf carrier remains); externalizing it drives it < 1 (got {mb_open:.2})");
 
-        // PROJECTED +OV externalization (the last lever): the `ov` opened-row carrier (`input_leaf_felts` = w_inner)
-        // is the ONLY region still scaling with the inner width. Moving it narrow-tall (columns → rows on a bus,
-        // like `narrow_openings` did for `pz`) removes its +1 slope. The projected width `fused_w − input_leaf_felts`
-        // has marginal → 0.00 ⇒ a STRICT contraction (B < 1) ⇒ an attracting canonical fixed point W* exists.
+        // W5 GATE — the REAL +ov measurement (brick 4b made narrow_ov an actual geometry, not a projection). The `ov`
+        // opened-row carrier (`input_leaf_felts` = w_inner) was the ONLY region still scaling with the inner width;
+        // dropping it narrow-tall (columns → rows on the leaf-hash→px bus) removes its +1 slope. Measure the marginal
+        // B of the REAL narrow_ov outer AND cross-check it equals the prior projection (`fused_w − input_leaf_felts`)
+        // — validating brick 4b's byte-level narrowing at the R5 self-composition scale.
+        let mb_ov = marg(true, true, true);
+        // cross-check: the REAL narrow_ov fused_w == the projected (openings fused_w − the ov carrier) at both points.
         let proj_ov = |w_inner: usize, nt: usize| {
-            let m = mk_outer(w_inner, nt, true, true);
-            (m.fused_w() - m.input_leaf_felts()) as f64
+            let m = mk_outer(w_inner, nt, true, true, false);
+            m.fused_w() - m.input_leaf_felts()
         };
-        let mb_ov = (proj_ov(w_in + d, ont + 2 * d) - proj_ov(w_in, ont)) / d as f64;
+        assert_eq!(outer_ov_w, proj_ov(w_in, ont), "the REAL narrow_ov fused_w must equal the openings width minus the ov carrier (brick 4b at R5)");
+        assert_eq!(mk_outer(w_in + d, ont + 2 * d, true, true, true).fused_w(), proj_ov(w_in + d, ont + 2 * d), "…and at the +Δ point (the slope agrees)");
         println!(
-            "PROJECTED +ov externalization: marginal B (fused_w − ov carrier) = {mb_ov:.2} cols/col ⇒ B < 1, a \
-             STRICT contraction ⇒ the tree CONVERGES to an attracting W* (the ov carrier is the LAST inner-scaling \
-             region; externalizing it narrow-tall is the W3-completing lever — a 4th narrow flag, Merkle-entangled).",
+            "W5 GATE [MEASURED, REAL narrow_ov]: marginal B = d(fused_w)/d(w_inner) = {mb_ov:.2} cols/col < 1 ⇒ a \
+             STRICT CONTRACTION ⇒ the self-composition W_out = A + B·W_in CONVERGES to an attracting fixed point W* \
+             (no explosion). The `ov` carrier was the LAST inner-scaling region; brick 4b externalized it (byte-level \
+             matches-native), so the R5 outer width now grows SUB-linearly in the inner width. The heavy end-to-end \
+             prove of the canonical wrap OOMs this 62 GB box, but the SIZE gate — the make-or-break W5 number — is met \
+             by measurement: marginal B {mb_full:.2} (FULL) → {mb_narrow:.2} (arith+caps) → {mb_open:.2} (+openings) → \
+             {mb_ov:.2} (+ov) < 1.",
         );
-        assert!(mb_ov < 1.0, "externalizing the ov carrier must drop the marginal B strictly below 1 (got {mb_ov:.2}) ⇒ a fixed point exists");
+        assert!(mb_ov < 1.0, "W5 GATE: the REAL narrow_ov marginal B must be strictly < 1 (got {mb_ov:.2}) ⇒ an attracting fixed point exists");
         assert!(mb_ov < mb_open, "the ov externalization must reduce the marginal further ({mb_open:.2} → {mb_ov:.2})");
     }
 }

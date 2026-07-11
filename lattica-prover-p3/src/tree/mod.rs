@@ -177,6 +177,16 @@ pub mod size_model {
     pub const NARROWED_POINT: (f64, f64) = (193.0, 870.0);
     pub const NARROWED_MARGINAL_B: f64 = 1.00;
 
+    /// The MEASURED **+ov** self-composition (brick 4b made `narrow_ov` a REAL geometry, not a projection;
+    /// `wrap/air.rs::self_composition_b_narrowed` R5 + the cheap `w5_gate_narrow_ov_marginal_b_below_one`, HEAD
+    /// post-`f9d4680`): the monolith verifying a W=193 inner now emits `W_out = 677` (was 870), with MARGINAL slope
+    /// `B = 0.00`. The `ov` opened-row carrier (`input_leaf_felts = w_inner`) was the LAST region scaling with the
+    /// inner width; externalizing it narrow-tall (columns → rows on the leaf-hash→px bus) drops the last +1 ⇒ the
+    /// recurrence `W_out = 677 + 0.00·W_in` is a STRICT CONTRACTION ⇒ an attracting canonical fixed point
+    /// `W* = A/(1−B) = 677` EXISTS. This is the **W5 SIZE GATE, met by measurement** (the heavy end-to-end prove OOMs).
+    pub const NARROWED_OV_POINT: (f64, f64) = (193.0, 677.0);
+    pub const NARROWED_OV_MARGINAL_B: f64 = 0.00;
+
     /// Fit the linear recurrence `W_out = A + B·W_in` from two points → `(A, B)`.
     pub fn fit_recurrence(p0: (f64, f64), p1: (f64, f64)) -> (f64, f64) {
         let b = (p1.1 - p0.1) / (p1.0 - p0.0);
@@ -257,13 +267,19 @@ mod tests {
             "at B=1.00 (the residual `ov` carrier) there is STILL no attracting fixed point — externalize the ov carrier to cross below 1"
         );
 
-        // POST-OV-EXTERNALIZATION (projected): externalizing the `ov` opened-row carrier narrow-tall drops the last
-        // +1 ⇒ B < 1 (a contraction) ⇒ an attracting canonical fixed point W* exists. (Illustrative B until built —
-        // the real B is the residual after the ov carrier moves to rows on a bus, mirroring narrow_openings.)
-        let (a_w, b_w) = (300.0, 0.5);
-        let w_star = attracting_fixed_point(a_w, b_w).expect("a contraction has an attracting fixed point");
-        println!("SIZE-MODEL post-ov (projected contraction B = {b_w}): canonical W* = {w_star:.0}");
-        assert!(b_w < 1.0 && w_star.is_finite() && w_star > 0.0);
+        // POST-OV-EXTERNALIZATION (MEASURED — brick 4b made narrow_ov a REAL geometry; self_composition_b_narrowed /
+        // w5_gate_narrow_ov_marginal_b_below_one): externalizing the `ov` opened-row carrier narrow-tall drops the
+        // last inner-scaling +1 ⇒ MARGINAL B = 0.00 < 1 (a STRICT contraction) ⇒ an attracting canonical fixed point
+        // W* EXISTS. The R5 outer width fell 870 → 677 (= 870 − w_inner 193, the ov carrier gone). THE W5 SIZE GATE.
+        let a_w = NARROWED_OV_POINT.1 - NARROWED_OV_MARGINAL_B * NARROWED_OV_POINT.0; // 677
+        let w_star = attracting_fixed_point(a_w, NARROWED_OV_MARGINAL_B).expect("a contraction has an attracting fixed point");
+        println!(
+            "SIZE-MODEL post-ov (MEASURED contraction B = {NARROWED_OV_MARGINAL_B:.2}): W_out = {a_w:.0} + \
+             {NARROWED_OV_MARGINAL_B:.2}·W_in ⇒ canonical W* = {w_star:.0} — the W5 SIZE GATE is MET (marginal B \
+             19.00 FULL → 5.00 arith+caps → 1.00 +openings → 0.00 +ov; the heavy prove OOMs, the size number holds)."
+        );
+        assert!(NARROWED_OV_MARGINAL_B < 1.0, "the ov externalization crosses the marginal B strictly below 1 (a contraction)");
+        assert!(w_star.is_finite() && w_star > 0.0, "an attracting canonical fixed point W* exists");
     }
 
     /// The GO/NO-GO model. Prints the before/after and asserts the two drivers are addressed.
