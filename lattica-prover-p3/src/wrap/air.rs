@@ -3522,6 +3522,91 @@ mod tests {
         );
     }
 
+    /// **W3 ov externalization brick 3 — the leaf-hash→px bus COMPOSES + BALANCES** (`--features lookup,recursion`,
+    /// cheap; the `sponge_opening_bus_composes` analog, one region over). Brick 2 showed the ov carrier felts already
+    /// sit in the input-Merkle leaf-hash Poseidon input lanes. This confirms the proven [`crate::wrap::SpongeCapBusAir`]
+    /// (the generic ordered `(gi, value)` bus the caps + openings reuse) binds them VERBATIM: lay each query's opened
+    /// trace row (= the leaf preimage = `px`) out `RATE` felts/leaf-block as the bus's provide lanes, read `px` on the
+    /// region side, and (1) COMPOSE `log_nqc ≤ LOG_BLOWUP` (one channel), (2) BALANCE natively (every `(gi, value)`
+    /// nets to zero ⇒ each `px` == its leaf-hash preimage lane). ⇒ the sound `narrow_ov` sources `px` from the leaf
+    /// hash via this bus, eliminating the `ov` carrier — the leaf hash is the Merkle-authenticated FS-anchor. (The
+    /// ASSEMBLED binding — the narrow_ov monolith reading `px` from the real leaf-hash rows through the bus + the
+    /// heavy prove — is the next brick; the assembled prove OOMs this 62 GB box, like the brick-5d prove.)
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn leaf_hash_px_bus_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::lookup::prover::combined_constraint_layout;
+        use crate::poseidon2_air::W as PW;
+        use crate::recursion::native_fri::make_config;
+        use crate::wrap::{sponge_cap_bus_trace, SpongeCapBusAir};
+        use p3_field::PrimeField64;
+        use p3_lookup::Lookups;
+        use p3_uni_stark::prove;
+        use std::collections::BTreeMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let rate = 4usize;
+        let n_q = proof.opening_proof.query_proofs.len();
+        // per query: the opened trace row (the leaf preimage = px). Lay it out RATE felts/leaf-block into synthetic
+        // "block_inputs" = the leaf-hash Poseidon input lanes SpongeCapBusAir provides; the region side reads px.
+        let mut block_inputs: Vec<[Val; PW]> = Vec::new();
+        let mut positions: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+        let mut committed: Vec<Val> = Vec::new();
+        for q in 0..n_q {
+            let row = &proof.opening_proof.query_proofs[q].input_proof[0].opened_values[0];
+            let w_inner = row.len();
+            let block_base = block_inputs.len();
+            for b in 0..w_inner.div_ceil(rate) {
+                let clen = core::cmp::min(rate, w_inner - b * rate);
+                let mut blk = [Val::ZERO; PW];
+                blk[..clen].copy_from_slice(&row[b * rate..b * rate + clen]);
+                block_inputs.push(blk);
+            }
+            for c in 0..w_inner {
+                positions.push((0, q, c, block_base + c / rate, c % rate));
+                committed.push(row[c]); // px = the opened-row felt = the leaf-hash preimage lane
+            }
+        }
+        let trace = sponge_cap_bus_trace(&block_inputs, &positions, &committed);
+        let (width, height) = (trace.width, trace.values.len() / trace.width);
+
+        // (1) COMPOSE (reuses the proven SpongeCapBusAir — same AIR the caps/openings bind through).
+        let air = SpongeCapBusAir;
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        assert_eq!(lookups.len(), 1, "one ordered-bus channel");
+        assert!(log_nqc <= LOG_BLOWUP, "the leaf-hash→px bus must compose within budget (got {log_nqc})");
+
+        // (2) BALANCE: sponge provides (gi, lane) −sel, region reads (gi, px) +is_region ⇒ px == the leaf preimage.
+        let g = |r: usize, c: usize| trace.values[r * width + c].as_canonical_u64();
+        let (is_reg, rgi, rval) = (3 * 4 + 2, 3 * 4, 3 * 4 + 1);
+        let mut bus: BTreeMap<(u64, u64), i64> = BTreeMap::new();
+        for r in 0..height {
+            for l in 0..rate {
+                if trace.values[r * width + 2 * rate + l] == Val::ONE {
+                    *bus.entry((g(r, rate + l), g(r, l))).or_insert(0) -= 1;
+                }
+            }
+            if trace.values[r * width + is_reg] == Val::ONE {
+                *bus.entry((g(r, rgi), g(r, rval))).or_insert(0) += 1;
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != 0).count();
+        assert_eq!(nonzero, 0, "leaf-hash→px bus must net to zero ({nonzero} imbalanced (gi,value) tuples)");
+        assert_eq!(bus.len(), positions.len(), "one balanced (gi,value) tuple per opened-row felt");
+        println!(
+            "W3 ov brick 3: {} opened-row felts ({n_q} queries), width {width}, {height} rows, log_nqc {log_nqc} — \
+             the leaf-hash→px bus COMPOSES + BALANCES (reuses the proven SpongeCapBusAir, the openings pattern one \
+             region over: the leaf hash provides px, so the ov carrier copy is eliminated). The assembled narrow_ov \
+             binding (px sourced from the real leaf-hash rows) + prove are next (the assembled prove OOMs this box).",
+            positions.len()
+        );
+    }
+
     /// **AA6 — the narrow_openings wrap COMPOSES (the plumbing/compose step).** The narrow_openings monolith
     /// (`arith_stride` 0 — the `pz` opening columns GONE) + [`OpeningsBci`] (DeepFold arith ⊕ OpTable epilogue,
     /// `ro`/`folded`/`quot` as FREE witnesses) builds its symbolic layout with NO degenerate `pz` read and composes
