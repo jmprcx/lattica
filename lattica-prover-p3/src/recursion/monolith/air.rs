@@ -1666,13 +1666,18 @@ impl MonolithAir {
         // (trm_committed_w felts) feeds BOTH its ζ term px(trm_trace(c)) AND its ζ_next term px(trm_next(c))
         // (px-sharing — one authenticated value → two DEEP terms) and the leaf. The trailing HIDING_SALT felts
         // (is_zk=1) are the free leaf salt: held but not px-bound (authenticated by folding to the committed cap).
-        for c in 0..self.input_leaf_felts() {
-            let ovc = self.ov_c(c);
-            builder.when_transition().assert_zero(hold.clone() * (nxt[ovc].clone() - cur[ovc].clone()));
-            // NARROW: px is not stored (the wrap SOURCES it from this ov carrier); nothing to bind here.
-            if c < self.trm_committed_w() && !self.narrow_arith {
-                builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_trace(c))].clone())); // @ ζ
-                builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_next(c))].clone())); // @ ζ_next
+        // NARROW-OV: the ov opened-row carrier is externalized (its columns dropped, `ov_carrier_w()→0`) — the
+        // leaf-hash lanes instead PROVIDE px to the leaf-hash→px bus (the assembled wrap), so skip the carrier's
+        // hold-carry + px-bind here (they'd read the dropped `ov_c`). Byte-identical when `!narrow_ov`.
+        if !self.narrow_ov {
+            for c in 0..self.input_leaf_felts() {
+                let ovc = self.ov_c(c);
+                builder.when_transition().assert_zero(hold.clone() * (nxt[ovc].clone() - cur[ovc].clone()));
+                // NARROW: px is not stored (the wrap SOURCES it from this ov carrier); nothing to bind here.
+                if c < self.trm_committed_w() && !self.narrow_arith {
+                    builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_trace(c))].clone())); // @ ζ
+                    builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_next(c))].clone())); // @ ζ_next
+                }
             }
         }
         // HIDING random-round carrier (random_leaf_felts felts, is_zk=1): the random-polynomial committed row
@@ -1724,8 +1729,12 @@ impl MonolithAir {
         // rest = 0 (fresh state). At W≤RATE this is the single-block milestone leaf (byte-for-byte).
         let leaf = p[self.m_leaf()].clone();
         let lc0 = core::cmp::min(self.input_leaf_felts(), RATE);
-        for c in 0..lc0 {
-            builder.assert_zero(leaf.clone() * (cur[c].clone() - cur[self.ov_c(c)].clone()));
+        // narrow_ov: the leaf-hash lanes cur[0..lc0] instead PROVIDE px to the leaf-hash→px bus (not bound to the
+        // dropped ov_c here). The capacity zeroing below (lanes lc0..W) is unchanged. Byte-identical when !narrow_ov.
+        if !self.narrow_ov {
+            for c in 0..lc0 {
+                builder.assert_zero(leaf.clone() * (cur[c].clone() - cur[self.ov_c(c)].clone()));
+            }
         }
         for i in lc0..W {
             builder.assert_zero(leaf.clone() * cur[i].clone());
@@ -1736,8 +1745,10 @@ impl MonolithAir {
         for b in 1..self.leaf_blocks() {
             let ia = p[self.ia_in(b)].clone();
             let clen = core::cmp::min(RATE, self.input_leaf_felts() - b * RATE);
-            for k in 0..clen {
-                builder.assert_zero(ia.clone() * (cur[k].clone() - cur[self.ov_c(b * RATE + k)].clone()));
+            if !self.narrow_ov {
+                for k in 0..clen {
+                    builder.assert_zero(ia.clone() * (cur[k].clone() - cur[self.ov_c(b * RATE + k)].clone()));
+                }
             }
         }
         if self.leaf_blocks() > 1 {
