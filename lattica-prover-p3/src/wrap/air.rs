@@ -4046,6 +4046,102 @@ mod tests {
         );
     }
 
+    /// **W3 ov externalization brick 4d — the query-keyed leaf-hash→px bus BALANCES on the REAL narrow_ov trace**
+    /// (`--features recursion`, cheap; native multiset, NO prove — the brick-5d soundness bar). On a real join-split
+    /// inner's narrow_ov monolith trace (`narrow_ov` on ⇒ the ov carrier DROPPED, `px` sourced from the leaf-hash
+    /// lanes), replicate the sound `[lqk, term]` leaf-hash→px bus and confirm it nets to zero. The two sides derive
+    /// their tuples INDEPENDENTLY and must meet at each committed felt: **providers** walk the PHYSICAL leaf-hash
+    /// blocks (row `off + (m_input_leaf + b)·BLOCK`, lane `l` ⇒ felt `c = b·RATE + l`) and provide the absorbed lane
+    /// value under BOTH shared DEEP terms `trm_trace(c)`/`trm_next(c)` (−1 each, gated `c < trm_committed_w` = the
+    /// w_sel selector); **readers** walk the FOLD's TRACE terms `k` (mapping `k → c` via the trace/next ranges) and
+    /// read px keyed by `(x_q, k)`. Balance ⇒ the physical leaf layout, the w_sel range, the term↔felt map, the query
+    /// key (`x_q = GEN·qt_acc[lg−1]`), and the 2×/felt multiplicity are all mutually consistent on the real geometry
+    /// (w_inner 19, 5 leaf blocks) — a bug in any would imbalance it (as the native balances localized the brick-5d
+    /// pz/quot bugs before the heavy prove). This validates the addressing/multiplicity/query-keying STRUCTURE on the
+    /// real trace (the value comes from the one authenticated leaf cell — the in-circuit px BINDING is closed by the
+    /// AIR eval + the heavy prove, which OOMs this 62 GB box like brick 5d); the AIR-eval wiring is the follow-on.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_leaf_px_bus_balances_on_real_trace() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::poseidon2_air::BLOCK;
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_field::{Field, PrimeField64};
+        use p3_goldilocks::Goldilocks;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+        use std::collections::BTreeMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        // narrow_ov trace (brick 4b): ov carrier dropped, leaf-hash lanes still filled.
+        let (tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts, binds, index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms, inner_counter: false, column_window: true, k_instances: 1,
+            fold: false, fold_txstmt: false, constraints,
+            w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true, narrow_caps: false, narrow_openings: true, narrow_ov: true,
+        };
+        let (fw, rate) = (m.fused_w(), 4usize);
+        let h = tr.len() / fw;
+        // arith heads (tf rows) ⇒ the per-query point x_q = GEN·qt_acc[lg−1] = the held lqk.
+        let tf_col = BaseAir::<Val>::periodic_columns(&m)[m.m_tf()].clone();
+        let heads: Vec<usize> = (0..h).filter(|&r| tf_col[r % tf_col.len()] == Val::ONE).collect();
+        assert_eq!(heads.len(), m.n_queries, "one arith head per query");
+
+        let g = |v: Val| v.as_canonical_u64();
+        let (cw, tb, nb, lb) = (m.trm_committed_w(), m.trm_trace_base(), m.trm_next_base(), m.leaf_blocks());
+        let mut bus: BTreeMap<(u64, u64, u64), i64> = BTreeMap::new();
+        for (q, &head) in heads.iter().enumerate() {
+            let off = m.tr() + q * m.m_period();
+            let x_q = g(<Goldilocks as Field>::GENERATOR * tr[head * fw + m.qt_acc() + m.lg() - 1]);
+            // PROVIDER — walk the PHYSICAL leaf-hash blocks; felt c = b·RATE + l, value = the absorbed rate lane.
+            for b in 0..lb {
+                for l in 0..rate {
+                    let c = b * rate + l;
+                    if c >= cw {
+                        continue; // w_sel: only committed felts (c < trm_committed_w) are read as px
+                    }
+                    let v = g(tr[(off + (m.m_input_leaf() + b) * BLOCK) * fw + l]);
+                    *bus.entry((x_q, (tb + c) as u64, v)).or_insert(0) -= 1; // shared term trm_trace(c)
+                    *bus.entry((x_q, (nb + c) as u64, v)).or_insert(0) -= 1; // shared term trm_next(c)
+                }
+            }
+            // READER — walk the FOLD's TRACE terms; k → felt c(k) via the trace/next ranges; read px at (x_q, k).
+            for k in 0..n_terms {
+                let c = if k >= tb && k < tb + cw {
+                    k - tb
+                } else if k >= nb && k < nb + cw {
+                    k - nb
+                } else {
+                    continue; // quotient term — px from the `qc` carrier on the z/px bus, not the leaf-hash bus
+                };
+                let v = g(tr[(off + (m.m_input_leaf() + c / rate) * BLOCK) * fw + (c % rate)]);
+                *bus.entry((x_q, k as u64, v)).or_insert(0) += 1;
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != 0).count();
+        assert_eq!(nonzero, 0, "the query-keyed leaf-hash→px bus must net to zero ({nonzero} imbalanced tuples)");
+        assert_eq!(bus.len(), 2 * cw * m.n_queries, "one balanced tuple per (query, committed felt, term-role trace|next)");
+        println!(
+            "W3 ov brick 4d: the query-keyed [lqk, term] leaf-hash→px bus BALANCES on the REAL narrow_ov trace — \
+             {} tuples net-zero ({} committed felts × 2 shared terms × {} queries), providers walked the physical \
+             leaf blocks (w_inner {WIDTH}, {lb} blocks), readers the fold's trace terms, meeting at every felt. \
+             Validates the physical leaf layout + w_sel + term↔felt map + query key (x_q) + 2×/felt multiplicity are \
+             mutually consistent on the real geometry (the addressing/structure the assembler must reproduce); the \
+             in-circuit px binding (AIR eval, compose de-risked by brick 4c) + the heavy prove (OOMs, like 5d) close it.",
+            bus.len(), cw, m.n_queries
+        );
+    }
+
     /// **AA5 — the cw=true narrow_caps TRACE builds (openings correct).** `build_symbolic_inner_window` gained a
     /// `narrow_caps` flag that skips the trace/quotient/commit cap felts from the pis window. At `true` it builds
     /// a valid cw=true trace with the cap slice DROPPED — and its internal diagnostics still pass: the native
