@@ -2174,14 +2174,31 @@ mod wrap_air {
         pub(crate) fn op_sel(&self) -> usize {
             self.op_base() + 13
         }
+        /// **Brick 5d.2** — marks an op-table TRACE opening leaf (Main{0}/Main{1}): reads its opening at `leaf_key`
+        /// (= the DEEP term index) from the shared opening-row's `pz` provide (the pz channel — the same FS-anchored
+        /// provide the DeepFold folds), so the leaf value binds to the committed opening. Non-trace leaves use `op_is_ch`.
+        pub(crate) fn is_tr_leaf(&self) -> usize {
+            self.op_base() + 14
+        }
+        /// **Brick 5d.2** — the op-table opening-leaf's bus read address: the DEEP term index for a trace leaf, or
+        /// the canonical `open_id` for a non-trace leaf.
+        pub(crate) fn leaf_key(&self) -> usize {
+            self.op_base() + 15
+        }
+        /// **Brick 5d.2** — one-hot channel selector routing a NON-trace opening leaf's read to the split channel
+        /// its committed opening is provided on (`(open_id − OPEN_BASE) % N_GROUPS`); the bus balance forces the match.
+        pub(crate) fn op_is_ch(&self, g: usize) -> usize {
+            self.op_base() + 16 + g
+        }
     }
 
     impl BaseAir<Goldilocks> for AssembledOpeningsWrapCwAir {
         fn width(&self) -> usize {
             // ro/folded/quot(6) + DeepFoldAir region(18) + df_sel/df_first/df_end/is_head(4) + term_idx(1)
-            // + is_ch(N_GROUPS) + opening-row(6) + 2·RATE sponge tags (+ brick 5d op-table 13 + op_sel).
+            // + is_ch(N_GROUPS) + opening-row(6) + 2·RATE sponge tags (+ brick 5d op-table 13 + op_sel + is_tr_leaf
+            // + leaf_key + op_is_ch(N_GROUPS)).
             let base = self.m.fused_w() + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * Self::RATE;
-            base + if self.bind_optable { 14 } else { 0 }
+            base + if self.bind_optable { 16 + N_GROUPS } else { 0 }
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
@@ -2306,9 +2323,9 @@ mod wrap_air {
             let g_trace = AB::Expr::from(Goldilocks::two_adic_generator(self.m.cm_rounds() - self.m.is_zk));
             let (zeta0, zeta1) = (cur[self.m.pw(2)].clone(), cur[self.m.pw(3)].clone());
 
-            // Channels: 0 ro, 1..=N_GROUPS z/px, N_GROUPS+1 pz, N_GROUPS+2 sponge; +1 (N_GROUPS+3) for the brick-5d
-            // op-table folded wiring bus.
-            let n_chan = N_GROUPS + 3 + if self.bind_optable { 1 } else { 0 };
+            // Channels: 0 ro, 1..=N_GROUPS z/px, N_GROUPS+1 pz, N_GROUPS+2 sponge; then brick 5d appends the op-table
+            // folded wiring bus (N_GROUPS+3) + the N_GROUPS non-trace-leaf split channels (N_GROUPS+4 .. 2·N_GROUPS+4).
+            let n_chan = N_GROUPS + 3 + if self.bind_optable { N_GROUPS + 1 } else { 0 };
             let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); n_chan];
             // Channel 0 — the ro bus.
             chans[0].push((vec![x.0.clone(), x.1.clone(), ro.0.clone(), ro.1.clone()], AB::Expr::ZERO - df_end.clone()));
@@ -2412,6 +2429,53 @@ mod wrap_air {
                     vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1],
                     is_head.clone(),
                 ));
+
+                // --- Brick 5d.2: the op-table OPENING-LEAF binding (the op-table's `c_k` inputs bound to the real
+                // FS-absorbed openings). Every op-table leaf reads its opening on a bus; the head/opening-row provides
+                // force the value. TWO mechanisms, reconciled by address space (term_idx < n_terms ≪ OPEN_BASE):
+                //   • TRACE leaves (Main{0}/Main{1}) read `[term_idx, o0, o1]` on the pz channel (N_GROUPS+1) — the
+                //     SHARED opening-row's FS-anchored pz provide, the same one the DeepFold folds (no 2nd anchor);
+                //   • NON-trace leaves (Public/Periodic/selector) read `[open_id, o0, o1]` on their is_ch split channel;
+                //     the arith head PROVIDES each from the cw=true window, SPLIT across N_GROUPS channels (the 5c
+                //     pattern) so no single row/channel exceeds the degree budget.
+                let leaf_key = cur[self.leaf_key()].clone();
+                let (lv0, lv1) = (cur[ob + 4].clone(), cur[ob + 5].clone()); // the leaf's out value (= o0, o1)
+                let is_tr_leaf = cur[self.is_tr_leaf()].clone();
+                builder.assert_zero(is_tr_leaf.clone() * (is_tr_leaf.clone() - one.clone()));
+                chans[N_GROUPS + 1].push((vec![leaf_key.clone(), lv0.clone(), lv1.clone()], is_tr_leaf));
+
+                let nt = N_GROUPS + 4; // the non-trace split channels: nt .. nt+N_GROUPS
+                let neg_head = AB::Expr::ZERO - is_head.clone();
+                let (wu, npu, nperu) = (self.m.w_inner() as u64, self.m.n_pub() as u64, self.m.n_periodic() as u64);
+                let route = |a: u64| ((a - OPEN_BASE) as usize) % N_GROUPS; // an opening's split channel
+                let oidv = |x: u64| AB::Expr::from(Goldilocks::from_u64(x));
+                for i in 0..self.m.n_pub() {
+                    let a = open_id((2, i as u64), wu, npu, nperu);
+                    chans[nt + route(a)].push((vec![oidv(a), cur[self.m.pw(self.m.pub_pi() + i)].clone(), AB::Expr::ZERO], neg_head.clone()));
+                }
+                for i in 0..self.m.n_periodic() {
+                    let a = open_id((3, i as u64), wu, npu, nperu);
+                    let b = self.m.periodic_base() + 2 * i;
+                    chans[nt + route(a)].push((vec![oidv(a), cur[self.m.pw(b)].clone(), cur[self.m.pw(b + 1)].clone()], neg_head.clone()));
+                }
+                // The selector openings: is_first ← sel(0), is_last ← sel(2) (trace cols), is_trans ← ζ (window pw(2/3)):
+                // is_trans(ζ) = ζ − g^{-1} (the AssembledWrapAir formula, ζ from the cw=true window not empty pis).
+                for (key, s) in [((4u8, 0u64), self.m.sel(0)), ((5u8, 0u64), self.m.sel(2))] {
+                    let a = open_id(key, wu, npu, nperu);
+                    chans[nt + route(a)].push((vec![oidv(a), cur[s].clone(), cur[s + 1].clone()], neg_head.clone()));
+                }
+                let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(self.m.cm_rounds() - self.m.is_zk).inverse());
+                let a6 = open_id((6, 0), wu, npu, nperu);
+                chans[nt + route(a6)].push((
+                    vec![oidv(a6), cur[self.m.pw(2)].clone() - g_inv, cur[self.m.pw(3)].clone()],
+                    neg_head,
+                ));
+                // Non-trace leaf reads: one is_ch-routed read per split channel (gated; only the matching channel fires).
+                for g in 0..N_GROUPS {
+                    let ich = cur[self.op_is_ch(g)].clone();
+                    builder.assert_zero(ich.clone() * (ich.clone() - one.clone()));
+                    chans[nt + g].push((vec![leaf_key.clone(), lv0.clone(), lv1.clone()], ich));
+                }
             }
 
             for ch in chans {
@@ -3939,15 +4003,19 @@ mod tests {
         assert!(log_nqc <= LOG_BLOWUP, "openings AA1+AA2+AA2b cw=true must compose within the degree budget (got {log_nqc})");
     }
 
-    /// **AA6 brick 5d.1 — the op-table folded binding COEXISTS with the openings fold at cw=true** (`--features
-    /// lookup,recursion`, cheap). Extends `openings_wrap_cw_assembled_composes` with `bind_optable`: the
+    /// **AA6 brick 5d.1+5d.2 — the op-table folded + opening-leaf binding COEXIST with the openings fold at cw=true**
+    /// (`--features lookup,recursion`, cheap). Extends `openings_wrap_cw_assembled_composes` with `bind_optable`: the
     /// [`AssembledOpeningsWrapCwAir`] now ALSO appends the op-table region ([`OpTableF2Air`] relations, op_sel-gated)
     /// computing `folded` + a folded wiring bus (channel N_GROUPS+3) binding `folded_col` to the op-table's fold — so
     /// the epilogue `folded·inv_van == quot` ([`OpeningsBci`]) reads a fold actually computed in slack, not a free
-    /// witness. Confirms the DeepFold arith region + the op-table region + all N_GROUPS+4 channels COEXIST within the
-    /// degree budget (`log_nqc ≤ LOG_BLOWUP`) at cw=true — the DeepFold/op-table coexistence the handoff flagged as
-    /// the key open question. The op-table's opening LEAVES (its `c_k` inputs) stay free here; the opening-leaf
-    /// binding (trace leaves at term_idx, non-trace via the N_GROUPS split) + the quot recompose are the next bricks.
+    /// witness (5d.1). **5d.2** binds the op-table's opening LEAVES (its `c_k` inputs) to the real FS-absorbed openings:
+    /// TRACE leaves (Main{0}/Main{1}) read at `term_idx` off the SHARED opening-row's pz provide (the same FS-anchored
+    /// value the DeepFold folds — no second sponge anchor); NON-trace leaves (Public/Periodic/selector) read at their
+    /// canonical `open_id` off the arith head's cw=true-window provide, SPLIT across N_GROUPS channels (the brick-5c
+    /// pattern — all ~62 on one channel would recur the 2c wall). Confirms the DeepFold arith region + the op-table
+    /// region + the opening-leaf buses + all 2·N_GROUPS+4 channels COEXIST within the degree budget (`log_nqc ≤
+    /// LOG_BLOWUP`) at cw=true — the DeepFold/op-table coexistence the handoff flagged as the key open question. Only
+    /// `quot_col` stays free (the quotient-chunk recompose is the next brick); the balance/prove are AA3/AA4.
     #[cfg(feature = "recursion")]
     #[test]
     fn optable_openings_wrap_cw_composes() {
@@ -3995,18 +4063,24 @@ mod tests {
         let lookups = Lookups::from_air::<Challenge, _>(&air);
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         println!(
-            "AA6 brick 5d.1 (op-table folded binding): width {width} = fused_w {fw} + 35 + N_GROUPS + 2·RATE + 14 \
-             (op-table 13 + op_sel); {} channels (ro + {N_GROUPS} z/px + pz + sponge + folded wiring), log_nqc \
+            "AA6 brick 5d.1+5d.2 (op-table folded + opening-leaf binding): width {width} = fused_w {fw} + 35 + \
+             N_GROUPS + 2·RATE + 16 + N_GROUPS (op-table 13 + op_sel + is_tr_leaf + leaf_key + op_is_ch N_GROUPS); {} \
+             channels (ro + {N_GROUPS} z/px + pz + sponge + folded wiring + {N_GROUPS} non-trace-leaf split), log_nqc \
              {log_nqc} ≤ {LOG_BLOWUP}. The DeepFold arith region + the op-table region COEXIST; folded_col bound to \
-             the op-table's fold. Opening leaves + quot recompose next.",
+             the op-table's fold; trace leaves read at term_idx (shared pz provide), non-trace via the N_GROUPS split. \
+             quot recompose next.",
             lookups.len()
         );
         assert_eq!(
             width,
-            fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * AssembledOpeningsWrapCwAir::RATE + 14,
-            "base openings width + op-table 13 + op_sel"
+            fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * AssembledOpeningsWrapCwAir::RATE + 16 + N_GROUPS,
+            "base openings width + op-table 13 + op_sel + is_tr_leaf + leaf_key + op_is_ch(N_GROUPS)"
         );
-        assert_eq!(lookups.len(), N_GROUPS + 4, "ro + N_GROUPS z/px + pz bus + sponge FS-anchor + op-table folded wiring");
+        assert_eq!(
+            lookups.len(),
+            2 * N_GROUPS + 4,
+            "ro + N_GROUPS z/px + pz + sponge + op-table folded wiring + N_GROUPS non-trace-leaf split"
+        );
         assert!(log_nqc <= LOG_BLOWUP, "brick 5d op-table + openings coexistence must compose within budget (got {log_nqc})");
     }
 
