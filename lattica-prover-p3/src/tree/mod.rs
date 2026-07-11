@@ -670,4 +670,100 @@ mod tests {
             assert_eq!(lhs[i], aw1[i] + r * aw2[i], "A·fold must equal the RLC of A·w1, A·w2 (row {i})");
         }
     }
+
+    /// **Tier-3 — the FRI bridge: the fold IS the batched-opening relation FRI certifies.** FRI Merkle commitments
+    /// are NOT additively homomorphic, so the Nova-ideal (fold commitments, never open) needs a homomorphic layer.
+    /// But the SOUND, standard FRI accumulation doesn't need homomorphism — it's the **batched-opening reduction**:
+    /// fold the leaves' OPENED values `claimᵢ = Pᵢ(z)` into `acc = Σ αⁱ·claimᵢ` (the per-node O(K) fold, what
+    /// `FoldAir` proves), and open the COMBINED polynomial `Q = Σ αⁱ·Pᵢ` ONCE at the root (the decider's single
+    /// batched FRI). This test proves the identity that makes it sound: **`Q(z) = Σ αⁱ·Pᵢ(z) = acc`** — so opening
+    /// `Q` certifies the whole fold, no per-node opening. A corrupted leaf value breaks it (soundness ≤ (K−1)/|F|
+    /// on `α`). ⇒ the fold (`FoldAir`, proven on GPU) + a single batched open of `Q` (p3 `Pcs::open`, which already
+    /// supports batched openings) = the sound FRI accumulation; the non-homomorphism is a red herring for THIS path.
+    #[test]
+    fn accumulation_is_the_batched_opening_relation() {
+        use crate::config::Val;
+        use crate::tree::fold::fold_claims;
+        use p3_field::PrimeCharacteristicRing;
+
+        let eval = |coeffs: &[Val], z: Val| coeffs.iter().rev().fold(Val::ZERO, |a, &c| a * z + c);
+        let alpha = Val::from_u64(0x100000001b3);
+        let z = Val::from_u64(0xcbf29ce484222325);
+        let (k, deg) = (6usize, 4usize);
+        // K leaf polynomials Pᵢ (coeff vectors); the combined Q = Σ αⁱ·Pᵢ (coefficient-wise, same degree).
+        let polys: Vec<Vec<Val>> =
+            (0..k).map(|i| (0..deg).map(|j| Val::from_u64(1 + 10 * i as u64 + j as u64)).collect()).collect();
+        let q: Vec<Val> =
+            (0..deg).map(|j| fold_claims(&polys.iter().map(|p| p[j]).collect::<Vec<_>>(), alpha)).collect();
+        // the leaves' opened values claimᵢ = Pᵢ(z); the accumulated opened value acc = Σ αⁱ·Pᵢ(z).
+        let claims: Vec<Val> = polys.iter().map(|p| eval(p, z)).collect();
+        let acc = fold_claims(&claims, alpha);
+        // THE BRIDGE: Q(z) == the fold of the leaves' opened values ⇒ one batched opening of Q certifies the fold.
+        assert_eq!(eval(&q, z), acc, "Q(z) must equal Σ αⁱ·Pᵢ(z) — the fold IS the batched-opening value at z");
+        // a corrupted leaf opened value breaks the identity (whp over α) ⇒ soundness of the reduction.
+        let mut bad = claims.clone();
+        bad[2] += Val::ONE;
+        assert_ne!(
+            eval(&q, z),
+            fold_claims(&bad, alpha),
+            "a corrupted leaf opened value must break the batched-opening identity"
+        );
+    }
+
+    /// **Tier-3 — the FRI accumulation END-TO-END on the REAL p3 FRI PCS (the bridge, realized).** Commit K leaf
+    /// polynomials `Pᵢ` + their combination `Q = Σ αⁱ·Pᵢ` as one committed matrix, open ONCE at an OOD point `ζ`
+    /// via the real FRI PCS — the DECIDER's single batched opening — and confirm on the REAL opened values that the
+    /// batched-opening identity `Q(ζ) = Σ αⁱ·Pᵢ(ζ)` holds AND the FRI proof verifies. So the accumulation is NOT a
+    /// model: it runs on the SAME `Pcs::open`/`verify` machinery the wrap uses (which already batch-opens). The
+    /// non-homomorphism of FRI Merkle commitments never enters — `Q` is committed directly and opened once. (`α` is
+    /// a fixed FS-challenge stand-in here; the α-soundness is `accumulation_is_the_batched_opening_relation`.)
+    #[test]
+    fn accumulation_via_real_fri_batched_open() {
+        use crate::config::{make_config_lean, Challenge, Challenger, MyPcsLean, Val};
+        use p3_challenger::{CanObserve, FieldChallenger};
+        use p3_commit::Pcs;
+        use p3_field::PrimeCharacteristicRing;
+        use p3_matrix::dense::RowMajorMatrix;
+        use p3_uni_stark::StarkGenericConfig;
+
+        let alpha = Val::from_u64(0x100000001b3);
+        let (n, k) = (1usize << 6, 5usize);
+        // one matrix, n rows × (k+1) cols: cols 0..k the leaf polys Pᵢ (domain evals), col k the combined Q.
+        let mut vals = vec![Val::ZERO; n * (k + 1)];
+        for row in 0..n {
+            let (mut q, mut apow) = (Val::ZERO, Val::ONE);
+            for i in 0..k {
+                let p = Val::from_u64((1 + row as u64) * (7 + i as u64));
+                vals[row * (k + 1) + i] = p;
+                q += apow * p;
+                apow *= alpha;
+            }
+            vals[row * (k + 1) + k] = q; // Q's eval on the domain = Σ αⁱ·Pᵢ (pointwise ⇒ same OOD, by linearity)
+        }
+        let m = RowMajorMatrix::new(vals, k + 1);
+
+        let config = make_config_lean();
+        let pcs = config.pcs();
+        let mut ch = config.initialise_challenger();
+        let domain = <MyPcsLean as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, n);
+        let (commit, data) = <MyPcsLean as Pcs<Challenge, Challenger>>::commit(pcs, std::iter::once((domain, m)));
+        ch.observe(commit.clone());
+        let zeta: Challenge = ch.sample_algebra_element();
+        let (opened, proof) =
+            <MyPcsLean as Pcs<Challenge, Challenger>>::open(pcs, vec![(&data, vec![vec![zeta]])], &mut ch);
+        let at_zeta = &opened[0][0][0]; // the (k+1) column values at ζ (extension field)
+        // THE FRI ACCUMULATION: Q(ζ) == Σ αⁱ·Pᵢ(ζ) on the REAL opened values ⇒ one open certifies the whole fold.
+        let a = Challenge::from(alpha);
+        let fold = (0..k).rev().fold(Challenge::ZERO, |acc, i| acc * a + at_zeta[i]);
+        assert_eq!(at_zeta[k], fold, "Q(ζ) must equal the fold of the opened leaf values (one batched open certifies the fold)");
+        // THE DECIDER: the single batched FRI open verifies.
+        let mut chv = config.initialise_challenger();
+        chv.observe(commit.clone());
+        let _z: Challenge = chv.sample_algebra_element();
+        let coms = vec![(commit, vec![(domain, vec![(zeta, at_zeta.clone())])])];
+        assert!(
+            <MyPcsLean as Pcs<Challenge, Challenger>>::verify(pcs, coms, &proof, &mut chv).is_ok(),
+            "the batched FRI open (the decider) must verify"
+        );
+    }
 }
