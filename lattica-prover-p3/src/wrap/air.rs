@@ -1842,6 +1842,180 @@ mod wrap_air {
         }
     }
 
+    /// **AA6 op-table binding brick 5b — the op-table + its opening-leaf binding COMPOSES at cw=true** (`--features
+    /// lookup,recursion`, cheap). Extends [`OpTableBindCwAir`] with the op-table's OPENING-LEAF binding via the
+    /// sponge (the AA2b machinery, with the op-table leaf as the reader instead of the DeepFold): a shared
+    /// opening-row region reads each opening's 2 felts from the FS-absorbed sponge stream (channel 2) and
+    /// RE-PROVIDES the opening pair to the op-table's opening-leaf rows (channel 1) — so the op-table's `local`/
+    /// `next` leaves are BOUND to the real FS openings, SPREAD (one read per op-table leaf row; NEVER the
+    /// ~120-provides-on-one-row 2c wall that broke `AssembledWrapAir` at cw=true — and, since the sponge spreads
+    /// the provides, no `N_GROUPS` split is needed). With the op-table region + folded bus (channel 0), all THREE
+    /// channels compose within budget ⇒ the op-table epilogue — region + fold + sponge-bound leaves — integrates
+    /// at cw=true. (pubs/periodic/selector/constant leaves + the DeepFold-region coexistence + trace/prove follow.)
+    pub(crate) struct OpTableLeafBindCwAir {
+        pub(crate) m: MonolithAir,
+        pub(crate) op_periodics: Vec<Vec<Goldilocks>>,
+        pub(crate) folded_addr: u64,
+    }
+
+    impl OpTableLeafBindCwAir {
+        pub(crate) const RATE: usize = 4;
+        pub(crate) fn ro_col(&self) -> usize {
+            self.m.fused_w()
+        }
+        pub(crate) fn folded_col(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        pub(crate) fn quot_col(&self) -> usize {
+            self.m.fused_w() + 4
+        }
+        pub(crate) fn op_base(&self) -> usize {
+            self.m.fused_w() + 6
+        }
+        pub(crate) fn op_sel(&self) -> usize {
+            self.op_base() + 13
+        }
+        pub(crate) fn is_head(&self) -> usize {
+            self.op_base() + 14
+        }
+        /// Marks an op-table OPENING-leaf row (its `out` value reads the sponge-anchored opening on the op-table bus).
+        pub(crate) fn is_leaf(&self) -> usize {
+            self.op_base() + 15
+        }
+        /// The op-table-opening bus address the leaf reads (= the opening's `or_k`; the opening-row provides there).
+        pub(crate) fn leaf_key(&self) -> usize {
+            self.op_base() + 16
+        }
+        /// The shared opening-row region: `[gi_base, pz0, pz1, or_sel, or_k, or_mult]` (one DEEP opening/row).
+        pub(crate) fn or_base(&self) -> usize {
+            self.op_base() + 17
+        }
+        pub(crate) fn or_gi(&self) -> usize {
+            self.or_base()
+        }
+        pub(crate) fn or_pz(&self) -> usize {
+            self.or_base() + 1
+        }
+        pub(crate) fn or_sel(&self) -> usize {
+            self.or_base() + 3
+        }
+        pub(crate) fn or_k(&self) -> usize {
+            self.or_base() + 4
+        }
+        pub(crate) fn or_mult(&self) -> usize {
+            self.or_base() + 5
+        }
+        pub(crate) fn st_base(&self) -> usize {
+            self.or_base() + 6
+        }
+        pub(crate) fn w_gi(&self, l: usize) -> usize {
+            self.st_base() + 2 * l
+        }
+        pub(crate) fn w_sel(&self, l: usize) -> usize {
+            self.st_base() + 2 * l + 1
+        }
+        pub(crate) fn op_periodic_base(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+    }
+
+    impl BaseAir<Goldilocks> for OpTableLeafBindCwAir {
+        fn width(&self) -> usize {
+            // ro/folded/quot(6) + op-table(13) + op_sel/is_head/is_leaf/leaf_key(4) + opening-row(6) + sponge(2·RATE).
+            self.m.fused_w() + 6 + 13 + 4 + 6 + 2 * Self::RATE
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
+            p.extend(self.op_periodics.iter().cloned());
+            p
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for OpTableLeafBindCwAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(
+                builder,
+                &OpeningsBci { ro_col: self.ro_col(), folded_col: self.folded_col(), quot_col: self.quot_col() },
+            );
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let one = AB::Expr::ONE;
+            let we = AB::Expr::from(Goldilocks::from_u64(7)); // F_p² : X² = 7
+            let ob = self.op_base();
+
+            // (2) The op-table REGION (OpTableF2Air relations, op_sel-gated) — as OpTableBindCwAir.
+            let (is_mul, is_add, is_sub) = (cur[ob].clone(), cur[ob + 1].clone(), cur[ob + 2].clone());
+            let (out_addr, o0, o1) = (cur[ob + 3].clone(), cur[ob + 4].clone(), cur[ob + 5].clone());
+            let (a_addr, a0, a1) = (cur[ob + 6].clone(), cur[ob + 7].clone(), cur[ob + 8].clone());
+            let (b_addr, b0, b1) = (cur[ob + 9].clone(), cur[ob + 10].clone(), cur[ob + 11].clone());
+            let out_mult = cur[ob + 12].clone();
+            let op_sel = cur[self.op_sel()].clone();
+            builder.assert_zero(op_sel.clone() * (op_sel.clone() - one.clone()));
+            for s in [&is_mul, &is_add, &is_sub] {
+                builder.assert_zero(op_sel.clone() * s.clone() * (s.clone() - one.clone()));
+            }
+            let is_op = is_mul.clone() + is_add.clone() + is_sub.clone();
+            builder.assert_zero(op_sel.clone() * is_op.clone() * (is_op.clone() - one.clone()));
+            builder.assert_zero(op_sel.clone() * is_mul.clone() * (o0.clone() - (a0.clone() * b0.clone() + we.clone() * a1.clone() * b1.clone())));
+            builder.assert_zero(op_sel.clone() * is_mul.clone() * (o1.clone() - (a0.clone() * b1.clone() + a1.clone() * b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_add.clone() * (o0.clone() - (a0.clone() + b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_add.clone() * (o1.clone() - (a1.clone() + b1.clone())));
+            builder.assert_zero(op_sel.clone() * is_sub.clone() * (o0.clone() - (a0.clone() - b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_sub.clone() * (o1.clone() - (a1.clone() - b1.clone())));
+
+            // (3) Markers: is_head bound to tf; is_leaf + or_sel boolean; sponge tags pinned to op_periodics.
+            let is_head = cur[self.is_head()].clone();
+            builder.assert_zero(is_head.clone() * (is_head.clone() - one.clone()));
+            builder.assert_zero(is_head.clone() - p[self.m.m_tf()].clone());
+            let is_leaf = cur[self.is_leaf()].clone();
+            builder.assert_zero(is_leaf.clone() * (is_leaf.clone() - one.clone()));
+            let or_sel = cur[self.or_sel()].clone();
+            builder.assert_zero(or_sel.clone() * (or_sel.clone() - one.clone()));
+            let pbase = self.op_periodic_base();
+            for l in 0..Self::RATE {
+                builder.assert_zero(cur[self.w_gi(l)].clone() - p[pbase + 2 * l].clone());
+                builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 2 * l + 1].clone());
+            }
+
+            let mut chans: Vec<Vec<(Vec<AB::Expr>, AB::Expr)>> = vec![Vec::new(); 3];
+            // Channel 0 — op-table wiring + the folded read (as OpTableBindCwAir).
+            let read_mult = op_sel.clone() * is_op;
+            let folded = (cur[self.folded_col()].clone(), cur[self.folded_col() + 1].clone());
+            chans[0].push((vec![a_addr, a0, a1], read_mult.clone()));
+            chans[0].push((vec![b_addr, b0, b1], read_mult));
+            chans[0].push((vec![out_addr, o0.clone(), o1.clone()], op_sel * out_mult));
+            chans[0].push((vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1], is_head));
+            // Channel 1 — the op-table-opening bus: the opening-row PROVIDES `[or_k, pz]` (or_mult), each op-table
+            // opening-leaf READS `[leaf_key, o0, o1]` (+is_leaf). Balance ⇒ the leaf value == the sponge opening.
+            chans[1].push((
+                vec![cur[self.or_k()].clone(), cur[self.or_pz()].clone(), cur[self.or_pz() + 1].clone()],
+                cur[self.or_mult()].clone(),
+            ));
+            chans[1].push((vec![cur[self.leaf_key()].clone(), o0, o1], is_leaf));
+            // Channel 2 — the sponge FS-anchor: transcript PROVIDES `[w_gi_l, cur[l]]` (−w_sel_l), the opening-row
+            // READS its 2 opening felts `[gi_base+i, pz_i]` (+or_sel). (The AA2b sponge bus, one reader over.)
+            for l in 0..Self::RATE {
+                chans[2].push((
+                    vec![cur[self.w_gi(l)].clone(), cur[l].clone()],
+                    AB::Expr::ZERO - cur[self.w_sel(l)].clone(),
+                ));
+            }
+            for i in 0..2 {
+                let gi_i = cur[self.or_gi()].clone() + AB::Expr::from(Goldilocks::from_u64(i as u64));
+                chans[2].push((vec![gi_i, cur[self.or_pz() + i].clone()], or_sel.clone()));
+            }
+            for ch in chans {
+                builder.push_local_interaction(ch);
+            }
+        }
+    }
+
     /// **AA6 openings assembly AA1 — the cw=true sound reduced-opening fold** (the [`AssembledArithWrapAir`] analog
     /// one regime deeper, at `column_window = true` — the deep-tree fixed-point regime). `narrow_openings` drops the
     /// `2·n_terms` `pz` opening COLUMNS from the arith tile, so the DEEP fold `ro = Σ α^k·(pz − px)/(z − x)` is
@@ -2157,7 +2331,8 @@ mod wrap_air {
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
     native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledCapWrapCwAir,
-    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, OpeningBindCwAir, OpTableBindCwAir, WrapAir,
+    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, OpeningBindCwAir, OpTableBindCwAir,
+    OpTableLeafBindCwAir, WrapAir,
     N_GROUPS, OPEN_BASE,
 };
 
@@ -3463,6 +3638,70 @@ mod tests {
         assert_eq!(width, fw + 6 + 13 + 2, "ro/folded/quot 6 + op-table 13 + op_sel + is_head");
         assert_eq!(lookups.len(), 1, "one op-table wiring + folded bus channel");
         assert!(log_nqc <= LOG_BLOWUP, "the cw=true op-table epilogue must compose within the degree budget (got {log_nqc})");
+    }
+
+    /// **AA6 op-table binding brick 5b — the op-table + its sponge-bound opening leaves COMPOSE at cw=true**
+    /// (`--features lookup,recursion`, cheap). [`OpTableLeafBindCwAir`]: brick 5a's op-table region + folded bus
+    /// PLUS the opening-leaf binding via the sponge (the AA2b machinery, op-table leaf as the reader) — a shared
+    /// opening-row reads each opening's felts from the FS-absorbed sponge (channel 2) and re-provides the pair to
+    /// the op-table's opening-leaf rows (channel 1). Confirms all THREE channels compose within budget at cw=true
+    /// (`log_nqc ≤ LOG_BLOWUP`) — so the op-table epilogue's `local`/`next` leaves bind to the real FS openings
+    /// SPREAD (no 2c wall), the last epilogue degree question before the full assembly.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn optable_leaf_bind_cw_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+        };
+        let h = m.height();
+        // dummy op_periodics: compose reads the symbolic constraint STRUCTURE, not the values.
+        let op_periodics = vec![vec![Val::ZERO; h]; 2 * OpTableLeafBindCwAir::RATE];
+        let air = OpTableLeafBindCwAir { m, op_periodics, folded_addr: 1 << 20 };
+        let fw = air.m.fused_w();
+        let width = <OpTableLeafBindCwAir as BaseAir<Val>>::width(&air);
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "AA6 op-table binding brick 5b: OpTableLeafBindCwAir (op-table region + folded bus + the op-table-opening \
+             bus + the sponge FS-anchor) width {width} = fused_w {fw} + 29 + 2·RATE, {} channels (wiring/folded + \
+             op-table-opening + sponge), log_nqc {log_nqc} ≤ {LOG_BLOWUP} — the op-table's local/next leaves bind to \
+             the FS openings SPREAD (no 2c wall), so the whole op-table epilogue integrates at cw=true.",
+            lookups.len()
+        );
+        assert_eq!(width, fw + 6 + 13 + 4 + 6 + 2 * OpTableLeafBindCwAir::RATE, "op-table + markers + opening-row + sponge");
+        assert_eq!(lookups.len(), 3, "wiring/folded + op-table-opening + sponge FS-anchor");
+        assert!(log_nqc <= LOG_BLOWUP, "the cw=true op-table + leaf binding must compose within the degree budget (got {log_nqc})");
     }
 
     /// **AA6 openings AA1+AA2+AA2b cw=true — the FULLY-BOUND reduced-opening fold COMPOSES** (`--features
