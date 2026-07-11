@@ -5059,6 +5059,7 @@ mod tests {
         proof: &p3_uni_stark::Proof<crate::recursion::native_fri::MyConfig>,
         pvs: &[Val],
         bind_optable: bool,
+        narrow_ov: bool,
     ) -> (AssembledOpeningsWrapCwAir, RowMajorMatrix<Val>, Vec<Val>) {
         use crate::config::Challenge;
         use crate::joinsplit_air::{JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
@@ -5073,7 +5074,7 @@ mod tests {
 
         // narrow cw=true monolith trace + air (narrow_arith + narrow_openings; caps stay in the pis window).
         let (mono_tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(
-            config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, false,
+            config, &JoinSplitAir, proof, pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true, narrow_ov,
         );
         let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
         let m = MonolithAir {
@@ -5095,7 +5096,7 @@ mod tests {
             cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
             narrow_arith: true,
             narrow_caps: false,
-            narrow_openings: true, narrow_ov: false,
+            narrow_openings: true, narrow_ov,
         };
         let (fw, h) = (m.fused_w(), m.height());
         let rate = AssembledOpeningsWrapCwAir::RATE;
@@ -5110,7 +5111,13 @@ mod tests {
         let st_base = or_base + 6;
         let w_gi = |l: usize| st_base + 2 * l;
         let w_sel = |l: usize| st_base + 2 * l + 1;
-        let width = fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * rate + if bind_optable { 16 + N_GROUPS } else { 0 };
+        // brick 4d narrow_ov column bases (after the whole ro/DeepFold/opening(/optable) layout).
+        let nov_base = fw + 6 + 18 + 4 + 1 + N_GROUPS + 6 + 2 * rate + if bind_optable { 16 + N_GROUPS } else { 0 };
+        let (held_lqk, df_is_quot) = (nov_base, nov_base + 1);
+        let w_term0 = |l: usize| nov_base + 2 + 3 * l;
+        let w_term1 = |l: usize| nov_base + 3 + 3 * l;
+        let w_lsel = |l: usize| nov_base + 4 + 3 * l;
+        let width = nov_base + if narrow_ov { 2 + 3 * rate } else { 0 };
 
         // The FS-absorbed opening stream: positions[gi] = (oid, coeff, block, lane); committed[gi] = the felt
         // (== block_inputs[block][lane], the absorbed rate lane). A DEEP term k's F_p² opening is the pair
@@ -5123,6 +5130,27 @@ mod tests {
         for (gi, &(_oid, _coeff, block, lane)) in positions.iter().enumerate() {
             op_periodics[2 * lane][block * BLOCK] = Val::from_u64(gi as u64);
             op_periodics[2 * lane + 1][block * BLOCK] = Val::ONE;
+        }
+        // brick 4d leaf_periodics (3·RATE full-height cols): per query's leaf-hash block row, lane l ⇒ the two shared
+        // DEEP term ids trm_trace(c)/trm_next(c) + select (c = b·RATE+l committed) — the AIR pins the tag COLUMNS to
+        // these. Same values every query (the felt→term map + super-tile leaf offset repeat), matching the trace fill.
+        let mut leaf_periodics = vec![vec![Val::ZERO; h]; 3 * rate];
+        if narrow_ov {
+            for q in 0..m.n_queries {
+                let off = m.tr() + q * m.m_period();
+                for b in 0..m.leaf_blocks() {
+                    let lrow = off + (m.m_input_leaf() + b) * BLOCK;
+                    for l in 0..rate {
+                        let c = b * rate + l;
+                        if c >= m.trm_committed_w() {
+                            continue;
+                        }
+                        leaf_periodics[3 * l][lrow] = Val::from_u64(m.trm_trace(c) as u64);
+                        leaf_periodics[3 * l + 1][lrow] = Val::from_u64(m.trm_next(c) as u64);
+                        leaf_periodics[3 * l + 2][lrow] = Val::ONE;
+                    }
+                }
+            }
         }
 
         // arith heads (m_tf rows) — one DeepFold region per query, then the shared opening-row region.
@@ -5156,11 +5184,23 @@ mod tests {
             let x = Challenge::from(<Goldilocks as Field>::GENERATOR * row(m.qt_acc() + m.lg() - 1));
             // cw=true: ζ from the committed WINDOW pw(2), NOT pis (empty at cw=true).
             let zeta = Challenge::from_basis_coefficients_fn(|i| row(m.pw(2 + i)));
+            let off = m.tr() + q * m.m_period(); // query q's super-tile start
             let terms: Vec<(Challenge, Challenge, Challenge)> = (0..n_terms)
                 .map(|k| {
                     let z = if k >= m.trm_next_base() && k < m.trm_quot_base() { zeta * g_trace } else { zeta };
                     let pz = Challenge::from_basis_coefficients_fn(|i| committed[2 * k + i]);
-                    let px = Challenge::from(row(m.px_source(k)));
+                    // narrow_ov: a TRACE term's px `ov_c` carrier is dropped — source it from the authenticated leaf
+                    // lane (felt c → leaf-hash block c/RATE lane c%RATE). Quotient terms keep px from `qc` (px_source).
+                    let px = if narrow_ov && k < m.trm_quot_base() {
+                        let c = if k >= m.trm_trace_base() && k < m.trm_trace_base() + m.trm_committed_w() {
+                            k - m.trm_trace_base()
+                        } else {
+                            k - m.trm_next_base()
+                        };
+                        Challenge::from(mono_tr[(off + (m.m_input_leaf() + c / rate) * BLOCK) * fw + (c % rate)])
+                    } else {
+                        Challenge::from(row(m.px_source(k)))
+                    };
                     (z, pz, px)
                 })
                 .collect();
@@ -5188,6 +5228,34 @@ mod tests {
                 }
                 if k == n_terms - 1 {
                     wide[dst * width + df_end] = Val::ONE;
+                }
+                // narrow_ov: a QUOTIENT region row keeps its px on the z/px bus (df_is_quot=1); a TRACE row binds px
+                // via the leaf-hash bus (df_is_quot=0 ⇒ z/px px=0, leaf-hash read active).
+                if narrow_ov {
+                    wide[dst * width + df_is_quot] = if k >= m.trm_quot_base() { Val::ONE } else { Val::ZERO };
+                }
+            }
+            // narrow_ov: HELD lqk = x (the query point base felt) across the super-tile; the leaf-hash provide + the
+            // region read key on it (query-unique). `x`'s base felt = GEN·qt_acc[lg−1] (== the region rows' `x.0`).
+            if narrow_ov {
+                let x_felt = <Goldilocks as Field>::GENERATOR * row(m.qt_acc() + m.lg() - 1);
+                for r in off..off + m.m_period() {
+                    wide[r * width + held_lqk] = x_felt;
+                }
+                // leaf-hash provide tags: per leaf-hash block row, rate lane l, felt c = b·RATE+l ⇒ the two shared
+                // DEEP terms trm_trace(c)/trm_next(c) + select (c committed). Set the trace COLUMNS (the periodic below
+                // must match — the AIR pins the columns to the periodic).
+                for b in 0..m.leaf_blocks() {
+                    let lrow = off + (m.m_input_leaf() + b) * BLOCK;
+                    for l in 0..rate {
+                        let c = b * rate + l;
+                        if c >= m.trm_committed_w() {
+                            continue;
+                        }
+                        wide[lrow * width + w_term0(l)] = Val::from_u64(m.trm_trace(c) as u64);
+                        wide[lrow * width + w_term1(l)] = Val::from_u64(m.trm_next(c) as u64);
+                        wide[lrow * width + w_lsel(l)] = Val::ONE;
+                    }
                 }
             }
         }
@@ -5327,7 +5395,7 @@ mod tests {
         }
 
         (
-            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr, narrow_ov: false, leaf_periodics: Vec::new() },
+            AssembledOpeningsWrapCwAir { m, op_periodics, bind_optable, folded_addr, quot_addr, narrow_ov, leaf_periodics },
             RowMajorMatrix::new(wide, width),
             Vec::new(),
         )
@@ -5355,7 +5423,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false);
 
         let m = &asm.m;
         let (fw, h) = (m.fused_w(), m.height());
@@ -5454,7 +5522,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false);
 
         let m = &asm.m;
         let (fw, h) = (m.fused_w(), m.height());
@@ -5565,6 +5633,163 @@ mod tests {
         );
     }
 
+    /// **Brick 4d (balance) — the narrow_ov openings-wrap buses balance** (native, cheap — NO prove). Assemble the
+    /// cw=true narrow_ov trace and confirm each channel nets to zero as a signed multiset: the ro/pz/sponge channels
+    /// are unchanged from the proven openings-wrap; the z/px channels carry `px=0` for TRACE terms (their px moved off
+    /// the dropped `ov` carrier); and the NEW leaf-hash→px channel (N_GROUPS+3) balances iff every trace region px ==
+    /// the authenticated input-Merkle leaf lane at its (query, column), keyed by the held query point `lqk`. Localizes
+    /// any held-lqk / term-tag / leaf-lane bug before the heavy prove (as the AA2/AA3 balances did for arith/caps).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn narrow_ov_openings_wrap_bus_balances() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_field::{Field, PrimeField64, TwoAdicField};
+        use p3_goldilocks::Goldilocks;
+        use p3_uni_stark::prove;
+        use std::collections::HashMap;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true);
+
+        let m = &asm.m;
+        let (fw, h) = (m.fused_w(), m.height());
+        let rate = AssembledOpeningsWrapCwAir::RATE;
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        let (ro_col, db) = (fw, fw + 6);
+        let (df_sel, df_end, is_head, term_idx, is_ch0) = (db + 18, db + 20, db + 21, db + 22, db + 23);
+        let or_base = db + 23 + N_GROUPS;
+        let (or_gi, or_pz, or_sel, or_k, or_mult) = (or_base, or_base + 1, or_base + 3, or_base + 4, or_base + 5);
+        let st_base = or_base + 6;
+        let (w_gi, w_sel) = (|l: usize| st_base + 2 * l, |l: usize| st_base + 2 * l + 1);
+        // narrow_ov columns start where the op-table columns would (bind_optable=false ⇒ none): nov_base.
+        let nov = st_base + 2 * rate;
+        let (held_lqk, dq) = (nov, nov + 1);
+        let (wt0, wt1, wls) =
+            (|l: usize| nov + 2 + 3 * l, |l: usize| nov + 3 + 3 * l, |l: usize| nov + 4 + 3 * l);
+        let lhpx = N_GROUPS + 3; // n_chan − 1 (bind_optable=false, narrow_ov=true ⇒ n_chan = N_GROUPS+4)
+        let ku = |v: Val| v.as_canonical_u64();
+        let g_trace = Goldilocks::two_adic_generator(m.cm_rounds() - m.is_zk);
+
+        let mut bus: HashMap<(usize, Vec<u64>), Val> = HashMap::new();
+        let neg1 = Val::ZERO - Val::ONE;
+        for r in 0..h {
+            let b = r * width;
+            let g = |c: usize| trace.values[b + c];
+            // ---- ro bus (channel 0) — unchanged ----
+            if g(df_end) == Val::ONE {
+                *bus.entry((0, vec![ku(g(db + 2)), ku(g(db + 3)), ku(g(db + 16)), ku(g(db + 17))])).or_insert(Val::ZERO) += neg1;
+            }
+            if g(is_head) == Val::ONE {
+                let x_head = <Goldilocks as Field>::GENERATOR * g(m.qt_acc() + m.lg() - 1);
+                *bus.entry((0, vec![ku(x_head), 0, ku(g(ro_col)), ku(g(ro_col + 1))])).or_insert(Val::ZERO) += Val::ONE;
+                let (z0f, z1f) = (g(m.pw(2)), g(m.pw(3)));
+                for k in 0..m.n_terms {
+                    let (z0, z1) = if k >= m.trm_next_base() && k < m.trm_quot_base() { (z0f * g_trace, z1f * g_trace) } else { (z0f, z1f) };
+                    // narrow_ov: TRACE terms provide px=0 (bound via the leaf-hash bus); QUOTIENT terms keep px.
+                    let px = if k < m.trm_quot_base() { Val::ZERO } else { g(m.px_source(k)) };
+                    let tuple = vec![ku(x_head), 0, k as u64, ku(z0), ku(z1), ku(px)];
+                    *bus.entry((k % N_GROUPS + 1, tuple)).or_insert(Val::ZERO) += neg1;
+                }
+            }
+            if g(df_sel) == Val::ONE {
+                let gch = (0..N_GROUPS).find(|&gc| g(is_ch0 + gc) == Val::ONE).expect("a region row routes to one channel");
+                // narrow_ov region px = df_is_quot · cur[db+10] (0 for trace terms; bound via the leaf-hash bus).
+                let region_px = if g(dq) == Val::ONE { g(db + 10) } else { Val::ZERO };
+                let tuple = vec![ku(g(db + 2)), ku(g(db + 3)), ku(g(term_idx)), ku(g(db + 6)), ku(g(db + 7)), ku(region_px)];
+                *bus.entry((gch + 1, tuple)).or_insert(Val::ZERO) += Val::ONE;
+                *bus.entry((N_GROUPS + 1, vec![ku(g(term_idx)), ku(g(db + 8)), ku(g(db + 9))])).or_insert(Val::ZERO) += Val::ONE;
+                // leaf-hash READ (trace terms only): [x.0, term_idx, cur[db+10]] (+df_sel·(1−df_is_quot)).
+                if g(dq) == Val::ZERO {
+                    *bus.entry((lhpx, vec![ku(g(db + 2)), ku(g(term_idx)), ku(g(db + 10))])).or_insert(Val::ZERO) += Val::ONE;
+                }
+            }
+            if g(or_sel) == Val::ONE {
+                *bus.entry((N_GROUPS + 1, vec![ku(g(or_k)), ku(g(or_pz)), ku(g(or_pz + 1))])).or_insert(Val::ZERO) += g(or_mult);
+                for i in 0..2u64 {
+                    *bus.entry((N_GROUPS + 2, vec![ku(g(or_gi)) + i, ku(g(or_pz + i as usize))])).or_insert(Val::ZERO) += Val::ONE;
+                }
+            }
+            for l in 0..rate {
+                if g(w_sel(l)) == Val::ONE {
+                    *bus.entry((N_GROUPS + 2, vec![ku(g(w_gi(l))), ku(g(l))])).or_insert(Val::ZERO) += neg1;
+                }
+                // leaf-hash PROVIDES (two term-tags per lane: trm_trace/trm_next): [held, w_term, leaf_lane] (−w_lsel).
+                if g(wls(l)) == Val::ONE {
+                    *bus.entry((lhpx, vec![ku(g(held_lqk)), ku(g(wt0(l))), ku(g(l))])).or_insert(Val::ZERO) += neg1;
+                    *bus.entry((lhpx, vec![ku(g(held_lqk)), ku(g(wt1(l))), ku(g(l))])).or_insert(Val::ZERO) += neg1;
+                }
+            }
+        }
+        let nonzero = bus.values().filter(|&&v| v != Val::ZERO).count();
+        let bad: Vec<_> = bus.iter().filter(|(_, &v)| v != Val::ZERO).take(8).collect();
+        assert!(bad.is_empty(), "every (channel, tuple) must net to zero; {nonzero} nonzero, e.g. {bad:?}");
+        println!(
+            "narrow_ov openings-wrap cw=true buses ({} channels): {} distinct entries, all net-zero — the ov opened-row \
+             carrier externalized, every trace region px bound to the authenticated leaf lane via the held-lqk leaf-hash bus.",
+            N_GROUPS + 4,
+            bus.len()
+        );
+    }
+
+    /// **Brick 4d (prove) — the narrow_ov openings-wrap PROVES through the LEAN prover.** The definitive soundness
+    /// check for the ov externalization (the `openings_wrap_cw_assembled_proves` analog with `narrow_ov` on): build
+    /// the cw=true narrow_ov trace (the `ov` opened-row carrier GONE, every trace px re-sourced from the authenticated
+    /// input-Merkle leaf lane via the held-lqk leaf-hash bus) and prove + verify end-to-end. So the deep-tree B lever's
+    /// final residual — the +1 `ov` trace-leaf carrier (`input_leaf_felts = w_inner`) — is externalized narrow-tall as
+    /// a SOUND STARK, driving marginal B to 0. A corrupted region px (its leaf-hash read no longer matches any provide)
+    /// is rejected. Heavy (LEAN, ~32 GB / -j1); `--release --features lookup,recursion -j1 -- --ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy (LEAN, -j1): proves the cw=true narrow_ov openings-wrap through prove_lookup + tamper-rejects a corrupted trace px; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    fn narrow_ov_openings_wrap_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        println!(
+            "proving cw=true narrow_ov openings-wrap (ro + {} z/px + pz + sponge + leaf-hash→px): width {width}, {} \
+             rows, {} channels — the ov opened-row carrier externalized, trace px bound to the authenticated leaf lane",
+            N_GROUPS,
+            asm.m.height(),
+            N_GROUPS + 4
+        );
+        // LEAN (non-hiding, is_zk=0) prover ⇒ the quotient-domain LDE (the OOM term) ~2× smaller than the hiding path.
+        let lproof = prove_lookup_lean(&asm, trace, &pis);
+        assert!(
+            verify_lookup_lean(&asm, &lproof, &pis).is_ok(),
+            "the cw=true narrow_ov openings-wrap must prove + verify through the LEAN prover (width {width})"
+        );
+
+        // Corrupt a TRACE region's px (cur[db+10] on a df_sel row with df_is_quot=0) ⇒ its leaf-hash read no longer
+        // matches the authenticated-leaf provide ⇒ the leaf-hash bus unbalances (and the fold ro breaks) ⇒ rejected.
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true);
+        let db = asm2.m.fused_w() + 6;
+        let (df_sel, dq) = (db + 18, asm2.df_is_quot());
+        let row = (0..asm2.m.height())
+            .find(|&r| bad.values[r * width + df_sel] == Val::ONE && bad.values[r * width + dq] == Val::ZERO)
+            .expect("a trace region row (df_sel=1, df_is_quot=0)");
+        bad.values[row * width + db + 10] += Val::ONE; // trace region px.0
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let lp = prove_lookup_lean(&asm2, bad, &pis2);
+            verify_lookup_lean(&asm2, &lp, &pis2).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted trace region px must be rejected (leaf-hash bus unbalances)");
+    }
+
     /// **AA6 openings AA4 — the assembled openings-wrap PROVES through `prove_lookup`.** The definitive soundness
     /// check (the `arith_wrap_assembled_proves` / `cap_wrap_cw_assembled_proves` analog for the OPENINGS tile):
     /// build the cw=true narrow-openings trace (the `2·n_terms` pz opening COLUMNS gone) and prove + verify it
@@ -5585,7 +5810,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false);
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
         println!(
             "proving cw=true assembled openings-wrap (ro + {} z/px + pz + sponge FS-anchor): width {width}, {} rows, \
@@ -5604,7 +5829,7 @@ mod tests {
 
         // Corrupt the first opening-row's pz ⇒ BOTH the sponge FS-anchor bus (pz ≠ the FS-absorbed felt) and the pz
         // re-provide bus (opening-row pz ≠ the regions' pz) unbalance ⇒ the corrupted trace must not verify.
-        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false);
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, false);
         let fw = asm2.m.fused_w();
         let or_pz = (fw + 6) + 23 + N_GROUPS + 1; // db(fw+6) + 23 + N_GROUPS = or_base; or_pz = or_base + 1
         let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
@@ -5642,7 +5867,7 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false);
         let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
         println!(
             "proving cw=true op-table+openings assembled wrap (ro + {} z/px + pz + sponge + folded/quot wiring + {} \
@@ -5661,7 +5886,7 @@ mod tests {
 
         // Corrupt folded_col at an arith head ⇒ the folded wiring bus (head's folded_col read ≠ the op-table's folded
         // provide) unbalances AND the epilogue folded·inv_van == quot breaks ⇒ the corrupted trace must not verify.
-        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, true);
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, true, false);
         let fw = asm2.m.fused_w();
         let is_head = (fw + 6) + 21; // db(fw+6) + 21
         let head = (0..asm2.m.height())
