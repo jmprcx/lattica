@@ -1733,15 +1733,19 @@ mod wrap_air {
         }
     }
 
-    /// **W3 ov externalization brick 4c (compose de-risk) — the narrow_ov monolith + the leaf-hash→px bus COMPOSE.**
-    /// The [`OpeningBindCwAir`] analog for the ov carrier: the narrow_ov monolith ([`OpeningsBci`]; the ov-carrier
-    /// reads gated on `!narrow_ov` by brick 4a) + ONE ordered leaf-hash→px bus (the leaf-hash Poseidon input lanes
-    /// PROVIDE `px`, a px-region row READS it — the SAME generic FS-anchor shape as the sponge-opening bus / the
-    /// proven [`crate::wrap::SpongeCapBusAir`]). Confirms the bus + the narrow_ov monolith compose TOGETHER at
-    /// `log_nqc ≤ LOG_BLOWUP` — the DEGREE de-risk for the assembled px binding (the balance/assemble brick binds
-    /// `px` to the real leaf-hash rows with the query-keyed provider). Additive: does NOT touch the proven wrap.
+    /// **W3 ov externalization brick 4c (compose de-risk) — the narrow_ov monolith + the SOUND query-keyed leaf-hash→px
+    /// bus COMPOSE.** The [`OpeningBindCwAir`] analog for the ov carrier: the narrow_ov monolith ([`OpeningsBci`]; the
+    /// ov-carrier reads gated on `!narrow_ov` by brick 4a) + ONE ordered leaf-hash→px bus keyed by **`[lqk, term]`** —
+    /// `lqk` the HELD query point `x` (so the bus is query-UNIQUE; a periodic term tag alone REPEATS per query
+    /// super-tile ⇒ collides — the resolved crux), `term` the DEEP term index. Each leaf-hash rate lane PROVIDES its
+    /// absorbed felt under BOTH shared terms `trm_trace(c)`/`trm_next(c)` (−w_sel); the px-region READS `[lqk, term, px0]`
+    /// (+px_sel), reusing the fold's `term_idx`. Confirms the bus + the ov-dropped monolith compose TOGETHER at
+    /// `log_nqc ≤ LOG_BLOWUP` — the DEGREE de-risk for the assembled px binding (the balance brick binds `px` to the
+    /// real leaf-hash rows, `lqk` HELD+bound to `x_head` there). Additive: does NOT touch the proven wrap. `lqk`/px are
+    /// free witnesses here (held/bound in the assembly, as `ro`/`folded`/`quot`/`px` are free in the other de-risks).
     pub(crate) struct NarrowOvBindCwAir {
         pub(crate) m: MonolithAir,
+        /// `3·RATE` periodic-pinned tags: per rate lane, the two shared DEEP term ids + the provide-select bit.
         pub(crate) leaf_periodics: Vec<Vec<Goldilocks>>,
     }
 
@@ -1756,18 +1760,34 @@ mod wrap_air {
         pub(crate) fn quot_col(&self) -> usize {
             self.m.fused_w() + 4
         }
-        /// px-region row: `[gi_base, px0, px1, px_sel]` (one trace px/row; `gi_base` its leaf-hash-stream index).
-        pub(crate) fn pr(&self) -> usize {
+        /// The held query key `lqk` = the query point `x` (base-field `GEN^index`; the region's `x1 ≡ 0`), shared by
+        /// the leaf-hash PROVIDE and the region READ so the bus address is query-UNIQUE — the crux the periodic tag
+        /// alone can't solve (it REPEATS per query super-tile ⇒ collides across queries). A single O(1) slack column
+        /// (slope 0 — does NOT reintroduce the w_inner slope); free here, HELD+bound to `x_head` in the assembly.
+        pub(crate) fn lqk(&self) -> usize {
             self.m.fused_w() + 6
         }
-        pub(crate) fn px_sel(&self) -> usize {
-            self.pr() + 3
+        /// px-region row: `[term, px0, px_sel]` — reads its trace-term px keyed by `[lqk, term]`; `term` = the DEEP
+        /// term index (reused from the fold's `term_idx`, no felt-index map), `px0` the base-field opened felt (`px1≡0`).
+        pub(crate) fn term_r(&self) -> usize {
+            self.m.fused_w() + 7
         }
-        pub(crate) fn w_gi(&self, l: usize) -> usize {
-            self.pr() + 4 + 2 * l
+        pub(crate) fn px0(&self) -> usize {
+            self.m.fused_w() + 8
+        }
+        pub(crate) fn px_sel(&self) -> usize {
+            self.m.fused_w() + 9
+        }
+        /// leaf-hash provider tags (periodic-pinned): per rate lane, the TWO DEEP terms `trm_trace(c)`/`trm_next(c)`
+        /// sharing felt `c = block·RATE+lane` + the select bit (1 iff `c < trm_committed_w` — a felt read as px).
+        pub(crate) fn w_t0(&self, l: usize) -> usize {
+            self.m.fused_w() + 10 + 3 * l
+        }
+        pub(crate) fn w_t1(&self, l: usize) -> usize {
+            self.m.fused_w() + 11 + 3 * l
         }
         pub(crate) fn w_sel(&self, l: usize) -> usize {
-            self.pr() + 5 + 2 * l
+            self.m.fused_w() + 12 + 3 * l
         }
         pub(crate) fn leaf_periodic_base(&self) -> usize {
             BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
@@ -1776,14 +1796,14 @@ mod wrap_air {
 
     impl BaseAir<Goldilocks> for NarrowOvBindCwAir {
         fn width(&self) -> usize {
-            // ro/folded/quot(6) + px-region [gi,px0,px1,px_sel](4) + 2·RATE leaf-hash tags.
-            self.m.fused_w() + 10 + 2 * Self::RATE
+            // ro/folded/quot(6) + lqk(1) + px-region [term,px0,px_sel](3) + 3·RATE leaf-hash tags [t0,t1,sel]/lane.
+            self.m.fused_w() + 10 + 3 * Self::RATE
         }
         fn num_public_values(&self) -> usize {
             BaseAir::<Goldilocks>::num_public_values(&self.m)
         }
         fn num_periodic_columns(&self) -> usize {
-            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 2 * Self::RATE
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m) + 3 * Self::RATE
         }
         fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
             let mut p = BaseAir::<Goldilocks>::periodic_columns(&self.m);
@@ -1801,31 +1821,31 @@ mod wrap_air {
             let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
             let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
             let one = AB::Expr::ONE;
-            let pr = self.pr();
             let pbase = self.leaf_periodic_base();
             let rate = Self::RATE;
 
             let px_sel = cur[self.px_sel()].clone();
             builder.assert_zero(px_sel.clone() * (px_sel.clone() - one.clone()));
+            // term tags + select pinned to the periodics (periodic-out-of-interactions: witness the cols, use the cols).
             for l in 0..rate {
-                builder.assert_zero(cur[self.w_gi(l)].clone() - p[pbase + 2 * l].clone());
-                builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 2 * l + 1].clone());
+                builder.assert_zero(cur[self.w_t0(l)].clone() - p[pbase + 3 * l].clone());
+                builder.assert_zero(cur[self.w_t1(l)].clone() - p[pbase + 3 * l + 1].clone());
+                builder.assert_zero(cur[self.w_sel(l)].clone() - p[pbase + 3 * l + 2].clone());
             }
 
-            // ONE leaf-hash→px bus: per lane PROVIDE (w_gi_l, cur[l]) −w_sel_l (the leaf-hash absorbs the px lanes into
-            // cur[0..RATE]); the px-region row READS its px `(gi_base+k, px_k)` +px_sel (k=0,1 the F_p² px). SPREAD
-            // (RATE+2 tuples/row, mirrors the sponge-opening bus) — the degree stays ≤ budget.
-            let mut ch: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(rate + 2);
+            // ONE leaf-hash→px bus, QUERY-KEYED by `[lqk, term]` (the crux — the SOUND key, not the periodic-only `gi`
+            // which repeats per query). Each leaf-hash rate lane `l` (the absorbed opened felt `cur[l]`) PROVIDES its
+            // felt under BOTH DEEP terms `trm_trace(c)`/`trm_next(c)` sharing it (−w_sel each); the px-region row READS
+            // `[lqk, term, px0]` (+px_sel). The held `lqk` (= x) makes provides/reads query-unique where the term tag
+            // alone would collide across queries. TERM-keyed ⇒ the region reuses the fold's `term_idx` (no felt map).
+            let lqk = cur[self.lqk()].clone();
+            let mut ch: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(2 * rate + 1);
             for l in 0..rate {
-                ch.push((
-                    vec![cur[self.w_gi(l)].clone(), cur[l].clone()],
-                    AB::Expr::ZERO - cur[self.w_sel(l)].clone(),
-                ));
+                let neg_sel = AB::Expr::ZERO - cur[self.w_sel(l)].clone();
+                ch.push((vec![lqk.clone(), cur[self.w_t0(l)].clone(), cur[l].clone()], neg_sel.clone()));
+                ch.push((vec![lqk.clone(), cur[self.w_t1(l)].clone(), cur[l].clone()], neg_sel));
             }
-            for k in 0..2 {
-                let gi_k = cur[pr].clone() + AB::Expr::from(Goldilocks::from_u64(k as u64));
-                ch.push((vec![gi_k, cur[pr + 1 + k].clone()], px_sel.clone()));
-            }
+            ch.push((vec![lqk.clone(), cur[self.term_r()].clone(), cur[self.px0()].clone()], px_sel.clone()));
             builder.push_local_interaction(ch);
         }
     }
@@ -3952,17 +3972,21 @@ mod tests {
             narrow_ov: true,
         };
         let h = m.height();
-        let leaf_periodics = vec![vec![Val::ZERO; h]; 2 * NarrowOvBindCwAir::RATE];
+        // 3·RATE periodics: per lane the two shared DEEP term ids (trm_trace/trm_next) + the select bit (dummy for
+        // compose — the VALUES don't affect degree; the ASSEMBLED balance fills them from the real leaf geometry).
+        let leaf_periodics = vec![vec![Val::ZERO; h]; 3 * NarrowOvBindCwAir::RATE];
         let air = NarrowOvBindCwAir { m, leaf_periodics };
         let width = <NarrowOvBindCwAir as BaseAir<Val>>::width(&air);
         let lookups = Lookups::from_air::<Challenge, _>(&air);
         let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
         assert_eq!(lookups.len(), 1, "one leaf-hash→px bus channel");
-        assert!(log_nqc <= LOG_BLOWUP, "the narrow_ov monolith + leaf-hash→px bus must compose (got {log_nqc})");
+        assert!(log_nqc <= LOG_BLOWUP, "the narrow_ov monolith + query-keyed leaf-hash→px bus must compose (got {log_nqc})");
         println!(
-            "W3 ov brick 4c (compose): NarrowOvBindCwAir (narrow_ov monolith + ONE leaf-hash→px bus) width {width}, \
-             {} channel, log_nqc {log_nqc} ≤ {LOG_BLOWUP} — the bus + the ov-dropped monolith compose TOGETHER (the \
-             OpeningBindCwAir analog for px). The assembled px binding (query-keyed leaf-hash provider + balance) next.",
+            "W3 ov brick 4c (compose): NarrowOvBindCwAir (narrow_ov monolith + ONE leaf-hash→px bus, SOUND \
+             query-key [lqk, term]) width {width}, {} channel, log_nqc {log_nqc} ≤ {LOG_BLOWUP} — the bus + the \
+             ov-dropped monolith compose TOGETHER (the OpeningBindCwAir analog for px). The held lqk (= x) makes the \
+             bus query-unique (the periodic term tag alone repeats per query); each leaf lane provides under both \
+             shared DEEP terms trm_trace/trm_next, the region reads [lqk, term_idx, px0]. Assembled balance next.",
             lookups.len()
         );
     }
