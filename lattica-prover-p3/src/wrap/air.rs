@@ -1730,6 +1730,118 @@ mod wrap_air {
         }
     }
 
+    /// **AA6 op-table binding brick 5a — the cw=true op-table epilogue COMPOSES** (`--features lookup,recursion`,
+    /// cheap). The [`AssembledWrapAir`] op-table region + `folded` binding, ported to `column_window = true` +
+    /// `narrow_openings` (the openings-wrap regime) and re-based on [`OpeningsBci`] — the crux the cw=false
+    /// `AssembledWrapAir` could NOT reach (its 2c opening-leaf binding reads `pis[..]`, EMPTY at cw=true, and was
+    /// degree-infeasible `log_nqc 6`). The epilogue's `folded` is externalized to the FLATTEN op-table
+    /// ([`crate::wrap::OpTableF2Air`] relations inlined + gated by `op_sel` on slack rows) and bound to `folded_col`
+    /// through the wiring bus (the op-table PROVIDES its `folded` wire at `folded_addr`, the arith head READS
+    /// `folded_col` there). De-risks the DEGREE of the op-table region + the folded bus at cw=true BEFORE the full
+    /// assembly (the opening LEAVES stay free here — the sponge-opening bus binds them next, mirroring AA1→AA2b);
+    /// `ro_col`/`quot_col` are free witnesses (the DeepFold region + the quot recompose bind them). If `log_nqc ≤ 4`
+    /// the op-table epilogue integrates at cw=true within budget — the 2c wall is dissolved for the epilogue too.
+    pub(crate) struct OpTableBindCwAir {
+        pub(crate) m: MonolithAir,
+        /// The op-table wiring-bus address of the `folded` output wire (the arith head reads `folded_col` here).
+        pub(crate) folded_addr: u64,
+    }
+
+    impl OpTableBindCwAir {
+        pub(crate) fn ro_col(&self) -> usize {
+            self.m.fused_w()
+        }
+        pub(crate) fn folded_col(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        pub(crate) fn quot_col(&self) -> usize {
+            self.m.fused_w() + 4
+        }
+        /// The op-table region base (13 `OpTableF2Air` columns), after ro/folded/quot.
+        pub(crate) fn op_base(&self) -> usize {
+            self.m.fused_w() + 6
+        }
+        pub(crate) fn op_sel(&self) -> usize {
+            self.op_base() + 13
+        }
+        pub(crate) fn is_head(&self) -> usize {
+            self.op_base() + 14
+        }
+    }
+
+    impl BaseAir<Goldilocks> for OpTableBindCwAir {
+        fn width(&self) -> usize {
+            // ro/folded/quot(6) + op-table(13) + op_sel(1) + is_head(1).
+            self.m.fused_w() + 6 + 13 + 2
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks> + p3_lookup::InteractionBuilder> Air<AB> for OpTableBindCwAir {
+        fn eval(&self, builder: &mut AB) {
+            // (1) The narrow cw=true monolith with the OpeningsBci epilogue (reads folded_col/quot_col, checks
+            // folded·inv_van == quot_col). ro_col/folded_col/quot_col are free witnesses here.
+            self.m.eval_bci(
+                builder,
+                &OpeningsBci { ro_col: self.ro_col(), folded_col: self.folded_col(), quot_col: self.quot_col() },
+            );
+
+            let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+            let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+            let one = AB::Expr::ONE;
+            let we = AB::Expr::from(Goldilocks::from_u64(7)); // F_p² : X² = 7
+            let ob = self.op_base();
+
+            // (2) The op-table REGION — OpTableF2Air relations inlined + gated by op_sel (slack rows compute the
+            // c_k + the α-fold). Mirrors AssembledWrapAir's region, one regime deeper (cw=true).
+            let (is_mul, is_add, is_sub) = (cur[ob].clone(), cur[ob + 1].clone(), cur[ob + 2].clone());
+            let (out_addr, o0, o1) = (cur[ob + 3].clone(), cur[ob + 4].clone(), cur[ob + 5].clone());
+            let (a_addr, a0, a1) = (cur[ob + 6].clone(), cur[ob + 7].clone(), cur[ob + 8].clone());
+            let (b_addr, b0, b1) = (cur[ob + 9].clone(), cur[ob + 10].clone(), cur[ob + 11].clone());
+            let out_mult = cur[ob + 12].clone();
+            let op_sel = cur[self.op_sel()].clone();
+            builder.assert_zero(op_sel.clone() * (op_sel.clone() - one.clone()));
+            for s in [&is_mul, &is_add, &is_sub] {
+                builder.assert_zero(op_sel.clone() * s.clone() * (s.clone() - one.clone()));
+            }
+            let is_op = is_mul.clone() + is_add.clone() + is_sub.clone();
+            builder.assert_zero(op_sel.clone() * is_op.clone() * (is_op.clone() - one.clone()));
+            builder.assert_zero(op_sel.clone() * is_mul.clone() * (o0.clone() - (a0.clone() * b0.clone() + we.clone() * a1.clone() * b1.clone())));
+            builder.assert_zero(op_sel.clone() * is_mul.clone() * (o1.clone() - (a0.clone() * b1.clone() + a1.clone() * b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_add.clone() * (o0.clone() - (a0.clone() + b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_add.clone() * (o1.clone() - (a1.clone() + b1.clone())));
+            builder.assert_zero(op_sel.clone() * is_sub.clone() * (o0.clone() - (a0.clone() - b0.clone())));
+            builder.assert_zero(op_sel.clone() * is_sub.clone() * (o1.clone() - (a1.clone() - b1.clone())));
+
+            // (3) is_head bound to the periodic tf (so the folded bus READ is gated by the COLUMN, not periodic —
+            // the lookup prover feeds interactions an empty periodic slice).
+            let is_head = cur[self.is_head()].clone();
+            builder.assert_zero(is_head.clone() * (is_head.clone() - one.clone()));
+            builder.assert_zero(is_head.clone() - p[self.m.m_tf()].clone());
+
+            // (4) The wiring bus (one channel): the op-table reads its 2 operands (+op_sel·is_op) and DEFINES its
+            // output (op_sel·out_mult, −fanout INCLUDING the head's folded read); the arith head READS folded_col
+            // at folded_addr (+is_head). Balance ⇒ folded_col == the op-table's folded wire. Opening leaves free.
+            let read_mult = op_sel.clone() * is_op;
+            let folded = (cur[self.folded_col()].clone(), cur[self.folded_col() + 1].clone());
+            let ch: Vec<(Vec<AB::Expr>, AB::Expr)> = vec![
+                (vec![a_addr, a0, a1], read_mult.clone()),
+                (vec![b_addr, b0, b1], read_mult),
+                (vec![out_addr, o0, o1], op_sel * out_mult),
+                (vec![AB::Expr::from(Goldilocks::from_u64(self.folded_addr)), folded.0, folded.1], is_head),
+            ];
+            builder.push_local_interaction(ch);
+        }
+    }
+
     /// **AA6 openings assembly AA1 — the cw=true sound reduced-opening fold** (the [`AssembledArithWrapAir`] analog
     /// one regime deeper, at `column_window = true` — the deep-tree fixed-point regime). `narrow_openings` drops the
     /// `2·n_terms` `pz` opening COLUMNS from the arith tile, so the DEEP fold `ro = Σ α^k·(pz − px)/(z − x)` is
@@ -2045,7 +2157,7 @@ mod wrap_air {
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
     native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledCapWrapCwAir,
-    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, OpeningBindCwAir, WrapAir,
+    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, OpeningBindCwAir, OpTableBindCwAir, WrapAir,
     N_GROUPS, OPEN_BASE,
 };
 
@@ -3288,6 +3400,69 @@ mod tests {
             "the sponge-opening binding must compose ≤ budget in the assembled context (got {log_nqc}) — else the \
              2c wall is NOT dissolved and the narrow_openings approach needs a rethink"
         );
+    }
+
+    /// **AA6 op-table binding brick 5a — the cw=true op-table epilogue COMPOSES within budget** (`--features
+    /// lookup,recursion`, cheap). [`OpTableBindCwAir`]: the narrow cw=true monolith (`OpeningsBci` epilogue) + the
+    /// FLATTEN op-table region (`OpTableF2Air` relations, `op_sel`-gated) + the folded wiring bus binding
+    /// `folded_col`. The cw=true sibling of the `AssembledWrapAir` op-table epilogue — which it could NOT reach,
+    /// because that AIR's 2c opening-leaf binding provided ~120 openings on the arith head (`log_nqc 6`) AND read
+    /// the now-empty `pis`. Routing `folded` through the op-table + wiring bus (SPREAD across slack rows), the
+    /// epilogue integrates at cw=true within budget (`log_nqc ≤ LOG_BLOWUP`) — the last epilogue piece before the
+    /// full assembly (which binds the opening leaves via the sponge bus + recomposes `quot_col`).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn optable_bind_cw_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (_tr, counts, binds, index_binds, n_terms, _pv0) =
+            build_symbolic_inner_window(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, false, true, true);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        let m = MonolithAir {
+            counts,
+            binds,
+            index_binds,
+            n_queries: proof.opening_proof.query_proofs.len(),
+            n_terms,
+            inner_counter: false,
+            column_window: true,
+            k_instances: 1,
+            fold: false,
+            fold_txstmt: false,
+            constraints,
+            w_inner_f: WIDTH,
+            n_pub_f: N_PUBLIC,
+            n_periodic_f: N_PERIODIC,
+            is_zk: 0,
+            cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+            narrow_arith: true,
+            narrow_caps: false,
+            narrow_openings: true,
+        };
+        let air = OpTableBindCwAir { m, folded_addr: 1 << 20 };
+        let fw = air.m.fused_w();
+        let width = <OpTableBindCwAir as BaseAir<Val>>::width(&air);
+        let lookups = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "AA6 op-table binding brick 5a: OpTableBindCwAir (cw=true narrow monolith + OpeningsBci epilogue + the \
+             op-table region [OpTableF2Air relations] + the folded wiring bus) width {width} = fused_w {fw} + 21 \
+             (ro/folded/quot 6 + op-table 13 + op_sel + is_head), {} channel(s), log_nqc {log_nqc} ≤ {LOG_BLOWUP} — \
+             the epilogue's folded externalized to the op-table + bound to folded_col at cw=true, the 2c wall \
+             (AssembledWrapAir's log_nqc 6 / empty-pis) DISSOLVED for the epilogue.",
+            lookups.len()
+        );
+        assert_eq!(width, fw + 6 + 13 + 2, "ro/folded/quot 6 + op-table 13 + op_sel + is_head");
+        assert_eq!(lookups.len(), 1, "one op-table wiring + folded bus channel");
+        assert!(log_nqc <= LOG_BLOWUP, "the cw=true op-table epilogue must compose within the degree budget (got {log_nqc})");
     }
 
     /// **AA6 openings AA1+AA2+AA2b cw=true — the FULLY-BOUND reduced-opening fold COMPOSES** (`--features
