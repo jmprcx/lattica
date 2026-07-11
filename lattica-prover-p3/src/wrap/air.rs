@@ -4695,6 +4695,64 @@ mod tests {
         assert!(rejected, "a corrupted opening-row pz must be rejected (sponge FS-anchor + pz buses unbalance)");
     }
 
+    /// **AA6 brick 5d.5 — the op-table + openings assembled wrap PROVES through `prove_lookup`.** The definitive
+    /// soundness check for the COMPLETE cw=true narrow-openings epilogue: build the `bind_optable` trace (the op-table
+    /// region computes `folded` = α-fold of the c_k + `quot` = Σ zps_i·chunk_i; its opening leaves bound to the FS
+    /// opening-rows (trace/quot at term_idx) + the head window (non-trace/qwt); the wiring bus binds folded_col +
+    /// quot_col) and prove + verify it end-to-end through the W1 lookup prover. So the epilogue identity
+    /// `folded·inv_van == quot` now holds over BOUND values — the last two free witnesses that made it vacuous are
+    /// gone, at cw=true, with the `2·n_terms` pz opening COLUMNS externalized. A corrupted `folded_col` at a head is
+    /// rejected (the folded wiring bus unbalances AND the epilogue identity breaks). Heavy (~97min);
+    /// `--release --features lookup,recursion -j1 -- --ignored`.
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy (-j1, ~97min): proves the cw=true op-table+openings assembled wrap through prove_lookup + tamper-rejects a corrupted folded_col; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    fn optable_openings_wrap_cw_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, true);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        println!(
+            "proving cw=true op-table+openings assembled wrap (ro + {} z/px + pz + sponge + folded/quot wiring + {} \
+             non-trace split): width {width}, {} rows, {} channels — folded_col + quot_col bound to the op-table, the \
+             epilogue folded·inv_van == quot over BOUND values, the 2·n_terms pz opening columns externalized",
+            N_GROUPS,
+            N_GROUPS,
+            asm.m.height(),
+            2 * N_GROUPS + 4
+        );
+        let lproof = prove_lookup(&asm, trace, &pis);
+        assert!(
+            verify_lookup(&asm, &lproof, &pis).is_ok(),
+            "the cw=true op-table+openings assembled wrap must prove + verify through prove_lookup (width {width})"
+        );
+
+        // Corrupt folded_col at an arith head ⇒ the folded wiring bus (head's folded_col read ≠ the op-table's folded
+        // provide) unbalances AND the epilogue folded·inv_van == quot breaks ⇒ the corrupted trace must not verify.
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, true);
+        let fw = asm2.m.fused_w();
+        let is_head = (fw + 6) + 21; // db(fw+6) + 21
+        let head = (0..asm2.m.height())
+            .find(|&r| bad.values[r * width + is_head] == Val::ONE)
+            .expect("an arith head row");
+        bad.values[head * width + fw + 2] += Val::ONE; // folded_col.0
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let lp = prove_lookup(&asm2, bad, &pis2);
+            verify_lookup(&asm2, &lp, &pis2).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted folded_col must be rejected (folded wiring bus unbalances + epilogue identity breaks)");
+    }
+
     /// **Caps AA5 cw=true — both buses balance** (native, cheap — NO prove). Assemble the cw=true trace and confirm
     /// each channel nets to zero as a signed multiset: channel 0 (SELECT) ⇒ every head's `cap_c[g]` == the
     /// addressed cap-row digest; channel 1 (SPONGE-CAP) ⇒ every cap-row digest felt `(gi_base+k, digest[k])` cancels
