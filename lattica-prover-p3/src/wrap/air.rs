@@ -1010,6 +1010,115 @@ mod wrap_air {
         }
     }
 
+    /// **Tier-1 width merge — the combined caps ⊕ openings externalization strategy.** The two narrow-tall arcs
+    /// externalize DISJOINT parts of the monolith through DISJOINT `MonolithBci` methods: [`CapMuxBci`] the cap-mux
+    /// (`emit_capmux` → nothing; `cap_c` re-bound via the SELECT/SPONGE-CAP buses), [`OpeningsBci`] the arith fold +
+    /// epilogue (`emit_arith` → `ro_col`, `emit_epilogue` → `folded_col`/`quot_col`). So a monolith with BOTH
+    /// `narrow_caps` AND `narrow_openings` needs a strategy that routes `emit_capmux` to `CapMuxBci` and
+    /// `emit_arith`/`emit_epilogue` to `OpeningsBci` — a clean delegation (the methods touch disjoint columns/pis).
+    /// This is the Bci for the fully-narrowed wrap (`fused_w` 3849 → ~585, the 6.6× width lever); the assembled
+    /// merge wires all region buses (caps SELECT+SPONGE-CAP ⊕ openings ro/z-px/pz/sponge ⊕ ov leaf-hash) in one AIR.
+    pub(crate) struct CapOpeningsBci {
+        pub(crate) ro_col: usize,
+        pub(crate) folded_col: usize,
+        pub(crate) quot_col: usize,
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> MonolithBci<AB> for CapOpeningsBci {
+        fn emit_arith(&self, builder: &mut AB, air: &MonolithAir, cur: &[AB::Expr], tf: &AB::Expr, one: &AB::Expr, w: &AB::Expr) {
+            // openings: the reduced-opening fold `ro` externalized to `ro_col` (point stays inline + sound).
+            OpeningsBci { ro_col: self.ro_col, folded_col: self.folded_col, quot_col: self.quot_col }
+                .emit_arith(builder, air, cur, tf, one, w);
+        }
+
+        fn emit_capmux(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            pis: &[AB::Expr],
+            one: &AB::Expr,
+            tf: &AB::Expr,
+            openings: &[(usize, usize, usize, usize)],
+        ) {
+            // caps: the product-mux externalized (emit nothing) — `cap_c` re-bound by the SELECT/SPONGE-CAP buses.
+            CapMuxBci.emit_capmux(builder, air, cur, pis, one, tf, openings);
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn emit_epilogue(
+            &self,
+            builder: &mut AB,
+            air: &MonolithAir,
+            cur: &[AB::Expr],
+            tf: &AB::Expr,
+            w: &AB::Expr,
+            local: &[(AB::Expr, AB::Expr)],
+            next: &[(AB::Expr, AB::Expr)],
+            pubs: &[(AB::Expr, AB::Expr)],
+            periodic: &[(AB::Expr, AB::Expr)],
+            is_first: &(AB::Expr, AB::Expr),
+            is_last: &(AB::Expr, AB::Expr),
+            is_trans: &(AB::Expr, AB::Expr),
+            alpha_stark: &(AB::Expr, AB::Expr),
+            inv_van: &(AB::Expr, AB::Expr),
+            quot: &(AB::Expr, AB::Expr),
+        ) {
+            // openings: `folded·inv_van == quot` over the bus-bound `folded_col`/`quot_col`.
+            OpeningsBci { ro_col: self.ro_col, folded_col: self.folded_col, quot_col: self.quot_col }.emit_epilogue(
+                builder, air, cur, tf, w, local, next, pubs, periodic, is_first, is_last, is_trans, alpha_stark,
+                inv_van, quot,
+            );
+        }
+    }
+
+    /// **Tier-1 width merge — the bare fully-narrowed verifier (plumbing/compose).** The whole monolith (`eval_bci`)
+    /// with ALL FOUR narrow flags (`narrow_arith` + `narrow_caps` + `narrow_openings` + `narrow_ov`) and the combined
+    /// [`CapOpeningsBci`] — the cap-mux, the arith fold's `ro`, and the epilogue's `folded`/`quot` all externalized.
+    /// Width = `fused_w + 6` at the FULLY-narrowed `fused_w` (the 6.6× win). The `ro`/`folded`/`quot` columns are
+    /// FREE witnesses here (provable but UNSOUND until the assembled buses bind them + the caps/openings/ov regions),
+    /// exactly like [`CapWrapAir`]/[`NarrowOpeningsWrapAir`] one arc shallower. This brick de-risks the DEGREE: does
+    /// the caps externalization coexist with the openings externalization at `log_nqc ≤ 4` in ONE verifier?
+    pub(crate) struct CapNarrowWrapAir {
+        pub(crate) m: MonolithAir,
+    }
+
+    impl CapNarrowWrapAir {
+        pub(crate) fn ro_col(&self) -> usize {
+            self.m.fused_w()
+        }
+        pub(crate) fn folded_col(&self) -> usize {
+            self.m.fused_w() + 2
+        }
+        pub(crate) fn quot_col(&self) -> usize {
+            self.m.fused_w() + 4
+        }
+    }
+
+    impl BaseAir<Goldilocks> for CapNarrowWrapAir {
+        fn width(&self) -> usize {
+            self.m.fused_w() + 6
+        }
+        fn num_public_values(&self) -> usize {
+            BaseAir::<Goldilocks>::num_public_values(&self.m)
+        }
+        fn num_periodic_columns(&self) -> usize {
+            BaseAir::<Goldilocks>::num_periodic_columns(&self.m)
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
+            BaseAir::<Goldilocks>::periodic_columns(&self.m)
+        }
+    }
+
+    impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CapNarrowWrapAir {
+        fn eval(&self, builder: &mut AB) {
+            self.m.eval_bci(
+                builder,
+                &CapOpeningsBci { ro_col: self.ro_col(), folded_col: self.folded_col(), quot_col: self.quot_col() },
+            );
+        }
+    }
+
     /// The narrow-openings wrap AIR (plumbing/compose): the whole monolith (`eval_bci`) with [`OpeningsBci`] — the
     /// arith fold's `ro`, the epilogue's `folded`, and the recomposed `quot` each witnessed in an O(1) slack column
     /// pair (the `2·n_terms` `pz` opening columns GONE, `arith_stride` 0). Width = `fused_w + 6`. The columns are
@@ -2723,8 +2832,8 @@ mod wrap_air {
 #[cfg(feature = "recursion")]
 pub(crate) use wrap_air::{
     native_witnessed, open_id, ArithWrapAir, AssembledArithWrapAir, AssembledCapWrapAir, AssembledCapWrapCwAir,
-    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapWrapAir, NarrowOpeningsWrapAir, NarrowOvBindCwAir, OpeningBindCwAir, OpTableBindCwAir,
-    OpTableLeafBindCwAir, WrapAir,
+    AssembledOpeningsWrapCwAir, AssembledWrapAir, CapNarrowWrapAir, CapWrapAir, NarrowOpeningsWrapAir, NarrowOvBindCwAir,
+    OpeningBindCwAir, OpTableBindCwAir, OpTableLeafBindCwAir, WrapAir,
     N_GROUPS, OPEN_BASE,
 };
 
@@ -5041,6 +5150,74 @@ mod tests {
         );
         assert_eq!(lookups.len(), N_GROUPS + 4, "ro + N_GROUPS z/px + pz + sponge + leaf-hash→px");
         assert!(log_nqc <= LOG_BLOWUP, "the narrow_ov openings-wrap must compose within budget (got {log_nqc})");
+    }
+
+    /// **Tier-1 width merge M1a — the caps ⊕ openings externalizations coexist under budget.** The combined
+    /// [`CapOpeningsBci`] externalizes BOTH the cap-mux (`CapMuxBci`) AND the arith fold + epilogue (`OpeningsBci`)
+    /// in ONE bare verifier (`narrow_caps` + `narrow_arith` + `narrow_openings`). This is the DEGREE de-risk for the
+    /// 6.6× width merge — the NEW risk being whether the two externalizations coexist at `log_nqc ≤ LOG_BLOWUP`
+    /// (narrow_ov's coexistence with openings was already proven this session). `narrow_ov` is NOT a free-witness bare
+    /// verifier (its `px` has no source without the leaf-hash bus), so it enters only in the assembled merge — but its
+    /// `fused_w` contribution is pure column arithmetic, so the FULL 4-flag width win (the ~585 number vs ~3849) is
+    /// measured here regardless. `ro`/`folded`/`quot` are FREE columns (bound in the assembled merge next).
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_narrow_wrap_composes() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::recursion::monolith::tests::build_symbolic_inner_window;
+        use crate::recursion::monolith::MonolithAir;
+        use crate::recursion::native_fri::make_config;
+        use p3_lookup::InteractionSymbolicBuilder;
+        use p3_uni_stark::{get_symbolic_constraints, prove, AirLayout};
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let constraints = get_symbolic_constraints::<Val, _>(&JoinSplitAir, AirLayout::from_air::<Val>(&JoinSplitAir));
+        // Only counts/binds/n_terms (the symbolic shape) matter for log_nqc + fused_w. `full` (no flags) is the
+        // un-narrowed baseline; the 4-flag combo gives the fully-narrowed width (bus-independent column arithmetic).
+        let mk = |ncaps: bool, narith: bool, nopen: bool, nov: bool| {
+            let (_tr, counts, binds, index_binds, n_terms, _pv0) = build_symbolic_inner_window(
+                &config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, ncaps, narith, nopen, nov,
+            );
+            MonolithAir {
+                counts, binds, index_binds,
+                n_queries: proof.opening_proof.query_proofs.len(), n_terms,
+                inner_counter: false, column_window: true, k_instances: 1, fold: false, fold_txstmt: false,
+                constraints: constraints.clone(), w_inner_f: WIDTH, n_pub_f: N_PUBLIC, n_periodic_f: N_PERIODIC, is_zk: 0,
+                cap_height: proof.commitments.trace.roots().len().trailing_zeros() as usize,
+                narrow_arith: narith, narrow_caps: ncaps, narrow_openings: nopen, narrow_ov: nov,
+            }
+        };
+        let fw_full = mk(false, false, false, false).fused_w();
+        let fw_4flag = mk(true, true, true, true).fused_w(); // the full merge target (~585) — pure width, bus-independent
+        // The caps ⊕ openings bare verifier (narrow_ov off — it needs the assembled bus, not a free witness). A bare
+        // verifier pushes NO interactions, so `combined_constraint_layout`'s eval_all (which assumes ≥1 lookup)
+        // doesn't apply; measure the BASE-constraint degree directly via the symbolic builder — the real degree
+        // de-risk (do the two externalized checks combine above budget?). The per-channel bus degrees were already
+        // proven ≤ budget for caps and openings SEPARATELY, and log_nqc = max(base, bus) over disjoint constraints.
+        let air = CapNarrowWrapAir { m: mk(true, true, true, false) };
+        let width = <CapNarrowWrapAir as BaseAir<Val>>::width(&air);
+        let mut isb = InteractionSymbolicBuilder::<Val, Challenge>::new(AirLayout::from_air(&air));
+        air.eval(&mut isb);
+        let max_deg = isb
+            .base_constraints()
+            .iter()
+            .map(|c| c.degree_multiple())
+            .chain(isb.extension_constraints().iter().map(|c| c.degree_multiple()))
+            .max()
+            .unwrap_or(0);
+        let log_nqc = (max_deg.max(2) - 1).next_power_of_two().ilog2() as usize;
+        println!(
+            "Tier-1 MERGE (compose): fused_w FULL {fw_full} → 4-flag NARROW {fw_4flag} ({:.1}× width win). The caps ⊕ \
+             openings bare verifier (AIR width {width}) has base-constraint degree {max_deg} ⇒ log_nqc {log_nqc} ≤ \
+             {LOG_BLOWUP} — the cap-mux AND the arith fold/epilogue externalizations coexist in ONE verifier under \
+             budget (ro/folded/quot free, bound in the assembled merge; narrow_ov enters there via the leaf-hash bus).",
+            fw_full as f64 / fw_4flag as f64
+        );
+        assert!(log_nqc <= LOG_BLOWUP, "caps ⊕ openings base constraints must stay within budget (got log_nqc {log_nqc})");
+        assert!(fw_4flag * 4 < fw_full, "the merge must be a large width win (got FULL {fw_full} → 4-flag {fw_4flag})");
     }
 
     /// **AA6 openings AA3 — assemble the cw=true narrow-openings wrap trace** (the [`AssembledOpeningsWrapCwAir`]
