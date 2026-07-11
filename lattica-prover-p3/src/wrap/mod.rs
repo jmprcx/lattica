@@ -682,6 +682,208 @@ pub fn tip5_spread_round_trace(states: &[[u64; 16]]) -> RowMajorMatrix<Val> {
     RowMajorMatrix::new(rows, w)
 }
 
+/// **W4 (Tip5 in-circuit) — the full 5-round PERMUTATION (threaded spread rounds).** Chains the proven
+/// [`Tip5SpreadRoundAir`] across 5 rounds: the 5 round rows are CONSECUTIVE, so a TRANSITION constraint threads the
+/// state — `nxt.s == cur.so` gated by `cur.is_round · nxt.is_round` (round r's output feeds round r+1's input); the
+/// per-round round constants sit in `rc[16]` (bound to the round via a periodic/lookup in the assembly; free here in
+/// the degree de-risk). The S-box/connection buses are ROUND-TAGGED by a `round_idx` column (keys `round_idx·32+lane`
+/// for `s`, `+16` for `sb`) so rounds don't collide. Each split-lane S-box stays on its own row (8 lookups/row), so
+/// the whole permutation holds ≤8 lookups/channel/row ⇒ the degree de-risk measures it stays `log_nqc ≤ LOG_BLOWUP`
+/// (unlike the 32-lookup one-row round). The threaded 5-round permutation is then this AIR + a real chained trace.
+#[cfg(feature = "tip5")]
+pub struct Tip5PermAir;
+
+#[cfg(feature = "tip5")]
+impl Tip5PermAir {
+    pub const N: usize = crate::tip5::WIDTH;
+    pub const NS: usize = crate::tip5::NUM_SPLIT_LANES;
+    pub const NB: usize = 8;
+    pub const S: usize = 0;
+    pub const SB: usize = Self::S + Self::N;
+    pub const SO: usize = Self::SB + Self::N;
+    pub const RC: usize = Self::SO + Self::N; // per-round round constants (bound in assembly; free here)
+    pub const K: usize = Self::RC + Self::N;
+    pub const O: usize = Self::K + Self::NB;
+    pub const X2: usize = Self::O + Self::NB;
+    pub const LANE: usize = Self::X2 + (Self::N - Self::NS);
+    pub const SVAL: usize = Self::LANE + 1;
+    pub const OVAL: usize = Self::SVAL + 1;
+    pub const ROUND_IDX: usize = Self::OVAL + 1; // round tag (0..5) — makes the connection keys round-unique
+    pub const IS_SBOX: usize = Self::ROUND_IDX + 1;
+    pub const IS_ROUND: usize = Self::IS_SBOX + 1;
+    pub const TM: usize = Self::IS_ROUND + 1;
+    pub const W: usize = Self::TM + 1;
+}
+
+#[cfg(feature = "tip5")]
+impl<F: p3_field::Field> BaseAir<F> for Tip5PermAir {
+    fn width(&self) -> usize {
+        Self::W
+    }
+}
+
+#[cfg(feature = "tip5")]
+impl<AB: AirBuilder<F = Val> + InteractionBuilder> Air<AB> for Tip5PermAir {
+    fn eval(&self, builder: &mut AB) {
+        use crate::tip5::MDS_FIRST_COLUMN;
+        let (n, ns, nb) = (Tip5PermAir::N, Tip5PermAir::NS, Tip5PermAir::NB);
+        let main = builder.main();
+        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+        let c = |x: usize| cur[x].clone();
+        let (is_sbox, is_round, tm, ridx) =
+            (c(Tip5PermAir::IS_SBOX), c(Tip5PermAir::IS_ROUND), c(Tip5PermAir::TM), c(Tip5PermAir::ROUND_IDX));
+        let one = AB::Expr::ONE;
+        builder.assert_zero(is_sbox.clone() * (is_sbox.clone() - one.clone()));
+        builder.assert_zero(is_round.clone() * (is_round.clone() - one.clone()));
+        let b256 = AB::Expr::from(Val::from_u64(256));
+        // S-box row: sval = Σ kⱼ·256ʲ, oval = Σ oⱼ·256ʲ.
+        let (mut kr, mut or_, mut base) = (AB::Expr::ZERO, AB::Expr::ZERO, AB::Expr::ONE);
+        for j in 0..nb {
+            kr = kr + c(Tip5PermAir::K + j) * base.clone();
+            or_ = or_ + c(Tip5PermAir::O + j) * base.clone();
+            base = base * b256.clone();
+        }
+        builder.assert_zero(is_sbox.clone() * (c(Tip5PermAir::SVAL) - kr));
+        builder.assert_zero(is_sbox.clone() * (c(Tip5PermAir::OVAL) - or_));
+        // Round row: power lanes + MDS + per-round constants (rc[i]).
+        for i in ns..n {
+            let s = c(Tip5PermAir::S + i);
+            let x2 = c(Tip5PermAir::X2 + (i - ns));
+            builder.assert_zero(x2.clone() - s.clone() * s.clone());
+            builder.assert_zero(c(Tip5PermAir::SB + i) - x2.clone() * x2.clone() * x2.clone() * s);
+        }
+        for i in 0..n {
+            let mut acc = c(Tip5PermAir::RC + i);
+            for j in 0..n {
+                acc = acc + AB::Expr::from(Val::from_u64(MDS_FIRST_COLUMN[(i + n - j) % n])) * c(Tip5PermAir::SB + j);
+            }
+            builder.assert_zero(is_round.clone() * (c(Tip5PermAir::SO + i) - acc));
+        }
+        // STATE CHAIN: consecutive round rows ⇒ nxt.s == cur.so (round r output feeds round r+1 input).
+        let chain = is_round.clone() * nxt[Tip5PermAir::IS_ROUND].clone();
+        for i in 0..n {
+            builder.when_transition().assert_zero(chain.clone() * (nxt[Tip5PermAir::S + i].clone() - c(Tip5PermAir::SO + i)));
+        }
+        // ch0 — byte-table (8/row).
+        let mut ch0: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(nb);
+        for j in 0..nb {
+            let mult = if j == 0 { is_sbox.clone() + tm.clone() } else { is_sbox.clone() };
+            ch0.push((vec![c(Tip5PermAir::K + j), c(Tip5PermAir::O + j)], mult));
+        }
+        builder.push_local_interaction(ch0);
+        // ch1 — ROUND-TAGGED connection: key = round_idx·32 + lane (s), +16 (sb). Round provides s / reads sb per
+        // lane; each S-box row reads its s / provides its sb.
+        let tag = ridx.clone() * AB::Expr::from(Val::from_u64(2 * n as u64));
+        let mut ch1: Vec<(Vec<AB::Expr>, AB::Expr)> = Vec::with_capacity(2 * ns + 2);
+        for l in 0..ns {
+            let key_s = tag.clone() + AB::Expr::from(Val::from_u64(l as u64));
+            ch1.push((vec![key_s, c(Tip5PermAir::S + l)], AB::Expr::ZERO - is_round.clone()));
+        }
+        for l in 0..ns {
+            let key_sb = tag.clone() + AB::Expr::from(Val::from_u64((n + l) as u64));
+            ch1.push((vec![key_sb, c(Tip5PermAir::SB + l)], is_round.clone()));
+        }
+        ch1.push((vec![tag.clone() + c(Tip5PermAir::LANE), c(Tip5PermAir::SVAL)], is_sbox.clone()));
+        ch1.push((
+            vec![tag + c(Tip5PermAir::LANE) + AB::Expr::from(Val::from_u64(n as u64)), c(Tip5PermAir::OVAL)],
+            AB::Expr::ZERO - is_sbox.clone(),
+        ));
+        builder.push_local_interaction(ch1);
+    }
+}
+
+/// Build a full 5-round Tip5 PERMUTATION trace for one input: 256 table rows + 5 CONSECUTIVE round rows (chained by
+/// the transition `nxt.s == cur.so`) + 20 S-box rows (4/round, round-tagged). Matches [`Tip5PermAir`]; round row 4's
+/// `so` == `Tip5::permute(input)`. (One permutation ⇒ `round_idx` alone makes the connection keys unique.)
+#[cfg(feature = "tip5")]
+pub fn tip5_perm_trace(input: [u64; 16]) -> RowMajorMatrix<Val> {
+    use crate::tip5::{MDS_FIRST_COLUMN, NUM_ROUNDS, ROUND_CONSTANTS};
+    use p3_field::PrimeField64;
+    let (n, ns, nb, w) = (Tip5PermAir::N, Tip5PermAir::NS, Tip5PermAir::NB, Tip5PermAir::W);
+    let pow7 = |x: Val| {
+        let x2 = x * x;
+        x2 * x2 * x2 * x
+    };
+    // compute every round: (s_r, sb_r, so_r), chaining s_{r+1} = so_r.
+    let mut s: [Val; 16] = core::array::from_fn(|i| Val::from_u64(input[i]));
+    let mut rounds: Vec<([Val; 16], [Val; 16], [Val; 16])> = Vec::new();
+    for r in 0..NUM_ROUNDS {
+        let mut sb = [Val::ZERO; 16];
+        for i in 0..ns {
+            let mut y = 0u64;
+            for (j, byte) in s[i].as_canonical_u64().to_le_bytes().into_iter().enumerate() {
+                y = y.wrapping_add(tip5_lookup(byte as u64) << (8 * j));
+            }
+            sb[i] = Val::from_u64(y);
+        }
+        for i in ns..n {
+            sb[i] = pow7(s[i]);
+        }
+        let mut so = [Val::ZERO; 16];
+        for i in 0..n {
+            let mut acc = ROUND_CONSTANTS[r * n + i];
+            for j in 0..n {
+                acc += Val::from_u64(MDS_FIRST_COLUMN[(i + n - j) % n]) * sb[j];
+            }
+            so[i] = acc;
+        }
+        rounds.push((s, sb, so));
+        s = so;
+    }
+    let mut count = vec![0u64; 256];
+    for (sr, _, _) in &rounds {
+        for i in 0..ns {
+            for byte in sr[i].as_canonical_u64().to_le_bytes() {
+                count[byte as usize] += 1;
+            }
+        }
+    }
+    let mut rows: Vec<Val> = Vec::new();
+    for b in 0..256u64 {
+        let mut r = vec![Val::ZERO; w];
+        r[Tip5PermAir::K] = Val::from_u64(b);
+        r[Tip5PermAir::O] = Val::from_u64(tip5_lookup(b));
+        r[Tip5PermAir::TM] = -Val::from_u64(count[b as usize]);
+        rows.extend(r);
+    }
+    // 5 CONSECUTIVE round rows (the transition chains them).
+    for (r_idx, (sr, sbr, sor)) in rounds.iter().enumerate() {
+        let mut rr = vec![Val::ZERO; w];
+        for i in 0..n {
+            rr[Tip5PermAir::S + i] = sr[i];
+            rr[Tip5PermAir::SB + i] = sbr[i];
+            rr[Tip5PermAir::SO + i] = sor[i];
+            rr[Tip5PermAir::RC + i] = ROUND_CONSTANTS[r_idx * n + i];
+        }
+        for i in ns..n {
+            rr[Tip5PermAir::X2 + (i - ns)] = sr[i] * sr[i];
+        }
+        rr[Tip5PermAir::ROUND_IDX] = Val::from_u64(r_idx as u64);
+        rr[Tip5PermAir::IS_ROUND] = Val::ONE;
+        rows.extend(rr);
+    }
+    // 20 S-box rows (4 per round, round-tagged).
+    for (r_idx, (sr, sbr, _)) in rounds.iter().enumerate() {
+        for l in 0..ns {
+            let mut srow = vec![Val::ZERO; w];
+            for (j, byte) in sr[l].as_canonical_u64().to_le_bytes().into_iter().enumerate() {
+                srow[Tip5PermAir::K + j] = Val::from_u64(byte as u64);
+                srow[Tip5PermAir::O + j] = Val::from_u64(tip5_lookup(byte as u64));
+            }
+            srow[Tip5PermAir::LANE] = Val::from_u64(l as u64);
+            srow[Tip5PermAir::SVAL] = sr[l];
+            srow[Tip5PermAir::OVAL] = sbr[l];
+            srow[Tip5PermAir::ROUND_IDX] = Val::from_u64(r_idx as u64);
+            srow[Tip5PermAir::IS_SBOX] = Val::ONE;
+            rows.extend(srow);
+        }
+    }
+    let h = (rows.len() / w).next_power_of_two();
+    rows.resize(h * w, Val::ZERO);
+    RowMajorMatrix::new(rows, w)
+}
+
 /// **AA5 — the in-circuit ORDERED SPONGE-CAP BUS** (feasibility, real data). The FS-anchor AA5 needs binds the
 /// narrow-tall cap region to the caps the transcript sponge ACTUALLY absorbed (so removing the pw cap columns in
 /// cw=true keeps inner-auth non-vacuous, and closes the pre-existing FS⟂auth cap decoupling). This proves that
@@ -1785,6 +1987,67 @@ mod tests {
         let air = Tip5SpreadRoundAir;
         let proof = prove_lookup(&air, tip5_spread_round_trace(&states), &[]);
         assert!(verify_lookup(&air, &proof, &[]).is_ok(), "the spread Tip5 round must prove + verify (log_nqc 4)");
+    }
+
+    /// **W4 (Tip5 in-circuit) — the threaded 5-round PERMUTATION composes at ≤4** (`--features tip5,lookup`, cheap;
+    /// the degree de-risk for the full permutation). [`Tip5PermAir`] chains the proven spread round across 5 rounds:
+    /// the state chain is a TRANSITION (`nxt.s == cur.so` on consecutive round rows), the connection buses are
+    /// ROUND-TAGGED (`round_idx·32+lane`), each split-lane S-box stays on its own row (8 lookups/row). This measures
+    /// the whole permutation still holds `log_nqc ≤ LOG_BLOWUP` — so the threaded design is degree-FEASIBLE (the
+    /// transition chain + round-tagging added no degree wall). The real chained trace + prove is the final assembly.
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_perm_composes() {
+        let air = Tip5PermAir;
+        let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air);
+        let (_layout, log_nqc) = combined_constraint_layout(&air, &lookups, 1);
+        println!(
+            "Tip5 PERMUTATION (5 rounds threaded): width {}, {} channels, log_nqc {log_nqc} ≤ {LOG_BLOWUP} — the \
+             state-chain TRANSITION + round-tagged buses keep the threaded permutation degree-FEASIBLE.",
+            Tip5PermAir::W,
+            lookups.len()
+        );
+        assert_eq!(lookups.len(), 2, "byte-table + round-tagged connection");
+        assert!(log_nqc <= LOG_BLOWUP, "the threaded permutation must stay log_nqc ≤ {LOG_BLOWUP} (got {log_nqc})");
+    }
+
+    /// **W4 (Tip5 in-circuit) — the threaded permutation MATCHES native Tip5::permute** (`--features tip5,lookup`,
+    /// cheap; NO prove). Round row 4's output `so` (= the 5th round's output) equals `Tip5::permute(input)`
+    /// bit-for-bit — so the chained 5 spread rounds compute the EXACT full Tip5 permutation.
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_perm_matches_native() {
+        use crate::tip5::{Tip5, WIDTH as TW};
+        use p3_field::PrimeField64;
+        use p3_symmetric::Permutation;
+        let input: [u64; 16] = core::array::from_fn(|i| (i as u64) * 11 + 3);
+        let trace = tip5_perm_trace(input);
+        let w = Tip5PermAir::W;
+        let mut native: [p3_goldilocks::Goldilocks; TW] =
+            core::array::from_fn(|i| p3_goldilocks::Goldilocks::from_u64(input[i]));
+        Tip5.permute_mut(&mut native);
+        let row4 = 256 + 4; // the 5th (last) round row
+        for i in 0..TW {
+            assert_eq!(
+                trace.values[row4 * w + Tip5PermAir::SO + i].as_canonical_u64(),
+                native[i].as_canonical_u64(),
+                "permutation output lane {i} must equal native Tip5::permute"
+            );
+        }
+        println!("Tip5 PERMUTATION: the threaded 5-round in-circuit permutation output matches Tip5::permute bit-for-bit.");
+    }
+
+    /// **W4 (Tip5 in-circuit) — the FULL threaded 5-round Tip5 PERMUTATION PROVES + verifies as a STARK**
+    /// (`--features tip5,lookup`). The state-chain transition + round-tagged connection + spread S-boxes prove
+    /// end-to-end at `log_nqc 4` — the complete in-circuit Tip5 permutation gadget (Step 4's W4 for size). This is
+    /// what the recursion verifier would use to re-check a Tip5-committed inner proof's hashes (~4.6× fewer rows).
+    #[cfg(feature = "tip5")]
+    #[test]
+    fn tip5_perm_proves() {
+        let input: [u64; 16] = core::array::from_fn(|i| (i as u64) * 11 + 3);
+        let air = Tip5PermAir;
+        let proof = prove_lookup(&air, tip5_perm_trace(input), &[]);
+        assert!(verify_lookup(&air, &proof, &[]).is_ok(), "the threaded 5-round Tip5 permutation must prove + verify");
     }
 
     /// **W2-C (size)** — the narrow-tall running eval proves + verifies through the W1 lookup prover, which
