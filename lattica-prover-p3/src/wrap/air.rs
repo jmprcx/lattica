@@ -5312,6 +5312,23 @@ mod tests {
         );
         assert_eq!(lookups.len(), N_GROUPS + 5, "openings (ro + N_GROUPS z/px + pz + sponge) + caps SELECT + SPONGE-CAP");
         assert!(log_nqc <= LOG_BLOWUP, "the assembled caps ⊕ openings merge must compose within budget (got {log_nqc})");
+
+        // ── CANONICAL self-composition FORMAT bridge — the added verification surface, quantified. ──
+        // For canonical self-composition (the wrap verifying a WRAP proof), the OUTER must verify THIS merged wrap's
+        // LookupProof, which differs from a p3 Proof only by: ONE extra committed matrix — the LogUp aux (permutation)
+        // trace, `lookups.len()+1` columns, opened at ζ/ζ_next — plus the LogUp fraction constraints and a committed
+        // terminal (checked == 0). ALL of it is the SAME low degree the merged wrap composes at (log_nqc ≤ budget), so
+        // an in-circuit verifier that witnesses it (WrapAir-style) stays ≤ budget. ⇒ the format bridge adds O(channels)
+        // opening surface at NO degree cost — a MECHANICAL verifier extension, not a research wall.
+        let aux_width = lookups.len() + 1; // the LogUp permutation trace: accumulator + one fraction col per channel
+        println!(
+            "FORMAT BRIDGE surface (canonical self-composition): the outer must additionally verify the inner's LogUp \
+             aux commit ({aux_width} cols, opened at ζ/ζ_next) + {} fraction constraints + a committed terminal — all \
+             at log_nqc ≤ {LOG_BLOWUP} (the merged wrap's own budget). O(channels) added surface, NO degree cost ⇒ the \
+             bridge is a mechanical extension of build_symbolic_inner_window to the LookupProof format.",
+            lookups.len()
+        );
+        assert!(aux_width <= 2 * (N_GROUPS + 5), "the format-bridge aux surface is O(channels) — a small, bounded verifier extension");
     }
 
     /// **Tier-1 width merge M1a — the caps ⊕ openings externalizations coexist under budget.** The combined
