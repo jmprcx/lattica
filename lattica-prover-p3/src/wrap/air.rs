@@ -6556,7 +6556,7 @@ mod tests {
     /// digest. Heavy; `--release --features lookup,recursion -j1` (or `gpu,lookup,recursion` for the GPU path).
     #[cfg(feature = "recursion")]
     #[test]
-    #[ignore = "heavy (LEAN, -j1): proves the FULL 4-way merged wrap (width ~458) + tamper-rejects; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    #[ignore = "heavy (CONFIRMED: 103s, peak RSS ~7.05 GiB @ RAYON=6): proves the FULL 4-way merged wrap (width 540/fused_w 458) + tamper-rejects; run `--release --features lookup,recursion -- --ignored`"]
     fn cap_merge_full_proves() {
         use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
         use crate::recursion::native_fri::make_config;
