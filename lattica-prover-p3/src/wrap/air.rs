@@ -8433,5 +8433,26 @@ mod tests {
         );
         assert!(mb_ov < 1.0, "W5 GATE: the REAL narrow_ov marginal B must be strictly < 1 (got {mb_ov:.2}) ⇒ an attracting fixed point exists");
         assert!(mb_ov < mb_open, "the ov externalization must reduce the marginal further ({mb_open:.2} → {mb_ov:.2})");
+
+        // ── CANONICAL self-composition @ the MERGED wrap width (the wrap verifying a WRAP proof, not a join-split) ──
+        // At B=0 the outer width is CONSTANT across inner widths, so an outer verifying a MERGED-WRAP inner
+        // (w_inner ≈ 540, `cap_merge_full_builds`) emits ~the same W* — measured directly at w_inner=540.
+        let merged_w = 540usize; // the full 4-way merged wrap width
+        let outer_at_merged = mk_outer(merged_w, 2 * merged_w, true, true, true).fused_w();
+        let outer_at_merged_full = mk_outer(merged_w, 2 * merged_w, false, false, false).fused_w();
+        println!(
+            "CANONICAL self-composition [merged width]: an outer verifying a {merged_w}-wide MERGED-WRAP inner has \
+             fused_w FULL {outer_at_merged_full} → NARROWED {outer_at_merged} ({:.0}× smaller). At B=0 this is ~W* \
+             regardless of inner width; the merged prove at this width MEASURED ~7 GiB RSS ⇒ canonical self-composition \
+             FITS (~7 GB vs the un-narrowed ~133 GB OOM) and the witnessed WrapAir keeps log_nqc ≤ {LOG_BLOWUP} \
+             (wrap_fixes_self_recursion). ⇒ SIZE + DEGREE both support it. The ONE remaining obstacle is the proof \
+             FORMAT: the narrow wrap proves a LookupProof (aux/LogUp), but the inner-verifier consumes a p3 Proof — an \
+             in-circuit LogUp verifier is the bridge.",
+            outer_at_merged_full as f64 / outer_at_merged as f64
+        );
+        assert!(
+            outer_at_merged * 8 < outer_at_merged_full,
+            "the merged narrowing shrinks the R5 outer verifying a 540-wide inner by >8× ({outer_at_merged_full} → {outer_at_merged}) ⇒ it fits ~7 GB"
+        );
     }
 }
