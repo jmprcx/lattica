@@ -6521,6 +6521,77 @@ mod tests {
         );
     }
 
+    /// **Tier-1 FULL 4-way merge (assemble) — caps ⊕ openings ⊕ ov in ONE trace.** `assemble_openings_wrap_cw` with
+    /// BOTH `bind_caps` AND `narrow_ov`: the cap COLUMNS + the `2·n_terms` pz opening COLUMNS + the ov opened-row
+    /// carrier ALL externalized (width 545 → ~458). The narrow_ov leaf-hash fill + the cap-region fill coexist (caps
+    /// in the slack after the opening-rows; the leaf-hash + sponge-cap tags on transcript rows, disjoint columns; the
+    /// caps channels ordered BEFORE narrow_ov's last-channel leaf-hash), and the leaf lanes are sourced at the
+    /// narrow_caps COLLAPSED offsets — the internal ro-assert validates the whole fill at assembly time.
+    #[cfg(feature = "recursion")]
+    #[test]
+    fn cap_merge_full_builds() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, _pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true, true);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        assert_eq!(trace.values.len(), asm.m.height() * width, "the full-merge trace has the assembled width");
+        let n_cap_rows = (0..asm.m.height()).filter(|&r| trace.values[r * width + asm.cap_sel_c()] == Val::ONE).count();
+        assert!(n_cap_rows > 0 && asm.narrow_ov && asm.bind_caps, "all four externalizations on + the cap-region filled");
+        println!(
+            "Tier-1 FULL 4-way MERGE (assemble): caps ⊕ openings ⊕ ov trace width {width} (narrow_caps+openings+ov \
+             fused_w {} + regions), {n_cap_rows} cap-rows — all four externalizations coexist in one trace (ro-assert passed).",
+            asm.m.fused_w()
+        );
+    }
+
+    /// **Tier-1 FULL 4-way merge — the caps ⊕ openings ⊕ ov wrap PROVES (lean).** The COMPLETE width merge as a SOUND
+    /// STARK: the cap COLUMNS + the pz opening COLUMNS + the ov trace-leaf carrier ALL gone (width ~458 vs the
+    /// caps-un-narrowed 3792, ~8× less quotient-domain LDE). Prove + verify + tamper-reject a corrupted cap-row
+    /// digest. Heavy; `--release --features lookup,recursion -j1` (or `gpu,lookup,recursion` for the GPU path).
+    #[cfg(feature = "recursion")]
+    #[test]
+    #[ignore = "heavy (LEAN, -j1): proves the FULL 4-way merged wrap (width ~458) + tamper-rejects; run `--release --features lookup,recursion -j1 -- --ignored`"]
+    fn cap_merge_full_proves() {
+        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir};
+        use crate::recursion::native_fri::make_config;
+        use p3_uni_stark::prove;
+
+        let config = make_config(1, 4);
+        let w = demo_witness();
+        let pvs = public_values(&w);
+        let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
+        let (asm, trace, pis) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true, true);
+        let width = <AssembledOpeningsWrapCwAir as BaseAir<Val>>::width(&asm);
+        println!("proving the FULL 4-way merged wrap: width {width}, {} rows", asm.m.height());
+        let lproof = prove_lookup_lean(&asm, trace, &pis);
+        assert!(
+            verify_lookup_lean(&asm, &lproof, &pis).is_ok(),
+            "the full 4-way merged wrap must prove + verify through the LEAN prover (width {width})"
+        );
+
+        // Corrupt the first cap-row's digest ⇒ the SELECT + SPONGE-CAP buses unbalance ⇒ rejected.
+        let (asm2, mut bad, pis2) = assemble_openings_wrap_cw(&config, &proof, &pvs, false, true, true);
+        let used = asm2.m.tr() + asm2.m.n_queries * asm2.m.m_period();
+        let cap_start = used + asm2.m.n_terms * asm2.m.n_queries + asm2.m.n_terms;
+        let cr = asm2.cap_base();
+        bad.values[cap_start * width + cr + 2] += Val::ONE;
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let lp = prove_lookup_lean(&asm2, bad, &pis2);
+            verify_lookup_lean(&asm2, &lp, &pis2).is_err()
+        }))
+        .unwrap_or(true);
+        std::panic::set_hook(hook);
+        assert!(rejected, "a corrupted cap-row digest must be rejected in the full 4-way merge");
+    }
+
     /// **Tier-1 merge M1c/M3 — the merged caps ⊕ openings wrap PROVES (lean).** The 9.2× width merge as a SOUND
     /// STARK: assemble the `narrow_caps` + `narrow_openings` + `narrow_arith` wrap (width ~545 — BOTH the
     /// `2^cap_height` cap COLUMNS and the `2·n_terms` pz opening columns GONE) and prove + verify end-to-end through
