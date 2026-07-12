@@ -766,4 +766,44 @@ mod tests {
             "the batched FRI open (the decider) must verify"
         );
     }
+
+    /// **Tier-3 — the accumulation telescopes ACROSS TREE LEVELS to ONE root opening.** A 2-level K-ary fold tree:
+    /// K² leaves, K nodes (`nodeⱼ = Σ βⁱ·leafⱼᵢ`), root = `Σ γʲ·nodeⱼ`. The root polynomial `R = Σ γʲ·Σ βⁱ·Pⱼᵢ`
+    /// evaluated at z equals the FULLY-folded leaf claims — so ONE opening of R at the root certifies the WHOLE tree
+    /// (every leaf, every level), no per-node opening. This is the tree-DEPTH accumulation (the `fold_tree` structure,
+    /// which W6/B=0 stacks unboundedly) realized as a single-opening reduction; a corrupted leaf breaks the root
+    /// identity (whp over β,γ). ⇒ with `FoldAir` proving each level's fold in-circuit (+ GPU) and this telescoping,
+    /// the tree-level accumulation is: per-node O(K) folds, ONE FRI open at the root — the low-per-node-RAM prover.
+    #[test]
+    fn accumulation_across_tree_levels() {
+        use crate::config::Val;
+        use crate::tree::fold::fold_claims;
+        use p3_field::PrimeCharacteristicRing;
+
+        let eval = |c: &[Val], z: Val| c.iter().rev().fold(Val::ZERO, |a, &x| a * z + x);
+        let (k, deg) = (3usize, 4usize);
+        let (beta, gamma, z) = (Val::from_u64(0x9e3779b9), Val::from_u64(0x85ebca77), Val::from_u64(0xc2b2ae3d));
+        // K² leaf polynomials Pⱼᵢ (coeff vectors).
+        let leaves: Vec<Vec<Vec<Val>>> = (0..k)
+            .map(|j| (0..k).map(|i| (0..deg).map(|d| Val::from_u64(1 + ((j * k + i) * deg + d) as u64)).collect()).collect())
+            .collect();
+        // level 1: nodeⱼ = Σ βⁱ·leafⱼᵢ (coefficient-wise); root = Σ γʲ·nodeⱼ.
+        let node = |j: usize| -> Vec<Val> {
+            (0..deg).map(|d| fold_claims(&(0..k).map(|i| leaves[j][i][d]).collect::<Vec<_>>(), beta)).collect()
+        };
+        let nodes: Vec<Vec<Val>> = (0..k).map(node).collect();
+        let root: Vec<Val> =
+            (0..deg).map(|d| fold_claims(&(0..k).map(|j| nodes[j][d]).collect::<Vec<_>>(), gamma)).collect();
+        // the tree of OPENED claims: leaf evals → node claims (fold β) → root claim (fold γ).
+        let leaf_evals: Vec<Vec<Val>> = (0..k).map(|j| (0..k).map(|i| eval(&leaves[j][i], z)).collect()).collect();
+        let node_claims: Vec<Val> = (0..k).map(|j| fold_claims(&leaf_evals[j], beta)).collect();
+        let root_claim = fold_claims(&node_claims, gamma);
+        // ONE opening of the root at z certifies the WHOLE tree.
+        assert_eq!(eval(&root, z), root_claim, "root(z) == the fully-folded leaf claims — one root open certifies every leaf, every level");
+        // a corrupted leaf claim breaks the root identity (whp over β,γ) ⇒ soundness across levels.
+        let mut bad = leaf_evals.clone();
+        bad[1][0] += Val::ONE;
+        let bad_root = fold_claims(&(0..k).map(|j| fold_claims(&bad[j], beta)).collect::<Vec<_>>(), gamma);
+        assert_ne!(eval(&root, z), bad_root, "a corrupted leaf must break the telescoped root identity");
+    }
 }
