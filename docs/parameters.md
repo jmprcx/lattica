@@ -1,5 +1,7 @@
 # Lattica — Production Parameter Selection
 
+> **Document role:** Normative parameter rationale for the production CPU proof family. Research recursion profiles are documented separately.
+
 > **⚠ Reference-only — not the v1 audit artifact.** Design guidance that predates the Plonky3 cutover;
 > the live soundness/parameter accounting is `soundness-budget.md`. Start at [`AUDITORS.md`](AUDITORS.md).
 

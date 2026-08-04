@@ -7,6 +7,7 @@
 //! algebraic (Poseidon2) hiding Merkle commitment, and a `DuplexChallenger`, so the only differences
 //! are the field and its natural extension/width. The ratio (not the absolute size) is the takeaway.
 
+use p3_air::BaseAir;
 use p3_baby_bear::{
     default_babybear_poseidon2_16, BabyBear, GenericPoseidon2LinearLayersBabyBear,
     BABYBEAR_POSEIDON2_HALF_FULL_ROUNDS, BABYBEAR_POSEIDON2_PARTIAL_ROUNDS_16,
@@ -21,7 +22,6 @@ use p3_goldilocks::{
     default_goldilocks_poseidon2_8, GenericPoseidon2LinearLayersGoldilocks, Goldilocks,
     GOLDILOCKS_POSEIDON2_HALF_FULL_ROUNDS, GOLDILOCKS_POSEIDON2_PARTIAL_ROUNDS_8,
 };
-use p3_air::BaseAir;
 use p3_poseidon2_air::{Poseidon2Air, RoundConstants};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_uni_stark::{prove, verify, StarkConfig};
@@ -47,8 +47,7 @@ fn goldilocks_measure(n: usize) -> Row {
     type Perm = p3_goldilocks::Poseidon2Goldilocks<8>;
     type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
     type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-    type ValMmcs =
-        MerkleHiding<Val, MyHash, MyCompress, 4>;
+    type ValMmcs = MerkleHiding<Val, MyHash, MyCompress, 4>;
     type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
     type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
     type Dft = Radix2DitParallel<Val>;
@@ -67,7 +66,12 @@ fn goldilocks_measure(n: usize) -> Row {
     let perm = default_goldilocks_poseidon2_8();
     let mut rng = SmallRng::seed_from_u64(1);
     let air: Air = Poseidon2Air::new(RoundConstants::from_rng(&mut rng));
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0, SmallRng::seed_from_u64(1));
+    let val_mmcs = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm.clone()),
+        0,
+        SmallRng::seed_from_u64(1),
+    );
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let fri = FriParameters {
         log_blowup: LOG_BLOWUP,
@@ -89,7 +93,13 @@ fn goldilocks_measure(n: usize) -> Row {
     let t1 = Instant::now();
     verify(&config, &air, &proof, &[]).unwrap();
     let verify_ms = t1.elapsed().as_millis();
-    Row { field: "Goldilocks w8", width, proof_kb: bytes.len() as f64 / 1024.0, prove_ms, verify_ms }
+    Row {
+        field: "Goldilocks w8",
+        width,
+        proof_kb: bytes.len() as f64 / 1024.0,
+        prove_ms,
+        verify_ms,
+    }
 }
 
 fn babybear_measure(n: usize) -> Row {
@@ -117,7 +127,12 @@ fn babybear_measure(n: usize) -> Row {
     let perm = default_babybear_poseidon2_16();
     let mut rng = SmallRng::seed_from_u64(1);
     let air: Air = Poseidon2Air::new(RoundConstants::from_rng(&mut rng));
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0, SmallRng::seed_from_u64(1));
+    let val_mmcs = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm.clone()),
+        0,
+        SmallRng::seed_from_u64(1),
+    );
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let fri = FriParameters {
         log_blowup: LOG_BLOWUP,
@@ -139,7 +154,13 @@ fn babybear_measure(n: usize) -> Row {
     let t1 = Instant::now();
     verify(&config, &air, &proof, &[]).unwrap();
     let verify_ms = t1.elapsed().as_millis();
-    Row { field: "BabyBear w16", width, proof_kb: bytes.len() as f64 / 1024.0, prove_ms, verify_ms }
+    Row {
+        field: "BabyBear w16",
+        width,
+        proof_kb: bytes.len() as f64 / 1024.0,
+        prove_ms,
+        verify_ms,
+    }
 }
 
 // Shared hiding-Mmcs alias to keep the per-field type lines short.
@@ -157,9 +178,15 @@ type MerkleHiding<Val, H, C, const D: usize> = p3_merkle_tree::MerkleTreeHidingM
 fn main() {
     let n = 128; // compressions (≈ the spend's ~36 hashes, padded); ratio is N-independent
     println!("Field comparison: {n} Poseidon2 compressions, matched FRI (lb{LOG_BLOWUP} q{NUM_QUERIES} pow{QUERY_POW} ar1 cap0), ZK");
-    println!("{:<16} {:>6} {:>10} {:>10} {:>11}", "field", "width", "proof(KB)", "prove(ms)", "verify(ms)");
+    println!(
+        "{:<16} {:>6} {:>10} {:>10} {:>11}",
+        "field", "width", "proof(KB)", "prove(ms)", "verify(ms)"
+    );
     println!("{}", "-".repeat(58));
     for r in [goldilocks_measure(n), babybear_measure(n)] {
-        println!("{:<16} {:>6} {:>10.1} {:>10} {:>11}", r.field, r.width, r.proof_kb, r.prove_ms, r.verify_ms);
+        println!(
+            "{:<16} {:>6} {:>10.1} {:>10} {:>11}",
+            r.field, r.width, r.proof_kb, r.prove_ms, r.verify_ms
+        );
     }
 }

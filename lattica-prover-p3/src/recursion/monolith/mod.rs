@@ -52,7 +52,8 @@ mod lineage;
 mod tests;
 
 pub(crate) use air::*;
-#[allow(unused_imports)] // consumed by the test harnesses (native_verify + tests), not the lib pass
+#[allow(unused_imports)]
+// consumed by the test harnesses (native_verify + tests), not the lib pass
 pub(crate) use build::*;
 pub(crate) use gadgets::*;
 #[cfg(test)]
@@ -75,9 +76,9 @@ const QT_BIT: usize = 6; // fold: group-order bit
 const QT_SPT: usize = 7; // fold: point s_r
 const QT_I2S: usize = 8; // fold: inv(2 s_r)
 const QT_DBITS: usize = 9; // DEEP index bits (row 0)
-// The db=6 milestone reference cap height (2^6 = 64 entries of 4 felts). `MonolithAir.cap_height` is the
-// RUNTIME per-inner value (proof-derivable: log2 of MerkleCap.roots().len()); this const now serves only
-// the cfg(test) reference values + the frozen standalone-gadget/lineage tests.
+                           // The db=6 milestone reference cap height (2^6 = 64 entries of 4 felts). `MonolithAir.cap_height` is the
+                           // RUNTIME per-inner value (proof-derivable: log2 of MerkleCap.roots().len()); this const now serves only
+                           // the cfg(test) reference values + the frozen standalone-gadget/lineage tests.
 #[cfg(test)]
 const CM_CAP_HEIGHT: usize = 6;
 
@@ -87,8 +88,8 @@ const CM_CAP_HEIGHT: usize = 6;
 //    literal (guarded by the `geometry_matches_milestone` test). Layout: block 0 arith | input-Merkle |
 //    quotient-Merkle | commit-phase Merkle (CM_ROUNDS rounds). ──
 const LOG_BLOWUP: usize = 4; // FRI rate (log); log_global = degree_bits + LOG_BLOWUP
-// MonolithAir derives these at RUNTIME per-inner (cm_rounds()=nb−3, lg()=cm_rounds()+LOG_BLOWUP); these consts
-// are the db=6 milestone reference values, now used only by the guard/aggregator tests.
+                             // MonolithAir derives these at RUNTIME per-inner (cm_rounds()=nb−3, lg()=cm_rounds()+LOG_BLOWUP); these consts
+                             // are the db=6 milestone reference values, now used only by the guard/aggregator tests.
 #[cfg(test)]
 const M_DEGREE_BITS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // inner-trace degree_bits (10 − 4 = 6)
 #[cfg(test)]
@@ -96,19 +97,19 @@ const CM_ROUNDS: usize = DP_LOG_HEIGHT - LOG_BLOWUP; // FRI commit rounds = fold
 #[cfg(test)]
 const INPUT_DEPTH: usize = DP_LOG_HEIGHT - CM_CAP_HEIGHT; // input/quotient Merkle path depth to the cap (10 − 6 = 4)
 const M_INPUT_LEAF: usize = 1; // first input-leaf block; the leaf spans M_INPUT_LEAF .. +leaf_blocks (runtime)
-// HIDING (is_zk=1) width constants — the ZK wrapper's parameters (see native_verify / hiding_commit_layout).
+                               // HIDING (is_zk=1) width constants — the ZK wrapper's parameters (see native_verify / hiding_commit_layout).
 const HIDING_NUM_CW: usize = 4; // HidingFriPcs num_random_codewords added to each committed input matrix
 const HIDING_SALT: usize = 4; // MerkleTreeHidingMmcs SALT_ELEMS appended to each leaf preimage
 const HIDING_RAND_PUB: usize = 2; // random-round opened value width (one F_p²)
-// The LEAF-BLOCK / nqc dimensions of the layout (input-Merkle leaf blocks = ceil(W_inner/RATE), quotient-Merkle
-// leaf blocks = ceil(2·nqc/RATE), and everything downstream: M_INPUT_TERM, M_QUOT_LEAF/TERM, CM_LEAF/TERM,
-// M_NBLOCKS, M_PERIOD) vary PER INNER, so they are RUNTIME methods on `MonolithAir` (m_input_term()/…/m_period())
-// rather than consts — see the geometry methods on the impl. At the milestone (W≤RATE, nqc=1 ⇒ leaf_blocks=1)
-// they equal the db=6 literals (guarded by `geometry_matches_milestone`; validated across configs by
-// `commit_layout_generalizes`). Only the FRI-depth scalars below stay compile-time (one pinned config).
-// commit round r folds the codeword to log-height DP_LOG_HEIGHT−(r+1); its Merkle path is that many levels
-// above the cap (0 once the codeword ≤ 2^cap_height). depths at db=6: [3,2,1,0,0,0]. Parameterized by
-// (log_global, cap) so the formula is validated at other configs (see `commit_layout_generalizes`).
+                                  // The LEAF-BLOCK / nqc dimensions of the layout (input-Merkle leaf blocks = ceil(W_inner/RATE), quotient-Merkle
+                                  // leaf blocks = ceil(2·nqc/RATE), and everything downstream: M_INPUT_TERM, M_QUOT_LEAF/TERM, CM_LEAF/TERM,
+                                  // M_NBLOCKS, M_PERIOD) vary PER INNER, so they are RUNTIME methods on `MonolithAir` (m_input_term()/…/m_period())
+                                  // rather than consts — see the geometry methods on the impl. At the milestone (W≤RATE, nqc=1 ⇒ leaf_blocks=1)
+                                  // they equal the db=6 literals (guarded by `geometry_matches_milestone`; validated across configs by
+                                  // `commit_layout_generalizes`). Only the FRI-depth scalars below stay compile-time (one pinned config).
+                                  // commit round r folds the codeword to log-height DP_LOG_HEIGHT−(r+1); its Merkle path is that many levels
+                                  // above the cap (0 once the codeword ≤ 2^cap_height). depths at db=6: [3,2,1,0,0,0]. Parameterized by
+                                  // (log_global, cap) so the formula is validated at other configs (see `commit_layout_generalizes`).
 const fn cm_depth_at(r: usize, log_global: usize, cap: usize) -> usize {
     let h = log_global - (r + 1);
     if h > cap {
@@ -127,7 +128,13 @@ const fn cm_depth(r: usize) -> usize {
 // and generalizes to other depths (see `commit_layout_generalizes`); the monolith itself uses the consts.
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
-fn commit_layout(log_global: usize, cap: usize, log_blowup: usize, leaf_blocks: usize, quot_leaf_blocks: usize) -> (usize, usize, usize, usize, Vec<usize>, Vec<usize>, usize) {
+fn commit_layout(
+    log_global: usize,
+    cap: usize,
+    log_blowup: usize,
+    leaf_blocks: usize,
+    quot_leaf_blocks: usize,
+) -> (usize, usize, usize, usize, Vec<usize>, Vec<usize>, usize) {
     let cm_rounds = log_global - log_blowup;
     let input_depth = log_global - cap;
     let m_input_term = M_INPUT_LEAF + (leaf_blocks - 1) + input_depth; // multi-block input leaf + path
@@ -142,7 +149,15 @@ fn commit_layout(log_global: usize, cap: usize, log_blowup: usize, leaf_blocks: 
         blk += d + 1;
     }
     let m_nblocks = term[cm_rounds - 1] + 1;
-    (cm_rounds, input_depth, m_input_term, m_quot_term, leaf, term, m_nblocks)
+    (
+        cm_rounds,
+        input_depth,
+        m_input_term,
+        m_quot_term,
+        leaf,
+        term,
+        m_nblocks,
+    )
 }
 
 /// HIDING (is_zk=1) super-tile layout — the geometry the in-circuit hiding monolith needs (#86 AIR mode).
@@ -161,14 +176,23 @@ fn hiding_commit_layout(
     log_global: usize,
     cap: usize,
     log_blowup: usize,
-) -> (usize, usize, usize, Vec<usize>, Vec<usize>, usize, usize, [usize; 3]) {
+) -> (
+    usize,
+    usize,
+    usize,
+    Vec<usize>,
+    Vec<usize>,
+    usize,
+    usize,
+    [usize; 3],
+) {
     let cm_rounds = log_global - log_blowup;
     let input_depth = log_global - cap;
     // merged widths (public ‖ codewords) = the reduced-opening term widths (NO salt).
     let random_merged = HIDING_RAND_PUB + HIDING_NUM_CW;
     let trace_merged = w_inner + HIDING_NUM_CW;
     let quot_merged = 2 + HIDING_NUM_CW; // per chunk: F_p² (2) + codewords
-    // leaf felt widths = committed row ‖ salt; the quotient leaf is the multi-matrix concat over nqc chunks.
+                                         // leaf felt widths = committed row ‖ salt; the quotient leaf is the multi-matrix concat over nqc chunks.
     let rlb = (random_merged + HIDING_SALT).div_ceil(RATE);
     let ilb = (trace_merged + HIDING_SALT).div_ceil(RATE);
     let qlb = (nqc * (quot_merged + HIDING_SALT)).div_ceil(RATE);
@@ -192,7 +216,16 @@ fn hiding_commit_layout(
     let m_nblocks = term[cm_rounds - 1] + 1;
     // reduced-opening terms: random (×1 point) + trace (×2 points ζ,ζ_next) + quotient (nqc chunks ×1 point).
     let n_terms = random_merged + 2 * trace_merged + nqc * quot_merged;
-    (m_random_term, m_input_term, m_quot_term, leaf, term, m_nblocks, n_terms, [rlb, ilb, qlb])
+    (
+        m_random_term,
+        m_input_term,
+        m_quot_term,
+        leaf,
+        term,
+        m_nblocks,
+        n_terms,
+        [rlb, ilb, qlb],
+    )
 }
 
 /// Max inner proofs the tiled aggregator folds in ONE outer proof, mirroring `batch_joinsplit_air::

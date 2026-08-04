@@ -51,7 +51,7 @@ rayon = "1" # streaming FRI test: pin a 1-thread pool so p3's `find_map_any` PoW
 # the wire format, and the verifier are untouched. Requires an OpenCL runtime + a GPU at runtime.
 gpu = ["dep:ocl", "dep:rayon"]
 # Enable the RESEARCH in-circuit recursive STARK verifier (`src/recursion`: the monolith + aggregator). OFF by
-# default — it is NOT on any production path (zero of the 10 `lattica_*` externs reach it) and is NOT audited;
+# default — it is NOT on any production path (zero default `lattica_*` externs reach it) and is NOT audited;
 # gating it out keeps the default staticlib to the frozen node seam. Its ~80 `#[ignore]` tests + the 2 monolith
 # constraint-fingerprint pins compile only under this feature. Run with `--features recursion`.
 recursion = []
@@ -59,7 +59,7 @@ recursion = []
 # allocations (the trace/quotient/Merkle LDE) to a memory-mapped file on NVMe, bounding the prover's
 # peak RSS under a cgroup ceiling instead of holding the whole LDE in RAM. Additive + prove-only +
 # BYTE-IDENTICAL (only the backing store changes); OFF by default so the production staticlib and the
-# 10 frozen externs never install it. Run with `--features stream`. See `src/spill_alloc.rs`.
+# default externs never install it. Run with `--features stream`. See `src/spill_alloc.rs`.
 stream = ["dep:libc", "dep:p3-util", "dep:p3-maybe-rayon"]
 
 [profile.release]

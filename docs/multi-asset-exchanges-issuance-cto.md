@@ -1,5 +1,7 @@
 # Multi-Asset, Exchanges & Issuance/Bridging — Architecture Decision Memo
 
+> **Architecture note:** Forward-looking design outside the core single-asset production proof claim unless explicitly incorporated by the current audit scope.
+
 **Audience:** CTO / technical leadership. **Status:** decision memo (no code committed).
 **Scope:** the rubble shielded chain (lattica protocol layer) + the cross-chain stack
 (`rubble-xchain-xfer`). Frames the design space, trade-offs, effort/risk, and a recommended

@@ -70,11 +70,11 @@ use crate::poseidon2_air::{ext_linear, int_linear, native_permute, periodic_tabl
 // every `htlc_air::{N_IN, DIGEST, commit, merge, …}` path keeps resolving). `commit` is the canonical
 // 6-arg form (HTLC passes a real note_type). What stays in this file is THIS circuit's HTLC
 // extensions (`htlc_root`, `nullifier_owner`) + geometry + constraint system.
-pub use crate::spend_common::{
-    commit, fold, merge, nullifier, pos_of, recipient_of, PublicOutputs, BITS, DEPTH, DIGEST, M_OUT,
-    N_IN,
-};
 pub(crate) use crate::spend_common::{build_paths, h, W};
+pub use crate::spend_common::{
+    commit, fold, merge, nullifier, pos_of, recipient_of, PublicOutputs, BITS, DEPTH, DIGEST,
+    M_OUT, N_IN,
+};
 
 // A2 domain-separation tags (lane 0 of each data hash) + note types (commitment lane 7) — the
 // normative table lives in crate::domains.
@@ -87,7 +87,12 @@ type Val = Goldilocks;
 /// merge-shaped (chain ‖ data) absorbing `refund_tag`, `hashlock`, then `[timeout,0,0,0]`. Binding all
 /// four into the committed owner means a spender can't substitute different terms (the cm wouldn't be
 /// in the tree).
-pub fn htlc_root(redeem_tag: [Val; DIGEST], refund_tag: [Val; DIGEST], hashlock: [Val; DIGEST], timeout: Val) -> [Val; DIGEST] {
+pub fn htlc_root(
+    redeem_tag: [Val; DIGEST],
+    refund_tag: [Val; DIGEST],
+    hashlock: [Val; DIGEST],
+    timeout: Val,
+) -> [Val; DIGEST] {
     let mut s0 = [Val::ZERO; W];
     s0[0] = Val::from_u64(DOM_HTLC);
     s0[DIGEST..].copy_from_slice(&redeem_tag);
@@ -111,15 +116,17 @@ pub fn htlc_root(redeem_tag: [Val; DIGEST], refund_tag: [Val; DIGEST], hashlock:
 /// nullifier (else a note could be spent once per mode = double-spend). Layout `[DOM_NF_HTLC ‖
 /// owner(4) ‖ rho0 ‖ rho1 ‖ pos]`.
 pub fn nullifier_owner(owner: [Val; DIGEST], rho: [Val; 2], pos: Val) -> [Val; DIGEST] {
-    h(DOM_NF_HTLC, &[owner[0], owner[1], owner[2], owner[3], rho[0], rho[1], pos])
+    h(
+        DOM_NF_HTLC,
+        &[owner[0], owner[1], owner[2], owner[3], rho[0], rho[1], pos],
+    )
 }
-
 
 #[derive(Clone)]
 pub struct Input {
     pub nk: [u64; 2], // 128-bit nullifier key / spend authority (the claiming party for an HTLC note)
-    pub div: Val, // diversifier of the address this note was sent to (recipient = H(nk ‖ div))
-    pub asset: Val, // hidden asset id (all notes in a tx share one asset)
+    pub div: Val,     // diversifier of the address this note was sent to (recipient = H(nk ‖ div))
+    pub asset: Val,   // hidden asset id (all notes in a tx share one asset)
     pub note_type: Val, // 0 = PLAIN, 1 = HTLC
     pub value: u64,
     pub rho: [Val; 2], // 128-bit note randomness
@@ -139,8 +146,8 @@ pub struct Input {
 #[derive(Clone, Copy)]
 pub struct Output {
     pub recipient: [Val; DIGEST], // the note owner: a recipient digest (PLAIN) or an htlc_root (HTLC)
-    pub asset: Val, // hidden asset id (must equal the inputs' asset)
-    pub note_type: Val, // 0 = PLAIN, 1 = HTLC
+    pub asset: Val,               // hidden asset id (must equal the inputs' asset)
+    pub note_type: Val,           // 0 = PLAIN, 1 = HTLC
     pub value: u64,
     pub rho: [Val; 2],
     pub rcm: [Val; 2],
@@ -166,28 +173,56 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let asset = w.inputs[0].asset; // the single (hidden) asset of this tx
     let htlc = Val::from_u64(NOTE_HTLC);
     for (i, inp) in w.inputs.iter().enumerate() {
-        assert_eq!(inp.asset, asset, "input {i} uses a different asset (single-asset tx)");
+        assert_eq!(
+            inp.asset, asset,
+            "input {i} uses a different asset (single-asset tx)"
+        );
         let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
         let claim_tag = recipient_of(nk0, nk1, inp.div); // the claiming party's ownership tag
         let is_htlc = inp.note_type == htlc;
         // owner = htlc_root (HTLC) or the claiming recipient tag (PLAIN).
         let owner = if is_htlc {
-            htlc_root(inp.redeem_tag, inp.refund_tag, inp.hashlock, Val::from_u64(inp.timeout))
+            htlc_root(
+                inp.redeem_tag,
+                inp.refund_tag,
+                inp.hashlock,
+                Val::from_u64(inp.timeout),
+            )
         } else {
             claim_tag
         };
         if is_htlc {
             // The claiming party must own the tag selected by `mode`; and the timeout window must hold.
             let redeeming = inp.mode == Val::from_u64(1);
-            let want = if redeeming { inp.redeem_tag } else { inp.refund_tag };
-            assert_eq!(claim_tag, want, "input {i}: claim does not match the selected HTLC party");
-            if redeeming {
-                assert!(w.current_height < inp.timeout, "input {i}: redeem requires height < timeout");
+            let want = if redeeming {
+                inp.redeem_tag
             } else {
-                assert!(w.current_height >= inp.timeout, "input {i}: refund requires height >= timeout");
+                inp.refund_tag
+            };
+            assert_eq!(
+                claim_tag, want,
+                "input {i}: claim does not match the selected HTLC party"
+            );
+            if redeeming {
+                assert!(
+                    w.current_height < inp.timeout,
+                    "input {i}: redeem requires height < timeout"
+                );
+            } else {
+                assert!(
+                    w.current_height >= inp.timeout,
+                    "input {i}: refund requires height >= timeout"
+                );
             }
         }
-        let cm = commit(owner, Val::from_u64(inp.value), inp.rho, inp.rcm, inp.asset, inp.note_type);
+        let cm = commit(
+            owner,
+            Val::from_u64(inp.value),
+            inp.rho,
+            inp.rcm,
+            inp.asset,
+            inp.note_type,
+        );
         let root = fold(cm, &inp.sib, &inp.bits);
         match anchor {
             None => anchor = Some(root),
@@ -195,20 +230,42 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
         }
         // Nullifier: mode/party-independent for HTLC (owner-based), nk-based for PLAIN.
         let pos = pos_of(&inp.bits);
-        nullifiers[i] = if is_htlc { nullifier_owner(owner, inp.rho, pos) } else { nullifier(nk0, nk1, inp.rho, pos) };
+        nullifiers[i] = if is_htlc {
+            nullifier_owner(owner, inp.rho, pos)
+        } else {
+            nullifier(nk0, nk1, inp.rho, pos)
+        };
         in_sum += inp.value as u128;
     }
     // per-output commitment (the output owner — a recipient digest or an htlc_root — is a free witness)
     let mut out_cms = [[Val::ZERO; DIGEST]; M_OUT];
     let mut out_sum: u128 = 0;
     for (j, out) in w.outputs.iter().enumerate() {
-        assert_eq!(out.asset, asset, "output {j} uses a different asset (single-asset tx)");
-        out_cms[j] = commit(out.recipient, Val::from_u64(out.value), out.rho, out.rcm, out.asset, out.note_type);
+        assert_eq!(
+            out.asset, asset,
+            "output {j} uses a different asset (single-asset tx)"
+        );
+        out_cms[j] = commit(
+            out.recipient,
+            Val::from_u64(out.value),
+            out.rho,
+            out.rcm,
+            out.asset,
+            out.note_type,
+        );
         out_sum += out.value as u128;
     }
     // value balance (A3: all values range-bounded ⇒ no wraparound)
-    assert_eq!(in_sum + w.mint as u128, out_sum + w.fee as u128, "value balance Σin + mint = Σout + fee");
-    PublicOutputs { anchor: anchor.unwrap(), nullifiers, out_cms }
+    assert_eq!(
+        in_sum + w.mint as u128,
+        out_sum + w.fee as u128,
+        "value balance Σin + mint = Σout + fee"
+    );
+    PublicOutputs {
+        anchor: anchor.unwrap(),
+        nullifiers,
+        out_cms,
+    }
 }
 
 // ==============================================================================================
@@ -241,22 +298,22 @@ const RBIT: usize = 15;
 const NK1: usize = 16; // second limb of the 128-bit nullifier key (NK = limb 0)
 const RHO1: usize = 17; // rho limb 1 (local-persistent; 128-bit note randomness)
 const ASSET: usize = 18; // hidden asset id — GLOBAL-persistent (constant across the whole tx)
-// OWNER0..3: the note's owner digest (recipient for PLAIN, htlc_root for HTLC), local-persistent in
-// the span. Carries the owner into commit_a without block-adjacency, so the htlc_root (computed in the
-// span-end blocks) can feed commit_a (audit/AIR layout note in the header).
+                         // OWNER0..3: the note's owner digest (recipient for PLAIN, htlc_root for HTLC), local-persistent in
+                         // the span. Carries the owner into commit_a without block-adjacency, so the htlc_root (computed in the
+                         // span-end blocks) can feed commit_a (audit/AIR layout note in the header).
 const OWNER0: usize = 19;
 const NT: usize = 23; // note_type (0=PLAIN, 1=HTLC), local-persistent; == committed commit_b lane 7
-// CLAIM0..3: the claiming party's tag = own.out = H(DOM_OWN ‖ nk ‖ div), local-persistent. For an
-// HTLC note the spend proves CLAIM == the mode-selected party tag (redeem_tag / refund_tag).
+                      // CLAIM0..3: the claiming party's tag = own.out = H(DOM_OWN ‖ nk ‖ div), local-persistent. For an
+                      // HTLC note the spend proves CLAIM == the mode-selected party tag (redeem_tag / refund_tag).
 const CLAIM0: usize = 24;
 const MODE: usize = 28; // 1 = redeem, 0 = refund (local-persistent, boolean)
-// HTLC timeout compare (range argument, reusing REM/RBIT in the free span-end htlc region):
+                        // HTLC timeout compare (range argument, reusing REM/RBIT in the free span-end htlc region):
 const TIMEOUT: usize = 29; // the committed timeout (== htlc block 3 input lane 4), local-persistent
 const DIFF: usize = 30; // redeem: timeout-height-1 ; refund: height-timeout ; range-checked ≥ 0
-// Redeem hashlock-nonzero gadget (audit r3 hardening): on a redeem, PI_HASHLOCK must be non-zero, else
-// a maliciously-locked zero hashlock could be redeemed with a null preimage (no secret revealed). The
-// HLINV_k witness inverses of the hashlock limbs; HLPROD = Π_k(1 − PI_HASHLOCK[k]·HLINV_k) is 0 iff
-// some limb is invertible (non-zero). Used only at the htlc block-2 rows.
+                        // Redeem hashlock-nonzero gadget (audit r3 hardening): on a redeem, PI_HASHLOCK must be non-zero, else
+                        // a maliciously-locked zero hashlock could be redeemed with a null preimage (no secret revealed). The
+                        // HLINV_k witness inverses of the hashlock limbs; HLPROD = Π_k(1 − PI_HASHLOCK[k]·HLINV_k) is 0 iff
+                        // some limb is invertible (non-zero). Used only at the htlc block-2 rows.
 const HLINV0: usize = 31; // HLINV0..3 = 31..35
 const HLPROD: usize = 35;
 pub const WIDTH: usize = 36; // …, TIMEOUT=29, DIFF=30, HLINV0..3=31..35, HLPROD=35
@@ -465,7 +522,7 @@ pub fn periodic() -> Vec<Vec<Val>> {
     cols.push(one_hot(&[mint_in_row() + MINT_BLOCKS * BLOCK - 1])); // P_FINAL (after mint contribution)
     let in_commit_b: Vec<usize> = (0..N_IN).map(commit_b_in_row).collect(); // input commit_b only
     cols.push(one_hot(&in_commit_b)); // P_IN_COMMIT_B
-    // htlc_root chain selectors (span-end blocks 0..HTLC_BLOCKS of each input)
+                                      // htlc_root chain selectors (span-end blocks 0..HTLC_BLOCKS of each input)
     let htlc_in0: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, 0) * BLOCK).collect();
     let mut htlc_link: Vec<usize> = Vec::new();
     for i in 0..N_IN {
@@ -473,8 +530,12 @@ pub fn periodic() -> Vec<Vec<Val>> {
             htlc_link.push(htlc_out_row(i, k)); // block k output → block k+1 input (chain)
         }
     }
-    let htlc_in3: Vec<usize> = (0..N_IN).map(|i| htlc_block(i, HTLC_BLOCKS - 1) * BLOCK).collect();
-    let htlc_root_out: Vec<usize> = (0..N_IN).map(|i| htlc_out_row(i, HTLC_BLOCKS - 1)).collect();
+    let htlc_in3: Vec<usize> = (0..N_IN)
+        .map(|i| htlc_block(i, HTLC_BLOCKS - 1) * BLOCK)
+        .collect();
+    let htlc_root_out: Vec<usize> = (0..N_IN)
+        .map(|i| htlc_out_row(i, HTLC_BLOCKS - 1))
+        .collect();
     cols.push(one_hot(&htlc_in0)); // P_HTLC_IN0
     cols.push(one_hot(&htlc_link)); // P_HTLC_LINK
     cols.push(one_hot(&htlc_in3)); // P_HTLC_IN3
@@ -526,274 +587,343 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcAir {
 /// circuit, or the tile-boundary one-hot for the batch (it frees the per-tile-persistent columns + ASSET
 /// across tiles). Single-circuit behaviour is unchanged (statement = pis, tile_last = 0) — proven by this
 /// file's full suite, incl. the exhaustive corrupted-trace `--ignored` tests.
-pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(builder: &mut AB, statement: &[AB::Expr], tile_last: AB::Expr) {
-        let main = builder.main();
-        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
-        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
-        let one = AB::Expr::ONE;
-        let two = AB::Expr::TWO;
-        let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
-        let dom_cm = AB::Expr::from(Goldilocks::from_u64(DOM_CM));
-        let dom_nf = AB::Expr::from(Goldilocks::from_u64(DOM_NF));
-        let dom_htlc = AB::Expr::from(Goldilocks::from_u64(DOM_HTLC));
-        let dom_nf_htlc = AB::Expr::from(Goldilocks::from_u64(DOM_NF_HTLC));
+pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(
+    builder: &mut AB,
+    statement: &[AB::Expr],
+    tile_last: AB::Expr,
+) {
+    let main = builder.main();
+    let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+    let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+    let p: Vec<AB::Expr> = builder
+        .periodic_values()
+        .iter()
+        .map(|&x| x.into())
+        .collect();
+    let one = AB::Expr::ONE;
+    let two = AB::Expr::TWO;
+    let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
+    let dom_cm = AB::Expr::from(Goldilocks::from_u64(DOM_CM));
+    let dom_nf = AB::Expr::from(Goldilocks::from_u64(DOM_NF));
+    let dom_htlc = AB::Expr::from(Goldilocks::from_u64(DOM_HTLC));
+    let dom_nf_htlc = AB::Expr::from(Goldilocks::from_u64(DOM_NF_HTLC));
 
-        let is_init = p[0].clone();
-        let is_full = p[1].clone();
-        let is_partial = p[2].clone();
-        let rc: Vec<AB::Expr> = (0..8).map(|i| p[3 + i].clone()).collect();
+    let is_init = p[0].clone();
+    let is_full = p[1].clone();
+    let is_partial = p[2].clone();
+    let rc: Vec<AB::Expr> = (0..8).map(|i| p[3 + i].clone()).collect();
 
-        // ---- Poseidon2 round constraints on the state columns (period-32 schedule) ----
-        let mut init_s: [AB::Expr; 8] = core::array::from_fn(|i| cur[i].clone());
-        ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; 8] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
-        ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; 8] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
-        int_linear(&mut part_s);
-        for i in 0..8 {
-            let round = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
-                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
-                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
-            builder.when_transition().assert_zero(round);
+    // ---- Poseidon2 round constraints on the state columns (period-32 schedule) ----
+    let mut init_s: [AB::Expr; 8] = core::array::from_fn(|i| cur[i].clone());
+    ext_linear(&mut init_s);
+    let mut full_s: [AB::Expr; 8] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+    ext_linear(&mut full_s);
+    let mut part_s: [AB::Expr; 8] = core::array::from_fn(|i| {
+        if i == 0 {
+            pow7(cur[0].clone() + rc[0].clone())
+        } else {
+            cur[i].clone()
         }
+    });
+    int_linear(&mut part_s);
+    for i in 0..8 {
+        let round = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+            + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+            + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+        builder.when_transition().assert_zero(round);
+    }
 
-        // ---- local-persistent columns: constant within a region, free at region boundaries ----
-        // RHO1 MUST be here: it is read at both commit_a (lane 7) and the nullifier (lane 4); without
-        // persistence a prover could use one rho1 in the commitment and another in the nullifier,
-        // minting a fresh nullifier for a real note ⇒ double-spend.
-        // (batch) also free at the TILE boundary so tile k's keys/owner/mode/etc. don't bleed into k+1.
-        let not_last = one.clone() - p[P_REGION_LAST].clone() - tile_last.clone();
-        for &c in &[
-            NK, NK1, RHO, RHO1, VAL, OWNER0, OWNER0 + 1, OWNER0 + 2, OWNER0 + 3, NT,
-            CLAIM0, CLAIM0 + 1, CLAIM0 + 2, CLAIM0 + 3, MODE, TIMEOUT,
-        ] {
-            builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
-        }
-        // ASSET is per-tx-persistent: constant within a tx (one hidden asset), free at the tile boundary
-        // (batch) so distinct txs may carry distinct assets. every note's committed asset (bound at
-        // commit_b below) equals this tx's single value.
-        builder.when_transition().assert_zero((one.clone() - tile_last.clone()) * (nxt[ASSET].clone() - cur[ASSET].clone()));
-        // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
-        let bit = nxt[BIT].clone();
-        builder.when_transition().assert_zero(
-            not_last.clone()
-                * (nxt[POSACC].clone() - cur[POSACC].clone() - p[P_MEM_LINK].clone() * (bit.clone() * p[P_POS_COEFF].clone())),
-        );
-        builder.assert_zero(p[P_OWN_IN].clone() * cur[POSACC].clone()); // reset to 0 at span start
-
-        // ---- global value accumulator: +in (commit), −out, −fee ⇒ 0 ----
-        builder.assert_zero(p[P_ROW0].clone() * cur[VALACC].clone());
-        let acc_delta = (p[P_COMMIT_A_IN].clone() + p[P_MINT_IN].clone() - p[P_OUT_A_IN].clone() - p[P_FEE_IN].clone())
-            * cur[VAL].clone();
-        builder.when_transition().assert_zero(nxt[VALACC].clone() - cur[VALACC].clone() - acc_delta);
-        builder.assert_zero(p[P_FINAL].clone() * cur[VALACC].clone()); // balance: Σin = Σout + fee
-
-        // ---- range: rem=VAL at seed, rem=2·rem'+rbit (rbit boolean), rem=0 at close (A3) ----
-        builder.assert_zero(p[P_RANGE_SEED].clone() * (cur[REM].clone() - cur[VAL].clone()));
-        let ra = p[P_RANGE_ACTIVE].clone();
+    // ---- local-persistent columns: constant within a region, free at region boundaries ----
+    // RHO1 MUST be here: it is read at both commit_a (lane 7) and the nullifier (lane 4); without
+    // persistence a prover could use one rho1 in the commitment and another in the nullifier,
+    // minting a fresh nullifier for a real note ⇒ double-spend.
+    // (batch) also free at the TILE boundary so tile k's keys/owner/mode/etc. don't bleed into k+1.
+    let not_last = one.clone() - p[P_REGION_LAST].clone() - tile_last.clone();
+    for &c in &[
+        NK,
+        NK1,
+        RHO,
+        RHO1,
+        VAL,
+        OWNER0,
+        OWNER0 + 1,
+        OWNER0 + 2,
+        OWNER0 + 3,
+        NT,
+        CLAIM0,
+        CLAIM0 + 1,
+        CLAIM0 + 2,
+        CLAIM0 + 3,
+        MODE,
+        TIMEOUT,
+    ] {
         builder
             .when_transition()
-            .assert_zero(ra.clone() * (cur[REM].clone() - (two.clone() * nxt[REM].clone() + cur[RBIT].clone())));
-        builder.when_transition().assert_zero(ra.clone() * (cur[RBIT].clone() * (one.clone() - cur[RBIT].clone())));
-        builder.assert_zero(p[P_RANGE_CLOSE].clone() * cur[REM].clone());
+            .assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
+    }
+    // ASSET is per-tx-persistent: constant within a tx (one hidden asset), free at the tile boundary
+    // (batch) so distinct txs may carry distinct assets. every note's committed asset (bound at
+    // commit_b below) equals this tx's single value.
+    builder
+        .when_transition()
+        .assert_zero((one.clone() - tile_last.clone()) * (nxt[ASSET].clone() - cur[ASSET].clone()));
+    // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
+    let bit = nxt[BIT].clone();
+    builder.when_transition().assert_zero(
+        not_last.clone()
+            * (nxt[POSACC].clone()
+                - cur[POSACC].clone()
+                - p[P_MEM_LINK].clone() * (bit.clone() * p[P_POS_COEFF].clone())),
+    );
+    builder.assert_zero(p[P_OWN_IN].clone() * cur[POSACC].clone()); // reset to 0 at span start
 
-        // ---- ownership input: [DOM_OWN, nk0, nk1, d, 0,0,0,0] ----
-        // `d` (lane 3) is the diversifier — a FREE input: the spender uses the note's actual
-        // diversifier (else the recomputed recipient → cm won't be in the tree), so no extra
-        // constraint is needed (matching someone else's tag is a 2^128 preimage). recipient = H(DOM_OWN
-        // ‖ nk0 ‖ nk1 ‖ d).
-        let own = p[P_OWN_IN].clone();
-        builder.assert_zero(own.clone() * (cur[0].clone() - dom_own.clone()));
-        builder.assert_zero(own.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(own.clone() * (cur[2].clone() - cur[NK1].clone()));
-        for i in 4..8 {
-            builder.assert_zero(own.clone() * cur[i].clone());
-        }
+    // ---- global value accumulator: +in (commit), −out, −fee ⇒ 0 ----
+    builder.assert_zero(p[P_ROW0].clone() * cur[VALACC].clone());
+    let acc_delta = (p[P_COMMIT_A_IN].clone() + p[P_MINT_IN].clone()
+        - p[P_OUT_A_IN].clone()
+        - p[P_FEE_IN].clone())
+        * cur[VAL].clone();
+    builder
+        .when_transition()
+        .assert_zero(nxt[VALACC].clone() - cur[VALACC].clone() - acc_delta);
+    builder.assert_zero(p[P_FINAL].clone() * cur[VALACC].clone()); // balance: Σin = Σout + fee
 
-        // ---- owner binding (note_type-gated) ----
-        // NT is boolean (PLAIN=0 / HTLC=1).
-        builder.assert_zero(p[P_OWN_IN].clone() * cur[NT].clone() * (cur[NT].clone() - one.clone()));
-        let nt = cur[NT].clone();
-        let not_htlc = one.clone() - nt.clone();
-        // PLAIN: OWNER == own.out (the recipient digest) at the ownership output.
-        let rl = p[P_RECIP_LINK].clone();
+    // ---- range: rem=VAL at seed, rem=2·rem'+rbit (rbit boolean), rem=0 at close (A3) ----
+    builder.assert_zero(p[P_RANGE_SEED].clone() * (cur[REM].clone() - cur[VAL].clone()));
+    let ra = p[P_RANGE_ACTIVE].clone();
+    builder.when_transition().assert_zero(
+        ra.clone() * (cur[REM].clone() - (two.clone() * nxt[REM].clone() + cur[RBIT].clone())),
+    );
+    builder
+        .when_transition()
+        .assert_zero(ra.clone() * (cur[RBIT].clone() * (one.clone() - cur[RBIT].clone())));
+    builder.assert_zero(p[P_RANGE_CLOSE].clone() * cur[REM].clone());
+
+    // ---- ownership input: [DOM_OWN, nk0, nk1, d, 0,0,0,0] ----
+    // `d` (lane 3) is the diversifier — a FREE input: the spender uses the note's actual
+    // diversifier (else the recomputed recipient → cm won't be in the tree), so no extra
+    // constraint is needed (matching someone else's tag is a 2^128 preimage). recipient = H(DOM_OWN
+    // ‖ nk0 ‖ nk1 ‖ d).
+    let own = p[P_OWN_IN].clone();
+    builder.assert_zero(own.clone() * (cur[0].clone() - dom_own.clone()));
+    builder.assert_zero(own.clone() * (cur[1].clone() - cur[NK].clone()));
+    builder.assert_zero(own.clone() * (cur[2].clone() - cur[NK1].clone()));
+    for i in 4..8 {
+        builder.assert_zero(own.clone() * cur[i].clone());
+    }
+
+    // ---- owner binding (note_type-gated) ----
+    // NT is boolean (PLAIN=0 / HTLC=1).
+    builder.assert_zero(p[P_OWN_IN].clone() * cur[NT].clone() * (cur[NT].clone() - one.clone()));
+    let nt = cur[NT].clone();
+    let not_htlc = one.clone() - nt.clone();
+    // PLAIN: OWNER == own.out (the recipient digest) at the ownership output.
+    let rl = p[P_RECIP_LINK].clone();
+    for k in 0..DIGEST {
+        builder.assert_zero(
+            rl.clone() * not_htlc.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()),
+        );
+    }
+    // HTLC: OWNER == htlc_root (= htlc block 3 output) at the htlc_root row.
+    let hr = p[P_HTLC_ROOT].clone();
+    for k in 0..DIGEST {
+        builder.assert_zero(hr.clone() * nt.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()));
+    }
+    // ---- htlc_root chain: MD-chain(DOM_HTLC ‖ redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout) binds
+    //      all four HTLC terms into the committed owner (else cm wouldn't be in the tree). ----
+    let h0 = p[P_HTLC_IN0].clone();
+    builder.assert_zero(h0.clone() * (cur[0].clone() - dom_htlc.clone())); // block 0 lane0 = DOM_HTLC
+    for k in 1..DIGEST {
+        builder.assert_zero(h0.clone() * cur[k].clone()); // capacity lanes 1..4 = 0 (redeem_tag in lanes 4..8)
+    }
+    let hl = p[P_HTLC_LINK].clone();
+    for k in 0..DIGEST {
+        builder
+            .when_transition()
+            .assert_zero(hl.clone() * (nxt[k].clone() - cur[k].clone())); // chain out[0..4] → next in[0..4]
+    }
+    let h3 = p[P_HTLC_IN3].clone();
+    for k in (DIGEST + 1)..8 {
+        builder.assert_zero(h3.clone() * cur[k].clone()); // block 3 capacity lanes 5,6,7 = 0 (timeout in lane 4)
+    }
+
+    // ---- claim tag + HTLC tag-match (access control: who may spend the HTLC note) ----
+    // CLAIM == own.out = H(DOM_OWN ‖ nk ‖ div), the claiming party's tag (all notes).
+    for k in 0..DIGEST {
+        builder.assert_zero(rl.clone() * (cur[CLAIM0 + k].clone() - cur[k].clone()));
+    }
+    // MODE boolean (redeem=1 / refund=0).
+    let mode = cur[MODE].clone();
+    builder.assert_zero(own.clone() * mode.clone() * (mode.clone() - one.clone()));
+    // HTLC tag-match: the claiming party must own the mode-selected party tag. redeem_tag is block 0
+    // input lanes 4..8 (gated by MODE); refund_tag is block 1 input lanes 4..8 (gated by 1-MODE).
+    for k in 0..DIGEST {
+        builder.assert_zero(
+            h0.clone()
+                * nt.clone()
+                * mode.clone()
+                * (cur[DIGEST + k].clone() - cur[CLAIM0 + k].clone()),
+        );
+    }
+    let h1 = p[P_HTLC_IN1].clone();
+    for k in 0..DIGEST {
+        builder.assert_zero(
+            h1.clone()
+                * nt.clone()
+                * (one.clone() - mode.clone())
+                * (cur[DIGEST + k].clone() - cur[CLAIM0 + k].clone()),
+        );
+    }
+    // HTLC redeem: the note's hashlock (block 2 input lanes 4..8) == public redeem_hashlock =
+    // SHA256(preimage). The cross-chain atomic link — the node checks the revealed preimage hashes
+    // to it. Bound only on redeem (refund needs no preimage).
+    let h2 = p[P_HTLC_IN2].clone();
+    for k in 0..DIGEST {
+        builder.assert_zero(
+            h2.clone()
+                * nt.clone()
+                * mode.clone()
+                * (cur[DIGEST + k].clone() - statement[PI_HASHLOCK + k].clone()),
+        );
+    }
+    // ---- redeem hashlock-nonzero backstop (audit r3): on a redeem, PI_HASHLOCK must be ≠ 0 ----
+    // HLPROD = Π_k (1 − PI_HASHLOCK[k]·HLINV_k); it is 0 iff some limb is invertible (non-zero).
+    // Defined at the htlc block-2 rows (degree 9, keeps log_quotient_degree=3), then required to be 0
+    // on the redeem path (degree 4). A zero hashlock makes every factor 1 ⇒ HLPROD=1 ⇒ rejected, so a
+    // maliciously-locked zero hashlock can't be redeemed with a null preimage (consensus backstop to
+    // the wallet/await_lock guards).
+    let mut hlprod = one.clone();
+    for k in 0..DIGEST {
+        hlprod =
+            hlprod * (one.clone() - statement[PI_HASHLOCK + k].clone() * cur[HLINV0 + k].clone());
+    }
+    builder.assert_zero(h2.clone() * (cur[HLPROD].clone() - hlprod));
+    builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * cur[HLPROD].clone());
+
+    // ---- HTLC timeout compare (range argument on current_height vs the committed timeout) ----
+    // TIMEOUT == htlc block 3 input lane 4 (the committed timeout).
+    builder.assert_zero(h3.clone() * (cur[TIMEOUT].clone() - cur[DIGEST].clone()));
+    // Range seeds: REM = TIMEOUT, REM = DIFF (the generic REM decomposition + REM=0 close come from
+    // the shared P_RANGE_ACTIVE / P_RANGE_CLOSE, whose windows were extended to cover the htlc
+    // region) ⇒ TIMEOUT, DIFF ∈ [0, 2^BITS).
+    builder.assert_zero(p[P_TO_SEED].clone() * (cur[REM].clone() - cur[TIMEOUT].clone()));
+    builder.assert_zero(p[P_DIFF_SEED].clone() * (cur[REM].clone() - cur[DIFF].clone()));
+    // DIFF compute (HTLC only): redeem ⇒ timeout-height-1 ; refund ⇒ height-timeout. With TIMEOUT,
+    // DIFF, **and** current_height all range-bounded < 2^BITS (the height window just below), DIFF ≥ 0
+    // holds iff the timeout window does — redeem ⟺ height < timeout, refund ⟺ height ≥ timeout.
+    let height = statement[PI_HEIGHT].clone();
+    let redeem_diff = cur[TIMEOUT].clone() - height.clone() - one.clone();
+    let refund_diff = height.clone() - cur[TIMEOUT].clone();
+    let diff_expr = mode.clone() * redeem_diff + (one.clone() - mode.clone()) * refund_diff;
+    builder.assert_zero(p[P_DIFF_SEED].clone() * nt.clone() * (cur[DIFF].clone() - diff_expr));
+    // v3 hardening (defense-in-depth — the node also pins/bounds height in applyHtlc): range-check
+    // the public current_height in-circuit (REM = height at its seed; shared decomposition + REM=0
+    // close), so the timeout compare is sound WITHOUT trusting the node for height < 2^BITS — closing
+    // the wrap-around forgery where a near-p height makes a refund DIFF spuriously small.
+    builder
+        .assert_zero(p[P_HEIGHT_SEED].clone() * (cur[REM].clone() - statement[PI_HEIGHT].clone()));
+    // v3 hardening (defense-in-depth — the node also rejects mint ≠ 0 in applyHtlc): an HTLC spend
+    // never issues, so force mint = 0 in-circuit. Without this, the htlc_air verifier (reused in any
+    // context) would accept a value-inflating mint > 0.
+    builder.assert_zero(statement[PI_MINT].clone());
+
+    // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
+    let ca = p[P_COMMIT_A_IN].clone();
+    builder.assert_zero(ca.clone() * (cur[0].clone() - dom_cm.clone()));
+    for k in 0..DIGEST {
+        builder.assert_zero(ca.clone() * (cur[1 + k].clone() - cur[OWNER0 + k].clone()));
+        // owner lanes
+    }
+    builder.assert_zero(ca.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // value (lane 5)
+    builder.assert_zero(ca.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone())); // rho0  (lane 6)
+    builder.assert_zero(ca.clone() * (cur[3 + DIGEST].clone() - cur[RHO1].clone())); // rho1 (lane 7)
+
+    // ---- chain link: commit_b.in[0..4] = commit_a.out[0..4] (also out_b ← out_a) ----
+    let cl = p[P_CHAIN_LINK].clone();
+    for k in 0..DIGEST {
+        builder
+            .when_transition()
+            .assert_zero(cl.clone() * (nxt[k].clone() - cur[k].clone()));
+    }
+
+    // ---- commit_b input: [chain(4), rcm0, rcm1, 0, 0] — pad lanes 6,7 pinned to 0 (rcm free) ----
+    let cb = p[P_COMMIT_B].clone();
+    builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone())); // lane 6 = hidden asset id (in & out)
+                                                                                      // lane 7 = note_type: bound to NT for INPUT commitments (the spend gates on it); free for
+                                                                                      // outputs (part of the recipient's note, like out_recipient / out_rho).
+    builder.assert_zero(p[P_IN_COMMIT_B].clone() * (cur[DIGEST + 3].clone() - cur[NT].clone()));
+
+    // ---- membership links: place running digest (= commit_b output) by the bit ----
+    let ml = p[P_MEM_LINK].clone();
+    for k in 0..DIGEST {
+        let placed = (one.clone() - bit.clone()) * (nxt[k].clone() - cur[k].clone())
+            + bit.clone() * (nxt[DIGEST + k].clone() - cur[k].clone());
+        builder.when_transition().assert_zero(ml.clone() * placed);
+    }
+    builder
+        .when_transition()
+        .assert_zero(ml.clone() * (bit.clone() * (one.clone() - bit.clone())));
+
+    // ---- root: every input folds to the shared public anchor ----
+    let pr = p[P_ROOT].clone();
+    for k in 0..DIGEST {
+        builder.assert_zero(pr.clone() * (cur[k].clone() - statement[PI_ANCHOR + k].clone()));
+    }
+
+    // ---- nullifier input (A1: pos = pos_acc), note_type-gated ----
+    // PLAIN: [DOM_NF, nk0, nk1, rho0, rho1, pos, 0, 0]
+    // HTLC : [DOM_NF_HTLC, owner(4), rho0, rho1, pos]  — owner-based ⇒ mode/party-independent, so
+    //        one HTLC note has exactly one nullifier across redeem and refund (no double-spend).
+    let ni = p[P_NULL_IN].clone();
+    let nip = ni.clone() * not_htlc.clone();
+    builder.assert_zero(nip.clone() * (cur[0].clone() - dom_nf.clone()));
+    builder.assert_zero(nip.clone() * (cur[1].clone() - cur[NK].clone()));
+    builder.assert_zero(nip.clone() * (cur[2].clone() - cur[NK1].clone()));
+    builder.assert_zero(nip.clone() * (cur[3].clone() - cur[RHO].clone()));
+    builder.assert_zero(nip.clone() * (cur[4].clone() - cur[RHO1].clone()));
+    builder.assert_zero(nip.clone() * (cur[5].clone() - cur[POSACC].clone()));
+    builder.assert_zero(nip.clone() * cur[6].clone());
+    builder.assert_zero(nip.clone() * cur[7].clone());
+    let nih = ni.clone() * nt.clone();
+    builder.assert_zero(nih.clone() * (cur[0].clone() - dom_nf_htlc.clone()));
+    for k in 0..DIGEST {
+        builder.assert_zero(nih.clone() * (cur[1 + k].clone() - cur[OWNER0 + k].clone()));
+    }
+    builder.assert_zero(nih.clone() * (cur[1 + DIGEST].clone() - cur[RHO].clone()));
+    builder.assert_zero(nih.clone() * (cur[2 + DIGEST].clone() - cur[RHO1].clone()));
+    builder.assert_zero(nih.clone() * (cur[3 + DIGEST].clone() - cur[POSACC].clone()));
+    // ---- nullifier output: per-input public nf_i ----
+    for i in 0..N_IN {
+        let sel = p[P_NULLOUT + i].clone();
         for k in 0..DIGEST {
-            builder.assert_zero(rl.clone() * not_htlc.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()));
+            builder.assert_zero(
+                sel.clone() * (cur[k].clone() - statement[PI_NF + i * DIGEST + k].clone()),
+            );
         }
-        // HTLC: OWNER == htlc_root (= htlc block 3 output) at the htlc_root row.
-        let hr = p[P_HTLC_ROOT].clone();
-        for k in 0..DIGEST {
-            builder.assert_zero(hr.clone() * nt.clone() * (cur[OWNER0 + k].clone() - cur[k].clone()));
-        }
-        // ---- htlc_root chain: MD-chain(DOM_HTLC ‖ redeem_tag ‖ refund_tag ‖ hashlock ‖ timeout) binds
-        //      all four HTLC terms into the committed owner (else cm wouldn't be in the tree). ----
-        let h0 = p[P_HTLC_IN0].clone();
-        builder.assert_zero(h0.clone() * (cur[0].clone() - dom_htlc.clone())); // block 0 lane0 = DOM_HTLC
-        for k in 1..DIGEST {
-            builder.assert_zero(h0.clone() * cur[k].clone()); // capacity lanes 1..4 = 0 (redeem_tag in lanes 4..8)
-        }
-        let hl = p[P_HTLC_LINK].clone();
-        for k in 0..DIGEST {
-            builder.when_transition().assert_zero(hl.clone() * (nxt[k].clone() - cur[k].clone())); // chain out[0..4] → next in[0..4]
-        }
-        let h3 = p[P_HTLC_IN3].clone();
-        for k in (DIGEST + 1)..8 {
-            builder.assert_zero(h3.clone() * cur[k].clone()); // block 3 capacity lanes 5,6,7 = 0 (timeout in lane 4)
-        }
+    }
 
-        // ---- claim tag + HTLC tag-match (access control: who may spend the HTLC note) ----
-        // CLAIM == own.out = H(DOM_OWN ‖ nk ‖ div), the claiming party's tag (all notes).
+    // ---- output commit_a: [DOM_CM, out_recipient(free), out_value, out_rho0/1(free)] ----
+    // (out_b chain-link + pad lanes are covered by P_CHAIN_LINK / P_COMMIT_B above.)
+    let oa = p[P_OUT_A_IN].clone();
+    builder.assert_zero(oa.clone() * (cur[0].clone() - dom_cm.clone()));
+    builder.assert_zero(oa.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // out_value (lane 5)
+                                                                                    // ---- output-commitment output (out_b): per-output public out_cm_j ----
+    for j in 0..M_OUT {
+        let sel = p[P_OUTOUT + j].clone();
         for k in 0..DIGEST {
-            builder.assert_zero(rl.clone() * (cur[CLAIM0 + k].clone() - cur[k].clone()));
+            builder.assert_zero(
+                sel.clone() * (cur[k].clone() - statement[PI_OUTCM + j * DIGEST + k].clone()),
+            );
         }
-        // MODE boolean (redeem=1 / refund=0).
-        let mode = cur[MODE].clone();
-        builder.assert_zero(own.clone() * mode.clone() * (mode.clone() - one.clone()));
-        // HTLC tag-match: the claiming party must own the mode-selected party tag. redeem_tag is block 0
-        // input lanes 4..8 (gated by MODE); refund_tag is block 1 input lanes 4..8 (gated by 1-MODE).
-        for k in 0..DIGEST {
-            builder.assert_zero(h0.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - cur[CLAIM0 + k].clone()));
-        }
-        let h1 = p[P_HTLC_IN1].clone();
-        for k in 0..DIGEST {
-            builder.assert_zero(h1.clone() * nt.clone() * (one.clone() - mode.clone()) * (cur[DIGEST + k].clone() - cur[CLAIM0 + k].clone()));
-        }
-        // HTLC redeem: the note's hashlock (block 2 input lanes 4..8) == public redeem_hashlock =
-        // SHA256(preimage). The cross-chain atomic link — the node checks the revealed preimage hashes
-        // to it. Bound only on redeem (refund needs no preimage).
-        let h2 = p[P_HTLC_IN2].clone();
-        for k in 0..DIGEST {
-            builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * (cur[DIGEST + k].clone() - statement[PI_HASHLOCK + k].clone()));
-        }
-        // ---- redeem hashlock-nonzero backstop (audit r3): on a redeem, PI_HASHLOCK must be ≠ 0 ----
-        // HLPROD = Π_k (1 − PI_HASHLOCK[k]·HLINV_k); it is 0 iff some limb is invertible (non-zero).
-        // Defined at the htlc block-2 rows (degree 9, keeps log_quotient_degree=3), then required to be 0
-        // on the redeem path (degree 4). A zero hashlock makes every factor 1 ⇒ HLPROD=1 ⇒ rejected, so a
-        // maliciously-locked zero hashlock can't be redeemed with a null preimage (consensus backstop to
-        // the wallet/await_lock guards).
-        let mut hlprod = one.clone();
-        for k in 0..DIGEST {
-            hlprod = hlprod * (one.clone() - statement[PI_HASHLOCK + k].clone() * cur[HLINV0 + k].clone());
-        }
-        builder.assert_zero(h2.clone() * (cur[HLPROD].clone() - hlprod));
-        builder.assert_zero(h2.clone() * nt.clone() * mode.clone() * cur[HLPROD].clone());
+    }
 
-        // ---- HTLC timeout compare (range argument on current_height vs the committed timeout) ----
-        // TIMEOUT == htlc block 3 input lane 4 (the committed timeout).
-        builder.assert_zero(h3.clone() * (cur[TIMEOUT].clone() - cur[DIGEST].clone()));
-        // Range seeds: REM = TIMEOUT, REM = DIFF (the generic REM decomposition + REM=0 close come from
-        // the shared P_RANGE_ACTIVE / P_RANGE_CLOSE, whose windows were extended to cover the htlc
-        // region) ⇒ TIMEOUT, DIFF ∈ [0, 2^BITS).
-        builder.assert_zero(p[P_TO_SEED].clone() * (cur[REM].clone() - cur[TIMEOUT].clone()));
-        builder.assert_zero(p[P_DIFF_SEED].clone() * (cur[REM].clone() - cur[DIFF].clone()));
-        // DIFF compute (HTLC only): redeem ⇒ timeout-height-1 ; refund ⇒ height-timeout. With TIMEOUT,
-        // DIFF, **and** current_height all range-bounded < 2^BITS (the height window just below), DIFF ≥ 0
-        // holds iff the timeout window does — redeem ⟺ height < timeout, refund ⟺ height ≥ timeout.
-        let height = statement[PI_HEIGHT].clone();
-        let redeem_diff = cur[TIMEOUT].clone() - height.clone() - one.clone();
-        let refund_diff = height.clone() - cur[TIMEOUT].clone();
-        let diff_expr = mode.clone() * redeem_diff + (one.clone() - mode.clone()) * refund_diff;
-        builder.assert_zero(p[P_DIFF_SEED].clone() * nt.clone() * (cur[DIFF].clone() - diff_expr));
-        // v3 hardening (defense-in-depth — the node also pins/bounds height in applyHtlc): range-check
-        // the public current_height in-circuit (REM = height at its seed; shared decomposition + REM=0
-        // close), so the timeout compare is sound WITHOUT trusting the node for height < 2^BITS — closing
-        // the wrap-around forgery where a near-p height makes a refund DIFF spuriously small.
-        builder.assert_zero(p[P_HEIGHT_SEED].clone() * (cur[REM].clone() - statement[PI_HEIGHT].clone()));
-        // v3 hardening (defense-in-depth — the node also rejects mint ≠ 0 in applyHtlc): an HTLC spend
-        // never issues, so force mint = 0 in-circuit. Without this, the htlc_air verifier (reused in any
-        // context) would accept a value-inflating mint > 0.
-        builder.assert_zero(statement[PI_MINT].clone());
+    // ---- fee region: VAL = public fee (range-checked like any value; A3) ----
+    builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - statement[PI_FEE].clone()));
 
-        // ---- commit_a input: [DOM_CM, OWNER(4), value, rho0, rho1] ----
-        let ca = p[P_COMMIT_A_IN].clone();
-        builder.assert_zero(ca.clone() * (cur[0].clone() - dom_cm.clone()));
-        for k in 0..DIGEST {
-            builder.assert_zero(ca.clone() * (cur[1 + k].clone() - cur[OWNER0 + k].clone())); // owner lanes
-        }
-        builder.assert_zero(ca.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // value (lane 5)
-        builder.assert_zero(ca.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone())); // rho0  (lane 6)
-        builder.assert_zero(ca.clone() * (cur[3 + DIGEST].clone() - cur[RHO1].clone())); // rho1 (lane 7)
+    // ---- mint region: VAL = public mint (issuance; range-checked; added to the balance) ----
+    builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - statement[PI_MINT].clone()));
 
-        // ---- chain link: commit_b.in[0..4] = commit_a.out[0..4] (also out_b ← out_a) ----
-        let cl = p[P_CHAIN_LINK].clone();
-        for k in 0..DIGEST {
-            builder.when_transition().assert_zero(cl.clone() * (nxt[k].clone() - cur[k].clone()));
-        }
-
-        // ---- commit_b input: [chain(4), rcm0, rcm1, 0, 0] — pad lanes 6,7 pinned to 0 (rcm free) ----
-        let cb = p[P_COMMIT_B].clone();
-        builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone())); // lane 6 = hidden asset id (in & out)
-        // lane 7 = note_type: bound to NT for INPUT commitments (the spend gates on it); free for
-        // outputs (part of the recipient's note, like out_recipient / out_rho).
-        builder.assert_zero(p[P_IN_COMMIT_B].clone() * (cur[DIGEST + 3].clone() - cur[NT].clone()));
-
-        // ---- membership links: place running digest (= commit_b output) by the bit ----
-        let ml = p[P_MEM_LINK].clone();
-        for k in 0..DIGEST {
-            let placed = (one.clone() - bit.clone()) * (nxt[k].clone() - cur[k].clone())
-                + bit.clone() * (nxt[DIGEST + k].clone() - cur[k].clone());
-            builder.when_transition().assert_zero(ml.clone() * placed);
-        }
-        builder.when_transition().assert_zero(ml.clone() * (bit.clone() * (one.clone() - bit.clone())));
-
-        // ---- root: every input folds to the shared public anchor ----
-        let pr = p[P_ROOT].clone();
-        for k in 0..DIGEST {
-            builder.assert_zero(pr.clone() * (cur[k].clone() - statement[PI_ANCHOR + k].clone()));
-        }
-
-        // ---- nullifier input (A1: pos = pos_acc), note_type-gated ----
-        // PLAIN: [DOM_NF, nk0, nk1, rho0, rho1, pos, 0, 0]
-        // HTLC : [DOM_NF_HTLC, owner(4), rho0, rho1, pos]  — owner-based ⇒ mode/party-independent, so
-        //        one HTLC note has exactly one nullifier across redeem and refund (no double-spend).
-        let ni = p[P_NULL_IN].clone();
-        let nip = ni.clone() * not_htlc.clone();
-        builder.assert_zero(nip.clone() * (cur[0].clone() - dom_nf.clone()));
-        builder.assert_zero(nip.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(nip.clone() * (cur[2].clone() - cur[NK1].clone()));
-        builder.assert_zero(nip.clone() * (cur[3].clone() - cur[RHO].clone()));
-        builder.assert_zero(nip.clone() * (cur[4].clone() - cur[RHO1].clone()));
-        builder.assert_zero(nip.clone() * (cur[5].clone() - cur[POSACC].clone()));
-        builder.assert_zero(nip.clone() * cur[6].clone());
-        builder.assert_zero(nip.clone() * cur[7].clone());
-        let nih = ni.clone() * nt.clone();
-        builder.assert_zero(nih.clone() * (cur[0].clone() - dom_nf_htlc.clone()));
-        for k in 0..DIGEST {
-            builder.assert_zero(nih.clone() * (cur[1 + k].clone() - cur[OWNER0 + k].clone()));
-        }
-        builder.assert_zero(nih.clone() * (cur[1 + DIGEST].clone() - cur[RHO].clone()));
-        builder.assert_zero(nih.clone() * (cur[2 + DIGEST].clone() - cur[RHO1].clone()));
-        builder.assert_zero(nih.clone() * (cur[3 + DIGEST].clone() - cur[POSACC].clone()));
-        // ---- nullifier output: per-input public nf_i ----
-        for i in 0..N_IN {
-            let sel = p[P_NULLOUT + i].clone();
-            for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_NF + i * DIGEST + k].clone()));
-            }
-        }
-
-        // ---- output commit_a: [DOM_CM, out_recipient(free), out_value, out_rho0/1(free)] ----
-        // (out_b chain-link + pad lanes are covered by P_CHAIN_LINK / P_COMMIT_B above.)
-        let oa = p[P_OUT_A_IN].clone();
-        builder.assert_zero(oa.clone() * (cur[0].clone() - dom_cm.clone()));
-        builder.assert_zero(oa.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // out_value (lane 5)
-        // ---- output-commitment output (out_b): per-output public out_cm_j ----
-        for j in 0..M_OUT {
-            let sel = p[P_OUTOUT + j].clone();
-            for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_OUTCM + j * DIGEST + k].clone()));
-            }
-        }
-
-        // ---- fee region: VAL = public fee (range-checked like any value; A3) ----
-        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - statement[PI_FEE].clone()));
-
-        // ---- mint region: VAL = public mint (issuance; range-checked; added to the balance) ----
-        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - statement[PI_MINT].clone()));
-
-        // tx_binding (statement[PI_TXBIND..]) is bound to the proof by Fiat–Shamir (observed public input).
+    // tx_binding (statement[PI_TXBIND..]) is bound to the proof by Fiat–Shamir (observed public input).
 }
 
 // --- trace + ZK config: the production family lives in crate::config (single audited source) ----
@@ -904,12 +1034,17 @@ pub fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         set_block(&mut t, base + 2, b);
         let mut node = commit(owner, value, inp.rho, inp.rcm, inp.asset, inp.note_type); // = perm(b)[..DIGEST]
         for d in 0..DEPTH {
-            let (l, r) = if inp.bits[d] { (inp.sib[d], node) } else { (node, inp.sib[d]) };
+            let (l, r) = if inp.bits[d] {
+                (inp.sib[d], node)
+            } else {
+                (node, inp.sib[d])
+            };
             let mut min = [Val::ZERO; 8];
             min[..DIGEST].copy_from_slice(&l);
             min[DIGEST..].copy_from_slice(&r);
             set_block(&mut t, base + 3 + d, min);
-            t[((base + 3 + d) * BLOCK) * WIDTH + BIT] = if inp.bits[d] { Val::ONE } else { Val::ZERO };
+            t[((base + 3 + d) * BLOCK) * WIDTH + BIT] =
+                if inp.bits[d] { Val::ONE } else { Val::ZERO };
             node = merge(l, r);
         }
         // nullifier block — PLAIN: [DOM_NF, nk0, nk1, rho0, rho1, pos]; HTLC: mode/party-independent
@@ -951,10 +1086,14 @@ pub fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
             fill_col(&mut t, lo, hi, CLAIM0 + k, recipient[k]); // claim tag = own.out (the spender's tag)
         }
         fill_col(&mut t, lo, hi, MODE, inp.mode); // redeem(1)/refund(0)
-        // HTLC timeout compare: TIMEOUT (committed), DIFF (redeem: timeout-height-1; refund:
-        // height-timeout; 0 for PLAIN), each range-decomposed via REM/RBIT in the free htlc region.
+                                                  // HTLC timeout compare: TIMEOUT (committed), DIFF (redeem: timeout-height-1; refund:
+                                                  // height-timeout; 0 for PLAIN), each range-decomposed via REM/RBIT in the free htlc region.
         let diff_value: u64 = if is_htlc {
-            if inp.mode == Val::from_u64(1) { inp.timeout - w.current_height - 1 } else { w.current_height - inp.timeout }
+            if inp.mode == Val::from_u64(1) {
+                inp.timeout - w.current_height - 1
+            } else {
+                w.current_height - inp.timeout
+            }
         } else {
             0
         };
@@ -962,11 +1101,14 @@ pub fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         fill_col(&mut t, lo, hi, DIFF, Val::from_u64(diff_value));
         fill_range(&mut t, htlc_block(i, 0) * BLOCK, inp.timeout); // TIMEOUT ∈ [0, 2^BITS)
         fill_range(&mut t, htlc_block(i, 2) * BLOCK, diff_value); // DIFF ∈ [0, 2^BITS)
-        // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
+                                                                  // pos_acc: cumulative Σ bit_d·2^d (jumps after each membership link; leaf = commit_b output)
         let mut acc = 0u64;
         let mut links: Vec<(usize, u64)> = Vec::new();
         for d in 0..DEPTH {
-            links.push(((base + 2 + d) * BLOCK + BLOCK - 1, if inp.bits[d] { 1u64 << d } else { 0 }));
+            links.push((
+                (base + 2 + d) * BLOCK + BLOCK - 1,
+                if inp.bits[d] { 1u64 << d } else { 0 },
+            ));
         }
         for r in lo..=hi {
             t[r * WIDTH + POSACC] = Val::from_u64(acc);
@@ -1087,7 +1229,6 @@ pub fn prove_verify(w: &Witness) -> Result<(), String> {
     prove_verify_with(w, &public_values(w))
 }
 
-
 /// Prove an HTLC spend and return canonical (postcard) proof bytes.
 pub fn prove_to_bytes(w: &Witness) -> Vec<u8> {
     crate::config::proof_to_bytes(&HtlcAir, build_trace(w), &public_values(w))
@@ -1109,7 +1250,11 @@ pub fn demo_witness() -> Witness {
     let cms: Vec<[Val; DIGEST]> = (0..N_IN)
         .map(|i| {
             commit(
-                recipient_of(Val::from_u64(nks[i][0]), Val::from_u64(nks[i][1]), in_div(i)),
+                recipient_of(
+                    Val::from_u64(nks[i][0]),
+                    Val::from_u64(nks[i][1]),
+                    in_div(i),
+                ),
                 Val::from_u64(in_values[i]),
                 in_rho(i),
                 in_rcm(i),
@@ -1136,14 +1281,25 @@ pub fn demo_witness() -> Witness {
         timeout: 0,
     });
     let outputs = core::array::from_fn(|j| Output {
-        recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
+        recipient: recipient_of(
+            Val::from_u64(77 + j as u64),
+            Val::from_u64(j as u64),
+            Val::from_u64(600 + j as u64),
+        ),
         asset,
         note_type: Val::ZERO,
         value: [900u64, 500][j],
         rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
         rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
     });
-    Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: 0 }
+    Witness {
+        inputs,
+        outputs,
+        fee: 100,
+        mint: 0,
+        tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+        current_height: 0,
+    }
 }
 
 /// A demo HTLC **redeem** witness (input 0 = an HTLC note redeemed before timeout by the redeem party;
@@ -1154,29 +1310,92 @@ pub fn demo_htlc_witness() -> Witness {
     let (nk_f, div_f) = ([9u64, 90u64], Val::from_u64(2));
     let redeem_tag = recipient_of(Val::from_u64(nk_r[0]), Val::from_u64(nk_r[1]), div_r);
     let refund_tag = recipient_of(Val::from_u64(nk_f[0]), Val::from_u64(nk_f[1]), div_f);
-    let hashlock = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+    let hashlock = [
+        Val::from_u64(0x51),
+        Val::from_u64(0x52),
+        Val::from_u64(0x53),
+        Val::from_u64(0x54),
+    ];
     let (timeout, height) = (10u64, 5u64);
     let owner = htlc_root(redeem_tag, refund_tag, hashlock, Val::from_u64(timeout));
-    let (v, rho, rcm) = (1000u64, [Val::from_u64(11), Val::from_u64(211)], [Val::from_u64(100), Val::from_u64(300)]);
-    let cm0 = commit(owner, Val::from_u64(v), rho, rcm, asset, Val::from_u64(NOTE_HTLC));
-    let (drho, drcm) = ([Val::from_u64(13), Val::from_u64(213)], [Val::from_u64(101), Val::from_u64(301)]);
+    let (v, rho, rcm) = (
+        1000u64,
+        [Val::from_u64(11), Val::from_u64(211)],
+        [Val::from_u64(100), Val::from_u64(300)],
+    );
+    let cm0 = commit(
+        owner,
+        Val::from_u64(v),
+        rho,
+        rcm,
+        asset,
+        Val::from_u64(NOTE_HTLC),
+    );
+    let (drho, drcm) = (
+        [Val::from_u64(13), Val::from_u64(213)],
+        [Val::from_u64(101), Val::from_u64(301)],
+    );
     let d_rcp = recipient_of(Val::from_u64(nk_r[0]), Val::from_u64(nk_r[1]), div_r);
     let cm1 = commit(d_rcp, Val::ZERO, drho, drcm, asset, Val::ZERO);
     let (_, paths) = build_paths(&[cm0, cm1]);
     let in0 = Input {
-        nk: nk_r, div: div_r, asset, note_type: Val::from_u64(NOTE_HTLC), value: v, rho, rcm,
-        sib: paths[0].0, bits: paths[0].1, mode: Val::from_u64(1), redeem_tag, refund_tag, hashlock, timeout,
+        nk: nk_r,
+        div: div_r,
+        asset,
+        note_type: Val::from_u64(NOTE_HTLC),
+        value: v,
+        rho,
+        rcm,
+        sib: paths[0].0,
+        bits: paths[0].1,
+        mode: Val::from_u64(1),
+        redeem_tag,
+        refund_tag,
+        hashlock,
+        timeout,
     };
     let in1 = Input {
-        nk: nk_r, div: div_r, asset, note_type: Val::ZERO, value: 0, rho: drho, rcm: drcm,
-        sib: paths[1].0, bits: paths[1].1, mode: Val::ZERO,
-        redeem_tag: [Val::ZERO; DIGEST], refund_tag: [Val::ZERO; DIGEST], hashlock: [Val::ZERO; DIGEST], timeout: 0,
+        nk: nk_r,
+        div: div_r,
+        asset,
+        note_type: Val::ZERO,
+        value: 0,
+        rho: drho,
+        rcm: drcm,
+        sib: paths[1].0,
+        bits: paths[1].1,
+        mode: Val::ZERO,
+        redeem_tag: [Val::ZERO; DIGEST],
+        refund_tag: [Val::ZERO; DIGEST],
+        hashlock: [Val::ZERO; DIGEST],
+        timeout: 0,
     };
     let outputs = [
-        Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: v, rho: [Val::from_u64(21), Val::from_u64(221)], rcm: [Val::from_u64(22), Val::from_u64(222)] },
-        Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 0, rho: [Val::from_u64(23), Val::from_u64(223)], rcm: [Val::from_u64(24), Val::from_u64(224)] },
+        Output {
+            recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)),
+            asset,
+            note_type: Val::ZERO,
+            value: v,
+            rho: [Val::from_u64(21), Val::from_u64(221)],
+            rcm: [Val::from_u64(22), Val::from_u64(222)],
+        },
+        Output {
+            recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)),
+            asset,
+            note_type: Val::ZERO,
+            value: 0,
+            rho: [Val::from_u64(23), Val::from_u64(223)],
+            rcm: [Val::from_u64(24), Val::from_u64(224)],
+        },
     ];
-    Witness { inputs: [in0, in1], outputs, fee: 0, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: height }
+    Witness {
+        inputs: [in0, in1],
+        outputs,
+        fee: 0,
+        mint: 0,
+        tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+        current_height: height,
+    }
 }
 
 /// (proof bytes, prove ms, verify ms, proven security bits) for a representative join-split.
@@ -1224,10 +1443,22 @@ mod tests {
         let rcm2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 300)];
         let asset = Val::from_u64(42); // single hidden asset for the tx
         let cmf = |v: &(u64, [u64; 2], u64, u64, u64)| {
-            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1]), Val::from_u64(v.4)), Val::from_u64(v.0), rho2(v.2), rcm2(v.3), asset, Val::ZERO)
+            commit(
+                recipient_of(
+                    Val::from_u64(v.1[0]),
+                    Val::from_u64(v.1[1]),
+                    Val::from_u64(v.4),
+                ),
+                Val::from_u64(v.0),
+                rho2(v.2),
+                rcm2(v.3),
+                asset,
+                Val::ZERO,
+            )
         };
         let (_, paths) = build_paths(&[cmf(&in0), cmf(&in1)]);
-        let mk_in = |v: (u64, [u64; 2], u64, u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
+        let mk_in = |v: (u64, [u64; 2], u64, u64, u64),
+                     pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
             nk: v.1,
             div: Val::from_u64(v.4),
             asset,
@@ -1245,11 +1476,32 @@ mod tests {
         };
         let inputs = [mk_in(in0, &paths[0]), mk_in(in1, &paths[1])];
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: 900, rho: rho2(21), rcm: rcm2(22) },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 500, rho: rho2(23), rcm: rcm2(24) },
+            Output {
+                recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)),
+                asset,
+                note_type: Val::ZERO,
+                value: 900,
+                rho: rho2(21),
+                rcm: rcm2(22),
+            },
+            Output {
+                recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)),
+                asset,
+                note_type: Val::ZERO,
+                value: 500,
+                rho: rho2(23),
+                rcm: rcm2(24),
+            },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
-        Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: 0 }
+        Witness {
+            inputs,
+            outputs,
+            fee: 100,
+            mint: 0,
+            tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+            current_height: 0,
+        }
     }
 
     #[test]
@@ -1323,19 +1575,31 @@ mod tests {
             timeout: 0,
         });
         let outputs = core::array::from_fn(|j| Output {
-            recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
+            recipient: recipient_of(
+                Val::from_u64(77 + j as u64),
+                Val::from_u64(j as u64),
+                Val::from_u64(600 + j as u64),
+            ),
             asset,
             note_type: Val::ZERO,
             value: out_values[j],
             rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
             rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
         });
-        Witness { inputs, outputs, fee, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: 0 }
+        Witness {
+            inputs,
+            outputs,
+            fee,
+            mint: 0,
+            tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+            current_height: 0,
+        }
     }
 
     #[test]
     fn joinsplit_verifies() {
-        prove_verify(&witness_with([1000, 500], [900, 500], 100)).expect("valid join-split should verify");
+        prove_verify(&witness_with([1000, 500], [900, 500], 100))
+            .expect("valid join-split should verify");
     }
 
     #[test]
@@ -1345,7 +1609,10 @@ mod tests {
         let w = witness_with([1000, 500], [900, 500], 100);
         let a = prove_to_bytes(&w);
         let b = prove_to_bytes(&w);
-        assert_ne!(a, b, "ZK proofs of the same statement must be re-randomized");
+        assert_ne!(
+            a, b,
+            "ZK proofs of the same statement must be re-randomized"
+        );
         // both still verify
         assert!(verify_bytes(&a, &public_values(&w)));
         assert!(verify_bytes(&b, &public_values(&w)));
@@ -1356,7 +1623,10 @@ mod tests {
         // Regression gate: a parameter edit (blowup/queries/grinding/trace size) must not silently drop
         // proven soundness below the ~103-bit budget (docs/soundness-budget.md). Computed without proving.
         let bits = proven_security_bits();
-        assert!(bits >= 100, "htlc_air proven soundness {bits} bits < 100-bit floor (parameter regression?)");
+        assert!(
+            bits >= 100,
+            "htlc_air proven soundness {bits} bits < 100-bit floor (parameter regression?)"
+        );
     }
 
     #[test]
@@ -1367,7 +1637,10 @@ mod tests {
         let mut w = witness_with([0, 0], [1000, 0], 0);
         w.mint = 1000; // Σin(0) + mint(1000) = Σout(1000) + fee(0) — balanced, but issuance is forbidden
         let proof = prove_to_bytes(&w);
-        assert!(!verify_bytes(&proof, &public_values(&w)), "HTLC mint>0 must be rejected (no issuance)");
+        assert!(
+            !verify_bytes(&proof, &public_values(&w)),
+            "HTLC mint>0 must be rejected (no issuance)"
+        );
     }
 
     #[test]
@@ -1384,7 +1657,8 @@ mod tests {
         // A 1-real-in / 1-real-out transaction, padded to the fixed 2-in/2-out shape with
         // zero-value dummy notes (Σin = 1000 = 900 + 100 = Σout + fee). This is how variable
         // (N, M) is supported without a variable-shape circuit.
-        prove_verify(&witness_with([1000, 0], [900, 0], 100)).expect("dummy-padded tx should verify");
+        prove_verify(&witness_with([1000, 0], [900, 0], 100))
+            .expect("dummy-padded tx should verify");
     }
 
     #[test]
@@ -1443,7 +1717,10 @@ mod tests {
         let b0 = [false; DEPTH];
         let mut b1 = [false; DEPTH];
         b1[0] = true;
-        assert_ne!(nullifier(nk0, nk1, rho, pos_of(&b0)), nullifier(nk0, nk1, rho, pos_of(&b1)));
+        assert_ne!(
+            nullifier(nk0, nk1, rho, pos_of(&b0)),
+            nullifier(nk0, nk1, rho, pos_of(&b1))
+        );
     }
 
     /// Robust "this corrupted trace must not yield a verifying proof" (debug: prove's constraint
@@ -1467,13 +1744,25 @@ mod tests {
         for limb in 0..4usize {
             let w = sample();
             let mut trace = build_trace(&w);
-            let (nk0, nk1) = (Val::from_u64(w.inputs[0].nk[0]), Val::from_u64(w.inputs[0].nk[1]));
+            let (nk0, nk1) = (
+                Val::from_u64(w.inputs[0].nk[0]),
+                Val::from_u64(w.inputs[0].nk[1]),
+            );
             let mut vals = [nk0, nk1, w.inputs[0].rho[0], w.inputs[0].rho[1]];
             let pos = pos_of(&w.inputs[0].bits);
             vals[limb] += Val::ONE; // bump the limb the nullifier consumes
-            // rewrite input 0's nullifier block to bind the bumped limb (commitment/ownership keep the
-            // real value, so cm/anchor still verify); make the local nullifier binding hold.
-            let nin = [Val::from_u64(DOM_NF), vals[0], vals[1], vals[2], vals[3], pos, Val::ZERO, Val::ZERO];
+                                    // rewrite input 0's nullifier block to bind the bumped limb (commitment/ownership keep the
+                                    // real value, so cm/anchor still verify); make the local nullifier binding hold.
+            let nin = [
+                Val::from_u64(DOM_NF),
+                vals[0],
+                vals[1],
+                vals[2],
+                vals[3],
+                pos,
+                Val::ZERO,
+                Val::ZERO,
+            ];
             set_block(&mut trace.values, null_block(0), nin);
             for r in null_in_row(0)..=null_out_row(0) {
                 trace.values[r * WIDTH + cols[limb]] = vals[limb];
@@ -1481,7 +1770,10 @@ mod tests {
             let mut pis = public_values(&w);
             let nfp = nullifier(vals[0], vals[1], [vals[2], vals[3]], pos);
             pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&nfp);
-            assert!(corrupt_trace_rejected(trace, pis), "forged nullifier limb {limb} must not verify");
+            assert!(
+                corrupt_trace_rejected(trace, pis),
+                "forged nullifier limb {limb} must not verify"
+            );
         }
     }
 
@@ -1497,7 +1789,10 @@ mod tests {
         // public inputs unchanged: the forged chain breaks the chain-link (and downstream cm), which
         // must make the proof unverifiable regardless of the published statement.
         let pis = public_values(&w);
-        assert!(corrupt_trace_rejected(trace, pis), "a forged commitment chaining value must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "a forged commitment chaining value must not verify"
+        );
     }
 
     /// The hidden-asset binding must be non-vacuous: a prover must not turn the inputs' asset into a
@@ -1509,7 +1804,7 @@ mod tests {
         let mut trace = build_trace(&w);
         let out0 = w.outputs[0];
         let alt = out0.asset + Val::ONE; // a different asset for the output
-        // recompute output 0's commit_b (out_a output = chain; lane6 = forged asset).
+                                         // recompute output 0's commit_b (out_a output = chain; lane6 = forged asset).
         let mut oa = [Val::ZERO; 8];
         oa[0] = Val::from_u64(DOM_CM);
         oa[1..1 + DIGEST].copy_from_slice(&out0.recipient);
@@ -1527,48 +1822,118 @@ mod tests {
         let new_cm: [Val; DIGEST] = native_permute(ob)[..DIGEST].try_into().unwrap();
         let mut pis = public_values(&w);
         pis[PI_OUTCM..PI_OUTCM + DIGEST].copy_from_slice(&new_cm);
-        assert!(corrupt_trace_rejected(trace, pis), "a mismatched output asset must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "a mismatched output asset must not verify"
+        );
     }
 
     // ---- HTLC native-oracle tests (the spec the htlc_air AIR will be differential-tested against) ----
 
     /// Build a 2-in/2-out witness whose input 0 is an HTLC note (owner = htlc_root) claimed in
     /// `redeem`/refund mode at `height`, and input 1 a zero-value PLAIN dummy owned by the claimer.
-    pub(crate) fn htlc_witness(redeem: bool, height: u64, hashlock: [Val; DIGEST], timeout: u64) -> Witness {
+    pub(crate) fn htlc_witness(
+        redeem: bool,
+        height: u64,
+        hashlock: [Val; DIGEST],
+        timeout: u64,
+    ) -> Witness {
         let asset = Val::from_u64(42);
         let (nk_r, div_r) = ([7u64, 70u64], Val::from_u64(1));
         let (nk_f, div_f) = ([9u64, 90u64], Val::from_u64(2));
         let redeem_tag = recipient_of(Val::from_u64(nk_r[0]), Val::from_u64(nk_r[1]), div_r);
         let refund_tag = recipient_of(Val::from_u64(nk_f[0]), Val::from_u64(nk_f[1]), div_f);
         let owner = htlc_root(redeem_tag, refund_tag, hashlock, Val::from_u64(timeout));
-        let (v, rho, rcm) = (1000u64, [Val::from_u64(11), Val::from_u64(211)], [Val::from_u64(100), Val::from_u64(300)]);
-        let cm0 = commit(owner, Val::from_u64(v), rho, rcm, asset, Val::from_u64(NOTE_HTLC));
+        let (v, rho, rcm) = (
+            1000u64,
+            [Val::from_u64(11), Val::from_u64(211)],
+            [Val::from_u64(100), Val::from_u64(300)],
+        );
+        let cm0 = commit(
+            owner,
+            Val::from_u64(v),
+            rho,
+            rcm,
+            asset,
+            Val::from_u64(NOTE_HTLC),
+        );
         // claimer = redeem party (redeem) or refund party (refund); also owns the dummy input.
         let (cnk, cdiv) = if redeem { (nk_r, div_r) } else { (nk_f, div_f) };
-        let (drho, drcm) = ([Val::from_u64(13), Val::from_u64(213)], [Val::from_u64(101), Val::from_u64(301)]);
+        let (drho, drcm) = (
+            [Val::from_u64(13), Val::from_u64(213)],
+            [Val::from_u64(101), Val::from_u64(301)],
+        );
         let d_rcp = recipient_of(Val::from_u64(cnk[0]), Val::from_u64(cnk[1]), cdiv);
         let cm1 = commit(d_rcp, Val::ZERO, drho, drcm, asset, Val::ZERO);
         let (_, paths) = build_paths(&[cm0, cm1]);
         let in0 = Input {
-            nk: cnk, div: cdiv, asset, note_type: Val::from_u64(NOTE_HTLC), value: v, rho, rcm,
-            sib: paths[0].0, bits: paths[0].1, mode: Val::from_u64(redeem as u64),
-            redeem_tag, refund_tag, hashlock, timeout,
+            nk: cnk,
+            div: cdiv,
+            asset,
+            note_type: Val::from_u64(NOTE_HTLC),
+            value: v,
+            rho,
+            rcm,
+            sib: paths[0].0,
+            bits: paths[0].1,
+            mode: Val::from_u64(redeem as u64),
+            redeem_tag,
+            refund_tag,
+            hashlock,
+            timeout,
         };
         let in1 = Input {
-            nk: cnk, div: cdiv, asset, note_type: Val::ZERO, value: 0, rho: drho, rcm: drcm,
-            sib: paths[1].0, bits: paths[1].1, mode: Val::ZERO,
-            redeem_tag: [Val::ZERO; DIGEST], refund_tag: [Val::ZERO; DIGEST], hashlock: [Val::ZERO; DIGEST], timeout: 0,
+            nk: cnk,
+            div: cdiv,
+            asset,
+            note_type: Val::ZERO,
+            value: 0,
+            rho: drho,
+            rcm: drcm,
+            sib: paths[1].0,
+            bits: paths[1].1,
+            mode: Val::ZERO,
+            redeem_tag: [Val::ZERO; DIGEST],
+            refund_tag: [Val::ZERO; DIGEST],
+            hashlock: [Val::ZERO; DIGEST],
+            timeout: 0,
         };
         let outs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: v, rho: [Val::from_u64(21), Val::from_u64(221)], rcm: [Val::from_u64(22), Val::from_u64(222)] },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 0, rho: [Val::from_u64(23), Val::from_u64(223)], rcm: [Val::from_u64(24), Val::from_u64(224)] },
+            Output {
+                recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)),
+                asset,
+                note_type: Val::ZERO,
+                value: v,
+                rho: [Val::from_u64(21), Val::from_u64(221)],
+                rcm: [Val::from_u64(22), Val::from_u64(222)],
+            },
+            Output {
+                recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)),
+                asset,
+                note_type: Val::ZERO,
+                value: 0,
+                rho: [Val::from_u64(23), Val::from_u64(223)],
+                rcm: [Val::from_u64(24), Val::from_u64(224)],
+            },
         ];
-        Witness { inputs: [in0, in1], outputs: outs, fee: 0, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: height }
+        Witness {
+            inputs: [in0, in1],
+            outputs: outs,
+            fee: 0,
+            mint: 0,
+            tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+            current_height: height,
+        }
     }
 
     #[test]
     fn htlc_redeem_and_refund_native_ok() {
-        let hl = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+        let hl = [
+            Val::from_u64(0x51),
+            Val::from_u64(0x52),
+            Val::from_u64(0x53),
+            Val::from_u64(0x54),
+        ];
         // redeem before timeout, refund at/after timeout — both must satisfy the oracle.
         let r = native_outputs(&htlc_witness(true, 5, hl, 10));
         let f = native_outputs(&htlc_witness(false, 10, hl, 10));
@@ -1576,10 +1941,14 @@ mod tests {
         let owner = htlc_root(
             recipient_of(Val::from_u64(7), Val::from_u64(70), Val::from_u64(1)),
             recipient_of(Val::from_u64(9), Val::from_u64(90), Val::from_u64(2)),
-            hl, Val::from_u64(10),
+            hl,
+            Val::from_u64(10),
         );
         let pos = pos_of(&htlc_witness(true, 5, hl, 10).inputs[0].bits);
-        assert_eq!(r.nullifiers[0], nullifier_owner(owner, [Val::from_u64(11), Val::from_u64(211)], pos));
+        assert_eq!(
+            r.nullifiers[0],
+            nullifier_owner(owner, [Val::from_u64(11), Val::from_u64(211)], pos)
+        );
         let _ = f;
     }
 
@@ -1587,10 +1956,18 @@ mod tests {
     /// nullifier (mode/party-independent), so it can be spent at most once across both modes.
     #[test]
     fn htlc_nullifier_is_mode_independent() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let redeem = native_outputs(&htlc_witness(true, 5, hl, 10));
         let refund = native_outputs(&htlc_witness(false, 10, hl, 10));
-        assert_eq!(redeem.nullifiers[0], refund.nullifiers[0], "HTLC nullifier must not depend on mode/party");
+        assert_eq!(
+            redeem.nullifiers[0], refund.nullifiers[0],
+            "HTLC nullifier must not depend on mode/party"
+        );
     }
 
     /// Chain-level no-double-spend (the headline v3 property): a redeem AND a refund of the SAME htlc
@@ -1598,13 +1975,24 @@ mod tests {
     /// node's nullifier set rejects the second spend regardless of which window/party is used.
     #[test]
     fn htlc_redeem_and_refund_publish_the_same_nullifier() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let redeem = htlc_witness(true, 5, hl, 10);
         let refund = htlc_witness(false, 10, hl, 10);
         let rp = public_values(&redeem);
         let fp = public_values(&refund);
-        assert!(verify_bytes(&prove_to_bytes(&redeem), &rp), "redeem must verify");
-        assert!(verify_bytes(&prove_to_bytes(&refund), &fp), "refund must verify");
+        assert!(
+            verify_bytes(&prove_to_bytes(&redeem), &rp),
+            "redeem must verify"
+        );
+        assert!(
+            verify_bytes(&prove_to_bytes(&refund), &fp),
+            "refund must verify"
+        );
         assert_eq!(
             rp[PI_NF..PI_NF + DIGEST],
             fp[PI_NF..PI_NF + DIGEST],
@@ -1619,7 +2007,12 @@ mod tests {
     /// nullifier-input binding satisfied (nih.owner == OWNER column) so ONLY persistence can reject it.
     #[test]
     fn forged_htlc_owner_nullifier_is_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(true, 5, hl, 10); // input 0 = HTLC redeem
         let mut trace = build_trace(&w);
         let nr = null_in_row(0);
@@ -1630,7 +2023,16 @@ mod tests {
         let rho = w.inputs[0].rho;
         let pos = pos_of(&w.inputs[0].bits);
         owner[0] += Val::ONE; // forge a different owner at the nullifier row only
-        let nih = [Val::from_u64(DOM_NF_HTLC), owner[0], owner[1], owner[2], owner[3], rho[0], rho[1], pos];
+        let nih = [
+            Val::from_u64(DOM_NF_HTLC),
+            owner[0],
+            owner[1],
+            owner[2],
+            owner[3],
+            rho[0],
+            rho[1],
+            pos,
+        ];
         set_block(&mut trace.values, null_block(0), nih);
         for r in null_in_row(0)..=null_out_row(0) {
             trace.values[r * WIDTH + OWNER0] = owner[0]; // make nih.owner==OWNER hold ⇒ only persistence is left
@@ -1638,7 +2040,10 @@ mod tests {
         let mut pis = public_values(&w);
         let nfp = nullifier_owner(owner, rho, pos);
         pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&nfp);
-        assert!(corrupt_trace_rejected(trace, pis), "a forged HTLC owner-nullifier must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "a forged HTLC owner-nullifier must not verify"
+        );
     }
 
     /// In-circuit: an HTLC note (owner = htlc_root, owner-based nullifier) proves and verifies through
@@ -1646,13 +2051,23 @@ mod tests {
     /// the note_type-gated nullifier.
     #[test]
     fn htlc_redeem_air_verifies() {
-        let hl = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+        let hl = [
+            Val::from_u64(0x51),
+            Val::from_u64(0x52),
+            Val::from_u64(0x53),
+            Val::from_u64(0x54),
+        ];
         prove_verify(&htlc_witness(true, 5, hl, 10)).expect("HTLC redeem must verify in-circuit");
     }
 
     #[test]
     fn htlc_refund_air_verifies() {
-        let hl = [Val::from_u64(7), Val::from_u64(8), Val::from_u64(9), Val::from_u64(10)];
+        let hl = [
+            Val::from_u64(7),
+            Val::from_u64(8),
+            Val::from_u64(9),
+            Val::from_u64(10),
+        ];
         prove_verify(&htlc_witness(false, 10, hl, 10)).expect("HTLC refund must verify in-circuit");
     }
 
@@ -1662,7 +2077,12 @@ mod tests {
     /// owner-based, not mode/nk-based), so only the tag-match can reject — and it must.
     #[test]
     fn htlc_wrong_party_for_mode_is_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(false, 10, hl, 10); // refund: claimer = refund party, MODE=0
         let mut trace = build_trace(&w);
         let (lo, hi) = (own_in_row(0), span_last_row(0));
@@ -1670,19 +2090,30 @@ mod tests {
             trace.values[r * WIDTH + MODE] = Val::ONE; // claim the redeem branch with the refund party
         }
         let pis = public_values(&w);
-        assert!(corrupt_trace_rejected(trace, pis), "refund party must not pass the redeem tag-match");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "refund party must not pass the redeem tag-match"
+        );
     }
 
     /// Atomicity: a redeem must reveal the preimage of the committed hashlock. Prove a valid redeem,
     /// then verify against a wrong public redeem_hashlock — the hashlock binding must reject.
     #[test]
     fn htlc_redeem_wrong_hashlock_is_rejected() {
-        let hl = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
+        let hl = [
+            Val::from_u64(0x51),
+            Val::from_u64(0x52),
+            Val::from_u64(0x53),
+            Val::from_u64(0x54),
+        ];
         let w = htlc_witness(true, 5, hl, 10);
         let trace = build_trace(&w);
         let mut pis = public_values(&w);
         pis[PI_HASHLOCK] += Val::ONE; // a hashlock the revealed preimage does NOT hash to
-        assert!(corrupt_trace_rejected(trace, pis), "redeem with a wrong hashlock must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "redeem with a wrong hashlock must not verify"
+        );
     }
 
     /// Time-lock: redeem requires height < timeout. Prove a valid redeem (height 5 < timeout 10), then
@@ -1690,30 +2121,51 @@ mod tests {
     /// no longer matches the range-bounded DIFF, so it must reject.
     #[test]
     fn htlc_redeem_at_timeout_is_rejected_in_circuit() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(true, 5, hl, 10);
         let trace = build_trace(&w);
         let mut pis = public_values(&w);
         pis[PI_HEIGHT] = Val::from_u64(10); // height == timeout ⇒ redeem window closed
-        assert!(corrupt_trace_rejected(trace, pis), "redeem at/after timeout must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "redeem at/after timeout must not verify"
+        );
     }
 
     /// Time-lock: refund requires height >= timeout. Prove a valid refund (height 10 == timeout), then
     /// verify against current_height < timeout — must reject.
     #[test]
     fn htlc_refund_before_timeout_is_rejected_in_circuit() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(false, 10, hl, 10);
         let trace = build_trace(&w);
         let mut pis = public_values(&w);
         pis[PI_HEIGHT] = Val::from_u64(9); // height < timeout ⇒ refund window not open
-        assert!(corrupt_trace_rejected(trace, pis), "refund before timeout must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "refund before timeout must not verify"
+        );
     }
 
     /// Boundary: redeem at height = timeout-1 is the latest valid redeem (DIFF = 0).
     #[test]
     fn htlc_redeem_boundary_verifies() {
-        let hl = [Val::from_u64(5), Val::from_u64(6), Val::from_u64(7), Val::from_u64(8)];
+        let hl = [
+            Val::from_u64(5),
+            Val::from_u64(6),
+            Val::from_u64(7),
+            Val::from_u64(8),
+        ];
         prove_verify(&htlc_witness(true, 9, hl, 10)).expect("redeem at timeout-1 must verify");
     }
 
@@ -1723,29 +2175,64 @@ mod tests {
     /// in the DIFF compute; the range-check closes that.
     #[test]
     fn htlc_out_of_range_height_is_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         // refund (height ≥ timeout) with height = 2^BITS — native window OK, but height ∉ [0, 2^BITS).
         let w = htlc_witness(false, 1u64 << BITS, hl, 10);
         let proof = prove_to_bytes(&w);
-        assert!(!verify_bytes(&proof, &public_values(&w)), "current_height ≥ 2^BITS must be rejected");
+        assert!(
+            !verify_bytes(&proof, &public_values(&w)),
+            "current_height ≥ 2^BITS must be rejected"
+        );
     }
 
     #[test]
     fn htlc_root_binds_its_terms() {
         let a = recipient_of(Val::from_u64(7), Val::from_u64(70), Val::from_u64(1));
         let b = recipient_of(Val::from_u64(9), Val::from_u64(90), Val::from_u64(2));
-        let hl1 = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
-        let hl2 = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(5)];
-        assert_ne!(htlc_root(a, b, hl1, Val::from_u64(10)), htlc_root(a, b, hl2, Val::from_u64(10)), "hashlock must bind");
-        assert_ne!(htlc_root(a, b, hl1, Val::from_u64(10)), htlc_root(a, b, hl1, Val::from_u64(11)), "timeout must bind");
-        assert_ne!(htlc_root(a, b, hl1, Val::from_u64(10)), htlc_root(b, a, hl1, Val::from_u64(10)), "party order must bind");
+        let hl1 = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
+        let hl2 = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(5),
+        ];
+        assert_ne!(
+            htlc_root(a, b, hl1, Val::from_u64(10)),
+            htlc_root(a, b, hl2, Val::from_u64(10)),
+            "hashlock must bind"
+        );
+        assert_ne!(
+            htlc_root(a, b, hl1, Val::from_u64(10)),
+            htlc_root(a, b, hl1, Val::from_u64(11)),
+            "timeout must bind"
+        );
+        assert_ne!(
+            htlc_root(a, b, hl1, Val::from_u64(10)),
+            htlc_root(b, a, hl1, Val::from_u64(10)),
+            "party order must bind"
+        );
     }
 
     #[test]
     #[should_panic(expected = "claim does not match")]
     fn htlc_wrong_party_rejected() {
         // redeem mode but claim with the refund party's key ⇒ claim_tag != redeem_tag ⇒ oracle rejects.
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let mut w = htlc_witness(true, 5, hl, 10);
         w.inputs[0].nk = [9, 90]; // the refund party's nk, claiming the redeem branch
         w.inputs[0].div = Val::from_u64(2);
@@ -1755,14 +2242,24 @@ mod tests {
     #[test]
     #[should_panic(expected = "redeem requires height < timeout")]
     fn htlc_redeem_after_timeout_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let _ = native_outputs(&htlc_witness(true, 10, hl, 10)); // height == timeout, redeem ⇒ reject
     }
 
     #[test]
     #[should_panic(expected = "refund requires height >= timeout")]
     fn htlc_refund_before_timeout_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let _ = native_outputs(&htlc_witness(false, 9, hl, 10)); // height < timeout, refund ⇒ reject
     }
 
@@ -1786,15 +2283,35 @@ mod tests {
     #[ignore = "exhaustive audit suite (proves ~51 circuits, ~130s); run with `cargo test --release -- --ignored`"]
     fn persistent_columns_are_non_vacuous() {
         let cols: &[(&str, usize)] = &[
-            ("NK", NK), ("NK1", NK1), ("RHO", RHO), ("RHO1", RHO1), ("VAL", VAL), ("ASSET", ASSET),
-            ("OWNER0", OWNER0), ("OWNER1", OWNER0 + 1), ("OWNER2", OWNER0 + 2), ("OWNER3", OWNER0 + 3),
+            ("NK", NK),
+            ("NK1", NK1),
+            ("RHO", RHO),
+            ("RHO1", RHO1),
+            ("VAL", VAL),
+            ("ASSET", ASSET),
+            ("OWNER0", OWNER0),
+            ("OWNER1", OWNER0 + 1),
+            ("OWNER2", OWNER0 + 2),
+            ("OWNER3", OWNER0 + 3),
             ("NT", NT),
-            ("CLAIM0", CLAIM0), ("CLAIM1", CLAIM0 + 1), ("CLAIM2", CLAIM0 + 2), ("CLAIM3", CLAIM0 + 3),
-            ("MODE", MODE), ("TIMEOUT", TIMEOUT),
+            ("CLAIM0", CLAIM0),
+            ("CLAIM1", CLAIM0 + 1),
+            ("CLAIM2", CLAIM0 + 2),
+            ("CLAIM3", CLAIM0 + 3),
+            ("MODE", MODE),
+            ("TIMEOUT", TIMEOUT),
         ];
         let r0 = 5 * BLOCK + 7; // interior membership row of input 0's span — no block-local read here
-        assert!(r0 < HEIGHT && r0 < span_last_row(0), "interior probe row must be inside input 0's span");
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        assert!(
+            r0 < HEIGHT && r0 < span_last_row(0),
+            "interior probe row must be inside input 0's span"
+        );
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let cases: [(&str, Witness); 3] = [
             ("PLAIN", sample()),
             ("HTLC-redeem", htlc_witness(true, 5, hl, 10)),
@@ -1812,7 +2329,10 @@ mod tests {
                 }
             }
         }
-        assert!(failures.is_empty(), "VACUOUS persistence (corruption VERIFIED) for: {failures:?}");
+        assert!(
+            failures.is_empty(),
+            "VACUOUS persistence (corruption VERIFIED) for: {failures:?}"
+        );
     }
 
     // index-derived pseudo-randomness (splitmix64) — deterministic, NOT thread/OS rng.
@@ -1829,7 +2349,13 @@ mod tests {
     /// mode), output note_types, and tx_binding. Input 1 is a zero-value PLAIN dummy owned by the
     /// claimer (keeps balance trivial); input 0 carries the variation.
     fn rand_witness(s: u64) -> Witness {
-        let r = |k: u64| sm64(s.wrapping_mul(0x100000001B3).wrapping_add(k).wrapping_add(1));
+        let r = |k: u64| {
+            sm64(
+                s.wrapping_mul(0x100000001B3)
+                    .wrapping_add(k)
+                    .wrapping_add(1),
+            )
+        };
         let asset = Val::from_u64(1 + r(0) % 100_000);
         let is_htlc = (r(1) & 1) == 1;
         let redeem = (r(2) & 1) == 1;
@@ -1843,8 +2369,17 @@ mod tests {
         let claim = recipient_of(Val::from_u64(cnk[0]), Val::from_u64(cnk[1]), cdiv);
         let rho = [Val::from_u64(1 + r(9)), Val::from_u64(1 + r(10))];
         let rcm = [Val::from_u64(1 + r(11)), Val::from_u64(1 + r(12))];
-        let other = recipient_of(Val::from_u64(1 + r(13)), Val::from_u64(1 + r(14)), Val::from_u64(1 + r(15)));
-        let hashlock = [Val::from_u64(r(16)), Val::from_u64(r(17)), Val::from_u64(r(18)), Val::from_u64(r(19))];
+        let other = recipient_of(
+            Val::from_u64(1 + r(13)),
+            Val::from_u64(1 + r(14)),
+            Val::from_u64(1 + r(15)),
+        );
+        let hashlock = [
+            Val::from_u64(r(16)),
+            Val::from_u64(r(17)),
+            Val::from_u64(r(18)),
+            Val::from_u64(r(19)),
+        ];
         let timeout = 2 + r(20) % (1u64 << 30);
         let height = if !is_htlc {
             r(21) % (1u64 << 30)
@@ -1853,9 +2388,21 @@ mod tests {
         } else {
             timeout + (r(21) % (1u64 << 20)) // height >= timeout
         };
-        let (redeem_tag, refund_tag) = if redeem { (claim, other) } else { (other, claim) };
-        let nt0 = if is_htlc { Val::from_u64(NOTE_HTLC) } else { Val::ZERO };
-        let owner0 = if is_htlc { htlc_root(redeem_tag, refund_tag, hashlock, Val::from_u64(timeout)) } else { claim };
+        let (redeem_tag, refund_tag) = if redeem {
+            (claim, other)
+        } else {
+            (other, claim)
+        };
+        let nt0 = if is_htlc {
+            Val::from_u64(NOTE_HTLC)
+        } else {
+            Val::ZERO
+        };
+        let owner0 = if is_htlc {
+            htlc_root(redeem_tag, refund_tag, hashlock, Val::from_u64(timeout))
+        } else {
+            claim
+        };
         let cm0 = commit(owner0, Val::from_u64(v0), rho, rcm, asset, nt0);
         let drho = [Val::from_u64(1 + r(22)), Val::from_u64(1 + r(23))];
         let drcm = [Val::from_u64(1 + r(24)), Val::from_u64(1 + r(25))];
@@ -1863,8 +2410,15 @@ mod tests {
         let (_, paths) = build_paths(&[cm0, cm1]);
         let zero = [Val::ZERO; DIGEST];
         let in0 = Input {
-            nk: cnk, div: cdiv, asset, note_type: nt0, value: v0, rho, rcm,
-            sib: paths[0].0, bits: paths[0].1,
+            nk: cnk,
+            div: cdiv,
+            asset,
+            note_type: nt0,
+            value: v0,
+            rho,
+            rcm,
+            sib: paths[0].0,
+            bits: paths[0].1,
             mode: Val::from_u64(if is_htlc { redeem as u64 } else { 0 }),
             redeem_tag: if is_htlc { redeem_tag } else { zero },
             refund_tag: if is_htlc { refund_tag } else { zero },
@@ -1872,27 +2426,59 @@ mod tests {
             timeout: if is_htlc { timeout } else { 0 },
         };
         let in1 = Input {
-            nk: cnk, div: cdiv, asset, note_type: Val::ZERO, value: 0, rho: drho, rcm: drcm,
-            sib: paths[1].0, bits: paths[1].1, mode: Val::ZERO,
-            redeem_tag: zero, refund_tag: zero, hashlock: zero, timeout: 0,
+            nk: cnk,
+            div: cdiv,
+            asset,
+            note_type: Val::ZERO,
+            value: 0,
+            rho: drho,
+            rcm: drcm,
+            sib: paths[1].0,
+            bits: paths[1].1,
+            mode: Val::ZERO,
+            redeem_tag: zero,
+            refund_tag: zero,
+            hashlock: zero,
+            timeout: 0,
         };
-        let ont = |b: bool| if b { Val::from_u64(NOTE_HTLC) } else { Val::ZERO };
+        let ont = |b: bool| {
+            if b {
+                Val::from_u64(NOTE_HTLC)
+            } else {
+                Val::ZERO
+            }
+        };
         let outputs = [
             Output {
-                recipient: recipient_of(Val::from_u64(1 + r(26)), Val::from_u64(1 + r(27)), Val::from_u64(1 + r(28))),
-                asset, note_type: ont((r(29) & 1) == 1), value: out0,
+                recipient: recipient_of(
+                    Val::from_u64(1 + r(26)),
+                    Val::from_u64(1 + r(27)),
+                    Val::from_u64(1 + r(28)),
+                ),
+                asset,
+                note_type: ont((r(29) & 1) == 1),
+                value: out0,
                 rho: [Val::from_u64(1 + r(30)), Val::from_u64(1 + r(31))],
                 rcm: [Val::from_u64(1 + r(32)), Val::from_u64(1 + r(33))],
             },
             Output {
-                recipient: recipient_of(Val::from_u64(1 + r(34)), Val::from_u64(1 + r(35)), Val::from_u64(1 + r(36))),
-                asset, note_type: ont((r(37) & 1) == 1), value: out1,
+                recipient: recipient_of(
+                    Val::from_u64(1 + r(34)),
+                    Val::from_u64(1 + r(35)),
+                    Val::from_u64(1 + r(36)),
+                ),
+                asset,
+                note_type: ont((r(37) & 1) == 1),
+                value: out1,
                 rho: [Val::from_u64(1 + r(38)), Val::from_u64(1 + r(39))],
                 rcm: [Val::from_u64(1 + r(40)), Val::from_u64(1 + r(41))],
             },
         ];
         Witness {
-            inputs: [in0, in1], outputs, fee, mint: 0,
+            inputs: [in0, in1],
+            outputs,
+            fee,
+            mint: 0,
             tx_binding: core::array::from_fn(|i| Val::from_u64(1 + r(42 + i as u64))),
             current_height: height,
         }
@@ -1913,11 +2499,18 @@ mod tests {
         let mut plain_seen = 0u32;
         for s in 0..N_SAMPLES {
             let w = rand_witness(s);
-            if w.inputs[0].note_type == Val::from_u64(NOTE_HTLC) { htlc_seen += 1 } else { plain_seen += 1 }
+            if w.inputs[0].note_type == Val::from_u64(NOTE_HTLC) {
+                htlc_seen += 1
+            } else {
+                plain_seen += 1
+            }
             let pis = public_values(&w); // native oracle (panics if the witness is inconsistent)
             let trace = build_trace(&w);
             let proof = prove(&config, &HtlcAir, trace, &pis);
-            assert!(verify(&config, &HtlcAir, &proof, &pis).is_ok(), "sample {s}: AIR rejected a valid witness");
+            assert!(
+                verify(&config, &HtlcAir, &proof, &pis).is_ok(),
+                "sample {s}: AIR rejected a valid witness"
+            );
             for k in 0..pis.len() {
                 let mut bad = pis.clone();
                 bad[k] += Val::ONE;
@@ -1933,7 +2526,12 @@ mod tests {
     /// Part 3a — redeem/refund timeout WINDOW boundaries (in-circuit accept/reject).
     #[test]
     fn boundary_redeem_refund_windows() {
-        let hl = [Val::from_u64(5), Val::from_u64(6), Val::from_u64(7), Val::from_u64(8)];
+        let hl = [
+            Val::from_u64(5),
+            Val::from_u64(6),
+            Val::from_u64(7),
+            Val::from_u64(8),
+        ];
         // redeem valid at height = timeout-1, invalid at height = timeout.
         prove_verify(&htlc_witness(true, 9, hl, 10)).expect("redeem at timeout-1 must verify");
         {
@@ -1941,7 +2539,10 @@ mod tests {
             let trace = build_trace(&w);
             let mut pis = public_values(&w);
             pis[PI_HEIGHT] = Val::from_u64(10); // height == timeout
-            assert!(corrupt_trace_rejected(trace, pis), "redeem at height == timeout must be rejected");
+            assert!(
+                corrupt_trace_rejected(trace, pis),
+                "redeem at height == timeout must be rejected"
+            );
         }
         // refund valid at height = timeout, invalid at height = timeout-1.
         prove_verify(&htlc_witness(false, 10, hl, 10)).expect("refund at timeout must verify");
@@ -1950,7 +2551,10 @@ mod tests {
             let trace = build_trace(&w);
             let mut pis = public_values(&w);
             pis[PI_HEIGHT] = Val::from_u64(9); // height == timeout-1
-            assert!(corrupt_trace_rejected(trace, pis), "refund at height == timeout-1 must be rejected");
+            assert!(
+                corrupt_trace_rejected(trace, pis),
+                "refund at height == timeout-1 must be rejected"
+            );
         }
     }
 
@@ -1961,11 +2565,17 @@ mod tests {
     fn boundary_range_values() {
         let max = (1u64 << BITS) - 1;
         let over = 1u64 << BITS;
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
 
         // ---- value ----
         for v in [0u64, 1, max] {
-            prove_verify(&witness_with([v, 0], [v, 0], 0)).unwrap_or_else(|e| panic!("value {v} must verify: {e}"));
+            prove_verify(&witness_with([v, 0], [v, 0], 0))
+                .unwrap_or_else(|e| panic!("value {v} must verify: {e}"));
         }
         // 2^52: in-range outputs (2^51 each) keep the balance so ONLY the input range fails.
         assert!(
@@ -1975,7 +2585,8 @@ mod tests {
 
         // ---- fee ----
         for f in [0u64, 1, max] {
-            prove_verify(&witness_with([f, 0], [0, 0], f)).unwrap_or_else(|e| panic!("fee {f} must verify: {e}"));
+            prove_verify(&witness_with([f, 0], [0, 0], f))
+                .unwrap_or_else(|e| panic!("fee {f} must verify: {e}"));
         }
         // 2^52 fee, in-range inputs (2^51 each), zero outputs ⇒ only the fee range fails.
         assert!(
@@ -1986,7 +2597,8 @@ mod tests {
         // ---- timeout (HTLC) ----
         prove_verify(&htlc_witness(false, 0, hl, 0)).expect("timeout 0 (refund) must verify");
         prove_verify(&htlc_witness(false, 1, hl, 1)).expect("timeout 1 (refund) must verify");
-        prove_verify(&htlc_witness(false, max, hl, max)).expect("timeout 2^52-1 (refund) must verify");
+        prove_verify(&htlc_witness(false, max, hl, max))
+            .expect("timeout 2^52-1 (refund) must verify");
         // timeout 2^52 via REDEEM (height small & in-range, diff = timeout-height-1 < 2^52) ⇒ only the
         // TIMEOUT range check fails.
         assert!(
@@ -1997,12 +2609,16 @@ mod tests {
         // ---- current_height (HTLC) ----
         prove_verify(&htlc_witness(true, 0, hl, 10)).expect("height 0 (redeem) must verify");
         prove_verify(&htlc_witness(true, 1, hl, 10)).expect("height 1 (redeem) must verify");
-        prove_verify(&htlc_witness(false, max, hl, 10)).expect("height 2^52-1 (refund) must verify");
+        prove_verify(&htlc_witness(false, max, hl, 10))
+            .expect("height 2^52-1 (refund) must verify");
         // height 2^52: refund satisfies its window for any large height, but the in-circuit height
         // range-check must reject it (closes the field wrap-around forgery).
         {
             let w = htlc_witness(false, over, hl, 10);
-            assert!(!verify_bytes(&prove_to_bytes(&w), &public_values(&w)), "height 2^52 must be rejected");
+            assert!(
+                !verify_bytes(&prove_to_bytes(&w), &public_values(&w)),
+                "height 2^52 must be rejected"
+            );
         }
     }
 
@@ -2012,8 +2628,18 @@ mod tests {
     fn two_htlc_input_tx_verifies() {
         let asset = Val::from_u64(42);
         let (height, to0, to1) = (50u64, 100u64, 10u64); // in0 redeem (50<100), in1 refund (50>=10)
-        let hl0 = [Val::from_u64(0x51), Val::from_u64(0x52), Val::from_u64(0x53), Val::from_u64(0x54)];
-        let hl1 = [Val::from_u64(0x61), Val::from_u64(0x62), Val::from_u64(0x63), Val::from_u64(0x64)];
+        let hl0 = [
+            Val::from_u64(0x51),
+            Val::from_u64(0x52),
+            Val::from_u64(0x53),
+            Val::from_u64(0x54),
+        ];
+        let hl1 = [
+            Val::from_u64(0x61),
+            Val::from_u64(0x62),
+            Val::from_u64(0x63),
+            Val::from_u64(0x64),
+        ];
         // note 0: redeemed by party A; note 1: refunded by party B.
         let (nk0, div0) = ([7u64, 70u64], Val::from_u64(1));
         let (nk1, div1) = ([9u64, 90u64], Val::from_u64(2));
@@ -2027,29 +2653,93 @@ mod tests {
         let rho1 = [Val::from_u64(13), Val::from_u64(213)];
         let rcm0 = [Val::from_u64(100), Val::from_u64(300)];
         let rcm1 = [Val::from_u64(101), Val::from_u64(301)];
-        let cm0 = commit(owner0, Val::from_u64(v0), rho0, rcm0, asset, Val::from_u64(NOTE_HTLC));
-        let cm1 = commit(owner1, Val::from_u64(v1), rho1, rcm1, asset, Val::from_u64(NOTE_HTLC));
+        let cm0 = commit(
+            owner0,
+            Val::from_u64(v0),
+            rho0,
+            rcm0,
+            asset,
+            Val::from_u64(NOTE_HTLC),
+        );
+        let cm1 = commit(
+            owner1,
+            Val::from_u64(v1),
+            rho1,
+            rcm1,
+            asset,
+            Val::from_u64(NOTE_HTLC),
+        );
         let (_, paths) = build_paths(&[cm0, cm1]);
         let in0 = Input {
-            nk: nk0, div: div0, asset, note_type: Val::from_u64(NOTE_HTLC), value: v0, rho: rho0, rcm: rcm0,
-            sib: paths[0].0, bits: paths[0].1, mode: Val::from_u64(1),
-            redeem_tag: claim0, refund_tag: other, hashlock: hl0, timeout: to0,
+            nk: nk0,
+            div: div0,
+            asset,
+            note_type: Val::from_u64(NOTE_HTLC),
+            value: v0,
+            rho: rho0,
+            rcm: rcm0,
+            sib: paths[0].0,
+            bits: paths[0].1,
+            mode: Val::from_u64(1),
+            redeem_tag: claim0,
+            refund_tag: other,
+            hashlock: hl0,
+            timeout: to0,
         };
         let in1 = Input {
-            nk: nk1, div: div1, asset, note_type: Val::from_u64(NOTE_HTLC), value: v1, rho: rho1, rcm: rcm1,
-            sib: paths[1].0, bits: paths[1].1, mode: Val::from_u64(0),
-            redeem_tag: other, refund_tag: claim1, hashlock: hl1, timeout: to1,
+            nk: nk1,
+            div: div1,
+            asset,
+            note_type: Val::from_u64(NOTE_HTLC),
+            value: v1,
+            rho: rho1,
+            rcm: rcm1,
+            sib: paths[1].0,
+            bits: paths[1].1,
+            mode: Val::from_u64(0),
+            redeem_tag: other,
+            refund_tag: claim1,
+            hashlock: hl1,
+            timeout: to1,
         };
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, note_type: Val::ZERO, value: v0 + v1, rho: [Val::from_u64(21), Val::from_u64(221)], rcm: [Val::from_u64(22), Val::from_u64(222)] },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, note_type: Val::ZERO, value: 0, rho: [Val::from_u64(23), Val::from_u64(223)], rcm: [Val::from_u64(24), Val::from_u64(224)] },
+            Output {
+                recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)),
+                asset,
+                note_type: Val::ZERO,
+                value: v0 + v1,
+                rho: [Val::from_u64(21), Val::from_u64(221)],
+                rcm: [Val::from_u64(22), Val::from_u64(222)],
+            },
+            Output {
+                recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)),
+                asset,
+                note_type: Val::ZERO,
+                value: 0,
+                rho: [Val::from_u64(23), Val::from_u64(223)],
+                rcm: [Val::from_u64(24), Val::from_u64(224)],
+            },
         ];
-        let w = Witness { inputs: [in0, in1], outputs, fee: 0, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)), current_height: height };
+        let w = Witness {
+            inputs: [in0, in1],
+            outputs,
+            fee: 0,
+            mint: 0,
+            tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+            current_height: height,
+        };
         let pis = public_values(&w);
         // input 0 is a redeem ⇒ its hashlock is the published redeem_hashlock.
         assert_eq!(pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST], hl0[..]);
-        assert_ne!(pis[PI_NF..PI_NF + DIGEST], pis[PI_NF + DIGEST..PI_NF + 2 * DIGEST], "the two HTLC nullifiers must differ");
-        assert!(verify_bytes(&prove_to_bytes(&w), &pis), "a 2-HTLC-input tx (redeem + refund) must verify");
+        assert_ne!(
+            pis[PI_NF..PI_NF + DIGEST],
+            pis[PI_NF + DIGEST..PI_NF + 2 * DIGEST],
+            "the two HTLC nullifiers must differ"
+        );
+        assert!(
+            verify_bytes(&prove_to_bytes(&w), &pis),
+            "a 2-HTLC-input tx (redeem + refund) must verify"
+        );
     }
 
     /// Part 3d — an all-zero hashlock is a legitimate (if degenerate) hashlock: a redeem against it
@@ -2064,8 +2754,15 @@ mod tests {
         let zero_hl = [Val::ZERO; DIGEST];
         let w = htlc_witness(true, 5, zero_hl, 10);
         let pis = public_values(&w);
-        assert_eq!(pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST], zero_hl[..], "published redeem_hashlock is all-zero");
-        assert!(!verify_bytes(&prove_to_bytes(&w), &pis), "an all-zero hashlock redeem must be rejected (no-secret redeem)");
+        assert_eq!(
+            pis[PI_HASHLOCK..PI_HASHLOCK + DIGEST],
+            zero_hl[..],
+            "published redeem_hashlock is all-zero"
+        );
+        assert!(
+            !verify_bytes(&prove_to_bytes(&w), &pis),
+            "an all-zero hashlock redeem must be rejected (no-secret redeem)"
+        );
     }
 
     // ---- Part 4 — end-to-end forge / theft attempts (each MUST fail to verify) ----
@@ -2075,7 +2772,12 @@ mod tests {
     /// (commit_a lane 6 ↔ nullifier lane 5) must reject ⇒ a note cannot be double-spent.
     #[test]
     fn forge_htlc_second_nullifier_via_rho_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(true, 5, hl, 10);
         let mut trace = build_trace(&w);
         let nr = null_in_row(0);
@@ -2086,7 +2788,16 @@ mod tests {
         let rho0 = w.inputs[0].rho[0] + Val::ONE; // forged at the nullifier only
         let rho1 = w.inputs[0].rho[1];
         let pos = pos_of(&w.inputs[0].bits);
-        let nih = [Val::from_u64(DOM_NF_HTLC), owner[0], owner[1], owner[2], owner[3], rho0, rho1, pos];
+        let nih = [
+            Val::from_u64(DOM_NF_HTLC),
+            owner[0],
+            owner[1],
+            owner[2],
+            owner[3],
+            rho0,
+            rho1,
+            pos,
+        ];
         set_block(&mut trace.values, null_block(0), nih);
         for r in null_in_row(0)..=null_out_row(0) {
             trace.values[r * WIDTH + RHO] = rho0; // satisfy the local nih binding ⇒ only persistence is left
@@ -2094,7 +2805,10 @@ mod tests {
         let mut pis = public_values(&w);
         let nf = nullifier_owner(owner, [rho0, rho1], pos);
         pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&nf);
-        assert!(corrupt_trace_rejected(trace, pis), "a 2nd HTLC nullifier via a forged rho must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "a 2nd HTLC nullifier via a forged rho must not verify"
+        );
     }
 
     /// Theft: spend an HTLC note as if it were PLAIN (note_type = 0) to bypass the timeout / hashlock /
@@ -2102,14 +2816,22 @@ mod tests {
     /// PLAIN owner gate (OWNER == own.out recipient) fails (OWNER = htlc_root). Must reject.
     #[test]
     fn forge_spend_htlc_as_plain_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(true, 5, hl, 10);
         let mut trace = build_trace(&w);
         let (lo, hi) = (own_in_row(0), span_last_row(0));
         for r in lo..=hi {
             trace.values[r * WIDTH + NT] = Val::ZERO; // claim PLAIN to dodge the HTLC rules
         }
-        assert!(corrupt_trace_rejected(trace, public_values(&w)), "spending an HTLC note as PLAIN must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, public_values(&w)),
+            "spending an HTLC note as PLAIN must not verify"
+        );
     }
 
     /// Theft: redeem an HTLC note with a key that does NOT own the redeem_tag. Rewrite input 0's
@@ -2118,10 +2840,19 @@ mod tests {
     /// (CLAIM == redeem_tag, bound into the committed htlc_root) can reject — and it must.
     #[test]
     fn forge_wrong_key_redeem_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(true, 5, hl, 10);
         let mut trace = build_trace(&w);
-        let (bnk0, bnk1, bdiv) = (Val::from_u64(999_001), Val::from_u64(999_002), Val::from_u64(999_003));
+        let (bnk0, bnk1, bdiv) = (
+            Val::from_u64(999_001),
+            Val::from_u64(999_002),
+            Val::from_u64(999_003),
+        );
         let mut own = [Val::ZERO; 8];
         own[0] = Val::from_u64(DOM_OWN);
         own[1] = bnk0;
@@ -2137,41 +2868,68 @@ mod tests {
                 trace.values[r * WIDTH + CLAIM0 + k] = new_claim[k]; // CLAIM == own.out (recip-link holds)
             }
         }
-        assert!(corrupt_trace_rejected(trace, public_values(&w)), "redeem with a non-owning key must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, public_values(&w)),
+            "redeem with a non-owning key must not verify"
+        );
     }
 
     /// Theft: redeem well AFTER the timeout (height = 20, timeout = 10). The DIFF compute
     /// (mode·(timeout-height-1)) no longer matches the range-bounded DIFF column. Must reject.
     #[test]
     fn forge_redeem_after_timeout_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(true, 5, hl, 10);
         let trace = build_trace(&w);
         let mut pis = public_values(&w);
         pis[PI_HEIGHT] = Val::from_u64(20);
-        assert!(corrupt_trace_rejected(trace, pis), "redeem after timeout must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "redeem after timeout must not verify"
+        );
     }
 
     /// Theft: refund BEFORE the timeout (height = 3, timeout = 10). Symmetric to the above. Must reject.
     #[test]
     fn forge_refund_before_timeout_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(false, 10, hl, 10);
         let trace = build_trace(&w);
         let mut pis = public_values(&w);
         pis[PI_HEIGHT] = Val::from_u64(3);
-        assert!(corrupt_trace_rejected(trace, pis), "refund before timeout must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "refund before timeout must not verify"
+        );
     }
 
     /// Theft: claim issuance (mint > 0) on an HTLC spend to inflate value. The circuit forces
     /// pis[PI_MINT] == 0. Must reject.
     #[test]
     fn forge_mint_inflation_rejected() {
-        let hl = [Val::from_u64(1), Val::from_u64(2), Val::from_u64(3), Val::from_u64(4)];
+        let hl = [
+            Val::from_u64(1),
+            Val::from_u64(2),
+            Val::from_u64(3),
+            Val::from_u64(4),
+        ];
         let w = htlc_witness(true, 5, hl, 10);
         let trace = build_trace(&w);
         let mut pis = public_values(&w);
         pis[PI_MINT] += Val::ONE;
-        assert!(corrupt_trace_rejected(trace, pis), "mint > 0 on an HTLC spend must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "mint > 0 on an HTLC spend must not verify"
+        );
     }
 }

@@ -172,12 +172,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Poseidon2RowsAir {
         ext_linear(&mut init_s);
 
         // full round: next = M_ext(sbox(cur + rc))
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
 
         // partial round: next = M_int( [sbox(cur0 + rc0), cur1, .., cur7] )
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
 
         for i in 0..W {
@@ -226,7 +232,11 @@ mod tests {
     fn native_steps_match_poseidon2_goldilocks() {
         let input: [Val; W] = core::array::from_fn(|i| Val::from_u64(i as u64 + 1));
         let rows = native_steps(input);
-        assert_eq!(rows[BLOCK - 1], native_permute(input), "across-rows trace must match native");
+        assert_eq!(
+            rows[BLOCK - 1],
+            native_permute(input),
+            "across-rows trace must match native"
+        );
     }
 
     #[test]

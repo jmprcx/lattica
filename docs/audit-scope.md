@@ -1,5 +1,7 @@
 # Lattica — Audit Scope & Reviewer Guide
 
+> **Historical document:** This predates the production Plonky3 scope. Use [`audit-scope-p3.md`](audit-scope-p3.md) for current review work.
+
 > **⚠ Historical / reference-only — not the v1 audit artifact.** Predates the Plonky3 join-split
 > cutover (earlier Winterfell/Rescue stack). Start at [`AUDITORS.md`](AUDITORS.md); current scope is
 > `audit-scope-p3.md`.

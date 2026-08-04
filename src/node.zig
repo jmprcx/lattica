@@ -87,6 +87,8 @@ pub const TxError = error{
 /// Max transactions a single batch proof may cover at the ≥100-bit proven floor (must match
 /// `batch_joinsplit_air::MAX_BATCH_TILES`); a larger block emits multiple batch proofs.
 pub const MAX_BATCH_TILES: usize = 64;
+/// Upper bound for the join-split tree block seam. The Rust verifier also enforces this cap.
+pub const MAX_TREE_TX: usize = 1024;
 
 /// Upper bound on a single output's note ciphertext (the 128-byte note plaintext + AEAD tag is
 /// ~144 bytes; this generous cap lets the node reject malformed/oversize outputs before the expensive
@@ -1161,6 +1163,35 @@ pub const Chain = struct {
         self.commitNullifiers(&t.nullifiers);
         self.commitOutputs(&owned);
         self.commitRedeemEvent(t);
+    }
+
+    /// Verify a join-split proof-tree container for `txs` and apply them all atomically. The tree proof
+    /// binds the same ordered tx-root as `batchRoot`; the node still enforces stateful validity that the
+    /// proof system does not see (anchors, nullifier uniqueness, supply arithmetic, ciphertext caps).
+    pub fn applyJoinSplitTreeBlock(self: *Chain, txs: []const ShieldedTx, proof: []const u8) TxError!void {
+        if (txs.len == 0) return TxError.EmptyBatch;
+        if (txs.len > MAX_TREE_TX) return TxError.BatchTooLarge;
+
+        var seen = HashSet.init(self.allocator);
+        defer seen.deinit();
+        var candidate_supply = self.supply;
+        for (txs) |t| {
+            if (t.mint != 0) return TxError.IllegalIssuance;
+            if (!self.isKnownAnchor(&t.anchor)) return TxError.UnknownAnchor;
+            try statelessTxChecks(t);
+            try self.nullifierSeenScan(&seen, &t.nullifiers);
+            candidate_supply.apply(.{ .issued = 0, .burned = 0, .fee = t.fee }) catch return TxError.ValueOverflow;
+        }
+        if (proof.len > ffi.MAX_TREE_PROOF_LEN) return TxError.OversizeProof;
+        if (!ffi.verifyJoinSplitTree(proof, batchRoot(txs), txs.len)) return TxError.BadAuthProof;
+
+        try self.reserveApplyCapacity(txs.len, null);
+        var owned = try self.ownBatchOutputCiphertexts(txs);
+        defer owned.deinit(self.allocator);
+
+        self.supply = candidate_supply;
+        for (txs) |t| self.commitNullifiers(&t.nullifiers);
+        self.commitOutputs(owned.items);
     }
 
     /// Verify ONE batch proof for `txs` and apply them all — the consensus path for "one proof per

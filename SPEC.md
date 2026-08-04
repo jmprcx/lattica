@@ -1,5 +1,7 @@
 # Lattica — A Quantum-Safe Shielded Payment Protocol
 
+> **Document role:** Normative protocol specification. Implementation status, audit scope, and research features are tracked separately in [`docs/README.md`](docs/README.md) and [`docs/AUDITORS.md`](docs/AUDITORS.md).
+
 **Status:** design specification + proof of concept · **Version:** 0.1 (2026-06)
 
 Lattica is a clean-slate, Zcash-style shielded payment protocol whose security rests
@@ -143,7 +145,7 @@ composition polynomial; **FRI** folds it to a constant; and queries open the tra
 and the FRI layers, with the verifier checking Merkle paths, the algebraic composition⇔trace link,
 and fold consistency. This **closes gap R1** — the relation is a genuine one-way hash, replacing
 the earlier algebraic `x³ + C`. Parameters are PoC-grade (32 queries, rate 1/4, 64-bit field →
-effective conjectured ~50-bit, bounded by the field; see [`parameters.md`](./parameters.md)).
+effective conjectured ~50-bit, bounded by the field; see [`parameters.md`](docs/parameters.md)).
 
 **Zero-knowledge.** The proof is zero-knowledge (honest-verifier, via Fiat-Shamir). Two
 blindings make the openings reveal nothing about the witness: (1) the trace polynomial is masked
@@ -170,7 +172,7 @@ formally proven.
   General (non-leftmost) Merkle positions are supported (degree-2 one-of carry; position hidden).
   Remaining is hardening/integration, not new mechanism: the full commitment opening
   (`recipient`/`rcm`) + owner binding, switching the protocol's commitment/nullifier/Merkle
-  hashing to the field hash, and node integration. See [`soundness.md §6`](./soundness.md).
+  hashing to the field hash, and node integration. See [`soundness.md §6`](docs/soundness.md).
 - **Zero-knowledge (R2).** Implemented (trace blinding + masked FRI; see above). Honest-verifier
   and PoC-grade — a formal ZK proof and production parameters are future work.
 - **One-way in-circuit hash (R1).** Closed: the authorization relation is a Poseidon-style SPN

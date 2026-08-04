@@ -1,5 +1,7 @@
 # v3-audit — external audit handoff note
 
+> **Frozen record:** Handoff for the `v3-audit` revision. The later batch baseline is documented in [`v3-batch-audit-handoff.md`](v3-batch-audit-handoff.md).
+
 **This tag (`v3-audit`) is the v3 external-audit artifact.** Start with `docs/AUDITORS.md` (the
 comprehensive entry point); this note is the short orientation for a reviewer who already audited v1.
 

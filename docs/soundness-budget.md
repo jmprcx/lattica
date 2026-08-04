@@ -1,5 +1,7 @@
 # C-04 — soundness budget (Plonky3 spend circuit)
 
+> **Document role:** Authoritative quantitative soundness analysis for the production Plonky3 proof family.
+
 Resolves audit finding **C-04** ("~50-bit soundness on the 64-bit base field"). The production
 spend proof (`lattica-prover-p3/`) operates over the **Goldilocks** base field but draws all
 Fiat–Shamir / DEEP / FRI challenges from the **quadratic extension `F_p²`** (~127-bit), and uses FRI

@@ -1,5 +1,7 @@
 # Lattica — Soundness Argument and Gap Analysis
 
+> **Historical analysis:** Superseded for production parameters by [`soundness-budget.md`](soundness-budget.md); retained for the design record.
+
 > **⚠ Historical / reference-only — not the v1 audit artifact.** Superseded for the production stack by
 > `soundness-budget.md` (the C-04 ~103/127-bit accounting). Start at [`AUDITORS.md`](AUDITORS.md).
 

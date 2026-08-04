@@ -52,7 +52,14 @@ pub fn recipient_of(nk0: Val, nk1: Val, d: Val) -> [Val; DIGEST] {
 /// HTLC note; the commitment treats it uniformly (it's the 4-lane H1 owner slot). `note_type`
 /// (0=PLAIN, 1=HTLC) is committed in lane 7 so the spend can distinguish the two. `joinsplit_air`
 /// calls this with `note_type = 0` via its 5-arg wrapper (lane 7 stays 0 = PLAIN).
-pub fn commit(owner: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2], asset: Val, note_type: Val) -> [Val; DIGEST] {
+pub fn commit(
+    owner: [Val; DIGEST],
+    value: Val,
+    rho: [Val; 2],
+    rcm: [Val; 2],
+    asset: Val,
+    note_type: Val,
+) -> [Val; DIGEST] {
     let mut a = [Val::ZERO; W];
     a[0] = Val::from_u64(DOM_CM);
     a[1..1 + DIGEST].copy_from_slice(&owner);
@@ -92,10 +99,18 @@ pub fn pos_of(bits: &[bool; DEPTH]) -> Val {
 }
 
 /// Fold a leaf up a general-position path to the root.
-pub fn fold(leaf: [Val; DIGEST], sib: &[[Val; DIGEST]; DEPTH], bits: &[bool; DEPTH]) -> [Val; DIGEST] {
+pub fn fold(
+    leaf: [Val; DIGEST],
+    sib: &[[Val; DIGEST]; DEPTH],
+    bits: &[bool; DEPTH],
+) -> [Val; DIGEST] {
     let mut node = leaf;
     for d in 0..DEPTH {
-        node = if bits[d] { merge(sib[d], node) } else { merge(node, sib[d]) };
+        node = if bits[d] {
+            merge(sib[d], node)
+        } else {
+            merge(node, sib[d])
+        };
     }
     node
 }
@@ -131,7 +146,9 @@ pub(crate) fn build_paths(
     let mut levels: Vec<Vec<[Val; DIGEST]>> = vec![leaves.to_vec()];
     for d in 0..k {
         let cur = &levels[d];
-        let next: Vec<[Val; DIGEST]> = (0..cur.len() / 2).map(|i| merge(cur[2 * i], cur[2 * i + 1])).collect();
+        let next: Vec<[Val; DIGEST]> = (0..cur.len() / 2)
+            .map(|i| merge(cur[2 * i], cur[2 * i + 1]))
+            .collect();
         levels.push(next);
     }
     let subtree_root = levels[k][0];

@@ -14,23 +14,23 @@
 //! variable-length buffering + `sample_bits` are follow-ons. Base-field only.
 
 #[cfg(test)]
+use crate::config::{Challenge, Challenger};
+#[cfg(test)]
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
+#[cfg(test)]
+use p3_goldilocks::default_goldilocks_poseidon2_8;
 use p3_goldilocks::Goldilocks;
 #[cfg(test)]
 use p3_matrix::dense::RowMajorMatrix;
 #[cfg(test)]
 use p3_uni_stark::{prove, verify, Proof};
-#[cfg(test)]
-use crate::config::{Challenge, Challenger};
-#[cfg(test)]
-use p3_goldilocks::default_goldilocks_poseidon2_8;
 
+#[cfg(test)]
+use crate::poseidon2_air::{ext_linear, int_linear, native_steps, pow7};
 use crate::poseidon2_air::{native_permute, W};
 #[cfg(test)]
 use crate::poseidon2_air::{periodic_table, BLOCK};
-#[cfg(test)]
-use crate::poseidon2_air::{ext_linear, int_linear, native_steps, pow7};
 
 type Val = Goldilocks;
 const RATE: usize = 4;
@@ -72,7 +72,11 @@ pub struct ModelChallenger {
 
 impl ModelChallenger {
     pub fn new() -> Self {
-        Self { state: [Val::ZERO; W], input_buf: Vec::new(), output_buf: Vec::new() }
+        Self {
+            state: [Val::ZERO; W],
+            input_buf: Vec::new(),
+            output_buf: Vec::new(),
+        }
     }
     fn duplex(&mut self) {
         let n = self.input_buf.len();
@@ -159,7 +163,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SpongeAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let rate = AB::Expr::from(Goldilocks::from_u64(RATE as u64));
 
@@ -170,10 +178,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SpongeAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -197,11 +211,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SpongeAir {
         //      capacity lanes copied; the rate lanes of nxt are free (the next absorbed block). ----
         {
             let bl = p[P_BLOCK_LAST].clone();
-            builder
-                .when_transition()
-                .assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())));
+            builder.when_transition().assert_zero(
+                bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())),
+            );
             for i in (CAP_LANE + 1)..W {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
         }
 
@@ -243,7 +259,14 @@ use crate::config::{make_config, MyConfig};
 /// Prove that absorbing `blocks` squeezes `out` (the final rate lanes).
 #[cfg(test)]
 pub fn prove_squeeze(blocks: &[[Val; RATE]], out: [Val; RATE]) -> Vec<u8> {
-    let proof = prove(&make_config(), &SpongeAir { blocks: blocks.len() }, build_trace(blocks), &out.to_vec());
+    let proof = prove(
+        &make_config(),
+        &SpongeAir {
+            blocks: blocks.len(),
+        },
+        build_trace(blocks),
+        &out.to_vec(),
+    );
     postcard::to_allocvec(&proof).expect("serialize")
 }
 
@@ -263,7 +286,9 @@ mod tests {
     use p3_field::BasedVectorSpace;
 
     fn blocks_of(m: usize) -> Vec<[Val; RATE]> {
-        (0..m).map(|j| core::array::from_fn(|k| Val::from_u64(1 + (j * RATE + k) as u64))).collect()
+        (0..m)
+            .map(|j| core::array::from_fn(|k| Val::from_u64(1 + (j * RATE + k) as u64)))
+            .collect()
     }
 
     #[test]
@@ -309,7 +334,11 @@ mod tests {
             }
             let c: Challenge = ch.sample_algebra_element();
             let coeffs = <Challenge as BasedVectorSpace<Val>>::as_basis_coefficients_slice(&c);
-            assert_eq!(m.sample_ext(), [coeffs[0], coeffs[1]], "variable-length absorb");
+            assert_eq!(
+                m.sample_ext(),
+                [coeffs[0], coeffs[1]],
+                "variable-length absorb"
+            );
         }
 
         // (b) interleaved: observe, sample, observe more, sample again (state must thread through).
@@ -339,7 +368,11 @@ mod tests {
                 ch.observe(x);
             }
             for &bits in &[1usize, 8, 16, 20] {
-                assert_eq!(m.sample_bits(bits), CanSampleBits::<usize>::sample_bits(&mut ch, bits), "sample_bits({bits})");
+                assert_eq!(
+                    m.sample_bits(bits),
+                    CanSampleBits::<usize>::sample_bits(&mut ch, bits),
+                    "sample_bits({bits})"
+                );
             }
         }
     }

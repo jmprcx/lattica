@@ -83,7 +83,10 @@ fn cfg() -> &'static Cfg {
         let n = bytes.len().min(255);
         let mut buf = [0u8; 256];
         buf[..n].copy_from_slice(&bytes[..n]);
-        Cfg { dir: buf, dir_len: n }
+        Cfg {
+            dir: buf,
+            dir_len: n,
+        }
     })
 }
 
@@ -138,7 +141,14 @@ unsafe fn map_file(total: usize) -> Option<(*mut u8, i64)> {
         libc::close(fd);
         return None;
     }
-    let addr = libc::mmap(std::ptr::null_mut(), total, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+    let addr = libc::mmap(
+        std::ptr::null_mut(),
+        total,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED,
+        fd,
+        0,
+    );
     if addr == libc::MAP_FAILED {
         libc::close(fd);
         return None;
@@ -218,7 +228,10 @@ unsafe impl GlobalAlloc for SpillAlloc {
                 MMAP_BYTES.fetch_sub(total, Ordering::Relaxed);
             }
             MAGIC_SYS => {
-                System.dealloc(base, Layout::from_size_align_unchecked(total as usize, PAGE));
+                System.dealloc(
+                    base,
+                    Layout::from_size_align_unchecked(total as usize, PAGE),
+                );
             }
             // Should be unreachable (every >= THRESHOLD alloc writes a header); fall back rather than UB.
             _ => System.dealloc(ptr, layout),
@@ -275,7 +288,10 @@ pub fn is_armed() -> bool {
 
 /// `(live mmap spill count, live mmap spill bytes)` — for benches/tests to confirm spilling engaged.
 pub fn spill_stats() -> (u64, u64) {
-    (MMAP_COUNT.load(Ordering::Relaxed), MMAP_BYTES.load(Ordering::Relaxed))
+    (
+        MMAP_COUNT.load(Ordering::Relaxed),
+        MMAP_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 /// High-water mark of concurrently-mapped spill bytes since the last reset — the real "how much did we
@@ -310,8 +326,14 @@ mod tests {
             let n = (THRESHOLD / 8) + 4096;
             let v: Vec<u64> = (0..n as u64).collect();
             let (count, bytes) = spill_stats();
-            assert!(count >= 1, "an armed >= THRESHOLD alloc must spill to mmap (count={count})");
-            assert!(bytes as usize >= n * 8, "spill bytes {bytes} should cover the {n}-u64 buffer");
+            assert!(
+                count >= 1,
+                "an armed >= THRESHOLD alloc must spill to mmap (count={count})"
+            );
+            assert!(
+                bytes as usize >= n * 8,
+                "spill bytes {bytes} should cover the {n}-u64 buffer"
+            );
             assert_eq!(v[123], 123); // contents intact through the mmap backing
             drop(v);
         }
@@ -327,6 +349,9 @@ mod tests {
         let _g = SpillScope::arm();
         let n = (THRESHOLD / 8) + 4096;
         let v: Vec<u64> = vec![0u64; n]; // hits alloc_zeroed
-        assert!(v.iter().all(|&x| x == 0), "mmap-backed zeroed alloc must read as zero");
+        assert!(
+            v.iter().all(|&x| x == 0),
+            "mmap-backed zeroed alloc must read as zero"
+        );
     }
 }

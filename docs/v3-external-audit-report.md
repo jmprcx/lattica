@@ -1,5 +1,7 @@
 # Lattica — external-scope security audit report (v3 tip)
 
+> **Frozen audit record:** Conclusions apply to the revision and scope identified below, not automatically to later working-tree changes.
+
 **Date:** 2026-07-05 · **Target:** the v3 production tip (`lattica-prover-p3` circuits + C-ABI, the Zig
 protocol seam) · **Method:** five independent adversarial reviewers, each tasked to *break* the target,
 reading the actual code and writing/running probe tests; prior internal audits were treated as prior art

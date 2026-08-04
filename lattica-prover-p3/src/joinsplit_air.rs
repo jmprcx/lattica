@@ -34,12 +34,12 @@ use crate::poseidon2_air::{ext_linear, int_linear, native_permute, periodic_tabl
 // Shared spend geometry + native primitives (single-sourced in crate::spend_common; re-exported so
 // every `joinsplit_air::{N_IN, DIGEST, merge, commit, …}` path keeps resolving). What stays in this
 // file is THIS circuit's geometry + constraint system — the audit spec read linearly.
-pub use crate::spend_common::{
-    fold, merge, nullifier, pos_of, recipient_of, PublicOutputs, BITS, DEPTH, DIGEST, M_OUT, N_IN,
-};
 pub(crate) use crate::spend_common::build_paths;
 #[cfg(test)]
 use crate::spend_common::h;
+pub use crate::spend_common::{
+    fold, merge, nullifier, pos_of, recipient_of, PublicOutputs, BITS, DEPTH, DIGEST, M_OUT, N_IN,
+};
 
 // A2 domain-separation tags (lane 0 of each data hash) — the normative table lives in crate::domains.
 pub use crate::domains::{DOM_CM, DOM_NF, DOM_OWN};
@@ -49,15 +49,21 @@ type Val = Goldilocks;
 /// Join-split note commitment — the shared 6-arg `spend_common::commit` with `note_type = 0` (PLAIN;
 /// lane 7 stays 0). Byte-identical to the pre-refactor 5-arg form; kept as a 5-arg wrapper so every
 /// join-split caller and the `joinsplit_air::commit` path is unchanged.
-pub fn commit(recipient: [Val; DIGEST], value: Val, rho: [Val; 2], rcm: [Val; 2], asset: Val) -> [Val; DIGEST] {
+pub fn commit(
+    recipient: [Val; DIGEST],
+    value: Val,
+    rho: [Val; 2],
+    rcm: [Val; 2],
+    asset: Val,
+) -> [Val; DIGEST] {
     crate::spend_common::commit(recipient, value, rho, rcm, asset, Val::ZERO)
 }
 
 #[derive(Clone)]
 pub struct Input {
     pub nk: [u64; 2], // 128-bit nullifier key / spend authority
-    pub div: Val, // diversifier of the address this note was sent to (recipient = H(nk ‖ div))
-    pub asset: Val, // hidden asset id (all notes in a tx share one asset)
+    pub div: Val,     // diversifier of the address this note was sent to (recipient = H(nk ‖ div))
+    pub asset: Val,   // hidden asset id (all notes in a tx share one asset)
     pub value: u64,
     pub rho: [Val; 2], // 128-bit note randomness
     pub rcm: [Val; 2], // 128-bit commitment trapdoor
@@ -92,10 +98,19 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let mut in_sum: u128 = 0;
     let asset = w.inputs[0].asset; // the single (hidden) asset of this tx
     for (i, inp) in w.inputs.iter().enumerate() {
-        assert_eq!(inp.asset, asset, "input {i} uses a different asset (single-asset tx)");
+        assert_eq!(
+            inp.asset, asset,
+            "input {i} uses a different asset (single-asset tx)"
+        );
         let (nk0, nk1) = (Val::from_u64(inp.nk[0]), Val::from_u64(inp.nk[1]));
         let recipient = recipient_of(nk0, nk1, inp.div);
-        let cm = commit(recipient, Val::from_u64(inp.value), inp.rho, inp.rcm, inp.asset);
+        let cm = commit(
+            recipient,
+            Val::from_u64(inp.value),
+            inp.rho,
+            inp.rcm,
+            inp.asset,
+        );
         let root = fold(cm, &inp.sib, &inp.bits);
         match anchor {
             None => anchor = Some(root),
@@ -108,13 +123,30 @@ pub fn native_outputs(w: &Witness) -> PublicOutputs {
     let mut out_cms = [[Val::ZERO; DIGEST]; M_OUT];
     let mut out_sum: u128 = 0;
     for (j, out) in w.outputs.iter().enumerate() {
-        assert_eq!(out.asset, asset, "output {j} uses a different asset (single-asset tx)");
-        out_cms[j] = commit(out.recipient, Val::from_u64(out.value), out.rho, out.rcm, out.asset);
+        assert_eq!(
+            out.asset, asset,
+            "output {j} uses a different asset (single-asset tx)"
+        );
+        out_cms[j] = commit(
+            out.recipient,
+            Val::from_u64(out.value),
+            out.rho,
+            out.rcm,
+            out.asset,
+        );
         out_sum += out.value as u128;
     }
     // value balance (A3: all values range-bounded ⇒ no wraparound)
-    assert_eq!(in_sum + w.mint as u128, out_sum + w.fee as u128, "value balance Σin + mint = Σout + fee");
-    PublicOutputs { anchor: anchor.unwrap(), nullifiers, out_cms }
+    assert_eq!(
+        in_sum + w.mint as u128,
+        out_sum + w.fee as u128,
+        "value balance Σin + mint = Σout + fee"
+    );
+    PublicOutputs {
+        anchor: anchor.unwrap(),
+        nullifiers,
+        out_cms,
+    }
 }
 
 // ==============================================================================================
@@ -344,166 +376,201 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitAir {
 /// frees the per-tile-persistent columns + ASSET across tiles). Single-circuit behaviour is unchanged
 /// (statement = pis, tile_last = 0) — proven by this file's full suite, incl. the corrupted-trace-
 /// rejection tests. (This mirrors `htlc_air::eval_spend`, the pattern's origin.)
-pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(builder: &mut AB, statement: &[AB::Expr], tile_last: AB::Expr) {
-        let main = builder.main();
-        let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
-        let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
-        let one = AB::Expr::ONE;
-        let two = AB::Expr::TWO;
-        let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
-        let dom_cm = AB::Expr::from(Goldilocks::from_u64(DOM_CM));
-        let dom_nf = AB::Expr::from(Goldilocks::from_u64(DOM_NF));
+pub fn eval_spend<AB: AirBuilder<F = Goldilocks>>(
+    builder: &mut AB,
+    statement: &[AB::Expr],
+    tile_last: AB::Expr,
+) {
+    let main = builder.main();
+    let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
+    let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
+    let p: Vec<AB::Expr> = builder
+        .periodic_values()
+        .iter()
+        .map(|&x| x.into())
+        .collect();
+    let one = AB::Expr::ONE;
+    let two = AB::Expr::TWO;
+    let dom_own = AB::Expr::from(Goldilocks::from_u64(DOM_OWN));
+    let dom_cm = AB::Expr::from(Goldilocks::from_u64(DOM_CM));
+    let dom_nf = AB::Expr::from(Goldilocks::from_u64(DOM_NF));
 
-        let is_init = p[0].clone();
-        let is_full = p[1].clone();
-        let is_partial = p[2].clone();
-        let rc: Vec<AB::Expr> = (0..8).map(|i| p[3 + i].clone()).collect();
+    let is_init = p[0].clone();
+    let is_full = p[1].clone();
+    let is_partial = p[2].clone();
+    let rc: Vec<AB::Expr> = (0..8).map(|i| p[3 + i].clone()).collect();
 
-        // ---- Poseidon2 round constraints on the state columns (period-32 schedule) ----
-        let mut init_s: [AB::Expr; 8] = core::array::from_fn(|i| cur[i].clone());
-        ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; 8] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
-        ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; 8] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
-        int_linear(&mut part_s);
-        for i in 0..8 {
-            let round = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
-                + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
-                + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
-            builder.when_transition().assert_zero(round);
+    // ---- Poseidon2 round constraints on the state columns (period-32 schedule) ----
+    let mut init_s: [AB::Expr; 8] = core::array::from_fn(|i| cur[i].clone());
+    ext_linear(&mut init_s);
+    let mut full_s: [AB::Expr; 8] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+    ext_linear(&mut full_s);
+    let mut part_s: [AB::Expr; 8] = core::array::from_fn(|i| {
+        if i == 0 {
+            pow7(cur[0].clone() + rc[0].clone())
+        } else {
+            cur[i].clone()
         }
+    });
+    int_linear(&mut part_s);
+    for i in 0..8 {
+        let round = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
+            + is_full.clone() * (nxt[i].clone() - full_s[i].clone())
+            + is_partial.clone() * (nxt[i].clone() - part_s[i].clone());
+        builder.when_transition().assert_zero(round);
+    }
 
-        // ---- local-persistent columns: constant within a region, free at region boundaries ----
-        // RHO1 MUST be here: it is read at both commit_a (lane 7) and the nullifier (lane 4); without
-        // persistence a prover could use one rho1 in the commitment and another in the nullifier,
-        // minting a fresh nullifier for a real note ⇒ double-spend.
-        // (batch) also free at the TILE boundary so tile k's keys/rho don't bleed into k+1.
-        let not_last = one.clone() - p[P_REGION_LAST].clone() - tile_last.clone();
-        for &c in &[NK, NK1, RHO, RHO1, VAL] {
-            builder.when_transition().assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
-        }
-        // ASSET is per-tx-persistent: constant within a tx (one hidden asset), free at the tile boundary
-        // (batch) so distinct txs may carry distinct assets. every note's committed asset (bound at
-        // commit_b below) equals this tx's single value.
-        builder.when_transition().assert_zero((one.clone() - tile_last.clone()) * (nxt[ASSET].clone() - cur[ASSET].clone()));
-        // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
-        let bit = nxt[BIT].clone();
-        builder.when_transition().assert_zero(
-            not_last.clone()
-                * (nxt[POSACC].clone() - cur[POSACC].clone() - p[P_MEM_LINK].clone() * (bit.clone() * p[P_POS_COEFF].clone())),
-        );
-        builder.assert_zero(p[P_OWN_IN].clone() * cur[POSACC].clone()); // reset to 0 at span start
-
-        // ---- global value accumulator: +in (commit), −out, −fee ⇒ 0 ----
-        builder.assert_zero(p[P_ROW0].clone() * cur[VALACC].clone());
-        let acc_delta = (p[P_COMMIT_A_IN].clone() + p[P_MINT_IN].clone() - p[P_OUT_A_IN].clone() - p[P_FEE_IN].clone())
-            * cur[VAL].clone();
-        builder.when_transition().assert_zero(nxt[VALACC].clone() - cur[VALACC].clone() - acc_delta);
-        builder.assert_zero(p[P_FINAL].clone() * cur[VALACC].clone()); // balance: Σin = Σout + fee
-
-        // ---- range: rem=VAL at seed, rem=2·rem'+rbit (rbit boolean), rem=0 at close (A3) ----
-        builder.assert_zero(p[P_RANGE_SEED].clone() * (cur[REM].clone() - cur[VAL].clone()));
-        let ra = p[P_RANGE_ACTIVE].clone();
+    // ---- local-persistent columns: constant within a region, free at region boundaries ----
+    // RHO1 MUST be here: it is read at both commit_a (lane 7) and the nullifier (lane 4); without
+    // persistence a prover could use one rho1 in the commitment and another in the nullifier,
+    // minting a fresh nullifier for a real note ⇒ double-spend.
+    // (batch) also free at the TILE boundary so tile k's keys/rho don't bleed into k+1.
+    let not_last = one.clone() - p[P_REGION_LAST].clone() - tile_last.clone();
+    for &c in &[NK, NK1, RHO, RHO1, VAL] {
         builder
             .when_transition()
-            .assert_zero(ra.clone() * (cur[REM].clone() - (two.clone() * nxt[REM].clone() + cur[RBIT].clone())));
-        builder.when_transition().assert_zero(ra.clone() * (cur[RBIT].clone() * (one.clone() - cur[RBIT].clone())));
-        builder.assert_zero(p[P_RANGE_CLOSE].clone() * cur[REM].clone());
+            .assert_zero(not_last.clone() * (nxt[c].clone() - cur[c].clone()));
+    }
+    // ASSET is per-tx-persistent: constant within a tx (one hidden asset), free at the tile boundary
+    // (batch) so distinct txs may carry distinct assets. every note's committed asset (bound at
+    // commit_b below) equals this tx's single value.
+    builder
+        .when_transition()
+        .assert_zero((one.clone() - tile_last.clone()) * (nxt[ASSET].clone() - cur[ASSET].clone()));
+    // pos_acc: += bit·2^d at membership links, else constant within the span (A1)
+    let bit = nxt[BIT].clone();
+    builder.when_transition().assert_zero(
+        not_last.clone()
+            * (nxt[POSACC].clone()
+                - cur[POSACC].clone()
+                - p[P_MEM_LINK].clone() * (bit.clone() * p[P_POS_COEFF].clone())),
+    );
+    builder.assert_zero(p[P_OWN_IN].clone() * cur[POSACC].clone()); // reset to 0 at span start
 
-        // ---- ownership input: [DOM_OWN, nk0, nk1, d, 0,0,0,0] ----
-        // `d` (lane 3) is the diversifier — a FREE input: the spender uses the note's actual
-        // diversifier (else the recomputed recipient → cm won't be in the tree), so no extra
-        // constraint is needed (matching someone else's tag is a 2^128 preimage). recipient = H(DOM_OWN
-        // ‖ nk0 ‖ nk1 ‖ d).
-        let own = p[P_OWN_IN].clone();
-        builder.assert_zero(own.clone() * (cur[0].clone() - dom_own.clone()));
-        builder.assert_zero(own.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(own.clone() * (cur[2].clone() - cur[NK1].clone()));
-        for i in 4..8 {
-            builder.assert_zero(own.clone() * cur[i].clone());
-        }
+    // ---- global value accumulator: +in (commit), −out, −fee ⇒ 0 ----
+    builder.assert_zero(p[P_ROW0].clone() * cur[VALACC].clone());
+    let acc_delta = (p[P_COMMIT_A_IN].clone() + p[P_MINT_IN].clone()
+        - p[P_OUT_A_IN].clone()
+        - p[P_FEE_IN].clone())
+        * cur[VAL].clone();
+    builder
+        .when_transition()
+        .assert_zero(nxt[VALACC].clone() - cur[VALACC].clone() - acc_delta);
+    builder.assert_zero(p[P_FINAL].clone() * cur[VALACC].clone()); // balance: Σin = Σout + fee
 
-        // ---- recipient link: commit.in[1..5] = own.out[0..4] ----
-        let rl = p[P_RECIP_LINK].clone();
+    // ---- range: rem=VAL at seed, rem=2·rem'+rbit (rbit boolean), rem=0 at close (A3) ----
+    builder.assert_zero(p[P_RANGE_SEED].clone() * (cur[REM].clone() - cur[VAL].clone()));
+    let ra = p[P_RANGE_ACTIVE].clone();
+    builder.when_transition().assert_zero(
+        ra.clone() * (cur[REM].clone() - (two.clone() * nxt[REM].clone() + cur[RBIT].clone())),
+    );
+    builder
+        .when_transition()
+        .assert_zero(ra.clone() * (cur[RBIT].clone() * (one.clone() - cur[RBIT].clone())));
+    builder.assert_zero(p[P_RANGE_CLOSE].clone() * cur[REM].clone());
+
+    // ---- ownership input: [DOM_OWN, nk0, nk1, d, 0,0,0,0] ----
+    // `d` (lane 3) is the diversifier — a FREE input: the spender uses the note's actual
+    // diversifier (else the recomputed recipient → cm won't be in the tree), so no extra
+    // constraint is needed (matching someone else's tag is a 2^128 preimage). recipient = H(DOM_OWN
+    // ‖ nk0 ‖ nk1 ‖ d).
+    let own = p[P_OWN_IN].clone();
+    builder.assert_zero(own.clone() * (cur[0].clone() - dom_own.clone()));
+    builder.assert_zero(own.clone() * (cur[1].clone() - cur[NK].clone()));
+    builder.assert_zero(own.clone() * (cur[2].clone() - cur[NK1].clone()));
+    for i in 4..8 {
+        builder.assert_zero(own.clone() * cur[i].clone());
+    }
+
+    // ---- recipient link: commit.in[1..5] = own.out[0..4] ----
+    let rl = p[P_RECIP_LINK].clone();
+    for k in 0..DIGEST {
+        builder
+            .when_transition()
+            .assert_zero(rl.clone() * (nxt[1 + k].clone() - cur[k].clone()));
+    }
+
+    // ---- commit_a input: [DOM_CM, recipient(link), value, rho0, rho1] ----
+    let ca = p[P_COMMIT_A_IN].clone();
+    builder.assert_zero(ca.clone() * (cur[0].clone() - dom_cm.clone()));
+    builder.assert_zero(ca.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // value (lane 5)
+    builder.assert_zero(ca.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone())); // rho0  (lane 6)
+    builder.assert_zero(ca.clone() * (cur[3 + DIGEST].clone() - cur[RHO1].clone())); // rho1 (lane 7)
+
+    // ---- chain link: commit_b.in[0..4] = commit_a.out[0..4] (also out_b ← out_a) ----
+    let cl = p[P_CHAIN_LINK].clone();
+    for k in 0..DIGEST {
+        builder
+            .when_transition()
+            .assert_zero(cl.clone() * (nxt[k].clone() - cur[k].clone()));
+    }
+
+    // ---- commit_b input: [chain(4), rcm0, rcm1, 0, 0] — pad lanes 6,7 pinned to 0 (rcm free) ----
+    let cb = p[P_COMMIT_B].clone();
+    builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone())); // lane 6 = hidden asset id
+    builder.assert_zero(cb.clone() * cur[DIGEST + 3].clone()); // lane 7 = 0 (reserved)
+
+    // ---- membership links: place running digest (= commit_b output) by the bit ----
+    let ml = p[P_MEM_LINK].clone();
+    for k in 0..DIGEST {
+        let placed = (one.clone() - bit.clone()) * (nxt[k].clone() - cur[k].clone())
+            + bit.clone() * (nxt[DIGEST + k].clone() - cur[k].clone());
+        builder.when_transition().assert_zero(ml.clone() * placed);
+    }
+    builder
+        .when_transition()
+        .assert_zero(ml.clone() * (bit.clone() * (one.clone() - bit.clone())));
+
+    // ---- root: every input folds to the shared public anchor ----
+    let pr = p[P_ROOT].clone();
+    for k in 0..DIGEST {
+        builder.assert_zero(pr.clone() * (cur[k].clone() - statement[PI_ANCHOR + k].clone()));
+    }
+
+    // ---- nullifier input: [DOM_NF, nk0, nk1, rho0, rho1, pos_acc, 0, 0] (A1: pos = pos_acc) ----
+    let ni = p[P_NULL_IN].clone();
+    builder.assert_zero(ni.clone() * (cur[0].clone() - dom_nf.clone()));
+    builder.assert_zero(ni.clone() * (cur[1].clone() - cur[NK].clone()));
+    builder.assert_zero(ni.clone() * (cur[2].clone() - cur[NK1].clone()));
+    builder.assert_zero(ni.clone() * (cur[3].clone() - cur[RHO].clone()));
+    builder.assert_zero(ni.clone() * (cur[4].clone() - cur[RHO1].clone()));
+    builder.assert_zero(ni.clone() * (cur[5].clone() - cur[POSACC].clone()));
+    for i in 6..8 {
+        builder.assert_zero(ni.clone() * cur[i].clone());
+    }
+    // ---- nullifier output: per-input public nf_i ----
+    for i in 0..N_IN {
+        let sel = p[P_NULLOUT + i].clone();
         for k in 0..DIGEST {
-            builder.when_transition().assert_zero(rl.clone() * (nxt[1 + k].clone() - cur[k].clone()));
+            builder.assert_zero(
+                sel.clone() * (cur[k].clone() - statement[PI_NF + i * DIGEST + k].clone()),
+            );
         }
+    }
 
-        // ---- commit_a input: [DOM_CM, recipient(link), value, rho0, rho1] ----
-        let ca = p[P_COMMIT_A_IN].clone();
-        builder.assert_zero(ca.clone() * (cur[0].clone() - dom_cm.clone()));
-        builder.assert_zero(ca.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // value (lane 5)
-        builder.assert_zero(ca.clone() * (cur[2 + DIGEST].clone() - cur[RHO].clone())); // rho0  (lane 6)
-        builder.assert_zero(ca.clone() * (cur[3 + DIGEST].clone() - cur[RHO1].clone())); // rho1 (lane 7)
-
-        // ---- chain link: commit_b.in[0..4] = commit_a.out[0..4] (also out_b ← out_a) ----
-        let cl = p[P_CHAIN_LINK].clone();
+    // ---- output commit_a: [DOM_CM, out_recipient(free), out_value, out_rho0/1(free)] ----
+    // (out_b chain-link + pad lanes are covered by P_CHAIN_LINK / P_COMMIT_B above.)
+    let oa = p[P_OUT_A_IN].clone();
+    builder.assert_zero(oa.clone() * (cur[0].clone() - dom_cm.clone()));
+    builder.assert_zero(oa.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // out_value (lane 5)
+                                                                                    // ---- output-commitment output (out_b): per-output public out_cm_j ----
+    for j in 0..M_OUT {
+        let sel = p[P_OUTOUT + j].clone();
         for k in 0..DIGEST {
-            builder.when_transition().assert_zero(cl.clone() * (nxt[k].clone() - cur[k].clone()));
+            builder.assert_zero(
+                sel.clone() * (cur[k].clone() - statement[PI_OUTCM + j * DIGEST + k].clone()),
+            );
         }
+    }
 
-        // ---- commit_b input: [chain(4), rcm0, rcm1, 0, 0] — pad lanes 6,7 pinned to 0 (rcm free) ----
-        let cb = p[P_COMMIT_B].clone();
-        builder.assert_zero(cb.clone() * (cur[DIGEST + 2].clone() - cur[ASSET].clone())); // lane 6 = hidden asset id
-        builder.assert_zero(cb.clone() * cur[DIGEST + 3].clone()); // lane 7 = 0 (reserved)
+    // ---- fee region: VAL = public fee (range-checked like any value; A3) ----
+    builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - statement[PI_FEE].clone()));
 
-        // ---- membership links: place running digest (= commit_b output) by the bit ----
-        let ml = p[P_MEM_LINK].clone();
-        for k in 0..DIGEST {
-            let placed = (one.clone() - bit.clone()) * (nxt[k].clone() - cur[k].clone())
-                + bit.clone() * (nxt[DIGEST + k].clone() - cur[k].clone());
-            builder.when_transition().assert_zero(ml.clone() * placed);
-        }
-        builder.when_transition().assert_zero(ml.clone() * (bit.clone() * (one.clone() - bit.clone())));
+    // ---- mint region: VAL = public mint (issuance; range-checked; added to the balance) ----
+    builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - statement[PI_MINT].clone()));
 
-        // ---- root: every input folds to the shared public anchor ----
-        let pr = p[P_ROOT].clone();
-        for k in 0..DIGEST {
-            builder.assert_zero(pr.clone() * (cur[k].clone() - statement[PI_ANCHOR + k].clone()));
-        }
-
-        // ---- nullifier input: [DOM_NF, nk0, nk1, rho0, rho1, pos_acc, 0, 0] (A1: pos = pos_acc) ----
-        let ni = p[P_NULL_IN].clone();
-        builder.assert_zero(ni.clone() * (cur[0].clone() - dom_nf.clone()));
-        builder.assert_zero(ni.clone() * (cur[1].clone() - cur[NK].clone()));
-        builder.assert_zero(ni.clone() * (cur[2].clone() - cur[NK1].clone()));
-        builder.assert_zero(ni.clone() * (cur[3].clone() - cur[RHO].clone()));
-        builder.assert_zero(ni.clone() * (cur[4].clone() - cur[RHO1].clone()));
-        builder.assert_zero(ni.clone() * (cur[5].clone() - cur[POSACC].clone()));
-        for i in 6..8 {
-            builder.assert_zero(ni.clone() * cur[i].clone());
-        }
-        // ---- nullifier output: per-input public nf_i ----
-        for i in 0..N_IN {
-            let sel = p[P_NULLOUT + i].clone();
-            for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_NF + i * DIGEST + k].clone()));
-            }
-        }
-
-        // ---- output commit_a: [DOM_CM, out_recipient(free), out_value, out_rho0/1(free)] ----
-        // (out_b chain-link + pad lanes are covered by P_CHAIN_LINK / P_COMMIT_B above.)
-        let oa = p[P_OUT_A_IN].clone();
-        builder.assert_zero(oa.clone() * (cur[0].clone() - dom_cm.clone()));
-        builder.assert_zero(oa.clone() * (cur[1 + DIGEST].clone() - cur[VAL].clone())); // out_value (lane 5)
-        // ---- output-commitment output (out_b): per-output public out_cm_j ----
-        for j in 0..M_OUT {
-            let sel = p[P_OUTOUT + j].clone();
-            for k in 0..DIGEST {
-                builder.assert_zero(sel.clone() * (cur[k].clone() - statement[PI_OUTCM + j * DIGEST + k].clone()));
-            }
-        }
-
-        // ---- fee region: VAL = public fee (range-checked like any value; A3) ----
-        builder.assert_zero(p[P_FEE_IN].clone() * (cur[VAL].clone() - statement[PI_FEE].clone()));
-
-        // ---- mint region: VAL = public mint (issuance; range-checked; added to the balance) ----
-        builder.assert_zero(p[P_MINT_IN].clone() * (cur[VAL].clone() - statement[PI_MINT].clone()));
-
-        // tx_binding (statement[PI_TXBIND..]) is bound to the proof by Fiat–Shamir for the single
-        // circuit (observed public input), and staged + folded into the tx-root by the batch.
+    // tx_binding (statement[PI_TXBIND..]) is bound to the proof by Fiat–Shamir for the single
+    // circuit (observed public input), and staged + folded into the tx-root by the batch.
 }
 
 // --- trace + ZK config: the production family lives in crate::config (single audited source) ----
@@ -569,12 +636,17 @@ pub fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         set_block(&mut t, base + 2, b);
         let mut node = commit(recipient, value, inp.rho, inp.rcm, inp.asset); // = perm(b)[..DIGEST]
         for d in 0..DEPTH {
-            let (l, r) = if inp.bits[d] { (inp.sib[d], node) } else { (node, inp.sib[d]) };
+            let (l, r) = if inp.bits[d] {
+                (inp.sib[d], node)
+            } else {
+                (node, inp.sib[d])
+            };
             let mut min = [Val::ZERO; 8];
             min[..DIGEST].copy_from_slice(&l);
             min[DIGEST..].copy_from_slice(&r);
             set_block(&mut t, base + 3 + d, min);
-            t[((base + 3 + d) * BLOCK) * WIDTH + BIT] = if inp.bits[d] { Val::ONE } else { Val::ZERO };
+            t[((base + 3 + d) * BLOCK) * WIDTH + BIT] =
+                if inp.bits[d] { Val::ONE } else { Val::ZERO };
             node = merge(l, r);
         }
         // nullifier block: [DOM_NF, nk0, nk1, rho0, rho1, pos, 0, 0]
@@ -598,7 +670,10 @@ pub fn build_trace(w: &Witness) -> RowMajorMatrix<Val> {
         let mut acc = 0u64;
         let mut links: Vec<(usize, u64)> = Vec::new();
         for d in 0..DEPTH {
-            links.push(((base + 2 + d) * BLOCK + BLOCK - 1, if inp.bits[d] { 1u64 << d } else { 0 }));
+            links.push((
+                (base + 2 + d) * BLOCK + BLOCK - 1,
+                if inp.bits[d] { 1u64 << d } else { 0 },
+            ));
         }
         for r in lo..=hi {
             t[r * WIDTH + POSACC] = Val::from_u64(acc);
@@ -731,7 +806,11 @@ pub fn demo_witness() -> Witness {
     let cms: Vec<[Val; DIGEST]> = (0..N_IN)
         .map(|i| {
             commit(
-                recipient_of(Val::from_u64(nks[i][0]), Val::from_u64(nks[i][1]), in_div(i)),
+                recipient_of(
+                    Val::from_u64(nks[i][0]),
+                    Val::from_u64(nks[i][1]),
+                    in_div(i),
+                ),
                 Val::from_u64(in_values[i]),
                 in_rho(i),
                 in_rcm(i),
@@ -751,13 +830,23 @@ pub fn demo_witness() -> Witness {
         bits: paths[i].1,
     });
     let outputs = core::array::from_fn(|j| Output {
-        recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
+        recipient: recipient_of(
+            Val::from_u64(77 + j as u64),
+            Val::from_u64(j as u64),
+            Val::from_u64(600 + j as u64),
+        ),
         asset,
         value: [900u64, 500][j],
         rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
         rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
     });
-    Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+    Witness {
+        inputs,
+        outputs,
+        fee: 100,
+        mint: 0,
+        tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+    }
 }
 
 /// (proof bytes, prove ms, verify ms, proven security bits) for a representative join-split.
@@ -800,10 +889,21 @@ mod tests {
         let rcm2 = |x: u64| [Val::from_u64(x), Val::from_u64(x + 300)];
         let asset = Val::from_u64(42); // single hidden asset for the tx
         let cmf = |v: &(u64, [u64; 2], u64, u64, u64)| {
-            commit(recipient_of(Val::from_u64(v.1[0]), Val::from_u64(v.1[1]), Val::from_u64(v.4)), Val::from_u64(v.0), rho2(v.2), rcm2(v.3), asset)
+            commit(
+                recipient_of(
+                    Val::from_u64(v.1[0]),
+                    Val::from_u64(v.1[1]),
+                    Val::from_u64(v.4),
+                ),
+                Val::from_u64(v.0),
+                rho2(v.2),
+                rcm2(v.3),
+                asset,
+            )
         };
         let (_, paths) = build_paths(&[cmf(&in0), cmf(&in1)]);
-        let mk_in = |v: (u64, [u64; 2], u64, u64, u64), pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
+        let mk_in = |v: (u64, [u64; 2], u64, u64, u64),
+                     pth: &([[Val; DIGEST]; DEPTH], [bool; DEPTH])| Input {
             nk: v.1,
             div: Val::from_u64(v.4),
             asset,
@@ -815,11 +915,29 @@ mod tests {
         };
         let inputs = [mk_in(in0, &paths[0]), mk_in(in1, &paths[1])];
         let outputs = [
-            Output { recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)), asset, value: 900, rho: rho2(21), rcm: rcm2(22) },
-            Output { recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)), asset, value: 500, rho: rho2(23), rcm: rcm2(24) },
+            Output {
+                recipient: recipient_of(Val::from_u64(77), Val::from_u64(7), Val::from_u64(601)),
+                asset,
+                value: 900,
+                rho: rho2(21),
+                rcm: rcm2(22),
+            },
+            Output {
+                recipient: recipient_of(Val::from_u64(88), Val::from_u64(8), Val::from_u64(602)),
+                asset,
+                value: 500,
+                rho: rho2(23),
+                rcm: rcm2(24),
+            },
         ];
         // Σin = 1500, Σout = 1400, fee = 100
-        Witness { inputs, outputs, fee: 100, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+        Witness {
+            inputs,
+            outputs,
+            fee: 100,
+            mint: 0,
+            tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+        }
     }
 
     #[test]
@@ -886,18 +1004,29 @@ mod tests {
             bits: paths[i].1,
         });
         let outputs = core::array::from_fn(|j| Output {
-            recipient: recipient_of(Val::from_u64(77 + j as u64), Val::from_u64(j as u64), Val::from_u64(600 + j as u64)),
+            recipient: recipient_of(
+                Val::from_u64(77 + j as u64),
+                Val::from_u64(j as u64),
+                Val::from_u64(600 + j as u64),
+            ),
             asset,
             value: out_values[j],
             rho: [Val::from_u64(21 + j as u64), Val::from_u64(221 + j as u64)],
             rcm: [Val::from_u64(22 + j as u64), Val::from_u64(222 + j as u64)],
         });
-        Witness { inputs, outputs, fee, mint: 0, tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)) }
+        Witness {
+            inputs,
+            outputs,
+            fee,
+            mint: 0,
+            tx_binding: core::array::from_fn(|i| Val::from_u64(0xABCD + i as u64)),
+        }
     }
 
     #[test]
     fn joinsplit_verifies() {
-        prove_verify(&witness_with([1000, 500], [900, 500], 100)).expect("valid join-split should verify");
+        prove_verify(&witness_with([1000, 500], [900, 500], 100))
+            .expect("valid join-split should verify");
     }
 
     #[test]
@@ -907,7 +1036,10 @@ mod tests {
         let w = witness_with([1000, 500], [900, 500], 100);
         let a = prove_to_bytes(&w);
         let b = prove_to_bytes(&w);
-        assert_ne!(a, b, "ZK proofs of the same statement must be re-randomized");
+        assert_ne!(
+            a, b,
+            "ZK proofs of the same statement must be re-randomized"
+        );
         // both still verify
         assert!(verify_bytes(&a, &public_values(&w)));
         assert!(verify_bytes(&b, &public_values(&w)));
@@ -935,7 +1067,8 @@ mod tests {
         // A 1-real-in / 1-real-out transaction, padded to the fixed 2-in/2-out shape with
         // zero-value dummy notes (Σin = 1000 = 900 + 100 = Σout + fee). This is how variable
         // (N, M) is supported without a variable-shape circuit.
-        prove_verify(&witness_with([1000, 0], [900, 0], 100)).expect("dummy-padded tx should verify");
+        prove_verify(&witness_with([1000, 0], [900, 0], 100))
+            .expect("dummy-padded tx should verify");
     }
 
     #[test]
@@ -994,7 +1127,10 @@ mod tests {
         let b0 = [false; DEPTH];
         let mut b1 = [false; DEPTH];
         b1[0] = true;
-        assert_ne!(nullifier(nk0, nk1, rho, pos_of(&b0)), nullifier(nk0, nk1, rho, pos_of(&b1)));
+        assert_ne!(
+            nullifier(nk0, nk1, rho, pos_of(&b0)),
+            nullifier(nk0, nk1, rho, pos_of(&b1))
+        );
     }
 
     /// Robust "this corrupted trace must not yield a verifying proof" (debug: prove's constraint
@@ -1019,7 +1155,11 @@ mod tests {
         for extra in [vec![0xAAu8], vec![0u8; 64], vec![7u8; 4096]] {
             let mut mauled = proof.clone();
             mauled.extend_from_slice(&extra);
-            assert!(!verify_bytes(&mauled, &pis), "proof + {} trailing bytes must be rejected", extra.len());
+            assert!(
+                !verify_bytes(&mauled, &pis),
+                "proof + {} trailing bytes must be rejected",
+                extra.len()
+            );
         }
     }
 
@@ -1034,13 +1174,25 @@ mod tests {
         for limb in 0..4usize {
             let w = sample();
             let mut trace = build_trace(&w);
-            let (nk0, nk1) = (Val::from_u64(w.inputs[0].nk[0]), Val::from_u64(w.inputs[0].nk[1]));
+            let (nk0, nk1) = (
+                Val::from_u64(w.inputs[0].nk[0]),
+                Val::from_u64(w.inputs[0].nk[1]),
+            );
             let mut vals = [nk0, nk1, w.inputs[0].rho[0], w.inputs[0].rho[1]];
             let pos = pos_of(&w.inputs[0].bits);
             vals[limb] += Val::ONE; // bump the limb the nullifier consumes
-            // rewrite input 0's nullifier block to bind the bumped limb (commitment/ownership keep the
-            // real value, so cm/anchor still verify); make the local nullifier binding hold.
-            let nin = [Val::from_u64(DOM_NF), vals[0], vals[1], vals[2], vals[3], pos, Val::ZERO, Val::ZERO];
+                                    // rewrite input 0's nullifier block to bind the bumped limb (commitment/ownership keep the
+                                    // real value, so cm/anchor still verify); make the local nullifier binding hold.
+            let nin = [
+                Val::from_u64(DOM_NF),
+                vals[0],
+                vals[1],
+                vals[2],
+                vals[3],
+                pos,
+                Val::ZERO,
+                Val::ZERO,
+            ];
             set_block(&mut trace.values, null_block(0), nin);
             for r in null_in_row(0)..=null_out_row(0) {
                 trace.values[r * WIDTH + cols[limb]] = vals[limb];
@@ -1048,7 +1200,10 @@ mod tests {
             let mut pis = public_values(&w);
             let nfp = nullifier(vals[0], vals[1], [vals[2], vals[3]], pos);
             pis[PI_NF..PI_NF + DIGEST].copy_from_slice(&nfp);
-            assert!(corrupt_trace_rejected(trace, pis), "forged nullifier limb {limb} must not verify");
+            assert!(
+                corrupt_trace_rejected(trace, pis),
+                "forged nullifier limb {limb} must not verify"
+            );
         }
     }
 
@@ -1064,7 +1219,10 @@ mod tests {
         // public inputs unchanged: the forged chain breaks the chain-link (and downstream cm), which
         // must make the proof unverifiable regardless of the published statement.
         let pis = public_values(&w);
-        assert!(corrupt_trace_rejected(trace, pis), "a forged commitment chaining value must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "a forged commitment chaining value must not verify"
+        );
     }
 
     /// The hidden-asset binding must be non-vacuous: a prover must not turn the inputs' asset into a
@@ -1076,7 +1234,7 @@ mod tests {
         let mut trace = build_trace(&w);
         let out0 = w.outputs[0];
         let alt = out0.asset + Val::ONE; // a different asset for the output
-        // recompute output 0's commit_b (out_a output = chain; lane6 = forged asset).
+                                         // recompute output 0's commit_b (out_a output = chain; lane6 = forged asset).
         let mut oa = [Val::ZERO; 8];
         oa[0] = Val::from_u64(DOM_CM);
         oa[1..1 + DIGEST].copy_from_slice(&out0.recipient);
@@ -1093,6 +1251,9 @@ mod tests {
         let new_cm: [Val; DIGEST] = native_permute(ob)[..DIGEST].try_into().unwrap();
         let mut pis = public_values(&w);
         pis[PI_OUTCM..PI_OUTCM + DIGEST].copy_from_slice(&new_cm);
-        assert!(corrupt_trace_rejected(trace, pis), "a mismatched output asset must not verify");
+        assert!(
+            corrupt_trace_rejected(trace, pis),
+            "a mismatched output asset must not verify"
+        );
     }
 }

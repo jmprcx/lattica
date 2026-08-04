@@ -1,5 +1,7 @@
 # Phase-0 framework decision
 
+> **Decision record:** Historical rationale for selecting Plonky3. The current implementation status is in [`audit-readiness-status.md`](audit-readiness-status.md).
+
 > **⚠ Historical / reference-only — not the v1 audit artifact.** Records the Phase-0 framework choice
 > (the project ultimately moved to Plonky3). Start at [`AUDITORS.md`](AUDITORS.md).
 

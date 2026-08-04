@@ -1,5 +1,7 @@
 # Prover ↔ node wire formats (normative)
 
+> **Document role:** Normative byte-level contract between Rust proof code and Zig consumers.
+
 The Zig node and the Rust prover (`lattica-prover-p3`) exchange bytes across the C ABI declared in
 `lattica-prover-p3/include/lattica_prover_p3.h` (mirrored by `src/ffi_integration.zig`,
 `src/integration_node.zig`, `lattica-prover-p3/tests/ffi_integration.c`). Everything on this page is

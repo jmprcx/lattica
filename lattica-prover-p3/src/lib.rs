@@ -4,23 +4,23 @@
 //! canonical proof serialization + the `lattica_joinsplit_*` / `lattica_htlc_*` **C ABI** the Zig node
 //! calls (matching `src/ffi.zig`).
 
+pub mod batch_common; // shared batch machinery: MAX_BATCH_TILES, tile padding, the fold-block writer
+pub mod batch_htlc_air; // batch aggregation for the v3 shielded-HTLC spend (mirrors batch_joinsplit_air)
+pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-split tiling + tx-root fold)
 pub mod config; // crate-wide STARK config: the production (wire-pinned) + demo parameter families
 pub mod domains; // consensus-frozen domain-separation tags (the normative table; mirrored by the Zig node)
-pub mod spend_common; // shared native spend primitives (hashes/commit/nullifier/merge/fold) for both circuits
-pub mod joinsplit_air;
-pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsplit_air, extended
-pub mod batch_common; // shared batch machinery: MAX_BATCH_TILES, tile padding, the fold-block writer
-pub mod batch_joinsplit_air; // batch aggregation: one proof per block (join-split tiling + tx-root fold)
-pub mod batch_htlc_air; // batch aggregation for the v3 shielded-HTLC spend (mirrors batch_joinsplit_air)
-pub mod poseidon2_air;
-#[cfg(feature = "recursion")]
-pub mod recursion; // Phase B: recursive STARK verifier (B1 spike = in-circuit FRI Merkle-opening verifier)
 #[cfg(feature = "gpu")]
 pub mod gpu; // opt-in OpenCL LDE acceleration (additive, prove-only; --features gpu)
 #[cfg(feature = "gpu")]
 pub mod gpu_pcs; // GPU-hiding PCS wrapper: quotient randomization pipeline device-side
+pub mod htlc_air; // v3: shielded HTLC spend (redeem/refund) — clone of joinsplit_air, extended
+pub mod joinsplit_air;
+pub mod poseidon2_air;
 #[cfg(feature = "gpu")]
-pub mod quotient_gpu; // opt-in GPU quotient offload (fork of p3 prove; --features gpu)
+pub mod quotient_gpu;
+#[cfg(feature = "recursion")]
+pub mod recursion; // Phase B: recursive STARK verifier (B1 spike = in-circuit FRI Merkle-opening verifier)
+pub mod spend_common; // shared native spend primitives (hashes/commit/nullifier/merge/fold) for both circuits // opt-in GPU quotient offload (fork of p3 prove; --features gpu)
 
 #[cfg(feature = "stream")]
 pub mod spill_alloc; // opt-in out-of-core allocator: spills large LDE/quotient/Merkle buffers to an
@@ -35,17 +35,25 @@ static SPILL_ALLOC: spill_alloc::SpillAlloc = spill_alloc::SpillAlloc;
 mod constraint_fingerprint; // refactor/audit oracle: pinned constraint-set fingerprints for every production AIR
 
 use core::slice;
+use p3_field::PrimeCharacteristicRing;
 use p3_field::PrimeField64;
 use p3_goldilocks::Goldilocks;
 
 /// Goldilocks modulus `p = 2^64 − 2^32 + 1`; field-element bytes are rejected if `≥ p` (canonical).
 const GOLDILOCKS_ORDER: u64 = 0xFFFF_FFFF_0000_0001;
 const DIGEST_BYTES: usize = 32; // a 4-element Goldilocks digest, little-endian
+const DIGEST: usize = DIGEST_BYTES / 8;
 
 /// Upper bound on an accepted proof, in bytes (real proofs are ~0.5 MB). The verifier C ABI rejects
 /// anything larger before deserialization so untrusted callers can't force huge parse work (audit
 /// M-08). Must match `src/ffi.zig`'s `MAX_PROOF_LEN`.
 const MAX_PROOF_LEN: usize = 1 << 21;
+/// Upper bound for the join-split tree proof container. The first implementation stores the
+/// per-transaction production proofs plus their canonical public inputs; the recursive-wrap
+/// implementation can shrink this without changing the verifier ABI.
+const MAX_TREE_PROOF_LEN: usize = 1 << 29;
+const MAX_TREE_TX: usize = 1024;
+const TREE_MAGIC: &[u8; 8] = b"LJSTREE1";
 
 fn parse_felt(b: &[u8]) -> Option<Goldilocks> {
     let v = u64::from_le_bytes(b.try_into().ok()?);
@@ -74,7 +82,11 @@ const JS_PUBLIC_INPUTS_LEN: usize =
 /// (this IS the full join-split statement; the HTLC statement is this head + current_height +
 /// redeem_hashlock). Returns the pis and the byte offset consumed. The CALLER checks total length
 /// first (fail-closed) so the fixed-slice reads here cannot index past the end.
-fn parse_spend_statement_head(b: &[u8], n_in: usize, m_out: usize) -> Option<(Vec<Goldilocks>, usize)> {
+fn parse_spend_statement_head(
+    b: &[u8],
+    n_in: usize,
+    m_out: usize,
+) -> Option<(Vec<Goldilocks>, usize)> {
     let mut pis = Vec::new();
     let mut off = 0;
     push_digest(&b[off..off + 32], &mut pis)?; // anchor
@@ -100,7 +112,12 @@ fn parse_spend_statement_head(b: &[u8], n_in: usize, m_out: usize) -> Option<(Ve
 
 /// Encode the spend-statement head into `out` (inverse of `parse_spend_statement_head`); returns the
 /// byte offset written. `pis` is the circuit vector `[anchor, nf.., out_cm.., fee, mint, tx_binding..]`.
-fn encode_spend_statement_head(out: &mut [u8], pis: &[Goldilocks], n_in: usize, m_out: usize) -> usize {
+fn encode_spend_statement_head(
+    out: &mut [u8],
+    pis: &[Goldilocks],
+    n_in: usize,
+    m_out: usize,
+) -> usize {
     let d = crate::spend_common::DIGEST;
     let put = |dst: &mut [u8], felts: &[Goldilocks]| {
         for (k, f) in felts.iter().enumerate() {
@@ -233,7 +250,14 @@ pub unsafe extern "C" fn lattica_joinsplit_verify(
     pi_ptr: *const u8,
     pi_len: usize,
 ) -> i32 {
-    verify_abi(proof_ptr, proof_len, pi_ptr, pi_len, parse_joinsplit_public_inputs, joinsplit_air::verify_bytes)
+    verify_abi(
+        proof_ptr,
+        proof_len,
+        pi_ptr,
+        pi_len,
+        parse_joinsplit_public_inputs,
+        joinsplit_air::verify_bytes,
+    )
 }
 
 /// C ABI: prove the fixed demo join-split witness and write the proof + the `JoinSplitPublicInputs`
@@ -261,7 +285,9 @@ pub unsafe extern "C" fn lattica_joinsplit_prove_demo(
         Some(b) => b,
         None => return 1,
     };
-    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
+    write_out2(
+        &proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len,
+    )
 }
 
 /// Encode the circuit's join-split public-input vector into the `JoinSplitPublicInputs` byte layout
@@ -307,8 +333,12 @@ pub fn encode_htlc_public_inputs(pis: &[Goldilocks]) -> Option<Vec<u8>> {
     let fee_idx = d + (htlc_air::N_IN + htlc_air::M_OUT) * d;
     out[off..off + 8].copy_from_slice(&pis[fee_idx + 2 + d].as_canonical_u64().to_le_bytes()); // current_height
     off += 8;
-    for (k, f) in pis[fee_idx + 2 + d + 1..fee_idx + 2 + d + 1 + d].iter().enumerate() {
-        out[off + k * 8..off + k * 8 + 8].copy_from_slice(&f.as_canonical_u64().to_le_bytes()); // redeem_hashlock
+    for (k, f) in pis[fee_idx + 2 + d + 1..fee_idx + 2 + d + 1 + d]
+        .iter()
+        .enumerate()
+    {
+        out[off + k * 8..off + k * 8 + 8].copy_from_slice(&f.as_canonical_u64().to_le_bytes());
+        // redeem_hashlock
     }
     Some(out)
 }
@@ -325,7 +355,14 @@ pub unsafe extern "C" fn lattica_htlc_verify(
     pi_ptr: *const u8,
     pi_len: usize,
 ) -> i32 {
-    verify_abi(proof_ptr, proof_len, pi_ptr, pi_len, parse_htlc_public_inputs, htlc_air::verify_bytes)
+    verify_abi(
+        proof_ptr,
+        proof_len,
+        pi_ptr,
+        pi_len,
+        parse_htlc_public_inputs,
+        htlc_air::verify_bytes,
+    )
 }
 
 /// C ABI: prove the fixed demo HTLC-redeem witness, writing the proof + `HtlcPublicInputs` bytes.
@@ -351,7 +388,9 @@ pub unsafe extern "C" fn lattica_htlc_prove_demo(
         Some(b) => b,
         None => return 1,
     };
-    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
+    write_out2(
+        &proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len,
+    )
 }
 
 // --- wallet-side prover ABI -------------------------------------------------------------------
@@ -390,7 +429,13 @@ fn rd_felt2(b: &[u8], off: &mut usize) -> Option<[Goldilocks; 2]> {
 
 /// Read a membership path — `DEPTH` sibling digests then `DEPTH` path bits (each a strict 0/1 byte,
 /// audit M-03). The shared witness-record tail present in both circuits. `DEPTH` is the same for both.
-fn rd_path(b: &[u8], off: &mut usize) -> Option<([[Goldilocks; 4]; crate::spend_common::DEPTH], [bool; crate::spend_common::DEPTH])> {
+fn rd_path(
+    b: &[u8],
+    off: &mut usize,
+) -> Option<(
+    [[Goldilocks; 4]; crate::spend_common::DEPTH],
+    [bool; crate::spend_common::DEPTH],
+)> {
     use crate::spend_common::DEPTH;
     let mut sib = Vec::with_capacity(DEPTH);
     for _ in 0..DEPTH {
@@ -437,7 +482,16 @@ fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
         let rho = rd_felt2(b, &mut off)?;
         let rcm = rd_felt2(b, &mut off)?;
         let (sib, bits) = rd_path(b, &mut off)?;
-        inputs.push(Input { nk, div, asset, value, rho, rcm, sib, bits });
+        inputs.push(Input {
+            nk,
+            div,
+            asset,
+            value,
+            rho,
+            rcm,
+            sib,
+            bits,
+        });
     }
     let inputs: [Input; N_IN] = inputs.try_into().ok()?;
     let mut outputs = Vec::with_capacity(M_OUT);
@@ -447,20 +501,33 @@ fn parse_joinsplit_witness(b: &[u8]) -> Option<joinsplit_air::Witness> {
         let value = rd_u64(b, &mut off);
         let rho = rd_felt2(b, &mut off)?;
         let rcm = rd_felt2(b, &mut off)?;
-        outputs.push(Output { recipient, asset, value, rho, rcm });
+        outputs.push(Output {
+            recipient,
+            asset,
+            value,
+            rho,
+            rcm,
+        });
     }
     let outputs: [Output; M_OUT] = outputs.try_into().ok()?;
     let fee = rd_u64(b, &mut off);
     let mint = rd_u64(b, &mut off);
     let tx_binding = rd_digest(b, &mut off)?;
-    Some(Witness { inputs, outputs, fee, mint, tx_binding })
+    Some(Witness {
+        inputs,
+        outputs,
+        fee,
+        mint,
+        tx_binding,
+    })
 }
 
 /// Encode a circuit witness into the canonical wallet→prover byte layout (inverse of
 /// `parse_joinsplit_witness`). Used by tests and the wallet glue.
 pub fn encode_joinsplit_witness(w: &joinsplit_air::Witness) -> Vec<u8> {
     let mut out = Vec::with_capacity(JS_WITNESS_LEN);
-    let put_felt = |o: &mut Vec<u8>, f: Goldilocks| o.extend_from_slice(&f.as_canonical_u64().to_le_bytes());
+    let put_felt =
+        |o: &mut Vec<u8>, f: Goldilocks| o.extend_from_slice(&f.as_canonical_u64().to_le_bytes());
     let put_u64 = |o: &mut Vec<u8>, v: u64| o.extend_from_slice(&v.to_le_bytes());
     for inp in &w.inputs {
         put_u64(&mut out, inp.nk[0]);
@@ -536,7 +603,9 @@ pub unsafe extern "C" fn lattica_joinsplit_prove(
         Ok(Some(x)) => x,
         _ => return 1,
     };
-    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
+    write_out2(
+        &proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len,
+    )
 }
 
 // --- batch aggregation (one proof per block) C ABI --------------------------------------------
@@ -563,7 +632,14 @@ pub unsafe extern "C" fn lattica_batch_verify(
     root_ptr: *const u8,
     root_len: usize,
 ) -> i32 {
-    verify_abi(proof_ptr, proof_len, root_ptr, root_len, parse_root_digest, batch_joinsplit_air::verify_batch_bytes)
+    verify_abi(
+        proof_ptr,
+        proof_len,
+        root_ptr,
+        root_len,
+        parse_root_digest,
+        batch_joinsplit_air::verify_batch_bytes,
+    )
 }
 
 /// C ABI: prove `n_tx` concatenated join-split witnesses (each `JS_WITNESS_LEN` bytes) as ONE batch
@@ -585,7 +661,12 @@ pub unsafe extern "C" fn lattica_batch_prove(
     root_cap: usize,
     root_len: *mut usize,
 ) -> i32 {
-    if witness_ptr.is_null() || proof_out.is_null() || root_out.is_null() || proof_len.is_null() || root_len.is_null() {
+    if witness_ptr.is_null()
+        || proof_out.is_null()
+        || root_out.is_null()
+        || proof_len.is_null()
+        || root_len.is_null()
+    {
         return 1; // fail-closed on any null pointer (audit M-01)
     }
     // Reject empty or beyond the proven-soundness floor FIRST. `padded_tiles(n) ≤ 64 ⟺ n ≤ 64`, so this
@@ -617,7 +698,214 @@ pub unsafe extern "C" fn lattica_batch_prove(
         Err(_) => return 1,
     };
     let rb = encode_digest(&root);
-    write_out2(&proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len)
+    write_out2(
+        &proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len,
+    )
+}
+
+// --- join-split proof tree container -----------------------------------------------------------
+
+fn append_tree_leaf(out: &mut Vec<u8>, pi: &[u8], proof: &[u8]) -> Option<()> {
+    if pi.len() != JS_PUBLIC_INPUTS_LEN || proof.len() > MAX_PROOF_LEN {
+        return None;
+    }
+    let proof_len = u32::try_from(proof.len()).ok()?;
+    out.extend_from_slice(pi);
+    out.extend_from_slice(&proof_len.to_le_bytes());
+    out.extend_from_slice(proof);
+    Some(())
+}
+
+fn finish_tree_root(mut root: [Goldilocks; DIGEST], n_tx: usize) -> [Goldilocks; DIGEST] {
+    let n_padded = batch_common::padded_tiles(n_tx);
+    for _ in n_tx..n_padded {
+        root = joinsplit_air::merge(root, batch_joinsplit_air::dummy_sk());
+    }
+    root
+}
+
+fn prove_joinsplit_tree_to_bytes(
+    ws: &[joinsplit_air::Witness],
+) -> Option<(Vec<u8>, [Goldilocks; DIGEST])> {
+    if ws.is_empty() || ws.len() > MAX_TREE_TX {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(TREE_MAGIC);
+    out.extend_from_slice(&(ws.len() as u32).to_le_bytes());
+    let root_pos = out.len();
+    out.extend_from_slice(&[0u8; DIGEST_BYTES]);
+
+    let mut root = [Goldilocks::ZERO; DIGEST];
+    for w in ws {
+        let pvs = joinsplit_air::public_values(w);
+        let pi = encode_joinsplit_public_inputs(&pvs)?;
+        let proof = joinsplit_air::prove_to_bytes(w);
+        append_tree_leaf(&mut out, &pi, &proof)?;
+        root = joinsplit_air::merge(root, batch_joinsplit_air::tx_statement_digest(&pvs));
+    }
+    root = finish_tree_root(root, ws.len());
+    let root_bytes = encode_digest(&root);
+    out[root_pos..root_pos + DIGEST_BYTES].copy_from_slice(&root_bytes);
+    if out.len() > MAX_TREE_PROOF_LEN {
+        return None;
+    }
+    Some((out, root))
+}
+
+fn verify_joinsplit_tree_bytes(
+    proof_bytes: &[u8],
+    expected_root: &[Goldilocks],
+    expected_n_tx: usize,
+) -> bool {
+    if proof_bytes.len() > MAX_TREE_PROOF_LEN
+        || expected_root.len() != DIGEST
+        || expected_n_tx == 0
+        || expected_n_tx > MAX_TREE_TX
+    {
+        return false;
+    }
+    let mut off = 0usize;
+    if proof_bytes.len() < TREE_MAGIC.len() + 4 + DIGEST_BYTES {
+        return false;
+    }
+    if &proof_bytes[off..off + TREE_MAGIC.len()] != TREE_MAGIC {
+        return false;
+    }
+    off += TREE_MAGIC.len();
+    let n_tx = u32::from_le_bytes(match proof_bytes[off..off + 4].try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    }) as usize;
+    off += 4;
+    if n_tx != expected_n_tx || n_tx == 0 || n_tx > MAX_TREE_TX {
+        return false;
+    }
+    let declared_root = &proof_bytes[off..off + DIGEST_BYTES];
+    off += DIGEST_BYTES;
+    let expected_root_bytes = encode_digest(expected_root);
+    if declared_root != expected_root_bytes.as_slice() {
+        return false;
+    }
+
+    let mut root = [Goldilocks::ZERO; DIGEST];
+    for _ in 0..n_tx {
+        if proof_bytes.len().saturating_sub(off) < JS_PUBLIC_INPUTS_LEN + 4 {
+            return false;
+        }
+        let pi_bytes = &proof_bytes[off..off + JS_PUBLIC_INPUTS_LEN];
+        off += JS_PUBLIC_INPUTS_LEN;
+        let leaf_proof_len = u32::from_le_bytes(match proof_bytes[off..off + 4].try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        }) as usize;
+        off += 4;
+        if leaf_proof_len > MAX_PROOF_LEN || proof_bytes.len().saturating_sub(off) < leaf_proof_len
+        {
+            return false;
+        }
+        let leaf_proof = &proof_bytes[off..off + leaf_proof_len];
+        off += leaf_proof_len;
+        let pvs = match parse_joinsplit_public_inputs(pi_bytes) {
+            Some(pvs) => pvs,
+            None => return false,
+        };
+        if !joinsplit_air::verify_bytes(leaf_proof, &pvs) {
+            return false;
+        }
+        root = joinsplit_air::merge(root, batch_joinsplit_air::tx_statement_digest(&pvs));
+    }
+    if off != proof_bytes.len() {
+        return false;
+    }
+    root = finish_tree_root(root, n_tx);
+    encode_digest(&root) == expected_root_bytes
+}
+
+/// C ABI: verify a join-split tree proof container against the canonical 32-byte block tx-root and
+/// transaction count. This first tree seam validates every embedded production join-split proof and
+/// folds their public statements into the exact `batch_root` used by the Zig node.
+///
+/// # Safety
+/// `proof_ptr`/`root_ptr` must point to `proof_len`/`root_len` readable bytes (or be null).
+#[no_mangle]
+pub unsafe extern "C" fn lattica_joinsplit_tree_verify(
+    proof_ptr: *const u8,
+    proof_len: usize,
+    root_ptr: *const u8,
+    root_len: usize,
+    n_tx: usize,
+) -> i32 {
+    if proof_ptr.is_null() || root_ptr.is_null() || proof_len > MAX_TREE_PROOF_LEN {
+        return 1;
+    }
+    let proof = slice::from_raw_parts(proof_ptr, proof_len);
+    let rb = slice::from_raw_parts(root_ptr, root_len);
+    let root = match parse_root_digest(rb) {
+        Some(root) => root,
+        None => return 1,
+    };
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_joinsplit_tree_bytes(proof, &root, n_tx)
+    }));
+    if matches!(ok, Ok(true)) {
+        0
+    } else {
+        1
+    }
+}
+
+/// C ABI: prove a join-split tree container from `n_tx` concatenated join-split witnesses. The
+/// container can be produced level-by-level by a block builder; this ABI writes the canonical form
+/// accepted by `lattica_joinsplit_tree_verify`.
+///
+/// # Safety
+/// `witness_ptr` must point to `witness_len` readable bytes; `*_out` must point to `*_cap` writable
+/// bytes; `len` pointers must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn lattica_joinsplit_tree_prove(
+    witness_ptr: *const u8,
+    witness_len: usize,
+    n_tx: usize,
+    proof_out: *mut u8,
+    proof_cap: usize,
+    proof_len: *mut usize,
+    root_out: *mut u8,
+    root_cap: usize,
+    root_len: *mut usize,
+) -> i32 {
+    if witness_ptr.is_null()
+        || proof_out.is_null()
+        || root_out.is_null()
+        || proof_len.is_null()
+        || root_len.is_null()
+        || n_tx == 0
+        || n_tx > MAX_TREE_TX
+    {
+        return 1;
+    }
+    if witness_len != n_tx.checked_mul(JS_WITNESS_LEN).unwrap_or(usize::MAX) {
+        return 1;
+    }
+    let wb = slice::from_raw_parts(witness_ptr, witness_len);
+    let mut ws = Vec::with_capacity(n_tx);
+    for i in 0..n_tx {
+        match parse_joinsplit_witness(&wb[i * JS_WITNESS_LEN..(i + 1) * JS_WITNESS_LEN]) {
+            Some(w) => ws.push(w),
+            None => return 1,
+        }
+    }
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prove_joinsplit_tree_to_bytes(&ws)
+    }));
+    let (proof, root) = match built {
+        Ok(Some(x)) => x,
+        _ => return 1,
+    };
+    let rb = encode_digest(&root);
+    write_out2(
+        &proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len,
+    )
 }
 
 // --- HTLC batch aggregation C ABI (mirrors the join-split batch; HTLC witnesses + tx-root) ----
@@ -634,7 +922,14 @@ pub unsafe extern "C" fn lattica_htlc_batch_verify(
     root_ptr: *const u8,
     root_len: usize,
 ) -> i32 {
-    verify_abi(proof_ptr, proof_len, root_ptr, root_len, parse_root_digest, batch_htlc_air::verify_batch_bytes)
+    verify_abi(
+        proof_ptr,
+        proof_len,
+        root_ptr,
+        root_len,
+        parse_root_digest,
+        batch_htlc_air::verify_batch_bytes,
+    )
 }
 
 /// C ABI: prove `n_tx` concatenated **HTLC** witnesses (each `HTLC_WITNESS_LEN` bytes) as ONE batch
@@ -655,7 +950,12 @@ pub unsafe extern "C" fn lattica_htlc_batch_prove(
     root_cap: usize,
     root_len: *mut usize,
 ) -> i32 {
-    if witness_ptr.is_null() || proof_out.is_null() || root_out.is_null() || proof_len.is_null() || root_len.is_null() {
+    if witness_ptr.is_null()
+        || proof_out.is_null()
+        || root_out.is_null()
+        || proof_len.is_null()
+        || root_len.is_null()
+    {
         return 1;
     }
     // See lattica_batch_prove — cap n_tx first (overflow-safe; audit F2).
@@ -683,7 +983,9 @@ pub unsafe extern "C" fn lattica_htlc_batch_prove(
         Err(_) => return 1,
     };
     let rb = encode_digest(&root);
-    write_out2(&proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len)
+    write_out2(
+        &proof, proof_out, proof_cap, proof_len, &rb, root_out, root_cap, root_len,
+    )
 }
 
 // --- HTLC wallet-side prover ABI --------------------------------------------------------------
@@ -723,7 +1025,20 @@ fn parse_htlc_witness(b: &[u8]) -> Option<htlc_air::Witness> {
         let hashlock = rd_digest(b, &mut off)?;
         let timeout = rd_u64(b, &mut off);
         inputs.push(Input {
-            nk, div, asset, note_type, value, rho, rcm, sib, bits, mode, redeem_tag, refund_tag, hashlock, timeout,
+            nk,
+            div,
+            asset,
+            note_type,
+            value,
+            rho,
+            rcm,
+            sib,
+            bits,
+            mode,
+            redeem_tag,
+            refund_tag,
+            hashlock,
+            timeout,
         });
     }
     let inputs: [Input; N_IN] = inputs.try_into().ok()?;
@@ -735,20 +1050,35 @@ fn parse_htlc_witness(b: &[u8]) -> Option<htlc_air::Witness> {
         let value = rd_u64(b, &mut off);
         let rho = rd_felt2(b, &mut off)?;
         let rcm = rd_felt2(b, &mut off)?;
-        outputs.push(Output { recipient, asset, note_type, value, rho, rcm });
+        outputs.push(Output {
+            recipient,
+            asset,
+            note_type,
+            value,
+            rho,
+            rcm,
+        });
     }
     let outputs: [Output; M_OUT] = outputs.try_into().ok()?;
     let fee = rd_u64(b, &mut off);
     let mint = rd_u64(b, &mut off);
     let tx_binding = rd_digest(b, &mut off)?;
     let current_height = rd_u64(b, &mut off);
-    Some(Witness { inputs, outputs, fee, mint, tx_binding, current_height })
+    Some(Witness {
+        inputs,
+        outputs,
+        fee,
+        mint,
+        tx_binding,
+        current_height,
+    })
 }
 
 /// Encode an HTLC witness into the canonical byte layout (inverse of `parse_htlc_witness`).
 pub fn encode_htlc_witness(w: &htlc_air::Witness) -> Vec<u8> {
     let mut out = Vec::with_capacity(HTLC_WITNESS_LEN);
-    let put_felt = |o: &mut Vec<u8>, f: Goldilocks| o.extend_from_slice(&f.as_canonical_u64().to_le_bytes());
+    let put_felt =
+        |o: &mut Vec<u8>, f: Goldilocks| o.extend_from_slice(&f.as_canonical_u64().to_le_bytes());
     let put_u64 = |o: &mut Vec<u8>, v: u64| o.extend_from_slice(&v.to_le_bytes());
     let put_digest = |o: &mut Vec<u8>, d: &[Goldilocks; 4]| {
         for &f in d {
@@ -829,7 +1159,9 @@ pub unsafe extern "C" fn lattica_htlc_prove(
         Ok(Some(x)) => x,
         _ => return 1,
     };
-    write_out2(&proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len)
+    write_out2(
+        &proof, proof_out, proof_cap, proof_len, &pib, pi_out, pi_cap, pi_len,
+    )
 }
 
 #[cfg(test)]
@@ -894,7 +1226,9 @@ mod tests {
         assert_eq!(parse_joinsplit_public_inputs(&pib).unwrap(), pis);
         // accept
         assert_eq!(
-            unsafe { lattica_joinsplit_verify(proof.as_ptr(), proof.len(), pib.as_ptr(), pib.len()) },
+            unsafe {
+                lattica_joinsplit_verify(proof.as_ptr(), proof.len(), pib.as_ptr(), pib.len())
+            },
             0
         );
         // tampered anchor → reject
@@ -902,12 +1236,16 @@ mod tests {
         bad[0] += Goldilocks::ONE;
         let badb = encode_joinsplit_public_inputs(&bad).unwrap();
         assert_ne!(
-            unsafe { lattica_joinsplit_verify(proof.as_ptr(), proof.len(), badb.as_ptr(), badb.len()) },
+            unsafe {
+                lattica_joinsplit_verify(proof.as_ptr(), proof.len(), badb.as_ptr(), badb.len())
+            },
             0
         );
         // wrong length / null → fail-closed
         assert_ne!(
-            unsafe { lattica_joinsplit_verify(proof.as_ptr(), proof.len(), pib.as_ptr(), pib.len() - 1) },
+            unsafe {
+                lattica_joinsplit_verify(proof.as_ptr(), proof.len(), pib.as_ptr(), pib.len() - 1)
+            },
             0
         );
         assert_ne!(
@@ -918,7 +1256,14 @@ mod tests {
         let mut bad_proof = proof.clone();
         bad_proof[proof.len() / 2] ^= 0xFF;
         assert_ne!(
-            unsafe { lattica_joinsplit_verify(bad_proof.as_ptr(), bad_proof.len(), pib.as_ptr(), pib.len()) },
+            unsafe {
+                lattica_joinsplit_verify(
+                    bad_proof.as_ptr(),
+                    bad_proof.len(),
+                    pib.as_ptr(),
+                    pib.len(),
+                )
+            },
             0
         );
         // garbage proof buffers of various lengths → reject, never panic (catch_unwind isolation)
@@ -948,9 +1293,14 @@ mod tests {
         let (mut pl, mut pil) = (0usize, 0usize);
         let rc = unsafe {
             lattica_joinsplit_prove(
-                wb.as_ptr(), wb.len(),
-                proof.as_mut_ptr(), proof.len(), &mut pl,
-                pi.as_mut_ptr(), pi.len(), &mut pil,
+                wb.as_ptr(),
+                wb.len(),
+                proof.as_mut_ptr(),
+                proof.len(),
+                &mut pl,
+                pi.as_mut_ptr(),
+                pi.len(),
+                &mut pil,
             )
         };
         assert_eq!(rc, 0);
@@ -961,9 +1311,14 @@ mod tests {
         // a truncated witness is rejected (fail-closed, no unwind across the ABI)
         let rc_bad = unsafe {
             lattica_joinsplit_prove(
-                wb.as_ptr(), wb.len() - 1,
-                proof.as_mut_ptr(), proof.len(), &mut pl,
-                pi.as_mut_ptr(), pi.len(), &mut pil,
+                wb.as_ptr(),
+                wb.len() - 1,
+                proof.as_mut_ptr(),
+                proof.len(),
+                &mut pl,
+                pi.as_mut_ptr(),
+                pi.len(),
+                &mut pil,
             )
         };
         assert_eq!(rc_bad, 1);
@@ -979,22 +1334,44 @@ mod tests {
         let (mut pl, mut pil) = (0usize, 0usize);
         let np: *mut u8 = core::ptr::null_mut();
         let nl: *mut usize = core::ptr::null_mut();
-        let prove = |wp: *const u8, wl: usize, po: *mut u8, pc: usize, plp: *mut usize, pio: *mut u8, pic: usize, pilp: *mut usize| unsafe {
+        let prove = |wp: *const u8,
+                     wl: usize,
+                     po: *mut u8,
+                     pc: usize,
+                     plp: *mut usize,
+                     pio: *mut u8,
+                     pic: usize,
+                     pilp: *mut usize| unsafe {
             lattica_joinsplit_prove(wp, wl, po, pc, plp, pio, pic, pilp)
         };
         let (wp, wl) = (wb.as_ptr(), wb.len());
         let (po, pc) = (proof.as_mut_ptr(), proof.len());
         let (pio, pic) = (pi.as_mut_ptr(), pi.len());
-        assert_eq!(prove(core::ptr::null(), 0, po, pc, &mut pl, pio, pic, &mut pil), 1); // witness_ptr
+        assert_eq!(
+            prove(core::ptr::null(), 0, po, pc, &mut pl, pio, pic, &mut pil),
+            1
+        ); // witness_ptr
         assert_eq!(prove(wp, wl, np, pc, &mut pl, pio, pic, &mut pil), 1); // proof_out
         assert_eq!(prove(wp, wl, po, pc, nl, pio, pic, &mut pil), 1); // proof_len
         assert_eq!(prove(wp, wl, po, pc, &mut pl, np, pic, &mut pil), 1); // pi_out
         assert_eq!(prove(wp, wl, po, pc, &mut pl, pio, pic, nl), 1); // pi_len
-        // demo prover: each output pointer null → fail-closed
-        assert_eq!(unsafe { lattica_joinsplit_prove_demo(np, pc, &mut pl, pio, pic, &mut pil) }, 1);
-        assert_eq!(unsafe { lattica_joinsplit_prove_demo(po, pc, nl, pio, pic, &mut pil) }, 1);
-        assert_eq!(unsafe { lattica_joinsplit_prove_demo(po, pc, &mut pl, np, pic, &mut pil) }, 1);
-        assert_eq!(unsafe { lattica_joinsplit_prove_demo(po, pc, &mut pl, pio, pic, nl) }, 1);
+                                                                     // demo prover: each output pointer null → fail-closed
+        assert_eq!(
+            unsafe { lattica_joinsplit_prove_demo(np, pc, &mut pl, pio, pic, &mut pil) },
+            1
+        );
+        assert_eq!(
+            unsafe { lattica_joinsplit_prove_demo(po, pc, nl, pio, pic, &mut pil) },
+            1
+        );
+        assert_eq!(
+            unsafe { lattica_joinsplit_prove_demo(po, pc, &mut pl, np, pic, &mut pil) },
+            1
+        );
+        assert_eq!(
+            unsafe { lattica_joinsplit_prove_demo(po, pc, &mut pl, pio, pic, nl) },
+            1
+        );
     }
 
     #[test]
@@ -1009,7 +1386,16 @@ mod tests {
         let mut pi = vec![0u8; 512];
         let (mut pl, mut pil) = (0usize, 0usize);
         let rc = unsafe {
-            lattica_joinsplit_prove(wb.as_ptr(), wb.len(), proof.as_mut_ptr(), proof.len(), &mut pl, pi.as_mut_ptr(), pi.len(), &mut pil)
+            lattica_joinsplit_prove(
+                wb.as_ptr(),
+                wb.len(),
+                proof.as_mut_ptr(),
+                proof.len(),
+                &mut pl,
+                pi.as_mut_ptr(),
+                pi.len(),
+                &mut pil,
+            )
         };
         assert_eq!(rc, 1);
     }
@@ -1022,7 +1408,9 @@ mod tests {
         let pib = encode_joinsplit_public_inputs(&pis).unwrap();
         let buf = [0u8; 8];
         assert_ne!(
-            unsafe { lattica_joinsplit_verify(buf.as_ptr(), MAX_PROOF_LEN + 1, pib.as_ptr(), pib.len()) },
+            unsafe {
+                lattica_joinsplit_verify(buf.as_ptr(), MAX_PROOF_LEN + 1, pib.as_ptr(), pib.len())
+            },
             0
         );
     }
@@ -1054,7 +1442,14 @@ mod tests {
         let mut pibuf = vec![0u8; 512];
         let (mut pl, mut pil) = (0usize, 0usize);
         let rc = unsafe {
-            lattica_htlc_prove_demo(pbuf.as_mut_ptr(), pbuf.len(), &mut pl, pibuf.as_mut_ptr(), pibuf.len(), &mut pil)
+            lattica_htlc_prove_demo(
+                pbuf.as_mut_ptr(),
+                pbuf.len(),
+                &mut pl,
+                pibuf.as_mut_ptr(),
+                pibuf.len(),
+                &mut pil,
+            )
         };
         assert_eq!(rc, 0);
         assert_eq!(
@@ -1071,19 +1466,45 @@ mod tests {
         assert_eq!(wb.len(), HTLC_WITNESS_LEN);
         // the byte layout round-trips to the same statement
         let w2 = parse_htlc_witness(&wb).unwrap();
-        assert_eq!(crate::htlc_air::public_values(&w2), crate::htlc_air::public_values(&w));
+        assert_eq!(
+            crate::htlc_air::public_values(&w2),
+            crate::htlc_air::public_values(&w)
+        );
         // prove from the serialized witness → the proof verifies against the returned public inputs
         let mut pbuf = vec![0u8; 1 << 20];
         let mut pibuf = vec![0u8; 512];
         let (mut pl, mut pil) = (0usize, 0usize);
         let rc = unsafe {
-            lattica_htlc_prove(wb.as_ptr(), wb.len(), pbuf.as_mut_ptr(), pbuf.len(), &mut pl, pibuf.as_mut_ptr(), pibuf.len(), &mut pil)
+            lattica_htlc_prove(
+                wb.as_ptr(),
+                wb.len(),
+                pbuf.as_mut_ptr(),
+                pbuf.len(),
+                &mut pl,
+                pibuf.as_mut_ptr(),
+                pibuf.len(),
+                &mut pil,
+            )
         };
         assert_eq!(rc, 0);
-        assert_eq!(unsafe { lattica_htlc_verify(pbuf.as_ptr(), pl, pibuf.as_ptr(), pil) }, 0);
+        assert_eq!(
+            unsafe { lattica_htlc_verify(pbuf.as_ptr(), pl, pibuf.as_ptr(), pil) },
+            0
+        );
         // a truncated witness is rejected (fail-closed)
         assert_eq!(
-            unsafe { lattica_htlc_prove(wb.as_ptr(), wb.len() - 1, pbuf.as_mut_ptr(), pbuf.len(), &mut pl, pibuf.as_mut_ptr(), pibuf.len(), &mut pil) },
+            unsafe {
+                lattica_htlc_prove(
+                    wb.as_ptr(),
+                    wb.len() - 1,
+                    pbuf.as_mut_ptr(),
+                    pbuf.len(),
+                    &mut pl,
+                    pibuf.as_mut_ptr(),
+                    pibuf.len(),
+                    &mut pil,
+                )
+            },
             1
         );
     }
@@ -1097,7 +1518,9 @@ mod tests {
         let pib = encode_htlc_public_inputs(&pis).unwrap();
         let buf = [0u8; 8];
         assert_ne!(
-            unsafe { lattica_htlc_verify(buf.as_ptr(), MAX_PROOF_LEN + 1, pib.as_ptr(), pib.len()) },
+            unsafe {
+                lattica_htlc_verify(buf.as_ptr(), MAX_PROOF_LEN + 1, pib.as_ptr(), pib.len())
+            },
             0
         );
     }
@@ -1131,7 +1554,10 @@ mod tests {
         let prove = |wp, wl, po, pc, plp, pio, pic, pilp| unsafe {
             lattica_htlc_prove(wp, wl, po, pc, plp, pio, pic, pilp)
         };
-        assert_eq!(prove(core::ptr::null(), 0, po, pc, &mut pl, pio, pic, &mut pil), 1);
+        assert_eq!(
+            prove(core::ptr::null(), 0, po, pc, &mut pl, pio, pic, &mut pil),
+            1
+        );
         assert_eq!(prove(wp, wl, np, pc, &mut pl, pio, pic, &mut pil), 1);
         assert_eq!(prove(wp, wl, po, pc, nl, pio, pic, &mut pil), 1);
         assert_eq!(prove(wp, wl, po, pc, &mut pl, np, pic, &mut pil), 1);
@@ -1149,7 +1575,16 @@ mod tests {
         let mut pi = vec![0u8; 512];
         let (mut pl, mut pil) = (0usize, 0usize);
         let rc = unsafe {
-            lattica_htlc_prove(wb.as_ptr(), wb.len(), proof.as_mut_ptr(), proof.len(), &mut pl, pi.as_mut_ptr(), pi.len(), &mut pil)
+            lattica_htlc_prove(
+                wb.as_ptr(),
+                wb.len(),
+                proof.as_mut_ptr(),
+                proof.len(),
+                &mut pl,
+                pi.as_mut_ptr(),
+                pi.len(),
+                &mut pil,
+            )
         };
         assert_eq!(rc, 1);
     }
@@ -1171,16 +1606,32 @@ mod tests {
         let mut root = [0u8; 32];
         let (mut pl, mut rl) = (0usize, 0usize);
         let rc = unsafe {
-            lattica_batch_prove(wb.as_ptr(), wb.len(), 2, proof.as_mut_ptr(), proof.len(), &mut pl, root.as_mut_ptr(), root.len(), &mut rl)
+            lattica_batch_prove(
+                wb.as_ptr(),
+                wb.len(),
+                2,
+                proof.as_mut_ptr(),
+                proof.len(),
+                &mut pl,
+                root.as_mut_ptr(),
+                root.len(),
+                &mut rl,
+            )
         };
         assert_eq!(rc, 0);
         assert_eq!(rl, 32);
         // the proof verifies against the returned root
-        assert_eq!(unsafe { lattica_batch_verify(proof.as_ptr(), pl, root.as_ptr(), rl) }, 0);
+        assert_eq!(
+            unsafe { lattica_batch_verify(proof.as_ptr(), pl, root.as_ptr(), rl) },
+            0
+        );
         // a tampered root is rejected
         let mut bad = root;
         bad[0] ^= 1;
-        assert_ne!(unsafe { lattica_batch_verify(proof.as_ptr(), pl, bad.as_ptr(), 32) }, 0);
+        assert_ne!(
+            unsafe { lattica_batch_verify(proof.as_ptr(), pl, bad.as_ptr(), 32) },
+            0
+        );
     }
 
     #[test]
@@ -1190,34 +1641,91 @@ mod tests {
         let mut r = [0u8; 32];
         // null witness pointer ⇒ 1
         assert_eq!(
-            unsafe { lattica_batch_prove(core::ptr::null(), 0, 1, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            unsafe {
+                lattica_batch_prove(
+                    core::ptr::null(),
+                    0,
+                    1,
+                    p.as_mut_ptr(),
+                    p.len(),
+                    &mut pl,
+                    r.as_mut_ptr(),
+                    r.len(),
+                    &mut rl,
+                )
+            },
             1
         );
         // null proof pointer on verify ⇒ reject
-        assert_ne!(unsafe { lattica_batch_verify(core::ptr::null(), 0, r.as_ptr(), 32) }, 0);
+        assert_ne!(
+            unsafe { lattica_batch_verify(core::ptr::null(), 0, r.as_ptr(), 32) },
+            0
+        );
         // witness_len not == n_tx · JS_WITNESS_LEN ⇒ 1
         let wb = vec![0u8; JS_WITNESS_LEN + 1];
         assert_eq!(
-            unsafe { lattica_batch_prove(wb.as_ptr(), wb.len(), 1, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            unsafe {
+                lattica_batch_prove(
+                    wb.as_ptr(),
+                    wb.len(),
+                    1,
+                    p.as_mut_ptr(),
+                    p.len(),
+                    &mut pl,
+                    r.as_mut_ptr(),
+                    r.len(),
+                    &mut rl,
+                )
+            },
             1
         );
         // n_tx beyond MAX_BATCH_TILES ⇒ rejected before any parsing/proving
         let big = vec![0u8; 65 * JS_WITNESS_LEN];
         assert_eq!(
-            unsafe { lattica_batch_prove(big.as_ptr(), big.len(), 65, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            unsafe {
+                lattica_batch_prove(
+                    big.as_ptr(),
+                    big.len(),
+                    65,
+                    p.as_mut_ptr(),
+                    p.len(),
+                    &mut pl,
+                    r.as_mut_ptr(),
+                    r.len(),
+                    &mut rl,
+                )
+            },
             1
         );
         // F2 (audit): n_tx in the `padded_tiles` next_power_of_two overflow window (near 2^64) must reject
         // — NOT wrap to 0, bypass the cap, and hit `from_raw_parts(usize::MAX)` UB / a with_capacity panic.
         // The early `n_tx > MAX_BATCH_TILES` cap catches it before any size math or `from_raw_parts`.
         assert_eq!(
-            unsafe { lattica_batch_prove(big.as_ptr(), usize::MAX, usize::MAX, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            unsafe {
+                lattica_batch_prove(
+                    big.as_ptr(),
+                    usize::MAX,
+                    usize::MAX,
+                    p.as_mut_ptr(),
+                    p.len(),
+                    &mut pl,
+                    r.as_mut_ptr(),
+                    r.len(),
+                    &mut rl,
+                )
+            },
             1
         );
         // oversize proof_len on verify ⇒ rejected before deref (M-08)
-        assert_ne!(unsafe { lattica_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) }, 0);
+        assert_ne!(
+            unsafe { lattica_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) },
+            0
+        );
         // wrong root length ⇒ reject
-        assert_ne!(unsafe { lattica_batch_verify(r.as_ptr(), 0, r.as_ptr(), 31) }, 0);
+        assert_ne!(
+            unsafe { lattica_batch_verify(r.as_ptr(), 0, r.as_ptr(), 31) },
+            0
+        );
     }
 
     #[test]
@@ -1233,14 +1741,30 @@ mod tests {
         let mut root = [0u8; 32];
         let (mut pl, mut rl) = (0usize, 0usize);
         let rc = unsafe {
-            lattica_htlc_batch_prove(wb.as_ptr(), wb.len(), 2, proof.as_mut_ptr(), proof.len(), &mut pl, root.as_mut_ptr(), root.len(), &mut rl)
+            lattica_htlc_batch_prove(
+                wb.as_ptr(),
+                wb.len(),
+                2,
+                proof.as_mut_ptr(),
+                proof.len(),
+                &mut pl,
+                root.as_mut_ptr(),
+                root.len(),
+                &mut rl,
+            )
         };
         assert_eq!(rc, 0);
         assert_eq!(rl, 32);
-        assert_eq!(unsafe { lattica_htlc_batch_verify(proof.as_ptr(), pl, root.as_ptr(), rl) }, 0);
+        assert_eq!(
+            unsafe { lattica_htlc_batch_verify(proof.as_ptr(), pl, root.as_ptr(), rl) },
+            0
+        );
         let mut bad = root;
         bad[0] ^= 1;
-        assert_ne!(unsafe { lattica_htlc_batch_verify(proof.as_ptr(), pl, bad.as_ptr(), 32) }, 0);
+        assert_ne!(
+            unsafe { lattica_htlc_batch_verify(proof.as_ptr(), pl, bad.as_ptr(), 32) },
+            0
+        );
     }
 
     #[test]
@@ -1249,21 +1773,66 @@ mod tests {
         let mut p = [0u8; 8];
         let mut r = [0u8; 32];
         assert_eq!(
-            unsafe { lattica_htlc_batch_prove(core::ptr::null(), 0, 1, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            unsafe {
+                lattica_htlc_batch_prove(
+                    core::ptr::null(),
+                    0,
+                    1,
+                    p.as_mut_ptr(),
+                    p.len(),
+                    &mut pl,
+                    r.as_mut_ptr(),
+                    r.len(),
+                    &mut rl,
+                )
+            },
             1
         );
-        assert_ne!(unsafe { lattica_htlc_batch_verify(core::ptr::null(), 0, r.as_ptr(), 32) }, 0);
+        assert_ne!(
+            unsafe { lattica_htlc_batch_verify(core::ptr::null(), 0, r.as_ptr(), 32) },
+            0
+        );
         let wb = vec![0u8; HTLC_WITNESS_LEN + 1];
         assert_eq!(
-            unsafe { lattica_htlc_batch_prove(wb.as_ptr(), wb.len(), 1, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            unsafe {
+                lattica_htlc_batch_prove(
+                    wb.as_ptr(),
+                    wb.len(),
+                    1,
+                    p.as_mut_ptr(),
+                    p.len(),
+                    &mut pl,
+                    r.as_mut_ptr(),
+                    r.len(),
+                    &mut rl,
+                )
+            },
             1
         );
         // F2 (audit): n_tx overflow window rejects (see batch_abi_fail_closed).
         assert_eq!(
-            unsafe { lattica_htlc_batch_prove(wb.as_ptr(), usize::MAX, usize::MAX, p.as_mut_ptr(), p.len(), &mut pl, r.as_mut_ptr(), r.len(), &mut rl) },
+            unsafe {
+                lattica_htlc_batch_prove(
+                    wb.as_ptr(),
+                    usize::MAX,
+                    usize::MAX,
+                    p.as_mut_ptr(),
+                    p.len(),
+                    &mut pl,
+                    r.as_mut_ptr(),
+                    r.len(),
+                    &mut rl,
+                )
+            },
             1
         );
-        assert_ne!(unsafe { lattica_htlc_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) }, 0);
-        assert_ne!(unsafe { lattica_htlc_batch_verify(r.as_ptr(), 0, r.as_ptr(), 31) }, 0);
+        assert_ne!(
+            unsafe { lattica_htlc_batch_verify(r.as_ptr(), MAX_PROOF_LEN + 1, r.as_ptr(), 32) },
+            0
+        );
+        assert_ne!(
+            unsafe { lattica_htlc_batch_verify(r.as_ptr(), 0, r.as_ptr(), 31) },
+            0
+        );
     }
 }

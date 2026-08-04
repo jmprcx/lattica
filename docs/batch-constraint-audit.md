@@ -1,5 +1,7 @@
 # Batch circuit — constraint-accounting self-audit ("one proof per block")
 
+> **Document role:** Security analysis of the production batch AIRs and their transaction-root binding.
+
 A constraint-by-constraint review of `lattica-prover-p3::batch_joinsplit_air` and `batch_htlc_air` —
 the **batch aggregation** circuits that prove *K* transactions as ONE block proof binding a single
 32-byte block **tx-root**. This audits the **delta over the single-tx circuits**; the per-tile spend

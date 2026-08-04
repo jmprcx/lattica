@@ -1,11 +1,13 @@
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_field::{Field, PrimeCharacteristicRing};
 #[cfg(test)]
 use p3_field::TwoAdicField;
+use p3_field::{Field, PrimeCharacteristicRing};
 use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 
-use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W};
+use crate::poseidon2_air::{
+    ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W,
+};
 use crate::recursion::native_fri::{Challenge, Val};
 
 use super::*;
@@ -65,7 +67,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralFoldAir {
         let one = AB::Expr::ONE;
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let arity = self.arity();
         let mut fr = builder.when_first_row();
@@ -86,7 +91,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralFoldAir {
             cp = cp.clone() * cp.clone();
         }
         let wscale = cur[self.c_wscale()].clone();
-        fr.assert_zero(wscale.clone() * (AB::Expr::from(Goldilocks::from_usize(arity)) * cp) - one.clone());
+        fr.assert_zero(
+            wscale.clone() * (AB::Expr::from(Goldilocks::from_usize(arity)) * cp) - one.clone(),
+        );
         // acc = Σ_i y_i ⊗ inv_i · (xs_i · weight_scale); folded = L(β) ⊗ acc.
         let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
         for i in 0..arity {
@@ -105,7 +112,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralFoldAir {
 }
 
 #[allow(dead_code)]
-pub(crate) fn build_general_fold_trace(log_arity: usize, evals: &[Challenge], beta: Challenge, xs: &[Val], folded: Challenge) -> RowMajorMatrix<Val> {
+pub(crate) fn build_general_fold_trace(
+    log_arity: usize,
+    evals: &[Challenge],
+    beta: Challenge,
+    xs: &[Val],
+    folded: Challenge,
+) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
     let air = GeneralFoldAir { log_arity };
     let arity = 1 << log_arity;
@@ -227,7 +240,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralLeafHashAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         // Poseidon2 rounds (all blocks hash).
         let is_init = p[0].clone();
@@ -236,10 +253,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralLeafHashAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -268,14 +291,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralLeafHashAir {
         {
             let bl = p[11].clone(); // P_BLOCK_LAST → capacity carry across every block boundary
             for k in RATE..W {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - cur[k].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(bl.clone() * (nxt[k].clone() - cur[k].clone()));
             }
         }
         // short final block: the rate lanes it does NOT overwrite (rem..RATE) carry the previous block's output.
         if self.rem() < RATE {
             let lc = p[self.p_last_carry()].clone();
             for k in self.rem()..RATE {
-                builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone()));
             }
         }
         // terminal: the last block's output rate == the committed leaf.
@@ -287,7 +314,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralLeafHashAir {
 }
 
 #[allow(dead_code)]
-pub(crate) fn build_general_leaf_trace(n_felts: usize, group: &[Val], leaf: [Val; 4]) -> RowMajorMatrix<Val> {
+pub(crate) fn build_general_leaf_trace(
+    n_felts: usize,
+    group: &[Val],
+    leaf: [Val; 4],
+) -> RowMajorMatrix<Val> {
     let air = GeneralLeafHashAir { n_felts };
     let n_blocks = air.n_blocks();
     let h = air.height();
@@ -372,19 +403,35 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Arity4FoldChainAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let p_fold = p[0].clone();
         let p_fin = p[1].clone();
-        let ev = |i: usize| (cur[A4_EVALS + 2 * i].clone(), cur[A4_EVALS + 2 * i + 1].clone());
+        let ev = |i: usize| {
+            (
+                cur[A4_EVALS + 2 * i].clone(),
+                cur[A4_EVALS + 2 * i + 1].clone(),
+            )
+        };
         // E_0 == ro
-        builder.when_first_row().assert_zero(cur[A4_E].clone() - pis[0].clone());
-        builder.when_first_row().assert_zero(cur[A4_E + 1].clone() - pis[1].clone());
+        builder
+            .when_first_row()
+            .assert_zero(cur[A4_E].clone() - pis[0].clone());
+        builder
+            .when_first_row()
+            .assert_zero(cur[A4_E + 1].clone() - pis[1].clone());
         // fold rows: slot bits, the running eval sits at slot, the barycentric fold → E_{r+1}.
         let b0 = cur[A4_B0].clone();
         let b1 = cur[A4_B1].clone();
@@ -400,7 +447,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Arity4FoldChainAir {
         let mut e_slot = (AB::Expr::ZERO, AB::Expr::ZERO);
         for j in 0..4 {
             let e = ev(j);
-            e_slot = (e_slot.0 + sel[j].clone() * e.0, e_slot.1 + sel[j].clone() * e.1);
+            e_slot = (
+                e_slot.0 + sel[j].clone() * e.0,
+                e_slot.1 + sel[j].clone() * e.1,
+            );
         }
         builder.assert_zero(p_fold.clone() * (cur[A4_E].clone() - e_slot.0));
         builder.assert_zero(p_fold.clone() * (cur[A4_E + 1].clone() - e_slot.1));
@@ -421,7 +471,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Arity4FoldChainAir {
             x2.clone() * x2
         };
         let wscale = cur[A4_WSCALE].clone();
-        builder.assert_zero(p_fold.clone() * (wscale.clone() * (AB::Expr::from(Goldilocks::from_usize(4)) * cp) - one.clone()));
+        builder.assert_zero(
+            p_fold.clone()
+                * (wscale.clone() * (AB::Expr::from(Goldilocks::from_usize(4)) * cp) - one.clone()),
+        );
         let mut acc = (AB::Expr::ZERO, AB::Expr::ZERO);
         for i in 0..4 {
             let y = ev(i);
@@ -432,8 +485,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Arity4FoldChainAir {
         }
         let res = emul(lz, acc);
         // chain: next row's E == this round's folded result.
-        builder.when_transition().assert_zero(p_fold.clone() * (nxt[A4_E].clone() - res.0));
-        builder.when_transition().assert_zero(p_fold * (nxt[A4_E + 1].clone() - res.1));
+        builder
+            .when_transition()
+            .assert_zero(p_fold.clone() * (nxt[A4_E].clone() - res.0));
+        builder
+            .when_transition()
+            .assert_zero(p_fold * (nxt[A4_E + 1].clone() - res.1));
         // accept: after N folds, E == final_poly[0].
         builder.assert_zero(p_fin.clone() * (cur[A4_E].clone() - pis[2].clone()));
         builder.assert_zero(p_fin * (cur[A4_E + 1].clone() - pis[3].clone()));
@@ -568,7 +625,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AggFoldAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let dom = AB::Expr::from(Goldilocks::from_u64(AF_DOM));
         // Poseidon2 rounds (every block hashes).
@@ -578,10 +639,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AggFoldAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -601,7 +668,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AggFoldAir {
         // SK block output → ROOT block rate-high (s_k link): nxt[4..8] == cur[0..4] on the SK block last row.
         let skl = p[self.p_sklast()].clone();
         for k in 0..4 {
-            builder.when_transition().assert_zero(skl.clone() * (nxt[4 + k].clone() - cur[k].clone()));
+            builder
+                .when_transition()
+                .assert_zero(skl.clone() * (nxt[4 + k].clone() - cur[k].clone()));
         }
         // ROOT block first row rate-low == the running ROOT column.
         let rin = p[self.p_rootin()].clone();
@@ -610,12 +679,19 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AggFoldAir {
         }
         // ROOT column: IV = 0; updated to the ROOT block output at P_ROOT_UPDATE; held otherwise.
         for k in 0..4 {
-            builder.when_first_row().assert_zero(cur[AF_ROOT + k].clone());
+            builder
+                .when_first_row()
+                .assert_zero(cur[AF_ROOT + k].clone());
         }
         let rupd = p[self.p_rootupd()].clone();
         for k in 0..4 {
-            builder.when_transition().assert_zero((AB::Expr::ONE - rupd.clone()) * (nxt[AF_ROOT + k].clone() - cur[AF_ROOT + k].clone()));
-            builder.when_transition().assert_zero(rupd.clone() * (nxt[AF_ROOT + k].clone() - cur[k].clone()));
+            builder.when_transition().assert_zero(
+                (AB::Expr::ONE - rupd.clone())
+                    * (nxt[AF_ROOT + k].clone() - cur[AF_ROOT + k].clone()),
+            );
+            builder
+                .when_transition()
+                .assert_zero(rupd.clone() * (nxt[AF_ROOT + k].clone() - cur[k].clone()));
         }
         // tx-root: the last ROOT block output == the single public input.
         let term = p[self.p_term()].clone();
@@ -626,14 +702,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for AggFoldAir {
 }
 
 #[allow(dead_code)]
-pub(crate) fn build_agg_fold_trace(n_tiles: usize, pvs0: &[Val], tx_root: [Val; 4]) -> RowMajorMatrix<Val> {
+pub(crate) fn build_agg_fold_trace(
+    n_tiles: usize,
+    pvs0: &[Val],
+    tx_root: [Val; 4],
+) -> RowMajorMatrix<Val> {
     let air = AggFoldAir { n_tiles };
     let h = air.height();
     let mut t = vec![Val::ZERO; h * AF_W];
     let mut root = [Val::ZERO; 4]; // IV = 0
     for tile in 0..n_tiles {
         let pv = pvs0.get(tile).copied().unwrap_or(Val::ZERO); // padding tiles fold pvs0 = 0
-        // SK block (2·tile): merge([DOM,0,0,0], [pv,0,0,0]) → s_k; ROOT column holds the running root.
+                                                               // SK block (2·tile): merge([DOM,0,0,0], [pv,0,0,0]) → s_k; ROOT column holds the running root.
         let mut sk_in = [Val::ZERO; W];
         sk_in[0] = Val::from_u64(AF_DOM);
         sk_in[4] = pv;
@@ -712,7 +792,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralEpilogueAir {
         let one = AB::Expr::ONE;
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let zeta = (pis[0].clone(), pis[1].clone());
         let alpha = (pis[2].clone(), pis[3].clone());
@@ -747,7 +830,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralEpilogueAir {
         let t0 = emul(coeff0, (a.0.clone() - p0, a.1.clone()));
         let t1 = emul(coeff1, (b.0.clone() - p1, b.1.clone()));
         let t2 = emul(coeff2, (na.0 - b.0.clone(), na.1 - b.1.clone()));
-        let t3 = emul(coeff3, (nb.0 - a.0.clone() - b.0.clone(), nb.1 - a.1.clone() - b.1.clone()));
+        let t3 = emul(
+            coeff3,
+            (
+                nb.0 - a.0.clone() - b.0.clone(),
+                nb.1 - a.1.clone() - b.1.clone(),
+            ),
+        );
         let t4 = emul(coeff4, (b.0.clone() - p2, b.1.clone()));
         let rhs = emul(rhs_coeff, q);
         let mut fr = builder.when_first_row();
@@ -767,7 +856,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for GeneralEpilogueAir {
 // =================================================================================================
 #[cfg(test)]
 pub(crate) struct MultiColReducedOpeningAir {
-    pub(crate) w: usize, // trace width (columns)
+    pub(crate) w: usize,      // trace width (columns)
     pub(crate) n_quot: usize, // quotient DEEP terms
 }
 #[cfg(test)]
@@ -803,7 +892,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MultiColReducedOpeningAir {
         let one = AB::Expr::ONE;
         let w_ext = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let alpha = (pis[0].clone(), pis[1].clone());
         let ro_pub = (pis[2].clone(), pis[3].clone());
@@ -816,7 +908,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MultiColReducedOpeningAir {
         let mut fr = builder.when_first_row();
         let mut ro = (AB::Expr::ZERO, AB::Expr::ZERO);
         // per-term contribution given (z, pz, px, k): check inv·(z−x)==1, add α^k·(pz−px)·inv.
-        let add_term = |fr: &mut _, ro: &mut (AB::Expr, AB::Expr), z: (AB::Expr, AB::Expr), pz: (AB::Expr, AB::Expr), inv: (AB::Expr, AB::Expr), px: AB::Expr, k: usize| {
+        let add_term = |fr: &mut _,
+                        ro: &mut (AB::Expr, AB::Expr),
+                        z: (AB::Expr, AB::Expr),
+                        pz: (AB::Expr, AB::Expr),
+                        inv: (AB::Expr, AB::Expr),
+                        px: AB::Expr,
+                        k: usize| {
             let chk = emul(inv.clone(), (z.0.clone() - x.clone(), z.1.clone()));
             AirBuilder::assert_zero(fr, chk.0 - one.clone());
             AirBuilder::assert_zero(fr, chk.1);
@@ -848,7 +946,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MultiColReducedOpeningAir {
 }
 
 #[cfg(test)]
-pub(crate) fn build_multicol_ro_trace(w: usize, terms: &[(Challenge, Challenge, Val)], x: Val, alpha: Challenge) -> RowMajorMatrix<Val> {
+pub(crate) fn build_multicol_ro_trace(
+    w: usize,
+    terms: &[(Challenge, Challenge, Val)],
+    x: Val,
+    alpha: Challenge,
+) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
     let cc = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
     let n_quot = terms.len() - 2 * w;
@@ -860,7 +963,12 @@ pub(crate) fn build_multicol_ro_trace(w: usize, terms: &[(Challenge, Challenge, 
     for c in 0..w {
         r0[c] = terms[c].2;
     }
-    let fill = |r0: &mut [Val], off: usize, z: Challenge, pz: Challenge, px_col: Option<usize>, px: Val| {
+    let fill = |r0: &mut [Val],
+                off: usize,
+                z: Challenge,
+                pz: Challenge,
+                px_col: Option<usize>,
+                px: Val| {
         r0[off..off + 2].copy_from_slice(&cc(z));
         r0[off + 2..off + 4].copy_from_slice(&cc(pz));
         r0[off + 4..off + 6].copy_from_slice(&cc((z - Challenge::from(x)).inverse()));
@@ -886,7 +994,11 @@ pub(crate) fn build_multicol_ro_trace(w: usize, terms: &[(Challenge, Challenge, 
 }
 
 #[cfg(test)]
-pub(crate) fn build_general_epilogue_trace(local: [Challenge; 2], next: [Challenge; 2], quotient: Challenge) -> RowMajorMatrix<Val> {
+pub(crate) fn build_general_epilogue_trace(
+    local: [Challenge; 2],
+    next: [Challenge; 2],
+    quotient: Challenge,
+) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
     let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
     let w = 10;
@@ -929,7 +1041,10 @@ pub(crate) fn eval_symbolic_circuit<AB: AirBuilder<F = Goldilocks>>(
 ) -> (AB::Expr, AB::Expr) {
     use p3_uni_stark::{BaseEntry, BaseLeaf, SymbolicExpr};
     let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-        (a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+        (
+            a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(),
+            a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+        )
     };
     match e {
         SymbolicExpr::Leaf(leaf) => match leaf {
@@ -951,22 +1066,36 @@ pub(crate) fn eval_symbolic_circuit<AB: AirBuilder<F = Goldilocks>>(
             BaseLeaf::Constant(c) => (AB::Expr::from(*c), AB::Expr::ZERO),
         },
         SymbolicExpr::Add { x, y, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
-            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(
+                x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext,
+            );
+            let b = eval_symbolic_circuit::<AB>(
+                y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext,
+            );
             (a.0 + b.0, a.1 + b.1)
         }
         SymbolicExpr::Sub { x, y, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
-            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(
+                x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext,
+            );
+            let b = eval_symbolic_circuit::<AB>(
+                y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext,
+            );
             (a.0 - b.0, a.1 - b.1)
         }
         SymbolicExpr::Neg { x, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(
+                x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext,
+            );
             (AB::Expr::ZERO - a.0, AB::Expr::ZERO - a.1)
         }
         SymbolicExpr::Mul { x, y, .. } => {
-            let a = eval_symbolic_circuit::<AB>(x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
-            let b = eval_symbolic_circuit::<AB>(y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext);
+            let a = eval_symbolic_circuit::<AB>(
+                x, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext,
+            );
+            let b = eval_symbolic_circuit::<AB>(
+                y, local, next, pubs, periodic, is_first, is_last, is_trans, w_ext,
+            );
             emul(a, b)
         }
     }
@@ -1022,11 +1151,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SymbolicEpilogueAir {
         let one = AB::Expr::ONE;
         let w_ext = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w_ext.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let zeta = (pis[0].clone(), pis[1].clone());
         let alpha = (pis[2].clone(), pis[3].clone());
-        let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub).map(|i| (pis[4 + i].clone(), AB::Expr::ZERO)).collect();
+        let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub)
+            .map(|i| (pis[4 + i].clone(), AB::Expr::ZERO))
+            .collect();
         // z_h = ζ^(2^db) − 1 and g^{-1} use the INNER's degree_bits (the standalone gadget verifies inners at
         // any height, unlike the monolith which is pinned to M_DEGREE_BITS).
         let g_inv = AB::Expr::from(Goldilocks::two_adic_generator(self.degree_bits).inverse());
@@ -1040,8 +1174,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SymbolicEpilogueAir {
         let is_first = (cur[self.c_isf()].clone(), cur[self.c_isf() + 1].clone());
         let is_last = (cur[self.c_isl()].clone(), cur[self.c_isl() + 1].clone());
         let inv_van = (cur[self.c_iv()].clone(), cur[self.c_iv() + 1].clone());
-        let local: Vec<(AB::Expr, AB::Expr)> = (0..self.w).map(|c| (cur[self.c_local(c)].clone(), cur[self.c_local(c) + 1].clone())).collect();
-        let next: Vec<(AB::Expr, AB::Expr)> = (0..self.w).map(|c| (cur[self.c_next(c)].clone(), cur[self.c_next(c) + 1].clone())).collect();
+        let local: Vec<(AB::Expr, AB::Expr)> = (0..self.w)
+            .map(|c| {
+                (
+                    cur[self.c_local(c)].clone(),
+                    cur[self.c_local(c) + 1].clone(),
+                )
+            })
+            .collect();
+        let next: Vec<(AB::Expr, AB::Expr)> = (0..self.w)
+            .map(|c| (cur[self.c_next(c)].clone(), cur[self.c_next(c) + 1].clone()))
+            .collect();
         let quot = (cur[self.c_quot()].clone(), cur[self.c_quot() + 1].clone());
         let mut fr = builder.when_first_row();
         // witnessed selectors bound to their ζ-definitions.
@@ -1055,11 +1198,20 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SymbolicEpilogueAir {
         fr.assert_zero(b_iv.0 - one.clone());
         fr.assert_zero(b_iv.1);
         // periodic column values at ζ (public, after ζ/α/pubs).
-        let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic).map(|i| (pis[4 + self.n_pub + 2 * i].clone(), pis[4 + self.n_pub + 2 * i + 1].clone())).collect();
+        let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic)
+            .map(|i| {
+                (
+                    pis[4 + self.n_pub + 2 * i].clone(),
+                    pis[4 + self.n_pub + 2 * i + 1].clone(),
+                )
+            })
+            .collect();
         // Horner α-fold over the extracted symbolic constraints (data-driven tree walk).
         let mut folded = (AB::Expr::ZERO, AB::Expr::ZERO);
         for c in &self.constraints {
-            let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w_ext);
+            let ci = eval_symbolic_circuit::<AB>(
+                c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w_ext,
+            );
             let fa = emul(folded.clone(), alpha.clone());
             folded = (fa.0 + ci.0, fa.1 + ci.1);
         }

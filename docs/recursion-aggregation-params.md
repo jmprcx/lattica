@@ -1,5 +1,7 @@
 # Recursion — aggregation-level soundness parameters (R3)
 
+> **Research specification:** Parameters for experimental recursive aggregation; not part of the production C ABI or audit boundary.
+
 **Status: design + measurement, on branch `v3`.** Companion to `docs/recursion-design.md` (what recursion
 buys) and `docs/recursion-verifier-audit.md` (the in-circuit verifier spec). This doc fixes the
 **parameters** of the recursive aggregation tree so its soundness clears the same **≥100-bit proven**

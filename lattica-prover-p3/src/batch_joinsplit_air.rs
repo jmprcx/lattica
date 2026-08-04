@@ -24,12 +24,12 @@ use p3_matrix::dense::RowMajorMatrix;
 #[cfg(test)]
 use p3_uni_stark::prove;
 
-use crate::poseidon2_air::BLOCK;
 use crate::joinsplit_air::{
     build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST,
-    HEIGHT, M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_MINT, PI_NF,
-    PI_OUTCM, PI_TXBIND, WIDTH,
+    HEIGHT, M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_MINT, PI_NF, PI_OUTCM,
+    PI_TXBIND, WIDTH,
 };
+use crate::poseidon2_air::BLOCK;
 
 type Val = Goldilocks;
 
@@ -88,7 +88,13 @@ pub fn dummy_witness() -> Witness {
         sib: [z4; DEPTH],
         bits: [false; DEPTH],
     };
-    let out = Output { recipient: z4, asset: Val::ZERO, value: 0, rho: [Val::ZERO; 2], rcm: [Val::ZERO; 2] };
+    let out = Output {
+        recipient: z4,
+        asset: Val::ZERO,
+        value: 0,
+        rho: [Val::ZERO; 2],
+        rcm: [Val::ZERO; 2],
+    };
     Witness {
         inputs: core::array::from_fn(|_| inp.clone()),
         outputs: [out; M_OUT],
@@ -203,7 +209,13 @@ fn batch_periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic();
     // P_TILE_LAST, the FOLD_SK_BLOCKS chunk-injection one-hots, then s_k-link / s_k→root / root-in /
     // root-update — the order MUST match the P_* indices above (shared machinery, geometry as data).
-    crate::batch_common::append_batch_selectors(&mut cols, TILE_HEIGHT, FOLD_SK_BLOCKS, FOLD_BASE, ROOT_BLOCK);
+    crate::batch_common::append_batch_selectors(
+        &mut cols,
+        TILE_HEIGHT,
+        FOLD_SK_BLOCKS,
+        FOLD_BASE,
+        ROOT_BLOCK,
+    );
     cols
 }
 
@@ -226,9 +238,23 @@ impl BaseAir<Goldilocks> for JoinSplitBatchAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
-        let nxt: Vec<AB::Expr> = builder.main().next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
+        let nxt: Vec<AB::Expr> = builder
+            .main()
+            .next_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let one = AB::Expr::ONE;
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         // 1 at each tile's last row — frees the cross-tile-leaking persistence inside eval_spend.
@@ -290,7 +316,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for JoinSplitBatchAir {
         //      blocks 1.. absorb each chunk) then root_k = perm([root_{k-1} ‖ s_k]), ROOT carried across
         //      tiles. Shared emitter; `fold_chunks()` is this circuit's chunk table (checked by eye
         //      against `statement_chunks`) and `ROOT` is the running-root column. ----
-        crate::batch_common::eval_txroot_fold(builder, &cur, &nxt, &pis, &p[P_FOLD_IN..], &fold_chunks(), ROOT);
+        crate::batch_common::eval_txroot_fold(
+            builder,
+            &cur,
+            &nxt,
+            &pis,
+            &p[P_FOLD_IN..],
+            &fold_chunks(),
+            ROOT,
+        );
     }
 }
 
@@ -318,16 +352,27 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
         // 2. staging columns (tile-persistent — filled on every row of the tile)
         for r in 0..TILE_HEIGHT {
             let b = (toff + r) * BATCH_WIDTH;
-            t[b + S_ANCHOR..b + S_ANCHOR + DIGEST].copy_from_slice(&pv[PI_ANCHOR..PI_ANCHOR + DIGEST]);
-            t[b + S_NF..b + S_NF + N_IN * DIGEST].copy_from_slice(&pv[PI_NF..PI_NF + N_IN * DIGEST]);
-            t[b + S_OUTCM..b + S_OUTCM + M_OUT * DIGEST].copy_from_slice(&pv[PI_OUTCM..PI_OUTCM + M_OUT * DIGEST]);
+            t[b + S_ANCHOR..b + S_ANCHOR + DIGEST]
+                .copy_from_slice(&pv[PI_ANCHOR..PI_ANCHOR + DIGEST]);
+            t[b + S_NF..b + S_NF + N_IN * DIGEST]
+                .copy_from_slice(&pv[PI_NF..PI_NF + N_IN * DIGEST]);
+            t[b + S_OUTCM..b + S_OUTCM + M_OUT * DIGEST]
+                .copy_from_slice(&pv[PI_OUTCM..PI_OUTCM + M_OUT * DIGEST]);
             t[b + S_FEE] = pv[PI_FEE];
             t[b + S_MINT] = pv[PI_MINT];
-            t[b + S_TXBIND..b + S_TXBIND + DIGEST].copy_from_slice(&pv[PI_TXBIND..PI_TXBIND + DIGEST]);
+            t[b + S_TXBIND..b + S_TXBIND + DIGEST]
+                .copy_from_slice(&pv[PI_TXBIND..PI_TXBIND + DIGEST]);
         }
         // 3. fold blocks (overwrite the trailing padding blocks): s_k MD-chain, then root chain.
-        let new_root =
-            crate::batch_common::write_fold_blocks(&mut t, toff, BATCH_WIDTH, &statement_chunks(&pv), root, FOLD_BASE, ROOT_BLOCK);
+        let new_root = crate::batch_common::write_fold_blocks(
+            &mut t,
+            toff,
+            BATCH_WIDTH,
+            &statement_chunks(&pv),
+            root,
+            FOLD_BASE,
+            ROOT_BLOCK,
+        );
         // 4. ROOT column: root_{k-1} up to (and incl.) the root block output row, then root_k onward.
         let rout = root_out_row();
         for r in 0..TILE_HEIGHT {
@@ -363,7 +408,13 @@ pub fn proven_security_bits(n: usize) -> usize {
 
 /// Verify a batch proof against the block tx-root (4 Goldilocks).
 pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
-    crate::config::verify_proof_bytes(&JoinSplitBatchAir, DIGEST, MAX_BATCH_TILES * TILE_HEIGHT, proof_bytes, root)
+    crate::config::verify_proof_bytes(
+        &JoinSplitBatchAir,
+        DIGEST,
+        MAX_BATCH_TILES * TILE_HEIGHT,
+        proof_bytes,
+        root,
+    )
 }
 
 #[cfg(test)]
@@ -384,7 +435,11 @@ mod tests {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(String::from))
-            .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
             .map(|kib| kib / 1024)
             .unwrap_or(0)
     }
@@ -398,7 +453,11 @@ mod tests {
     #[ignore = "bench: batch RAM vs block size (LATTICA_BATCH_N=<n>, one N per process)"]
     fn batch_ram_bench() {
         use p3_matrix::Matrix;
-        let n: usize = std::env::var("LATTICA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
+        let n: usize = std::env::var("LATTICA_BATCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .max(1);
         let ws: Vec<Witness> = (0..n).map(|i| variant_asset(1000 + i as u64)).collect();
         let root = batch_root(&ws);
         let trace = build_batch_trace(&ws);
@@ -426,7 +485,11 @@ mod tests {
     #[ignore = "bench: batch RAM/time on the GPU (LATTICA_BATCH_N=<n>, one N per process)"]
     fn batch_ram_bench_gpu() {
         use p3_matrix::Matrix;
-        let n: usize = std::env::var("LATTICA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
+        let n: usize = std::env::var("LATTICA_BATCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .max(1);
         let ws: Vec<Witness> = (0..n).map(|i| variant_asset(1000 + i as u64)).collect();
         let root = batch_root(&ws);
         let trace = build_batch_trace(&ws);
@@ -436,7 +499,10 @@ mod tests {
         let proof = prove(&cfg, &JoinSplitBatchAir, trace, &root);
         let prove_s = t0.elapsed().as_secs_f64();
         let bytes = postcard::to_allocvec(&proof).unwrap();
-        assert!(verify_batch_bytes(&bytes, &root), "batch of {n} verifies (GPU-proven, CPU verifier)");
+        assert!(
+            verify_batch_bytes(&bytes, &root),
+            "batch of {n} verifies (GPU-proven, CPU verifier)"
+        );
         println!(
             "BATCH-BENCH-GPU n={n} padded_tiles={} rows={rows} width={w} peak_rss={}MiB prove={prove_s:.1}s proof={}KiB",
             padded_tiles(n),
@@ -456,7 +522,11 @@ mod tests {
     #[ignore = "bench: batch RAM/time under the spill allocator (LATTICA_BATCH_N=<n>, LATTICA_SPILL_DIR=<disk>)"]
     fn batch_ram_bench_stream() {
         use p3_matrix::Matrix;
-        let n: usize = std::env::var("LATTICA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(64).max(1);
+        let n: usize = std::env::var("LATTICA_BATCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64)
+            .max(1);
         let ws: Vec<Witness> = (0..n).map(|i| variant_asset(1000 + i as u64)).collect();
         let root = batch_root(&ws);
         let trace = build_batch_trace(&ws);
@@ -470,7 +540,10 @@ mod tests {
         };
         let prove_s = t0.elapsed().as_secs_f64();
         let spill_peak = crate::spill_alloc::spill_peak_bytes();
-        assert!(verify_batch_bytes(&bytes, &root), "batch of {n} verifies (spill-proven)");
+        assert!(
+            verify_batch_bytes(&bytes, &root),
+            "batch of {n} verifies (spill-proven)"
+        );
         assert!(spill_peak > 0, "the LDE must spill to mmap while armed (n={n}); needs a block whose LDE exceeds the 64 MiB threshold + a writable LATTICA_SPILL_DIR");
         println!(
             "BATCH-BENCH-STREAM n={n} padded_tiles={} rows={rows} width={w} peak_rss={}MiB spill_peak={}MiB prove={prove_s:.1}s proof={}KiB",
@@ -532,7 +605,10 @@ mod tests {
     fn batch_n1_verifies_under_txroot() {
         let w = variant(1);
         let root = batch_root(std::slice::from_ref(&w));
-        assert!(verify_batch_bytes(&prove_batch_to_bytes(std::slice::from_ref(&w)), &root));
+        assert!(verify_batch_bytes(
+            &prove_batch_to_bytes(std::slice::from_ref(&w)),
+            &root
+        ));
     }
 
     #[test]
@@ -597,8 +673,24 @@ mod tests {
         let d = felts(&dummy_sk());
         println!("seq_statement_digest = {s:?}");
         println!("dummy_sk = {d:?}");
-        assert_eq!(s, [16413833029060099665, 4880920211288721702, 16696557975413361240, 12647866530414313287]);
-        assert_eq!(d, [10093663321021608916, 18280800825645272076, 7712995835321977355, 5336904204250640364]);
+        assert_eq!(
+            s,
+            [
+                16413833029060099665,
+                4880920211288721702,
+                16696557975413361240,
+                12647866530414313287
+            ]
+        );
+        assert_eq!(
+            d,
+            [
+                10093663321021608916,
+                18280800825645272076,
+                7712995835321977355,
+                5336904204250640364
+            ]
+        );
     }
 
     #[test]
@@ -606,7 +698,10 @@ mod tests {
         // n=1 matches the single join-split (103 proven); the floor holds through MAX_BATCH_TILES and
         // 2·MAX_BATCH_TILES is the first size below 100 — pinning N_MAX as exactly the boundary.
         assert_eq!(proven_security_bits(1), 103);
-        assert!(proven_security_bits(MAX_BATCH_TILES) >= 100, "MAX_BATCH_TILES must hold the ≥100-bit floor");
+        assert!(
+            proven_security_bits(MAX_BATCH_TILES) >= 100,
+            "MAX_BATCH_TILES must hold the ≥100-bit floor"
+        );
         assert!(
             proven_security_bits(MAX_BATCH_TILES * 2) < 100,
             "MAX_BATCH_TILES is the boundary: 2× drops below the 100-bit floor"
@@ -622,7 +717,11 @@ mod tests {
         let root = batch_root(&ws);
         let h = trace.values.len() / BATCH_WIDTH;
         for k in 0..DIGEST {
-            assert_eq!(trace.values[(h - 1) * BATCH_WIDTH + k], root[k], "fold limb {k} != oracle root");
+            assert_eq!(
+                trace.values[(h - 1) * BATCH_WIDTH + k],
+                root[k],
+                "fold limb {k} != oracle root"
+            );
         }
     }
 
@@ -645,11 +744,17 @@ mod tests {
         let ws = [variant(1), variant(2)];
         let root = batch_root(&ws);
         let bytes = prove_batch_to_bytes(&ws);
-        assert!(verify_batch_bytes(&bytes, &root), "the honest 2-tile batch must verify");
+        assert!(
+            verify_batch_bytes(&bytes, &root),
+            "the honest 2-tile batch must verify"
+        );
         let mut proof: Proof<MyConfig> = postcard::from_bytes(&bytes).unwrap();
         proof.degree_bits = (MAX_BATCH_TILES * TILE_HEIGHT).trailing_zeros() as usize + 2; // one above the cap
         let tampered = postcard::to_allocvec(&proof).unwrap();
-        assert!(!verify_batch_bytes(&tampered, &root), "a proof above the 64-tile height cap must reject");
+        assert!(
+            !verify_batch_bytes(&tampered, &root),
+            "a proof above the 64-tile height cap must reject"
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # v3 internal pre-audit — round 3 (audit the fixes + executable evidence)
 
+> **Frozen audit record:** Third internal review round and validation evidence for the identified v3 revision.
+
 A third internal pass, deliberately *not* a re-run. Rounds 1–2 read code and reasoned; round 3
 raises the methodology on three axes:
 1. **Audit the remediations.** Rounds 1–2 changed a lot of code (the OVK encryption rewrite,

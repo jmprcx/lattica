@@ -21,7 +21,9 @@
 
 use crate::config::{Challenge, Challenger};
 use crate::gpu::{gpu_quotient_chunk_lde, GpuDft, GpuHidingMerkleMmcs};
-use p3_commit::{BuildPeriodicLdeTableFast, ExtensionMmcs, OpenedValues, Pcs, PeriodicLdeTable, PolynomialSpace};
+use p3_commit::{
+    BuildPeriodicLdeTableFast, ExtensionMmcs, OpenedValues, Pcs, PeriodicLdeTable, PolynomialSpace,
+};
 use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::{batch_multiplicative_inverse, Field, PrimeCharacteristicRing, PrimeField64};
 use p3_fri::{FriParameters, HidingFriPcs};
@@ -92,7 +94,9 @@ fn get_zp_cis(qc_domains: &[TwoAdicMultiplicativeCoset<Val>]) -> Vec<Val> {
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| *j != i)
-                    .map(|(_, other_domain)| other_domain.vanishing_poly_at_point(domain.first_point()))
+                    .map(|(_, other_domain)| {
+                        other_domain.vanishing_poly_at_point(domain.first_point())
+                    })
                     .product()
             })
             .collect::<Vec<_>>(),
@@ -108,7 +112,8 @@ impl BuildPeriodicLdeTableFast for GpuHidingPcs {
         trace_domain: Self::PeriodicDomain,
         quotient_domain: Self::PeriodicDomain,
     ) -> Option<PeriodicLdeTable<Val>> {
-        self.inner.maybe_build_periodic_lde_table_fast(periodic_cols, trace_domain, quotient_domain)
+        self.inner
+            .maybe_build_periodic_lde_table_fast(periodic_cols, trace_domain, quotient_domain)
     }
 }
 
@@ -152,12 +157,17 @@ impl Pcs<Challenge, Challenger> for GpuHidingPcs {
         evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<Val>)>,
         num_chunks: usize,
     ) -> Vec<RowMajorMatrix<Val>> {
-        assert!(num_chunks > 1, "num_chunks must be > 1 to preserve hiding (got {num_chunks})");
+        assert!(
+            num_chunks > 1,
+            "num_chunks must be > 1 to preserve hiding (got {num_chunks})"
+        );
         let (domains, evaluations): (Vec<_>, Vec<_>) = evaluations.into_iter().unzip();
         let cis = get_zp_cis(&domains);
         let last_chunk = num_chunks - 1;
         let last_chunk_ci_inv = cis[last_chunk].inverse();
-        let mul_coeffs: Vec<Val> = (0..last_chunk).map(|i| cis[i] * last_chunk_ci_inv).collect();
+        let mul_coeffs: Vec<Val> = (0..last_chunk)
+            .map(|i| cis[i] * last_chunk_ci_inv)
+            .collect();
 
         let randomized_evaluations: Vec<RowMajorMatrix<Val>>;
         let mut all_random_values: Vec<Val>;
@@ -199,16 +209,27 @@ impl Pcs<Challenge, Challenger> for GpuHidingPcs {
                 // built/uploaded; the GPU zero-pads and NTTs it.
                 let p = shift.exp_u64(h as u64);
                 let mut van_prefix = vec![0u64; 2 * h * w];
-                Val::GENERATOR.powers().take(h).enumerate().for_each(|(r, p_r)| {
-                    for j in 0..w {
-                        let mul_coeff = p_r * random_values[r * w + j];
-                        van_prefix[r * w + j] = (-mul_coeff).as_canonical_u64();
-                        van_prefix[(h + r) * w + j] = (p * mul_coeff).as_canonical_u64();
-                    }
-                });
-                let evals_u64: Vec<u64> = evals.values.iter().map(|f| f.as_canonical_u64()).collect();
-                let stored =
-                    gpu_quotient_chunk_lde(&evals_u64, &van_prefix, h, w, self.log_blowup + 1, shift.as_canonical_u64());
+                Val::GENERATOR
+                    .powers()
+                    .take(h)
+                    .enumerate()
+                    .for_each(|(r, p_r)| {
+                        for j in 0..w {
+                            let mul_coeff = p_r * random_values[r * w + j];
+                            van_prefix[r * w + j] = (-mul_coeff).as_canonical_u64();
+                            van_prefix[(h + r) * w + j] = (p * mul_coeff).as_canonical_u64();
+                        }
+                    });
+                let evals_u64: Vec<u64> =
+                    evals.values.iter().map(|f| f.as_canonical_u64()).collect();
+                let stored = gpu_quotient_chunk_lde(
+                    &evals_u64,
+                    &van_prefix,
+                    h,
+                    w,
+                    self.log_blowup + 1,
+                    shift.as_canonical_u64(),
+                );
                 RowMajorMatrix::new(stored.into_iter().map(Goldilocks::new).collect(), w)
             })
             .collect()
@@ -224,7 +245,12 @@ impl Pcs<Challenge, Challenger> for GpuHidingPcs {
         idx: usize,
         domain: Self::Domain,
     ) -> Self::EvaluationsOnDomain<'a> {
-        <Inner as Pcs<Challenge, Challenger>>::get_evaluations_on_domain(&self.inner, prover_data, idx, domain)
+        <Inner as Pcs<Challenge, Challenger>>::get_evaluations_on_domain(
+            &self.inner,
+            prover_data,
+            idx,
+            domain,
+        )
     }
 
     fn get_evaluations_on_domain_no_random<'a>(
@@ -233,7 +259,12 @@ impl Pcs<Challenge, Challenger> for GpuHidingPcs {
         idx: usize,
         domain: Self::Domain,
     ) -> Self::EvaluationsOnDomain<'a> {
-        <Inner as Pcs<Challenge, Challenger>>::get_evaluations_on_domain_no_random(&self.inner, prover_data, idx, domain)
+        <Inner as Pcs<Challenge, Challenger>>::get_evaluations_on_domain_no_random(
+            &self.inner,
+            prover_data,
+            idx,
+            domain,
+        )
     }
 
     fn open(
@@ -241,7 +272,11 @@ impl Pcs<Challenge, Challenger> for GpuHidingPcs {
         commitment_data_with_opening_points: Vec<(&Self::ProverData, Vec<Vec<Challenge>>)>,
         fiat_shamir_challenger: &mut Challenger,
     ) -> (OpenedValues<Challenge>, Self::Proof) {
-        <Inner as Pcs<Challenge, Challenger>>::open(&self.inner, commitment_data_with_opening_points, fiat_shamir_challenger)
+        <Inner as Pcs<Challenge, Challenger>>::open(
+            &self.inner,
+            commitment_data_with_opening_points,
+            fiat_shamir_challenger,
+        )
     }
 
     fn open_with_preprocessing(
@@ -268,21 +303,32 @@ impl Pcs<Challenge, Challenger> for GpuHidingPcs {
         proof: &Self::Proof,
         fiat_shamir_challenger: &mut Challenger,
     ) -> Result<(), Self::Error> {
-        <Inner as Pcs<Challenge, Challenger>>::verify(&self.inner, commitments_with_opening_points, proof, fiat_shamir_challenger)
+        <Inner as Pcs<Challenge, Challenger>>::verify(
+            &self.inner,
+            commitments_with_opening_points,
+            proof,
+            fiat_shamir_challenger,
+        )
     }
 
     fn get_opt_randomization_poly_commitment(
         &self,
         domain: impl IntoIterator<Item = Self::Domain>,
     ) -> Option<(Self::Commitment, Self::ProverData)> {
-        <Inner as Pcs<Challenge, Challenger>>::get_opt_randomization_poly_commitment(&self.inner, domain)
+        <Inner as Pcs<Challenge, Challenger>>::get_opt_randomization_poly_commitment(
+            &self.inner,
+            domain,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{production_fri, ChallengeMmcs, MyCompress, MyHash, ValMmcs, CAP_HEIGHT, NUM_RANDOM_CODEWORDS};
+    use crate::config::{
+        production_fri, ChallengeMmcs, MyCompress, MyHash, ValMmcs, CAP_HEIGHT,
+        NUM_RANDOM_CODEWORDS,
+    };
     use p3_dft::Radix2DitParallel;
     use p3_goldilocks::default_goldilocks_poseidon2_8;
     use rand::SeedableRng;
@@ -339,12 +385,17 @@ mod tests {
             // A quotient domain split into chunks, with random "quotient evaluations".
             let log_q = log_chunk + num_chunks.trailing_zeros() as usize;
             let trace_domain =
-                <crate::config::MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&cpu, 1 << log_chunk);
+                <crate::config::MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                    &cpu,
+                    1 << log_chunk,
+                );
             let quotient_domain = trace_domain.create_disjoint_domain(1 << log_q);
             let sub_domains = quotient_domain.split_domains(num_chunks);
             let mut rng = ChaCha20Rng::seed_from_u64(99);
             let flat = RowMajorMatrix::new(
-                (0..(1usize << log_q) * w2).map(|_| Goldilocks::new(rng.random::<u64>() % 0xFFFF_FFFF_0000_0001)).collect(),
+                (0..(1usize << log_q) * w2)
+                    .map(|_| Goldilocks::new(rng.random::<u64>() % 0xFFFF_FFFF_0000_0001))
+                    .collect(),
                 w2,
             );
             let sub_evals = quotient_domain.split_evals(num_chunks, flat);
@@ -361,7 +412,10 @@ mod tests {
             assert_eq!(cpu_ldes.len(), gpu_ldes.len());
             for (i, (c, g)) in cpu_ldes.iter().zip(&gpu_ldes).enumerate() {
                 assert_eq!(c.width(), g.width(), "chunk {i} width, h=2^{log_chunk}");
-                assert_eq!(c.values, g.values, "chunk {i} LDE mismatch, h=2^{log_chunk}");
+                assert_eq!(
+                    c.values, g.values,
+                    "chunk {i} LDE mismatch, h=2^{log_chunk}"
+                );
             }
         }
     }

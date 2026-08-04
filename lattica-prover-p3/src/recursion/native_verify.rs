@@ -10,6 +10,9 @@
 //! real ZK path (random commitment + the hiding opening structure + the `is_zk`-adjusted quotient-chunk
 //! count). Transcript, openings, quotient, constraints are all exercised end-to-end.
 
+use super::native_fri::{
+    eval_final_poly, final_query_point, reverse_bits_len, verify_query, CommitStep,
+};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
 use p3_commit::{BatchOpening, Mmcs, Pcs, PolynomialSpace};
@@ -17,20 +20,20 @@ use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_fri::{FriParameters, TwoAdicFriFolding};
 use p3_goldilocks::Goldilocks;
 use p3_matrix::Dimensions;
+use p3_uni_stark::{
+    get_log_num_quotient_chunks, recompose_quotient_from_chunks, validate_degree_bits,
+    verify_constraints, AirLayout, Proof, StarkGenericConfig,
+};
 #[cfg(test)]
 use rand_chacha::ChaCha20Rng;
-use super::native_fri::{eval_final_poly, final_query_point, reverse_bits_len, verify_query, CommitStep};
-use p3_uni_stark::{
-    get_log_num_quotient_chunks, recompose_quotient_from_chunks, validate_degree_bits, verify_constraints,
-    AirLayout, Proof, StarkGenericConfig,
-};
 
 // The production hiding config family + Val/Challenge are single-sourced from crate::config (this
 // native re-verifier is validated against the REAL ZK path; `make_config_ar` below rebuilds the config
 // arity-parametrically, which the fixed `config::make_config` can't express).
-use crate::config::{Challenge, Challenger, ChallengeMmcs, MyConfig, MyPcs, Val, ValMmcs};
+use crate::config::MyHash;
+use crate::config::{Challenge, ChallengeMmcs, Challenger, MyConfig, MyPcs, Val, ValMmcs};
 #[cfg(test)]
-use crate::config::{Dft, MyCompress, MyHash};
+use crate::config::{Dft, MyCompress};
 
 /// Minimal AIR: a single column constrained to a public constant on every row.
 pub struct ConstAir;
@@ -50,8 +53,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone());
-        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone());
+        builder
+            .when_first_row()
+            .assert_zero(cur[0].clone() - pis[0].clone());
+        builder
+            .when_transition()
+            .assert_zero(nxt[0].clone() - cur[0].clone());
     }
 }
 
@@ -76,8 +83,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CounterAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone());
-        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE);
+        builder
+            .when_first_row()
+            .assert_zero(cur[0].clone() - pis[0].clone());
+        builder
+            .when_transition()
+            .assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE);
     }
 }
 
@@ -105,11 +116,21 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FibonacciAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0
-        builder.when_first_row().assert_zero(cur[1].clone() - pis[1].clone()); // C1
-        builder.when_transition().assert_zero(nxt[0].clone() - cur[1].clone()); // C2: a' = b
-        builder.when_transition().assert_zero(nxt[1].clone() - cur[0].clone() - cur[1].clone()); // C3: b' = a + b
-        builder.when_last_row().assert_zero(cur[1].clone() - pis[2].clone()); // C4
+        builder
+            .when_first_row()
+            .assert_zero(cur[0].clone() - pis[0].clone()); // C0
+        builder
+            .when_first_row()
+            .assert_zero(cur[1].clone() - pis[1].clone()); // C1
+        builder
+            .when_transition()
+            .assert_zero(nxt[0].clone() - cur[1].clone()); // C2: a' = b
+        builder
+            .when_transition()
+            .assert_zero(nxt[1].clone() - cur[0].clone() - cur[1].clone()); // C3: b' = a + b
+        builder
+            .when_last_row()
+            .assert_zero(cur[1].clone() - pis[2].clone()); // C4
     }
 }
 
@@ -135,11 +156,19 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MulAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0
-        builder.when_first_row().assert_zero(cur[1].clone() - pis[1].clone()); // C1
+        builder
+            .when_first_row()
+            .assert_zero(cur[0].clone() - pis[0].clone()); // C0
+        builder
+            .when_first_row()
+            .assert_zero(cur[1].clone() - pis[1].clone()); // C1
         builder.assert_zero(cur[2].clone() - cur[0].clone() * cur[1].clone()); // C2: c = a·b (degree 2, every row)
-        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C3: a' = a + 1
-        builder.when_transition().assert_zero(nxt[1].clone() - cur[1].clone() - AB::Expr::ONE); // C4: b' = b + 1
+        builder
+            .when_transition()
+            .assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C3: a' = a + 1
+        builder
+            .when_transition()
+            .assert_zero(nxt[1].clone() - cur[1].clone() - AB::Expr::ONE); // C4: b' = b + 1
     }
 }
 
@@ -164,7 +193,10 @@ impl BaseAir<Goldilocks> for PeriodicAir {
         1 // (the default is 0; must be overridden alongside periodic_columns)
     }
     fn periodic_columns(&self) -> Vec<Vec<Goldilocks>> {
-        vec![PERIODIC_PATTERN.iter().map(|&v| Goldilocks::from_u64(v)).collect()]
+        vec![PERIODIC_PATTERN
+            .iter()
+            .map(|&v| Goldilocks::from_u64(v))
+            .collect()]
     }
 }
 
@@ -174,9 +206,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PeriodicAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
-        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0
-        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - p[0].clone()); // C1: a' = a + p
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
+        builder
+            .when_first_row()
+            .assert_zero(cur[0].clone() - pis[0].clone()); // C0
+        builder
+            .when_transition()
+            .assert_zero(nxt[0].clone() - cur[0].clone() - p[0].clone()); // C1: a' = a + p
     }
 }
 
@@ -206,10 +246,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for WideAir {
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         for i in 0..WIDE_W {
-            builder.when_first_row().assert_zero(cur[i].clone() - pis[i].clone()); // C_i: seed col_i = pub_i
+            builder
+                .when_first_row()
+                .assert_zero(cur[i].clone() - pis[i].clone()); // C_i: seed col_i = pub_i
         }
         for i in 0..WIDE_W {
-            builder.when_transition().assert_zero(nxt[i].clone() - cur[i].clone() - AB::Expr::ONE); // C_{W+i}: col_i' = col_i + 1
+            builder
+                .when_transition()
+                .assert_zero(nxt[i].clone() - cur[i].clone() - AB::Expr::ONE); // C_{W+i}: col_i' = col_i + 1
         }
     }
 }
@@ -237,10 +281,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CubeAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0: a = pub
+        builder
+            .when_first_row()
+            .assert_zero(cur[0].clone() - pis[0].clone()); // C0: a = pub
         let a = cur[0].clone();
         builder.assert_zero(cur[1].clone() - a.clone() * a.clone() * a); // C1: c = a³ (degree 3, every row)
-        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C2: a' = a + 1
+        builder
+            .when_transition()
+            .assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C2: a' = a + 1
     }
 }
 
@@ -266,26 +314,45 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QuartAir {
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
-        builder.when_first_row().assert_zero(cur[0].clone() - pis[0].clone()); // C0: a = pub
+        builder
+            .when_first_row()
+            .assert_zero(cur[0].clone() - pis[0].clone()); // C0: a = pub
         let a2 = cur[0].clone() * cur[0].clone();
         builder.assert_zero(cur[1].clone() - a2.clone() * a2); // C1: c = a⁴ (degree 4, every row)
-        builder.when_transition().assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C2: a' = a + 1
+        builder
+            .when_transition()
+            .assert_zero(nxt[0].clone() - cur[0].clone() - AB::Expr::ONE); // C2: a' = a + 1
     }
 }
 
 /// Native re-verifier: re-implements `verify`'s orchestration step-by-step (production hiding/ZK config;
 /// the `is_zk=1` path — random commitment observed, `init_trace_domain = degree >> is_zk`, quotient-chunk
 /// count `1 << (log + is_zk)`), delegating only the FRI low-degree test to `pcs.verify`.
-pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val]) -> Result<(), String> {
+pub fn reverify(
+    config: &MyConfig,
+    proof: &Proof<MyConfig>,
+    public_values: &[Val],
+) -> Result<(), String> {
     let air = ConstAir;
-    let Proof { commitments, opened_values, opening_proof, degree_bits } = proof;
+    let Proof {
+        commitments,
+        opened_values,
+        opening_proof,
+        degree_bits,
+    } = proof;
     let degree_bits = *degree_bits;
     let pcs = config.pcs();
     let is_zk = config.is_zk();
 
-    let (base_degree_bits, degree) =
-        validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).map_err(|e| format!("degree bits: {e:?}"))?;
-    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let (base_degree_bits, degree) = validate_degree_bits(
+        None,
+        degree_bits,
+        is_zk,
+        <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+    )
+    .map_err(|e| format!("degree bits: {e:?}"))?;
+    let trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
     let preprocessed_width = 0usize; // ConstAir has no preprocessed trace
 
     let layout = AirLayout::from_air::<Val>(&air);
@@ -293,14 +360,17 @@ pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val
     let num_quotient_chunks = 1usize << (log_num_quotient_chunks + is_zk); // checked_log_size_sum(log, is_zk)
 
     let mut challenger = config.initialise_challenger();
-    let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+    let init_trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
 
     let quotient_domain_size = 1usize << (degree_bits + log_num_quotient_chunks);
     let quotient_domain = trace_domain.create_disjoint_domain(quotient_domain_size);
     let quotient_chunks_domains = quotient_domain.split_domains(num_quotient_chunks);
     let randomized_quotient_chunks_domains: Vec<_> = quotient_chunks_domains
         .iter()
-        .map(|d| <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk))
+        .map(|d| {
+            <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk)
+        })
         .collect();
 
     // ---- observe the instance ----
@@ -333,15 +403,27 @@ pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val
     // ---- opening rounds (random, trace, quotient) ----
     let main_next = !air.main_next_row_columns().is_empty();
     let mut coms_to_verify = if let Some(random_commit) = &commitments.random {
-        let random_values = opened_values.random.as_ref().ok_or("missing random opened values")?;
-        vec![(random_commit.clone(), vec![(trace_domain, vec![(zeta, random_values.clone())])])]
+        let random_values = opened_values
+            .random
+            .as_ref()
+            .ok_or("missing random opened values")?;
+        vec![(
+            random_commit.clone(),
+            vec![(trace_domain, vec![(zeta, random_values.clone())])],
+        )]
     } else {
         vec![]
     };
     let trace_round = {
         let mut pts = vec![(zeta, opened_values.trace_local.clone())];
         if main_next {
-            pts.push((zeta_next, opened_values.trace_next.clone().ok_or("missing trace_next")?));
+            pts.push((
+                zeta_next,
+                opened_values
+                    .trace_next
+                    .clone()
+                    .ok_or("missing trace_next")?,
+            ));
         }
         (commitments.trace.clone(), vec![(trace_domain, pts)])
     };
@@ -356,10 +438,20 @@ pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val
     ));
 
     // ---- FRI low-degree test (delegated; internals = the validated primitives) ----
-    <MyPcs as Pcs<Challenge, Challenger>>::verify(pcs, coms_to_verify, opening_proof, &mut challenger).map_err(|e| format!("pcs.verify: {e:?}"))?;
+    <MyPcs as Pcs<Challenge, Challenger>>::verify(
+        pcs,
+        coms_to_verify,
+        opening_proof,
+        &mut challenger,
+    )
+    .map_err(|e| format!("pcs.verify: {e:?}"))?;
 
     // ---- recompose the quotient + check the constraint relation at ζ ----
-    let quotient = recompose_quotient_from_chunks::<MyConfig>(&quotient_chunks_domains, &opened_values.quotient_chunks, zeta);
+    let quotient = recompose_quotient_from_chunks::<MyConfig>(
+        &quotient_chunks_domains,
+        &opened_values.quotient_chunks,
+        zeta,
+    );
     let zeros;
     let trace_next_slice: &[Challenge] = match &opened_values.trace_next {
         Some(v) => v.as_slice(),
@@ -400,7 +492,6 @@ pub fn reverify(config: &MyConfig, proof: &Proof<MyConfig>, public_values: &[Val
 /// the non-hiding `full_transcript_challenges` PLUS the two `is_zk=1` insertions: `observe(random_commitment)`
 /// after the quotient commitment (before ζ), and `observe(random_opened_values)` FIRST in the pre-α_fri
 /// opened-value absorb (the random round is coms_to_verify[0] in `reverify`).
-#[cfg(test)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn hiding_transcript_challenges(
     config: &MyConfig,
@@ -411,8 +502,13 @@ pub(crate) fn hiding_transcript_challenges(
     let pcs = config.pcs();
     let is_zk = config.is_zk();
     let degree_bits = proof.degree_bits;
-    let (base_degree_bits, _) =
-        validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).expect("degree bits");
+    let (base_degree_bits, _) = validate_degree_bits(
+        None,
+        degree_bits,
+        is_zk,
+        <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+    )
+    .expect("degree bits");
     let mut ch = config.initialise_challenger();
     // preamble → α_stark
     ch.observe(Val::from_usize(degree_bits));
@@ -442,7 +538,11 @@ pub(crate) fn hiding_transcript_challenges(
         observe_merged(&mut ch, rv, &rand_cws[round][0][0]);
         round += 1;
     }
-    observe_merged(&mut ch, &proof.opened_values.trace_local, &rand_cws[round][0][0]);
+    observe_merged(
+        &mut ch,
+        &proof.opened_values.trace_local,
+        &rand_cws[round][0][0],
+    );
     if let Some(tn) = &proof.opened_values.trace_next {
         observe_merged(&mut ch, tn, &rand_cws[round][0][1]);
     }
@@ -454,14 +554,22 @@ pub(crate) fn hiding_transcript_challenges(
     // per commit round → β_r (hiding opening_proof = (random-poly openings, FriProof); the FriProof is .1)
     let fri = &proof.opening_proof.1;
     let mut betas = Vec::new();
-    for (comm, w) in fri.commit_phase_commits.iter().zip(&fri.commit_pow_witnesses) {
+    for (comm, w) in fri
+        .commit_phase_commits
+        .iter()
+        .zip(&fri.commit_pow_witnesses)
+    {
         ch.observe(comm.clone());
         assert!(ch.check_witness(0, *w), "commit pow (0 bits)");
         betas.push(ch.sample_algebra_element::<Challenge>());
     }
     // final_poly + arities + query-PoW → the query index felts
     ch.observe_algebra_slice(&fri.final_poly);
-    let log_arities: Vec<usize> = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+    let log_arities: Vec<usize> = fri.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .collect();
     for &la in &log_arities {
         ch.observe(Val::from_usize(la));
     }
@@ -492,23 +600,36 @@ fn hiding_query_terms(
     use std::collections::BTreeMap;
     let mut reduced: BTreeMap<usize, (Challenge, Challenge)> = BTreeMap::new();
     if input_proof.len() != merged_coms.len() {
-        return Err(format!("batch count {} != {}", input_proof.len(), merged_coms.len()));
+        return Err(format!(
+            "batch count {} != {}",
+            input_proof.len(),
+            merged_coms.len()
+        ));
     }
     for (batch_opening, mats) in input_proof.iter().zip(merged_coms.iter()) {
         if batch_opening.opened_values.len() != mats.len() {
             return Err("batch matrix count mismatch".into());
         }
-        for (mat_opening, (log_dom, mat_pts)) in batch_opening.opened_values.iter().zip(mats.iter()) {
+        for (mat_opening, (log_dom, mat_pts)) in batch_opening.opened_values.iter().zip(mats.iter())
+        {
             let log_height = log_dom + log_blowup;
             let bits_reduced = log_global_max_height - log_height;
             let rev = reverse_bits_len(index >> bits_reduced, log_height);
             let x = Val::GENERATOR * Val::two_adic_generator(log_height).exp_u64(rev as u64);
-            let (alpha_pow, ro) = reduced.entry(log_height).or_insert((Challenge::ONE, Challenge::ZERO));
+            let (alpha_pow, ro) = reduced
+                .entry(log_height)
+                .or_insert((Challenge::ONE, Challenge::ZERO));
             for (z, ps_at_z) in mat_pts.iter() {
                 if mat_opening.len() != ps_at_z.len() {
-                    return Err(format!("col count {} != {} (merge shape)", mat_opening.len(), ps_at_z.len()));
+                    return Err(format!(
+                        "col count {} != {} (merge shape)",
+                        mat_opening.len(),
+                        ps_at_z.len()
+                    ));
                 }
-                let quotient = (*z - x).try_inverse().ok_or("opening point matches query point")?;
+                let quotient = (*z - x)
+                    .try_inverse()
+                    .ok_or("opening point matches query point")?;
                 for (&p_at_x, &p_at_z) in mat_opening.iter().zip(ps_at_z.iter()) {
                     *ro += *alpha_pow * (p_at_z - p_at_x) * quotient;
                     *alpha_pow *= alpha;
@@ -516,7 +637,11 @@ fn hiding_query_terms(
             }
         }
     }
-    Ok(reduced.into_iter().rev().map(|(lh, (_, ro))| (lh, ro)).collect())
+    Ok(reduced
+        .into_iter()
+        .rev()
+        .map(|(lh, (_, ro))| (lh, ro))
+        .collect())
 }
 
 /// The HIDING analog of monolith's `multicol_query_terms`: the per-query DEEP reduced-opening TERMS in the
@@ -525,8 +650,7 @@ fn hiding_query_terms(
 /// chunks over randomized domains]; for a hiding ConstAir all input matrices share one height (log_global), so
 /// there is a single `x`. This is the arith-tile witness the in-circuit hiding monolith's reduced opening
 /// consumes; the count is much larger than the is_zk=0 case (random round + merged widths + 2× quotient).
-#[cfg(test)]
-fn hiding_multicol_query_terms<A>(
+pub(crate) fn hiding_multicol_query_terms<A>(
     config: &MyConfig,
     inner: &A,
     proof: &Proof<MyConfig>,
@@ -540,12 +664,21 @@ where
     let pcs = config.pcs();
     let is_zk = config.is_zk();
     let degree_bits = proof.degree_bits;
-    let (_a_stark, zeta, alpha_fri, _betas, index_felts) = hiding_transcript_challenges(config, proof, public_values);
+    let (_a_stark, zeta, alpha_fri, _betas, index_felts) =
+        hiding_transcript_challenges(config, proof, public_values);
 
     // domains (mirror reverify): trace_domain (committed), init_trace_domain (constraint), randomized quotient.
-    let (_, degree) = validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).expect("degree bits");
-    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
-    let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+    let (_, degree) = validate_degree_bits(
+        None,
+        degree_bits,
+        is_zk,
+        <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+    )
+    .expect("degree bits");
+    let trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let init_trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
     let layout = AirLayout::from_air::<Val>(inner);
     let log_nqc = get_log_num_quotient_chunks::<Val, A>(inner, layout, is_zk);
     let nqc = 1usize << (log_nqc + is_zk);
@@ -553,7 +686,9 @@ where
     let rqcd: Vec<_> = qd
         .split_domains(nqc)
         .iter()
-        .map(|d| <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk))
+        .map(|d| {
+            <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk)
+        })
         .collect();
     let zeta_next = init_trace_domain.next_point(zeta).expect("next");
 
@@ -593,7 +728,12 @@ where
         merged.push(mr);
     }
 
-    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let log_global: usize = fri.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .sum::<usize>()
+        + 4;
     let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
 
     // open_input's reduced-opening loop, capturing the terms (z, p_z_merged, p_x).
@@ -627,14 +767,18 @@ where
 /// log_final_poly_len=0 the accept is `e == final_poly[0]`. This is the fold-chain witness the monolith's
 /// arith-tile fold consumes; the commit-phase fold is is_zk-agnostic (the hiding deltas are all in the INPUT,
 /// not the fold) but the proof MUST be arity-2 (the monolith's fold chain folds one bit per round).
-#[cfg(test)]
-fn hiding_query_fold_data<A>(
+pub(crate) fn hiding_query_fold_data<A>(
     config: &MyConfig,
     inner: &A,
     proof: &Proof<MyConfig>,
     public_values: &[Val],
     q: usize,
-) -> (Challenge, Vec<(Challenge, Challenge, bool, Val)>, Challenge, Challenge)
+) -> (
+    Challenge,
+    Vec<(Challenge, Challenge, bool, Val)>,
+    Challenge,
+    Challenge,
+)
 where
     A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
 {
@@ -644,9 +788,15 @@ where
     // (W trace + W trace_next + 2·nqc quotient + the random round) — passing the wrong AIR yields a wrong
     // `ro`, so the fold chain diverges and the commit-phase leaf groups are corrupt. (This was hardcoded to
     // ConstAir; correct for ConstAir, wrong for any wider/higher-degree inner like the real join-split.)
-    let (_terms, _x, _alpha, ro) = hiding_multicol_query_terms(config, inner, proof, public_values, q);
+    let (_terms, _x, _alpha, ro) =
+        hiding_multicol_query_terms(config, inner, proof, public_values, q);
     let fri = &proof.opening_proof.1;
-    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let log_global: usize = fri.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .sum::<usize>()
+        + 4;
     let mut start = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
     let mut e = ro;
     let mut log_current = log_global;
@@ -658,7 +808,8 @@ where
         let sibling = step.sibling_values[0];
         let log_folded = log_current - la;
         start >>= la;
-        let s = Val::two_adic_generator(log_folded + la).exp_u64(reverse_bits_len(start, log_folded) as u64);
+        let s = Val::two_adic_generator(log_folded + la)
+            .exp_u64(reverse_bits_len(start, log_folded) as u64);
         let (e0, e1) = if bit == 0 { (e, sibling) } else { (sibling, e) };
         e = crate::recursion::fri_fold::native_fold(e0, e1, betas[r], s);
         rounds.push((sibling, betas[r], bit == 1, s));
@@ -671,8 +822,7 @@ where
 /// `MyHash(committed_row ‖ salt)` (salt from opening_proof.0), the sibling path, and the cap entry
 /// `cap[index >> depth]`. Trace is input round 1 when the random round is present (is_zk=1). This is the
 /// leaf+path witness the monolith's inline input-Merkle region consumes (its leaf sponge now absorbs W+8 felts).
-#[cfg(test)]
-fn hiding_query_input_merkle(
+pub(crate) fn hiding_query_input_merkle(
     config: &MyConfig,
     proof: &Proof<MyConfig>,
     public_values: &[Val],
@@ -683,9 +833,18 @@ fn hiding_query_input_merkle(
     use p3_symmetric::CryptographicHasher;
     let (_, _, _, _, index_felts) = hiding_transcript_challenges(config, proof, public_values);
     let fri = &proof.opening_proof.1;
-    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let log_global: usize = fri.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .sum::<usize>()
+        + 4;
     let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
-    let trace_batch = if proof.commitments.random.is_some() { 1 } else { 0 };
+    let trace_batch = if proof.commitments.random.is_some() {
+        1
+    } else {
+        0
+    };
     let batch = &fri.query_proofs[q].input_proof[trace_batch];
     let row = &batch.opened_values[0];
     let salt = &batch.opening_proof.0[0]; // hiding MMCS Proof = (salts, siblings); salt per matrix
@@ -693,7 +852,11 @@ fn hiding_query_input_merkle(
     let preimage: Vec<Val> = row.iter().chain(salt.iter()).copied().collect();
     let leaf: [Val; 4] = hasher.hash_iter(preimage.iter().copied());
     let siblings = &batch.opening_proof.1;
-    let path: Vec<([Val; 4], bool)> = siblings.iter().enumerate().map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1)).collect();
+    let path: Vec<([Val; 4], bool)> = siblings
+        .iter()
+        .enumerate()
+        .map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1))
+        .collect();
     let depth = siblings.len();
     let cap_entry = proof.commitments.trace.roots()[index >> depth];
     (leaf, path, cap_entry)
@@ -704,8 +867,7 @@ fn hiding_query_input_merkle(
 /// MULTI-MATRIX salted hash: `MyHash((row_0 ‖ salt_0) ‖ (row_1 ‖ salt_1) ‖ …)` over the nqc chunks in matrix
 /// order (matching MerkleTreeHidingMmcs's per-matrix `row ‖ salt` feeding the inner tree). All chunks sit at
 /// log_global (randomized domain 2^degree_bits), so reduction is 0.
-#[cfg(test)]
-fn hiding_query_quotient_merkle(
+pub(crate) fn hiding_query_quotient_merkle(
     config: &MyConfig,
     proof: &Proof<MyConfig>,
     public_values: &[Val],
@@ -716,9 +878,18 @@ fn hiding_query_quotient_merkle(
     use p3_symmetric::CryptographicHasher;
     let (_, _, _, _, index_felts) = hiding_transcript_challenges(config, proof, public_values);
     let fri = &proof.opening_proof.1;
-    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let log_global: usize = fri.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .sum::<usize>()
+        + 4;
     let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
-    let quot_batch = if proof.commitments.random.is_some() { 2 } else { 1 };
+    let quot_batch = if proof.commitments.random.is_some() {
+        2
+    } else {
+        1
+    };
     let batch = &fri.query_proofs[q].input_proof[quot_batch];
     // multi-matrix salted leaf: per chunk, row_m ‖ salt_m, concatenated in matrix order.
     let mut preimage: Vec<Val> = Vec::new();
@@ -734,10 +905,19 @@ fn hiding_query_quotient_merkle(
     // 2^cap_height cap); cap_height = log2 of the committed cap's root count (NOT a hardcoded 6 — the
     // recursion-path inner configs use small caps). `reduction` maps the full log_global index down to
     // the quotient tree's index; 0 when the quotient is already at log_global (cap 6 production case).
-    let cap_h = proof.commitments.quotient_chunks.roots().len().trailing_zeros() as usize;
+    let cap_h = proof
+        .commitments
+        .quotient_chunks
+        .roots()
+        .len()
+        .trailing_zeros() as usize;
     let reduction = log_global - depth - cap_h;
     let reduced = index >> reduction;
-    let path: Vec<([Val; 4], bool)> = siblings.iter().enumerate().map(|(lvl, &s)| (s, (reduced >> lvl) & 1 == 1)).collect();
+    let path: Vec<([Val; 4], bool)> = siblings
+        .iter()
+        .enumerate()
+        .map(|(lvl, &s)| (s, (reduced >> lvl) & 1 == 1))
+        .collect();
     let cap_entry = proof.commitments.quotient_chunks.roots()[reduced >> depth];
     (leaf, path, cap_entry, preimage.len())
 }
@@ -747,8 +927,7 @@ fn hiding_query_quotient_merkle(
 /// ChallengeMmcs), so each round's leaf is `MyHash(group ‖ salt)` where group = the arity-2 fold pair
 /// [g0, g1] (4 felts) and salt (4 felts) comes from the step's opening_proof (a (salts, siblings) tuple for
 /// the hiding MMCS, vs a bare siblings Vec in the non-hiding case). Returns per round (group, leaf, path, cap).
-#[cfg(test)]
-fn hiding_query_commit_merkle_all<A>(
+pub(crate) fn hiding_query_commit_merkle_all<A>(
     config: &MyConfig,
     inner: &A,
     proof: &Proof<MyConfig>,
@@ -764,7 +943,12 @@ where
     let (_, _, _, _, index_felts) = hiding_transcript_challenges(config, proof, public_values);
     let (ro, rounds, _e, _f0) = hiding_query_fold_data(config, inner, proof, public_values, q);
     let fri = &proof.opening_proof.1;
-    let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+    let log_global: usize = fri.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .sum::<usize>()
+        + 4;
     let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
     let hasher = MyHash::new(default_goldilocks_poseidon2_8());
     let mut e = ro;
@@ -774,7 +958,10 @@ where
         let la = step.log_arity as usize;
         let (sibling, beta, bit, s) = rounds[r];
         let (g0, g1) = if !bit { (e, sibling) } else { (sibling, e) };
-        let flat: Vec<Val> = [g0, g1].iter().flat_map(|x| x.as_basis_coefficients_slice().to_vec()).collect();
+        let flat: Vec<Val> = [g0, g1]
+            .iter()
+            .flat_map(|x| x.as_basis_coefficients_slice().to_vec())
+            .collect();
         let group: [Val; 4] = flat.clone().try_into().unwrap();
         // hiding: the committed leaf is `group ‖ salt` (salt from the hiding-MMCS (salts, siblings) proof).
         let salt = &step.opening_proof.0[0];
@@ -783,7 +970,11 @@ where
         let leaf: [Val; 4] = hasher.hash_iter(preimage.iter().copied());
         start >>= la;
         let path_siblings = &step.opening_proof.1;
-        let path: Vec<([Val; 4], bool)> = path_siblings.iter().enumerate().map(|(lvl, &sb)| (sb, (start >> lvl) & 1 == 1)).collect();
+        let path: Vec<([Val; 4], bool)> = path_siblings
+            .iter()
+            .enumerate()
+            .map(|(lvl, &sb)| (sb, (start >> lvl) & 1 == 1))
+            .collect();
         let depth = path_siblings.len();
         let cap_entry = fri.commit_phase_commits[r].roots()[start >> depth];
         out.push((group, leaf, path, cap_entry));
@@ -797,34 +988,71 @@ where
 /// periodic columns are evaluated on the HALVED constraint domain init_trace_domain = degree>>is_zk (z_h uses
 /// degree_bits−is_zk), and the quotient is recomposed over the is_zk-aware split domains (nqc = 1<<(log+is_zk)).
 /// This is the epilogue witness the monolith's OOD region consumes; validated via p3's verify_constraints.
-#[cfg(test)]
 #[allow(clippy::type_complexity)]
-fn hiding_epilogue_openings<A>(
+pub(crate) fn hiding_epilogue_openings<A>(
     config: &MyConfig,
     air: &A,
     proof: &Proof<MyConfig>,
     public_values: &[Val],
-) -> (Vec<Challenge>, Vec<Challenge>, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Challenge, Vec<Challenge>)
+) -> (
+    Vec<Challenge>,
+    Vec<Challenge>,
+    Challenge,
+    Challenge,
+    Challenge,
+    Challenge,
+    Challenge,
+    Challenge,
+    Challenge,
+    Vec<Challenge>,
+)
 where
     A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
 {
     let (alpha_stark, zeta, _, _, _) = hiding_transcript_challenges(config, proof, public_values);
     let pcs = config.pcs();
     let is_zk = config.is_zk();
-    let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
-    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
-    let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+    let (_, degree) = validate_degree_bits(
+        None,
+        proof.degree_bits,
+        is_zk,
+        <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+    )
+    .unwrap();
+    let trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let init_trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
     let layout = AirLayout::from_air::<Val>(air);
     let log_nqc = get_log_num_quotient_chunks::<Val, A>(air, layout, is_zk);
     let nqc = 1usize << (log_nqc + is_zk);
     let qd = trace_domain.create_disjoint_domain(1 << (proof.degree_bits + log_nqc));
     let qcd = qd.split_domains(nqc);
-    let quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta);
+    let quotient = recompose_quotient_from_chunks::<MyConfig>(
+        &qcd,
+        &proof.opened_values.quotient_chunks,
+        zeta,
+    );
     let local = proof.opened_values.trace_local.clone();
     let next = proof.opened_values.trace_next.clone().unwrap_or_default();
     let sel = init_trace_domain.selectors_at_point(zeta);
-    let periodic: Vec<Challenge> = air.periodic_columns().iter().map(|c| init_trace_domain.evaluate_periodic_column_at(c, zeta)).collect();
-    (local, next, sel.is_first_row, sel.is_last_row, sel.is_transition, sel.inv_vanishing, quotient, alpha_stark, zeta, periodic)
+    let periodic: Vec<Challenge> = air
+        .periodic_columns()
+        .iter()
+        .map(|c| init_trace_domain.evaluate_periodic_column_at(c, zeta))
+        .collect();
+    (
+        local,
+        next,
+        sel.is_first_row,
+        sel.is_last_row,
+        sel.is_transition,
+        sel.inv_vanishing,
+        quotient,
+        alpha_stark,
+        zeta,
+        periodic,
+    )
 }
 
 /// Native hiding FRI low-degree verifier — the explicit `HidingFriPcs::verify` analog (what the in-circuit
@@ -834,6 +1062,50 @@ where
 /// `verify_query`, which re-checks each round's salted commit-phase Merkle). Accepts iff the reduced-opening
 /// oracle is correct — the fold only reaches `final_poly` when `ro` is the true DEEP-combined opening, so a
 /// wrong `hiding_query_terms` (missing the random round / codeword merge / randomized quotient domains) fails.
+/// is_zk-aware quotient recomposition weights for the hiding quotient split domains.
+pub(crate) fn hiding_quotient_recompose_weights<A>(
+    config: &MyConfig,
+    inner: &A,
+    proof: &Proof<MyConfig>,
+    pvs: &[Val],
+) -> Vec<Challenge>
+where
+    A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
+{
+    use p3_commit::PolynomialSpace;
+    let (_, zeta, _, _, _) = hiding_transcript_challenges(config, proof, pvs);
+    let pcs = config.pcs();
+    let is_zk = config.is_zk();
+    let (_, degree) = validate_degree_bits(
+        None,
+        proof.degree_bits,
+        is_zk,
+        <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+    )
+    .unwrap();
+    let trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let layout = AirLayout::from_air::<Val>(inner);
+    let log_nqc = get_log_num_quotient_chunks::<Val, A>(inner, layout, is_zk);
+    let nqc = 1usize << (log_nqc + is_zk);
+    let qd = trace_domain.create_disjoint_domain(1 << (proof.degree_bits + log_nqc));
+    let qcd = qd.split_domains(nqc);
+    (0..nqc)
+        .map(|i| {
+            let mut zp = Challenge::ONE;
+            for j in 0..nqc {
+                if j != i {
+                    zp *= qcd[j].vanishing_poly_at_point(zeta)
+                        * qcd[j]
+                            .vanishing_poly_at_point(qcd[i].first_point())
+                            .inverse();
+                }
+            }
+            zp
+        })
+        .collect()
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn hiding_verify_fri_native(
     config: &MyConfig,
@@ -843,16 +1115,27 @@ fn hiding_verify_fri_native(
     public_values: &[Val],
 ) -> Result<(), String> {
     let air = ConstAir;
-    let Proof { commitments, opened_values, opening_proof, degree_bits } = proof;
+    let Proof {
+        commitments,
+        opened_values,
+        opening_proof,
+        degree_bits,
+    } = proof;
     let degree_bits = *degree_bits;
     let pcs = config.pcs();
     let is_zk = config.is_zk();
 
-    let (base_degree_bits, degree) =
-        validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs))
-            .map_err(|e| format!("degree bits: {e:?}"))?;
-    let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
-    let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+    let (base_degree_bits, degree) = validate_degree_bits(
+        None,
+        degree_bits,
+        is_zk,
+        <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+    )
+    .map_err(|e| format!("degree bits: {e:?}"))?;
+    let trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+    let init_trace_domain =
+        <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
     let layout = AirLayout::from_air::<Val>(&air);
     let log_num_quotient_chunks = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, is_zk);
     let num_quotient_chunks = 1usize << (log_num_quotient_chunks + is_zk);
@@ -861,7 +1144,9 @@ fn hiding_verify_fri_native(
     let quotient_chunks_domains = quotient_domain.split_domains(num_quotient_chunks);
     let randomized_quotient_chunks_domains: Vec<_> = quotient_chunks_domains
         .iter()
-        .map(|d| <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk))
+        .map(|d| {
+            <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, d.size() << is_zk)
+        })
         .collect();
 
     // ---- transcript preamble → ζ (mirrors reverify) ----
@@ -889,7 +1174,13 @@ fn hiding_verify_fri_native(
     {
         let mut pts = vec![(zeta, opened_values.trace_local.clone())];
         if main_next {
-            pts.push((zeta_next, opened_values.trace_next.clone().ok_or("missing trace_next")?));
+            pts.push((
+                zeta_next,
+                opened_values
+                    .trace_next
+                    .clone()
+                    .ok_or("missing trace_next")?,
+            ));
         }
         rounds_um.push(vec![(ld_trace, pts)]);
     }
@@ -923,7 +1214,11 @@ fn hiding_verify_fri_native(
 
     // ---- β_r (per commit-phase round) ----
     let mut betas: Vec<Challenge> = Vec::new();
-    for (comm, w) in fri.commit_phase_commits.iter().zip(&fri.commit_pow_witnesses) {
+    for (comm, w) in fri
+        .commit_phase_commits
+        .iter()
+        .zip(&fri.commit_pow_witnesses)
+    {
         ch.observe(comm.clone());
         if !ch.check_witness(fri_params.commit_proof_of_work_bits, *w) {
             return Err("invalid commit pow".into());
@@ -934,8 +1229,11 @@ fn hiding_verify_fri_native(
         return Err("final poly length mismatch".into());
     }
     ch.observe_algebra_slice(&fri.final_poly);
-    let log_arities: Vec<usize> =
-        fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+    let log_arities: Vec<usize> = fri.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .collect();
     for &la in &log_arities {
         ch.observe(Val::from_usize(la));
     }
@@ -963,11 +1261,17 @@ fn hiding_verify_fri_native(
         // we pass the UN-salted row width. This is the exact preimage the in-circuit salted-leaf gadget hashes.
         for (b, mats) in merged.iter().enumerate() {
             let bo = &qp.input_proof[b];
-            let heights: Vec<usize> = mats.iter().map(|(ld, _)| 1usize << (ld + fri_params.log_blowup)).collect();
+            let heights: Vec<usize> = mats
+                .iter()
+                .map(|(ld, _)| 1usize << (ld + fri_params.log_blowup))
+                .collect();
             let dims: Vec<Dimensions> = mats
                 .iter()
                 .zip(&heights)
-                .map(|((_, pts), &h)| Dimensions { width: pts[0].1.len(), height: h })
+                .map(|((_, pts), &h)| Dimensions {
+                    width: pts[0].1.len(),
+                    height: h,
+                })
                 .collect();
             let max_h = *heights.iter().max().ok_or("empty batch")?;
             let reduced_index = index >> (log_global_max_height - max_h.trailing_zeros() as usize);
@@ -975,15 +1279,34 @@ fn hiding_verify_fri_native(
                 .verify_batch(input_commits[b], &dims, reduced_index, bo.into())
                 .map_err(|_| format!("input batch {b} salted MMCS verify failed"))?;
         }
-        let ro = hiding_query_terms(fri_params.log_blowup, log_global_max_height, index, &qp.input_proof, alpha_fri, &merged)?;
+        let ro = hiding_query_terms(
+            fri_params.log_blowup,
+            log_global_max_height,
+            index,
+            &qp.input_proof,
+            alpha_fri,
+            &merged,
+        )?;
         let mut domain_index = index;
         let fold_data: Vec<CommitStep<'_, ChallengeMmcs>> = betas
             .iter()
             .zip(fri.commit_phase_commits.iter())
             .zip(qp.commit_phase_openings.iter())
-            .map(|((&beta, commit), opening)| CommitStep { beta, commit, opening })
+            .map(|((&beta, commit), opening)| CommitStep {
+                beta,
+                commit,
+                opening,
+            })
             .collect();
-        let folded = verify_query(fri_params, &folding, &mut domain_index, &fold_data, ro, log_global_max_height, log_final_height)?;
+        let folded = verify_query(
+            fri_params,
+            &folding,
+            &mut domain_index,
+            &fold_data,
+            ro,
+            log_global_max_height,
+            log_final_height,
+        )?;
         let x = final_query_point(domain_index, log_global_max_height);
         if eval_final_poly(&fri.final_poly, x) != folded {
             return Err("final poly mismatch".into());
@@ -1009,7 +1332,12 @@ mod tests {
     /// 2^17 rows — while a small cap trades them for slightly deeper per-query Merkle paths.
     fn make_config_ar_cap(max_log_arity: usize, num_queries: usize, cap_height: usize) -> MyConfig {
         let perm = default_goldilocks_poseidon2_8();
-        let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), cap_height, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let val_mmcs = ValMmcs::new(
+            MyHash::new(perm.clone()),
+            MyCompress::new(perm.clone()),
+            cap_height,
+            ChaCha20Rng::from_rng(&mut rand::rng()),
+        );
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
         let fri = FriParameters {
             log_blowup: 4,
@@ -1020,7 +1348,13 @@ mod tests {
             query_proof_of_work_bits: 16,
             mmcs: challenge_mmcs,
         };
-        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let pcs = MyPcs::new(
+            Dft::default(),
+            val_mmcs,
+            fri,
+            4,
+            ChaCha20Rng::from_rng(&mut rand::rng()),
+        );
         MyConfig::new(pcs, Challenger::new(perm))
     }
 
@@ -1050,7 +1384,10 @@ mod tests {
         let fri = &proof.opening_proof.1;
         let rand_cws = &proof.opening_proof.0;
         println!("degree_bits={}", proof.degree_bits);
-        println!("commitments.random present: {}", proof.commitments.random.is_some());
+        println!(
+            "commitments.random present: {}",
+            proof.commitments.random.is_some()
+        );
         println!("opened_values: trace_local={} trace_next={:?} quotient_chunks={} (each {:?}) random={:?}",
             proof.opened_values.trace_local.len(),
             proof.opened_values.trace_next.as_ref().map(|v| v.len()),
@@ -1059,11 +1396,25 @@ mod tests {
             proof.opened_values.random.as_ref().map(|v| v.len()));
         println!("rand_cws rounds={}", rand_cws.len());
         for (r, round) in rand_cws.iter().enumerate() {
-            let per_mat: Vec<usize> = round.iter().map(|m| m.iter().map(|p| p.len()).sum()).collect();
-            println!("  round {r}: {} matrices, codeword felts/mat(sum over pts)={:?}", round.len(), per_mat);
+            let per_mat: Vec<usize> = round
+                .iter()
+                .map(|m| m.iter().map(|p| p.len()).sum())
+                .collect();
+            println!(
+                "  round {r}: {} matrices, codeword felts/mat(sum over pts)={:?}",
+                round.len(),
+                per_mat
+            );
         }
-        println!("commit_phase rounds={}, arities={:?}", fri.commit_phase_commits.len(),
-            fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity).collect::<Vec<_>>());
+        println!(
+            "commit_phase rounds={}, arities={:?}",
+            fri.commit_phase_commits.len(),
+            fri.query_proofs[0]
+                .commit_phase_openings
+                .iter()
+                .map(|o| o.log_arity)
+                .collect::<Vec<_>>()
+        );
         let ip = &fri.query_proofs[0].input_proof;
         println!("input_proof batches={}", ip.len());
         for (b, bo) in ip.iter().enumerate() {
@@ -1082,7 +1433,10 @@ mod tests {
         let (proof, pvs) = gen_proof(&config, 42, 6);
 
         // sanity: p3 accepts the proof.
-        assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "p3::verify should accept");
+        assert!(
+            verify(&config, &ConstAir, &proof, &pvs).is_ok(),
+            "p3::verify should accept"
+        );
         // the native re-verifier accepts the same valid proof.
         if let Err(e) = reverify(&config, &proof, &pvs) {
             panic!("reverify rejected a valid proof: {e}");
@@ -1091,7 +1445,10 @@ mod tests {
         // tampered public value ⇒ both reject (the constraint check fails the OOD relation).
         let bad_pvs = vec![Val::from_u64(43)];
         assert!(verify(&config, &ConstAir, &proof, &bad_pvs).is_err());
-        assert!(reverify(&config, &proof, &bad_pvs).is_err(), "reverify should reject wrong public value");
+        assert!(
+            reverify(&config, &proof, &bad_pvs).is_err(),
+            "reverify should reject wrong public value"
+        );
     }
 
     /// Native hiding oracle (step 1): `hiding_transcript_challenges` extracts α_stark/ζ from a HIDING proof
@@ -1104,37 +1461,71 @@ mod tests {
     fn hiding_transcript_matches_ood() {
         let config = make_config();
         let (proof, pvs) = gen_proof(&config, 42, 6);
-        assert!(reverify(&config, &proof, &pvs).is_ok(), "sanity: reverify accepts the hiding proof");
+        assert!(
+            reverify(&config, &proof, &pvs).is_ok(),
+            "sanity: reverify accepts the hiding proof"
+        );
 
-        let (alpha_stark, zeta, _alpha_fri, _betas, index_felts) = hiding_transcript_challenges(&config, &proof, &pvs);
+        let (alpha_stark, zeta, _alpha_fri, _betas, index_felts) =
+            hiding_transcript_challenges(&config, &proof, &pvs);
         assert_eq!(index_felts.len(), 96, "one index felt per FRI query");
 
         // OOD check with the ORACLE's α_stark/ζ — replicates reverify's constraint step (is_zk-aware domains).
         let air = ConstAir;
         let pcs = config.pcs();
         let is_zk = config.is_zk();
-        let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
-        let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
-        let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+        let (_, degree) = validate_degree_bits(
+            None,
+            proof.degree_bits,
+            is_zk,
+            <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+        )
+        .unwrap();
+        let trace_domain =
+            <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+        let init_trace_domain =
+            <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
         let layout = AirLayout::from_air::<Val>(&air);
         let log_nqc = get_log_num_quotient_chunks::<Val, ConstAir>(&air, layout, is_zk);
         let nqc = 1usize << (log_nqc + is_zk);
         let qd = trace_domain.create_disjoint_domain(1 << (proof.degree_bits + log_nqc));
         let qcd = qd.split_domains(nqc);
-        let quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta);
+        let quotient = recompose_quotient_from_chunks::<MyConfig>(
+            &qcd,
+            &proof.opened_values.quotient_chunks,
+            zeta,
+        );
         let zeros = Challenge::zero_vec(air.width());
         let trace_next: &[Challenge] = proof.opened_values.trace_next.as_deref().unwrap_or(&zeros);
-        let periodic: Vec<Challenge> = air.periodic_columns().iter().map(|c| init_trace_domain.evaluate_periodic_column_at(c, zeta)).collect();
+        let periodic: Vec<Challenge> = air
+            .periodic_columns()
+            .iter()
+            .map(|c| init_trace_domain.evaluate_periodic_column_at(c, zeta))
+            .collect();
         verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
             &air, &proof.opened_values.trace_local, trace_next, None, None, &periodic, &pvs, init_trace_domain, zeta, alpha_stark, quotient,
         )
         .expect("OOD check with the oracle's α_stark/ζ must hold ⇒ the hiding transcript (incl. random absorb) is correct");
 
         // wrong ζ ⇒ the OOD relation fails (guards against a vacuous check).
-        let bad_quotient = recompose_quotient_from_chunks::<MyConfig>(&qcd, &proof.opened_values.quotient_chunks, zeta + Challenge::ONE);
+        let bad_quotient = recompose_quotient_from_chunks::<MyConfig>(
+            &qcd,
+            &proof.opened_values.quotient_chunks,
+            zeta + Challenge::ONE,
+        );
         assert!(
             verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
-                &air, &proof.opened_values.trace_local, trace_next, None, None, &periodic, &pvs, init_trace_domain, zeta + Challenge::ONE, alpha_stark, bad_quotient,
+                &air,
+                &proof.opened_values.trace_local,
+                trace_next,
+                None,
+                None,
+                &periodic,
+                &pvs,
+                init_trace_domain,
+                zeta + Challenge::ONE,
+                alpha_stark,
+                bad_quotient,
             )
             .is_err(),
             "a wrong ζ must fail the OOD relation"
@@ -1153,12 +1544,20 @@ mod tests {
     fn hiding_query_terms_folds_to_final_poly() {
         let config = make_config();
         let (mut proof, pvs) = gen_proof(&config, 42, 6);
-        assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "sanity: p3::verify accepts");
+        assert!(
+            verify(&config, &ConstAir, &proof, &pvs).is_ok(),
+            "sanity: p3::verify accepts"
+        );
 
         // Rebuild the hiding FRI parameters the driver/verify_query need (deterministic — Poseidon2 + the
         // literals are fixed; the ChaCha rng only salts on the PROVE side, so any seed verifies identically).
         let perm = default_goldilocks_poseidon2_8();
-        let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::seed_from_u64(0));
+        let val_mmcs = ValMmcs::new(
+            MyHash::new(perm.clone()),
+            MyCompress::new(perm.clone()),
+            6,
+            ChaCha20Rng::seed_from_u64(0),
+        );
         let fri_params = FriParameters {
             log_blowup: 4,
             log_final_poly_len: 0,
@@ -1201,7 +1600,13 @@ mod tests {
     }
     impl Sim {
         fn new() -> Self {
-            Self { state: [Val::ZERO; SPONGE_W], input: vec![], output: vec![], block_inputs: vec![], counts: vec![] }
+            Self {
+                state: [Val::ZERO; SPONGE_W],
+                input: vec![],
+                output: vec![],
+                block_inputs: vec![],
+                counts: vec![],
+            }
         }
         fn duplex(&mut self) {
             let num = self.input.len();
@@ -1252,7 +1657,6 @@ mod tests {
         commit.roots().iter().flatten().copied().collect()
     }
 
-
     /// Native hiding monolith harness (#86, step 1): the block-based transcript Sim reproduces the HIDING
     /// challenges (α_stark, ζ, α_fri, β_r) that the real challenger produces (hiding_transcript_challenges).
     /// This validates the Poseidon2 block schedule the in-circuit transcript region will replay — including
@@ -1265,11 +1669,16 @@ mod tests {
         let (proof, pvs) = gen_proof(&config, 42, 6);
         let (blocks, counts, _binds, chs, _ibs, _ifs) = sim_full_hiding_all(&config, &proof, &pvs);
         assert_eq!(blocks.len(), counts.len());
-        let (a_stark, zeta, a_fri, betas, _idx) = hiding_transcript_challenges(&config, &proof, &pvs);
+        let (a_stark, zeta, a_fri, betas, _idx) =
+            hiding_transcript_challenges(&config, &proof, &pvs);
         let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
         assert_eq!(chs[0], c(a_stark), "Sim α_stark != challenger");
         assert_eq!(chs[1], c(zeta), "Sim ζ != challenger");
-        assert_eq!(chs[2], c(a_fri), "Sim α_fri != challenger (random absorb + codeword merge)");
+        assert_eq!(
+            chs[2],
+            c(a_fri),
+            "Sim α_fri != challenger (random absorb + codeword merge)"
+        );
         assert_eq!(chs.len(), 3 + betas.len(), "β count");
         for (i, b) in betas.iter().enumerate() {
             assert_eq!(chs[3 + i], c(*b), "Sim β_{i} != challenger");
@@ -1289,7 +1698,12 @@ mod tests {
         let config = make_config();
         let (proof, pvs) = gen_proof(&config, 42, 6);
         let perm = default_goldilocks_poseidon2_8();
-        let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::seed_from_u64(0));
+        let val_mmcs = ValMmcs::new(
+            MyHash::new(perm.clone()),
+            MyCompress::new(perm.clone()),
+            6,
+            ChaCha20Rng::seed_from_u64(0),
+        );
         let fri_params = FriParameters {
             log_blowup: 4,
             log_final_poly_len: 0,
@@ -1299,13 +1713,21 @@ mod tests {
             query_proof_of_work_bits: 16,
             mmcs: ChallengeMmcs::new(val_mmcs),
         };
-        let (_, _, alpha_fri, betas, index_felts) = hiding_transcript_challenges(&config, &proof, &pvs);
+        let (_, _, alpha_fri, betas, index_felts) =
+            hiding_transcript_challenges(&config, &proof, &pvs);
         let fri = &proof.opening_proof.1;
-        let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
-        let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> = TwoAdicFriFolding(core::marker::PhantomData);
+        let log_global: usize = fri.query_proofs[0]
+            .commit_phase_openings
+            .iter()
+            .map(|o| o.log_arity as usize)
+            .sum::<usize>()
+            + 4;
+        let folding: TwoAdicFriFolding<(), <ChallengeMmcs as Mmcs<Challenge>>::Error> =
+            TwoAdicFriFolding(core::marker::PhantomData);
         let mut n_terms = 0;
         for q in [0usize, 1, fri.query_proofs.len() - 1] {
-            let (terms, _x, alpha, ro) = hiding_multicol_query_terms(&config, &ConstAir, &proof, &pvs, q);
+            let (terms, _x, alpha, ro) =
+                hiding_multicol_query_terms(&config, &ConstAir, &proof, &pvs, q);
             assert_eq!(alpha, alpha_fri, "q{q}: terms use α_fri");
             n_terms = terms.len();
             // all hiding-ConstAir input matrices share one height (log_global) ⇒ ro seeds the fold at log_global.
@@ -1316,11 +1738,28 @@ mod tests {
                 .iter()
                 .zip(fri.commit_phase_commits.iter())
                 .zip(qp.commit_phase_openings.iter())
-                .map(|((&b, c), o)| CommitStep { beta: b, commit: c, opening: o })
+                .map(|((&b, c), o)| CommitStep {
+                    beta: b,
+                    commit: c,
+                    opening: o,
+                })
                 .collect();
-            let folded = verify_query(&fri_params, &folding, &mut di, &fold_data, vec![(log_global, ro)], log_global, 4).expect("fold");
+            let folded = verify_query(
+                &fri_params,
+                &folding,
+                &mut di,
+                &fold_data,
+                vec![(log_global, ro)],
+                log_global,
+                4,
+            )
+            .expect("fold");
             let x = final_query_point(di, log_global);
-            assert_eq!(eval_final_poly(&fri.final_poly, x), folded, "q{q}: terms' ro must fold to final_poly");
+            assert_eq!(
+                eval_final_poly(&fri.final_poly, x),
+                folded,
+                "q{q}: terms' ro must fold to final_poly"
+            );
         }
         println!("hiding per-query terms: {n_terms} reduced-opening terms fold to final_poly (random round + merged codewords + 2× quotient) — the true reduced opening");
     }
@@ -1334,16 +1773,26 @@ mod tests {
     fn hiding_fold_rounds_reach_final() {
         let config = make_config_ar(1, 96); // ARITY-2 hiding (the monolith's fold arity)
         let (proof, pvs) = gen_proof(&config, 42, 6);
-        assert!(reverify(&config, &proof, &pvs).is_ok(), "sanity: arity-2 hiding proof is valid");
+        assert!(
+            reverify(&config, &proof, &pvs).is_ok(),
+            "sanity: arity-2 hiding proof is valid"
+        );
         let fri = &proof.opening_proof.1;
         assert!(
-            fri.query_proofs[0].commit_phase_openings.iter().all(|o| o.log_arity == 1),
+            fri.query_proofs[0]
+                .commit_phase_openings
+                .iter()
+                .all(|o| o.log_arity == 1),
             "config must be arity-2 (log_arity==1) for the monolith fold chain"
         );
         let mut n_rounds = 0;
         for q in [0usize, 1, fri.query_proofs.len() - 1] {
-            let (_ro, rounds, e, final0) = hiding_query_fold_data(&config, &ConstAir, &proof, &pvs, q);
-            assert_eq!(e, final0, "q{q}: hiding fold chain must reach final_poly[0]");
+            let (_ro, rounds, e, final0) =
+                hiding_query_fold_data(&config, &ConstAir, &proof, &pvs, q);
+            assert_eq!(
+                e, final0,
+                "q{q}: hiding fold chain must reach final_poly[0]"
+            );
             n_rounds = rounds.len();
         }
         println!("hiding fold chain (arity-2): {n_rounds} rounds fold ro → final_poly[0] (monolith-compatible fold witness)");
@@ -1366,9 +1815,16 @@ mod tests {
             let (leaf, path, cap_entry) = hiding_query_input_merkle(&config, &proof, &pvs, q);
             let mut node = leaf;
             for (sib, dir) in &path {
-                node = if *dir { compressor.compress([*sib, node]) } else { compressor.compress([node, *sib]) };
+                node = if *dir {
+                    compressor.compress([*sib, node])
+                } else {
+                    compressor.compress([node, *sib])
+                };
             }
-            assert_eq!(node, cap_entry, "q{q}: salted leaf (row ‖ salt) + path must fold to the trace cap entry");
+            assert_eq!(
+                node, cap_entry,
+                "q{q}: salted leaf (row ‖ salt) + path must fold to the trace cap entry"
+            );
             depth = path.len();
         }
         println!("hiding input Merkle: salted leaf (row ‖ salt) + {depth}-level path folds to the trace cap entry");
@@ -1393,7 +1849,11 @@ mod tests {
             leaf_felts = n;
             let mut node = leaf;
             for (sib, dir) in &path {
-                node = if *dir { compressor.compress([*sib, node]) } else { compressor.compress([node, *sib]) };
+                node = if *dir {
+                    compressor.compress([*sib, node])
+                } else {
+                    compressor.compress([node, *sib])
+                };
             }
             assert_eq!(node, cap_entry, "q{q}: multi-matrix salted quotient leaf + path must fold to the quotient cap entry");
         }
@@ -1419,9 +1879,16 @@ mod tests {
             for (r, (_group, leaf, path, cap_entry)) in rounds.iter().enumerate() {
                 let mut node = *leaf;
                 for (sib, dir) in path {
-                    node = if *dir { compressor.compress([*sib, node]) } else { compressor.compress([node, *sib]) };
+                    node = if *dir {
+                        compressor.compress([*sib, node])
+                    } else {
+                        compressor.compress([node, *sib])
+                    };
                 }
-                assert_eq!(node, *cap_entry, "q{q} round {r}: salted commit-phase leaf + path must fold to the round cap");
+                assert_eq!(
+                    node, *cap_entry,
+                    "q{q} round {r}: salted commit-phase leaf + path must fold to the round cap"
+                );
             }
         }
         println!("hiding commit-phase Merkle: {n_rounds} rounds of salted MyHash(group ‖ salt) + path fold to each round's cap");
@@ -1436,25 +1903,63 @@ mod tests {
     fn hiding_epilogue_openings_pass_verify_constraints() {
         let config = make_config();
         let (proof, pvs) = gen_proof(&config, 42, 6);
-        assert!(reverify(&config, &proof, &pvs).is_ok(), "sanity: hiding proof valid");
+        assert!(
+            reverify(&config, &proof, &pvs).is_ok(),
+            "sanity: hiding proof valid"
+        );
         let (local, next, is_first, is_last, is_trans, inv_van, quotient, alpha, zeta, periodic) =
             hiding_epilogue_openings(&config, &ConstAir, &proof, &pvs);
         let air = ConstAir;
         let pcs = config.pcs();
         let is_zk = config.is_zk();
-        let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
-        let init_trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
+        let (_, degree) = validate_degree_bits(
+            None,
+            proof.degree_bits,
+            is_zk,
+            <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+        )
+        .unwrap();
+        let init_trace_domain =
+            <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree >> is_zk);
         // sanity: the packaged selectors are exactly the halved-domain selectors at ζ.
         let sel = init_trace_domain.selectors_at_point(zeta);
-        assert_eq!((is_first, is_last, is_trans, inv_van), (sel.is_first_row, sel.is_last_row, sel.is_transition, sel.inv_vanishing));
+        assert_eq!(
+            (is_first, is_last, is_trans, inv_van),
+            (
+                sel.is_first_row,
+                sel.is_last_row,
+                sel.is_transition,
+                sel.inv_vanishing
+            )
+        );
         verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
-            &air, &local, &next, None, None, &periodic, &pvs, init_trace_domain, zeta, alpha, quotient,
+            &air,
+            &local,
+            &next,
+            None,
+            None,
+            &periodic,
+            &pvs,
+            init_trace_domain,
+            zeta,
+            alpha,
+            quotient,
         )
         .expect("hiding epilogue openings must satisfy the OOD constraint relation");
         // tamper: wrong quotient(ζ) ⇒ reject.
         assert!(
             verify_constraints::<MyConfig, ConstAir, <MyPcs as Pcs<Challenge, Challenger>>::Error>(
-                &air, &local, &next, None, None, &periodic, &pvs, init_trace_domain, zeta, alpha, quotient + Challenge::ONE,
+                &air,
+                &local,
+                &next,
+                None,
+                None,
+                &periodic,
+                &pvs,
+                init_trace_domain,
+                zeta,
+                alpha,
+                quotient + Challenge::ONE,
             )
             .is_err(),
             "a tampered quotient(ζ) must fail the OOD relation"
@@ -1469,7 +1974,10 @@ mod tests {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|s| {
-                s.lines().find_map(|l| l.strip_prefix("VmHWM:").and_then(|r| r.split_whitespace().next()?.parse::<u64>().ok()))
+                s.lines().find_map(|l| {
+                    l.strip_prefix("VmHWM:")
+                        .and_then(|r| r.split_whitespace().next()?.parse::<u64>().ok())
+                })
             })
             .map(|kb| kb * 1024)
             .unwrap_or(0)
@@ -1478,7 +1986,12 @@ mod tests {
     /// The is_zk-aware analog of quotient_recompose_weights: the in-circuit epilogue's quotient(ζ) = Σ_i zps_i·
     /// chunk_i(ζ), with zps_i the verifier-computed weights over the HIDING split domains (nqc = 1<<(log+is_zk)).
     /// Matches p3's recompose_quotient_from_chunks (asserted against it in the harness before feeding the pis).
-    fn hiding_quotient_recompose_weights<A>(config: &MyConfig, inner: &A, proof: &Proof<MyConfig>, pvs: &[Val]) -> Vec<Challenge>
+    fn hiding_quotient_recompose_weights<A>(
+        config: &MyConfig,
+        inner: &A,
+        proof: &Proof<MyConfig>,
+        pvs: &[Val],
+    ) -> Vec<Challenge>
     where
         A: p3_air::Air<p3_uni_stark::SymbolicAirBuilder<Val>>,
     {
@@ -1486,8 +1999,15 @@ mod tests {
         let (_, zeta, _, _, _) = hiding_transcript_challenges(config, proof, pvs);
         let pcs = config.pcs();
         let is_zk = config.is_zk();
-        let (_, degree) = validate_degree_bits(None, proof.degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).unwrap();
-        let trace_domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
+        let (_, degree) = validate_degree_bits(
+            None,
+            proof.degree_bits,
+            is_zk,
+            <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+        )
+        .unwrap();
+        let trace_domain =
+            <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(pcs, degree);
         let layout = AirLayout::from_air::<Val>(inner);
         let log_nqc = get_log_num_quotient_chunks::<Val, A>(inner, layout, is_zk);
         let nqc = 1usize << (log_nqc + is_zk);
@@ -1498,7 +2018,10 @@ mod tests {
                 let mut zp = Challenge::ONE;
                 for j in 0..nqc {
                     if j != i {
-                        zp *= qcd[j].vanishing_poly_at_point(zeta) * qcd[j].vanishing_poly_at_point(qcd[i].first_point()).inverse();
+                        zp *= qcd[j].vanishing_poly_at_point(zeta)
+                            * qcd[j]
+                                .vanishing_poly_at_point(qcd[i].first_point())
+                                .inverse();
                     }
                 }
                 zp
@@ -1513,12 +2036,24 @@ mod tests {
         config: &MyConfig,
         proof: &Proof<MyConfig>,
         pvs: &[Val],
-    ) -> (Vec<[Val; SPONGE_W]>, Vec<u8>, Vec<usize>, Vec<[Val; 2]>, Vec<(usize, usize)>, Vec<Val>) {
+    ) -> (
+        Vec<[Val; SPONGE_W]>,
+        Vec<u8>,
+        Vec<usize>,
+        Vec<[Val; 2]>,
+        Vec<(usize, usize)>,
+        Vec<Val>,
+    ) {
         let pcs = config.pcs();
         let is_zk = config.is_zk();
         let degree_bits = proof.degree_bits;
-        let (base_degree_bits, _) =
-            validate_degree_bits(None, degree_bits, is_zk, <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs)).expect("degree bits");
+        let (base_degree_bits, _) = validate_degree_bits(
+            None,
+            degree_bits,
+            is_zk,
+            <MyPcs as Pcs<Challenge, Challenger>>::log_max_lde_height(pcs),
+        )
+        .expect("degree bits");
         let mut s = Sim::new();
         s.observe(Val::from_usize(degree_bits));
         s.observe(Val::from_usize(base_degree_bits));
@@ -1553,7 +2088,11 @@ mod tests {
             observe_merged(&mut s, rv, &rand_cws[round][0][0]);
             round += 1;
         }
-        observe_merged(&mut s, &proof.opened_values.trace_local, &rand_cws[round][0][0]);
+        observe_merged(
+            &mut s,
+            &proof.opened_values.trace_local,
+            &rand_cws[round][0][0],
+        );
         if let Some(tn) = &proof.opened_values.trace_next {
             observe_merged(&mut s, tn, &rand_cws[round][0][1]);
         }
@@ -1576,7 +2115,11 @@ mod tests {
         for &x in &fri.final_poly {
             s.observe_ext(x);
         }
-        let log_arities: Vec<usize> = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).collect();
+        let log_arities: Vec<usize> = fri.query_proofs[0]
+            .commit_phase_openings
+            .iter()
+            .map(|o| o.log_arity as usize)
+            .collect();
         for &la in &log_arities {
             s.observe(Val::from_usize(la));
         }
@@ -1589,7 +2132,14 @@ mod tests {
             index_binds.push((blk, lane));
             index_felts.push(f);
         }
-        (s.block_inputs, s.counts, binds, chs, index_binds, index_felts)
+        (
+            s.block_inputs,
+            s.counts,
+            binds,
+            chs,
+            index_binds,
+            index_felts,
+        )
     }
 
     /// #86 AIR mode — the END-TO-END hiding monolith: builds MonolithAir{is_zk:1} over a real arity-2 HIDING
@@ -1604,16 +2154,30 @@ mod tests {
         run_hiding_monolith_lh_cap(n_queries, log_height, 6, check_only)
     }
 
-    fn run_hiding_monolith_lh_cap(n_queries: usize, log_height: usize, cap_h: usize, check_only: bool) -> (u32, u64) {
+    fn run_hiding_monolith_lh_cap(
+        n_queries: usize,
+        log_height: usize,
+        cap_h: usize,
+        check_only: bool,
+    ) -> (u32, u64) {
         use crate::recursion::monolith::{monolith_build_trace, HidingWitness, MonolithAir};
         use p3_field::{BasedVectorSpace, PrimeField64};
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
         let config = make_config_ar_cap(1, n_queries, cap_h); // arity-2 hiding
         let (proof, pvs) = gen_proof(&config, 42, log_height);
-        assert!(verify(&config, &ConstAir, &proof, &pvs).is_ok(), "sanity: p3::verify accepts the hiding ConstAir proof");
-        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full_hiding_all(&config, &proof, &pvs);
+        assert!(
+            verify(&config, &ConstAir, &proof, &pvs).is_ok(),
+            "sanity: p3::verify accepts the hiding ConstAir proof"
+        );
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) =
+            sim_full_hiding_all(&config, &proof, &pvs);
         let fri = &proof.opening_proof.1;
-        let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+        let log_global: usize = fri.query_proofs[0]
+            .commit_phase_openings
+            .iter()
+            .map(|o| o.log_arity as usize)
+            .sum::<usize>()
+            + 4;
         let random_present = proof.commitments.random.is_some();
         let trace_batch = if random_present { 1 } else { 0 };
         let quot_batch = trace_batch + 1;
@@ -1626,8 +2190,10 @@ mod tests {
         let mut n_terms = 0;
         let mut final0 = Challenge::ZERO;
         for q in 0..n_queries {
-            let (terms, _x, alpha, ro) = hiding_multicol_query_terms(&config, &ConstAir, &proof, &pvs, q);
-            let (_ro2, rounds, _e, f0) = hiding_query_fold_data(&config, &ConstAir, &proof, &pvs, q);
+            let (terms, _x, alpha, ro) =
+                hiding_multicol_query_terms(&config, &ConstAir, &proof, &pvs, q);
+            let (_ro2, rounds, _e, f0) =
+                hiding_query_fold_data(&config, &ConstAir, &proof, &pvs, q);
             let (_leaf, path, _cap) = hiding_query_input_merkle(&config, &proof, &pvs, q);
             let (_ql, qpath, _qce, _qw) = hiding_query_quotient_merkle(&config, &proof, &pvs, q);
             let cm = hiding_query_commit_merkle_all(&config, &ConstAir, &proof, &pvs, q);
@@ -1638,19 +2204,42 @@ mod tests {
             let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
             // salts extracted directly from the proof (mirroring the salted-leaf witness fns).
             let qp = &fri.query_proofs[q];
-            let trace_salt: [Val; 4] = qp.input_proof[trace_batch].opening_proof.0[0].clone().try_into().unwrap();
+            let trace_salt: [Val; 4] = qp.input_proof[trace_batch].opening_proof.0[0]
+                .clone()
+                .try_into()
+                .unwrap();
             let rbatch = &qp.input_proof[0]; // random-round batch
             let random_salt: [Val; 4] = rbatch.opening_proof.0[0].clone().try_into().unwrap();
-            let random_path: Vec<([Val; 4], bool)> =
-                rbatch.opening_proof.1.iter().enumerate().map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1)).collect();
-            let quot_salts: Vec<[Val; 4]> =
-                (0..nqc).map(|m| qp.input_proof[quot_batch].opening_proof.0[m].clone().try_into().unwrap()).collect();
-            let commit_salts: Vec<[Val; 4]> =
-                qp.commit_phase_openings.iter().map(|o| o.opening_proof.0[0].clone().try_into().unwrap()).collect();
+            let random_path: Vec<([Val; 4], bool)> = rbatch
+                .opening_proof
+                .1
+                .iter()
+                .enumerate()
+                .map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1))
+                .collect();
+            let quot_salts: Vec<[Val; 4]> = (0..nqc)
+                .map(|m| {
+                    qp.input_proof[quot_batch].opening_proof.0[m]
+                        .clone()
+                        .try_into()
+                        .unwrap()
+                })
+                .collect();
+            let commit_salts: Vec<[Val; 4]> = qp
+                .commit_phase_openings
+                .iter()
+                .map(|o| o.opening_proof.0[0].clone().try_into().unwrap())
+                .collect();
             per_query.push(((index, terms, alpha, ro, rounds), pvs[0], path));
             quot_paths.push(qpath);
             commit_data.push(cm);
-            hiding.push(HidingWitness { trace_salt, random_salt, random_path, quot_salts, commit_salts });
+            hiding.push(HidingWitness {
+                trace_salt,
+                random_salt,
+                random_path,
+                quot_salts,
+                commit_salts,
+            });
         }
 
         let air = MonolithAir {
@@ -1662,7 +2251,8 @@ mod tests {
             inner_counter: false,
             column_window: false,
             k_instances: 1,
-            fold: false, fold_txstmt: false,
+            fold: false,
+            fold_txstmt: false,
             constraints: vec![],
             w_inner_f: 1,
             n_pub_f: 1,
@@ -1699,13 +2289,20 @@ mod tests {
         if nqc > 1 {
             // qwt weights; pre-check Σ zps_i·chunk_i == p3's recompose (guards the in-circuit recompose).
             let zps = hiding_quotient_recompose_weights(&config, &ConstAir, &proof, &pvs);
-            let (_, _, _, _, _, _, eo_quot, _, _, _) = hiding_epilogue_openings(&config, &ConstAir, &proof, &pvs);
-            let x = Challenge::from_basis_coefficients_fn(|k| if k == 1 { Val::ONE } else { Val::ZERO });
+            let (_, _, _, _, _, _, eo_quot, _, _, _) =
+                hiding_epilogue_openings(&config, &ConstAir, &proof, &pvs);
+            let x =
+                Challenge::from_basis_coefficients_fn(
+                    |k| if k == 1 { Val::ONE } else { Val::ZERO },
+                );
             let mut rq = Challenge::ZERO;
             for (i, ch) in proof.opened_values.quotient_chunks.iter().enumerate() {
                 rq += zps[i] * (ch[0] + ch[1] * x);
             }
-            assert_eq!(rq, eo_quot, "hiding qwt: Σ zps_i·chunk_i must equal p3 recompose_quotient_from_chunks");
+            assert_eq!(
+                rq, eo_quot,
+                "hiding qwt: Σ zps_i·chunk_i must equal p3 recompose_quotient_from_chunks"
+            );
             for z in &zps {
                 let c = cc(*z);
                 pis.push(c[0]);
@@ -1715,13 +2312,34 @@ mod tests {
         for e in proof.commitments.random.as_ref().unwrap().roots().iter() {
             pis.extend_from_slice(e);
         }
-        assert_eq!(pis.len(), air.pis_count(), "assembled pis length must match the geometry's pis_count");
+        assert_eq!(
+            pis.len(),
+            air.pis_count(),
+            "assembled pis length must match the geometry's pis_count"
+        );
 
-        let trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], Some(&hiding));
+        let trace = monolith_build_trace(
+            &air,
+            &block_inputs,
+            &per_query,
+            chs[2],
+            &index_felts,
+            &quot_paths,
+            &commit_data,
+            &[],
+            Some(&hiding),
+        );
         let hh = air.height();
-        println!("hiding monolith @ {n_queries} queries: 2^{} rows (width {}, is_zk=1, arity-2)", hh.trailing_zeros(), air.fused_w());
+        println!(
+            "hiding monolith @ {n_queries} queries: 2^{} rows (width {}, is_zk=1, arity-2)",
+            hh.trailing_zeros(),
+            air.fused_w()
+        );
         // per-query masked indices — for correlating an index-dependent failure with the triggering query.
-        let idxs: Vec<usize> = index_felts.iter().map(|f| (f.as_canonical_u64() as usize) & ((1 << log_global) - 1)).collect();
+        let idxs: Vec<usize> = index_felts
+            .iter()
+            .map(|f| (f.as_canonical_u64() as usize) & ((1 << log_global) - 1))
+            .collect();
         println!("  query indices (lg={log_global}): {idxs:?}");
         if check_only {
             // localize a constraint/build mismatch fast (row + constraint index) without the slow FRI, then
@@ -1743,17 +2361,26 @@ mod tests {
         // tamper: wrong inner public value ⇒ OOD epilogue fails ⇒ reject.
         let mut bad = pis.clone();
         bad[air.pub_pi()] += Val::ONE;
-        assert!(verify(&config, &air, &prf, &bad).is_err(), "tampered inner pub ⇒ epilogue rejects");
+        assert!(
+            verify(&config, &air, &prf, &bad).is_err(),
+            "tampered inner pub ⇒ epilogue rejects"
+        );
         // tamper: the FULL trace cap entry query 0 selects (index0 >> input_depth) ⇒ cap-mux ≠ terminal ⇒ reject.
         let idx0 = (index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1);
         let input_depth = log_global - cap_h;
         let mut bad_cap = pis.clone();
         bad_cap[air.cap_base() + (idx0 >> input_depth) * 4] += Val::ONE;
-        assert!(verify(&config, &air, &prf, &bad_cap).is_err(), "tampered selected trace cap ⇒ cap-mux rejects");
+        assert!(
+            verify(&config, &air, &prf, &bad_cap).is_err(),
+            "tampered selected trace cap ⇒ cap-mux rejects"
+        );
         // tamper: the selected RANDOM cap entry ⇒ the random round's cap-mux ⇒ reject (validates the hiding auth).
         let mut bad_rcap = pis.clone();
         bad_rcap[air.random_cap_base() + (idx0 >> input_depth) * 4] += Val::ONE;
-        assert!(verify(&config, &air, &prf, &bad_rcap).is_err(), "tampered selected random cap ⇒ cap-mux rejects");
+        assert!(
+            verify(&config, &air, &prf, &bad_rcap).is_err(),
+            "tampered selected random cap ⇒ cap-mux rejects"
+        );
         let rss = peak_rss_bytes();
         println!(" -> peak RSS {} MiB", rss / (1 << 20));
         (hh.trailing_zeros(), rss)
@@ -1785,9 +2412,15 @@ mod tests {
         use p3_uni_stark::{get_symbolic_constraints, AirLayout};
         let cc = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
         let n_queries = proof.opening_proof.1.query_proofs.len();
-        let (block_inputs, counts, binds, chs, index_binds, index_felts) = sim_full_hiding_all(config, proof, pvs);
+        let (block_inputs, counts, binds, chs, index_binds, index_felts) =
+            sim_full_hiding_all(config, proof, pvs);
         let fri = &proof.opening_proof.1;
-        let log_global: usize = fri.query_proofs[0].commit_phase_openings.iter().map(|o| o.log_arity as usize).sum::<usize>() + 4;
+        let log_global: usize = fri.query_proofs[0]
+            .commit_phase_openings
+            .iter()
+            .map(|o| o.log_arity as usize)
+            .sum::<usize>()
+            + 4;
         let random_present = proof.commitments.random.is_some();
         let trace_batch = if random_present { 1 } else { 0 };
         let quot_batch = trace_batch + 1;
@@ -1811,23 +2444,49 @@ mod tests {
             n_terms = terms.len();
             let index = (index_felts[q].as_canonical_u64() as usize) & ((1 << log_global) - 1);
             let qp = &fri.query_proofs[q];
-            let trace_salt: [Val; 4] = qp.input_proof[trace_batch].opening_proof.0[0].clone().try_into().unwrap();
+            let trace_salt: [Val; 4] = qp.input_proof[trace_batch].opening_proof.0[0]
+                .clone()
+                .try_into()
+                .unwrap();
             let rbatch = &qp.input_proof[0]; // random-round batch
             let random_salt: [Val; 4] = rbatch.opening_proof.0[0].clone().try_into().unwrap();
-            let random_path: Vec<([Val; 4], bool)> =
-                rbatch.opening_proof.1.iter().enumerate().map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1)).collect();
-            let quot_salts: Vec<[Val; 4]> =
-                (0..nqc).map(|m| qp.input_proof[quot_batch].opening_proof.0[m].clone().try_into().unwrap()).collect();
-            let commit_salts: Vec<[Val; 4]> =
-                qp.commit_phase_openings.iter().map(|o| o.opening_proof.0[0].clone().try_into().unwrap()).collect();
+            let random_path: Vec<([Val; 4], bool)> = rbatch
+                .opening_proof
+                .1
+                .iter()
+                .enumerate()
+                .map(|(lvl, &s)| (s, (index >> lvl) & 1 == 1))
+                .collect();
+            let quot_salts: Vec<[Val; 4]> = (0..nqc)
+                .map(|m| {
+                    qp.input_proof[quot_batch].opening_proof.0[m]
+                        .clone()
+                        .try_into()
+                        .unwrap()
+                })
+                .collect();
+            let commit_salts: Vec<[Val; 4]> = qp
+                .commit_phase_openings
+                .iter()
+                .map(|o| o.opening_proof.0[0].clone().try_into().unwrap())
+                .collect();
             per_query.push(((index, terms, alpha, ro, rounds), Val::ZERO, path));
             quot_paths.push(qpath);
             commit_data.push(cm);
-            hiding.push(HidingWitness { trace_salt, random_salt, random_path, quot_salts, commit_salts });
+            hiding.push(HidingWitness {
+                trace_salt,
+                random_salt,
+                random_path,
+                quot_salts,
+                commit_salts,
+            });
         }
         let layout = AirLayout::from_air::<Val>(inner);
         let constraints = get_symbolic_constraints::<Val, A>(inner, layout);
-        assert!(!constraints.is_empty(), "{label}: symbolic constraints extracted");
+        assert!(
+            !constraints.is_empty(),
+            "{label}: symbolic constraints extracted"
+        );
         let air = MonolithAir {
             counts,
             binds,
@@ -1837,7 +2496,8 @@ mod tests {
             inner_counter: false,
             column_window: false,
             k_instances: 1,
-            fold: false, fold_txstmt: false,
+            fold: false,
+            fold_txstmt: false,
             constraints,
             w_inner_f: w_inner,
             n_pub_f: n_pub,
@@ -1851,22 +2511,51 @@ mod tests {
             let olayout = AirLayout::from_air::<Val>(&air);
             let cs = get_symbolic_constraints::<Val, MonolithAir>(&air, olayout);
             let maxd = cs.iter().map(|c| c.degree_multiple()).max().unwrap();
-            let log_nqc = p3_uni_stark::get_log_num_quotient_chunks::<Val, MonolithAir>(&air, olayout, 1);
+            let log_nqc =
+                p3_uni_stark::get_log_num_quotient_chunks::<Val, MonolithAir>(&air, olayout, 1);
             println!("{label} hiding monolith probe: outer max_constraint_degree={maxd}, outer log_nqc={log_nqc} ({} constraints)", cs.len());
             assert!(log_nqc <= 4, "{label}: outer log_nqc {log_nqc} exceeds log_blowup 4 ⇒ silent quotient corruption");
         }
         // OOD openings + HALVED-domain selectors + periodic values at ζ (verifier-computed publics).
-        let (eo_local, eo_next, is_first, is_last, is_trans, inv_van, eo_quot, eo_alpha, _z, eo_periodic) =
-            hiding_epilogue_openings(config, inner, proof, pvs);
-        assert_eq!(eo_periodic.len(), n_periodic, "{label}: periodic column count matches n_periodic");
+        let (
+            eo_local,
+            eo_next,
+            is_first,
+            is_last,
+            is_trans,
+            inv_van,
+            eo_quot,
+            eo_alpha,
+            _z,
+            eo_periodic,
+        ) = hiding_epilogue_openings(config, inner, proof, pvs);
+        assert_eq!(
+            eo_periodic.len(),
+            n_periodic,
+            "{label}: periodic column count matches n_periodic"
+        );
         {
             // native pre-check on the halved domain (localizes wiring bugs vs in-circuit eval).
             let pubs: Vec<Challenge> = pvs.iter().map(|&p| Challenge::from(p)).collect();
             let mut folded = Challenge::ZERO;
             for c in &air.constraints {
-                folded = folded * eo_alpha + eval_symbolic_native(c, &eo_local, &eo_next, &pubs, &eo_periodic, is_first, is_last, is_trans);
+                folded = folded * eo_alpha
+                    + eval_symbolic_native(
+                        c,
+                        &eo_local,
+                        &eo_next,
+                        &pubs,
+                        &eo_periodic,
+                        is_first,
+                        is_last,
+                        is_trans,
+                    );
             }
-            assert_eq!(folded * inv_van, eo_quot, "{label} PRE-CHECK: native symbolic fold == quot(ζ) on the halved domain");
+            assert_eq!(
+                folded * inv_van,
+                eo_quot,
+                "{label} PRE-CHECK: native symbolic fold == quot(ζ) on the halved domain"
+            );
         }
         // pis in the geometry's order: challenges, index felts, final_poly[0], FULL trace cap, FULL quotient
         // cap, the n_pub inner pubs, per-round commit caps, periodic values, qwt weights (nqc>1), FULL random cap.
@@ -1903,12 +2592,18 @@ mod tests {
         if nqc > 1 {
             // qwt weights; pre-check Σ zps_i·chunk_i == the recomposed quotient (guards the in-circuit recompose).
             let zps = hiding_quotient_recompose_weights(config, inner, proof, pvs);
-            let x = Challenge::from_basis_coefficients_fn(|k| if k == 1 { Val::ONE } else { Val::ZERO });
+            let x =
+                Challenge::from_basis_coefficients_fn(
+                    |k| if k == 1 { Val::ONE } else { Val::ZERO },
+                );
             let mut rq = Challenge::ZERO;
             for (i, ch) in proof.opened_values.quotient_chunks.iter().enumerate() {
                 rq += zps[i] * (ch[0] + ch[1] * x);
             }
-            assert_eq!(rq, eo_quot, "{label}: Σ zps_i·chunk_i == recomposed quotient(ζ) (hiding nqc recompose)");
+            assert_eq!(
+                rq, eo_quot,
+                "{label}: Σ zps_i·chunk_i == recomposed quotient(ζ) (hiding nqc recompose)"
+            );
             for z in &zps {
                 let c = cc(*z);
                 pis.push(c[0]);
@@ -1918,8 +2613,22 @@ mod tests {
         for e in proof.commitments.random.as_ref().unwrap().roots().iter() {
             pis.extend_from_slice(e);
         }
-        assert_eq!(pis.len(), air.pis_count(), "{label}: pis layout matches pis_count");
-        let mut trace = monolith_build_trace(&air, &block_inputs, &per_query, chs[2], &index_felts, &quot_paths, &commit_data, &[], Some(&hiding));
+        assert_eq!(
+            pis.len(),
+            air.pis_count(),
+            "{label}: pis layout matches pis_count"
+        );
+        let mut trace = monolith_build_trace(
+            &air,
+            &block_inputs,
+            &per_query,
+            chs[2],
+            &index_felts,
+            &quot_paths,
+            &commit_data,
+            &[],
+            Some(&hiding),
+        );
         // fill the witnessed Lagrange selectors at ζ (HALVED domain), bound in-circuit to their ζ-defs.
         let (isf, isl, iv) = (cc(is_first), cc(is_last), cc(inv_van));
         let fw = air.fused_w();
@@ -1945,15 +2654,24 @@ mod tests {
         // tamper: inner pub ⇒ symbolic epilogue rejects; selected trace cap + selected RANDOM cap ⇒ cap-mux rejects.
         let mut bad = pis.clone();
         bad[air.pub_pi()] += Val::ONE;
-        assert!(verify(config, &air, &prf, &bad).is_err(), "{label}: tampered inner pub ⇒ epilogue rejects");
+        assert!(
+            verify(config, &air, &prf, &bad).is_err(),
+            "{label}: tampered inner pub ⇒ epilogue rejects"
+        );
         let idx0 = (index_felts[0].as_canonical_u64() as usize) & ((1 << log_global) - 1);
         let sel0 = idx0 >> air.input_depth();
         let mut bad_cap = pis.clone();
         bad_cap[air.cap_base() + sel0 * 4] += Val::ONE;
-        assert!(verify(config, &air, &prf, &bad_cap).is_err(), "{label}: tampered selected trace cap ⇒ cap-mux rejects");
+        assert!(
+            verify(config, &air, &prf, &bad_cap).is_err(),
+            "{label}: tampered selected trace cap ⇒ cap-mux rejects"
+        );
         let mut bad_rcap = pis.clone();
         bad_rcap[air.random_cap_base() + sel0 * 4] += Val::ONE;
-        assert!(verify(config, &air, &prf, &bad_rcap).is_err(), "{label}: tampered selected random cap ⇒ cap-mux rejects");
+        assert!(
+            verify(config, &air, &prf, &bad_rcap).is_err(),
+            "{label}: tampered selected random cap ⇒ cap-mux rejects"
+        );
         let rss = peak_rss_bytes();
         println!("  -> peak RSS {} MiB", rss / (1 << 20));
         (hh.trailing_zeros(), rss)
@@ -1971,15 +2689,19 @@ mod tests {
     #[test]
     #[ignore = "diagnostic: hiding join-split monolith column map"]
     fn phase8_joinsplit_hiding_colmap() {
-        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::joinsplit_air::{
+            build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
+        };
         use crate::recursion::monolith::MonolithAir;
         use p3_uni_stark::{get_symbolic_constraints, AirLayout};
         let config = make_config_ar_cap(1, 4, 2);
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full_hiding_all(&config, &proof, &pvs);
-        let (terms, _x, _a, _ro) = hiding_multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let (_bi, counts, binds, _chs, index_binds, index_felts) =
+            sim_full_hiding_all(&config, &proof, &pvs);
+        let (terms, _x, _a, _ro) =
+            hiding_multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
         let layout_in = AirLayout::from_air::<Val>(&JoinSplitAir);
         let constraints = get_symbolic_constraints::<Val, JoinSplitAir>(&JoinSplitAir, layout_in);
         let air = MonolithAir {
@@ -1991,7 +2713,8 @@ mod tests {
             inner_counter: false,
             column_window: false,
             k_instances: 1,
-            fold: false, fold_txstmt: false,
+            fold: false,
+            fold_txstmt: false,
             constraints,
             w_inner_f: WIDTH,
             n_pub_f: N_PUBLIC,
@@ -2052,9 +2775,14 @@ mod tests {
         // the commit-group fold (from hiding_query_fold_data) must use the SAME reduced opening `ro`, and the
         // fold chain must reach final_poly. Both take the INNER AIR — passing the wrong AIR (the old ConstAir
         // hardcode) computes `ro` over the wrong opened-column set ⇒ divergent chain ⇒ corrupt commit leaves.
-        let (_t, _x, _a, ro_mc) = hiding_multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
-        let (ro_fd, _rounds, folded0, f0) = hiding_query_fold_data(&config, &JoinSplitAir, &proof, &pvs, 0);
-        assert_eq!(ro_mc, ro_fd, "reduced opening: multicol_query_terms vs fold_data must agree");
+        let (_t, _x, _a, ro_mc) =
+            hiding_multicol_query_terms(&config, &JoinSplitAir, &proof, &pvs, 0);
+        let (ro_fd, _rounds, folded0, f0) =
+            hiding_query_fold_data(&config, &JoinSplitAir, &proof, &pvs, 0);
+        assert_eq!(
+            ro_mc, ro_fd,
+            "reduced opening: multicol_query_terms vs fold_data must agree"
+        );
         assert_eq!(folded0, f0, "fold chain must reach final_poly[0]");
         println!("hiding join-split colmap: pis aligned + reduced-opening consistent (n_terms={}, cap_base={})", air.n_terms, air.cap_base());
     }
@@ -2062,7 +2790,9 @@ mod tests {
     #[test]
     #[ignore = "slow + large RSS: Phase 8.2 the HIDING monolith verifies a REAL join-split proof"]
     fn phase8_joinsplit_hiding_monolith() {
-        use crate::joinsplit_air::{build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH};
+        use crate::joinsplit_air::{
+            build_trace, demo_witness, public_values, JoinSplitAir, N_PERIODIC, N_PUBLIC, WIDTH,
+        };
         // cap_height=2: at cap 6 the transcript's 16 cap observes (trace/quotient/random + 13 commit
         // rounds × 64 blocks each) forced 2^17 rows × width 1795 REGARDLESS of query count, and the
         // prove RSS (LDE = 16× the trace) OOM'd the 62 GB box at both 4 and 2 queries. A small cap on
@@ -2073,8 +2803,21 @@ mod tests {
         let w = demo_witness();
         let pvs = public_values(&w);
         let proof = prove(&config, &JoinSplitAir, build_trace(&w), &pvs);
-        assert!(verify(&config, &JoinSplitAir, &proof, &pvs).is_ok(), "sanity: p3 accepts the hiding join-split proof");
-        let (log2h, rss) = run_hiding_symbolic_monolith(&config, &JoinSplitAir, &proof, &pvs, WIDTH, N_PUBLIC, N_PERIODIC, std::env::var_os("MONOLITH_CHECK_ONLY").is_some(), "joinsplit");
+        assert!(
+            verify(&config, &JoinSplitAir, &proof, &pvs).is_ok(),
+            "sanity: p3 accepts the hiding join-split proof"
+        );
+        let (log2h, rss) = run_hiding_symbolic_monolith(
+            &config,
+            &JoinSplitAir,
+            &proof,
+            &pvs,
+            WIDTH,
+            N_PUBLIC,
+            N_PERIODIC,
+            std::env::var_os("MONOLITH_CHECK_ONLY").is_some(),
+            "joinsplit",
+        );
         println!("Phase 8.2: the HIDING monolith verifies a REAL production join-split proof at 2^{log2h} / {} MiB", rss / (1 << 20));
     }
 
@@ -2085,7 +2828,10 @@ mod tests {
     #[ignore = "diagnostic: hiding ConstAir at cap_height=2 (cap-mux bisect)"]
     fn hiding_monolith_cap2_bisect() {
         let (log_h, rss) = run_hiding_monolith_lh_cap(4, 4, 2, false);
-        println!("HIDING ConstAir cap=2: 2^{log_h} rows, {} MiB — accept-iff-p3::verify", rss / (1 << 20));
+        println!(
+            "HIDING ConstAir cap=2: 2^{log_h} rows, {} MiB — accept-iff-p3::verify",
+            rss / (1 << 20)
+        );
     }
 
     /// BISECT-2: hiding ConstAir at cap_height=2 with a DEEPER commit phase (log_height=8 ⇒ cm_rounds=9,
@@ -2108,7 +2854,11 @@ mod tests {
         // functionally green too (see hiding_monolith_plan_config) but its transcript forces 2^16 rows
         // (>512 sponge blocks of cap absorbs) ⇒ ~16 GB — outside the budget at any query count.
         let (log_h, rss) = run_hiding_monolith_lh(8, 4, false);
-        assert!(rss < 8u64 << 30, "hiding monolith must fit in 8 GB (got {} MiB)", rss / (1 << 20));
+        assert!(
+            rss < 8u64 << 30,
+            "hiding monolith must fit in 8 GB (got {} MiB)",
+            rss / (1 << 20)
+        );
         println!("HIDING monolith end-to-end: 2^{log_h} rows, {} MiB — accept-iff-p3::verify(hiding ConstAir)", rss / (1 << 20));
     }
 
@@ -2154,8 +2904,10 @@ mod tests {
         for lh in [3usize, 4] {
             let config = make_config_ar(1, 8);
             let (proof, pvs) = gen_proof(&config, 42, lh);
-            let (_bi, counts, binds, _chs, index_binds, index_felts) = sim_full_hiding_all(&config, &proof, &pvs);
-            let (terms, _x, _a, _ro) = hiding_multicol_query_terms(&config, &ConstAir, &proof, &pvs, 0);
+            let (_bi, counts, binds, _chs, index_binds, index_felts) =
+                sim_full_hiding_all(&config, &proof, &pvs);
+            let (terms, _x, _a, _ro) =
+                hiding_multicol_query_terms(&config, &ConstAir, &proof, &pvs, 0);
             let air = MonolithAir {
                 counts,
                 binds,
@@ -2165,7 +2917,8 @@ mod tests {
                 inner_counter: false,
                 column_window: false,
                 k_instances: 1,
-                fold: false, fold_txstmt: false,
+                fold: false,
+                fold_txstmt: false,
                 constraints: vec![],
                 w_inner_f: 1,
                 n_pub_f: 1,
@@ -2185,7 +2938,10 @@ mod tests {
             // the p3 quotient-domain containment budget: log_nqc ≤ log_blowup (= 4), i.e. maxdeg ≤ 16 with
             // the outer is_zk's +1. Crossing it does NOT error — it silently breaks every proof.
             assert!(log_nqc <= 4, "outer log_nqc {log_nqc} exceeds log_blowup 4 ⇒ silent quotient corruption (lh={lh})");
-            assert!(maxd <= 16, "outer max constraint degree {maxd} exceeds the 16 = 2^log_blowup budget (lh={lh})");
+            assert!(
+                maxd <= 16,
+                "outer max constraint degree {maxd} exceeds the 16 = 2^log_blowup budget (lh={lh})"
+            );
         }
     }
 

@@ -1,5 +1,7 @@
 # Plonky3 production port plan
 
+> **Historical plan:** The port is complete and Plonky3 is now the live proof stack. Retained as implementation history.
+
 > **⚠ Historical / reference-only — not the v1 audit artifact.** The port (M1–M6) is complete; this is
 > the milestone record. Start at [`AUDITORS.md`](AUDITORS.md); current state is `remediation-status.md`.
 

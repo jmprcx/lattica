@@ -6,7 +6,9 @@ use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 
-use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W};
+use crate::poseidon2_air::{
+    ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W,
+};
 use crate::recursion::native_fri::{Challenge, Val};
 
 use super::*;
@@ -77,7 +79,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PreambleAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let rate = AB::Expr::from(Goldilocks::from_u64(RATE as u64));
 
@@ -88,10 +94,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PreambleAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -111,9 +123,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PreambleAir {
         // capacity carries across blocks (+RATE); rate lanes free (the next absorbed felts).
         {
             let bl = p[P_BLOCK_LAST].clone();
-            builder.when_transition().assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())));
+            builder.when_transition().assert_zero(
+                bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())),
+            );
             for i in (CAP_LANE + 1)..W {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
         }
         // α squeeze at the last instance block's output: α = (rate[3], rate[2]).
@@ -134,9 +150,22 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PreambleAir {
 
 /// Fill the preamble trace by absorbing (instance ‖ commitment) felts blockwise (rate overwrite, capacity
 /// carry with the +RATE prefix-free count), matching the duplex challenger.
-pub(crate) fn preamble_build_trace(i_blocks: usize, c_blocks: usize, instance: &[Val], commitment: &[Val]) -> RowMajorMatrix<Val> {
-    assert_eq!(instance.len(), i_blocks * RATE, "instance must be i_blocks·RATE felts");
-    assert_eq!(commitment.len(), c_blocks * RATE, "commitment must be c_blocks·RATE felts");
+pub(crate) fn preamble_build_trace(
+    i_blocks: usize,
+    c_blocks: usize,
+    instance: &[Val],
+    commitment: &[Val],
+) -> RowMajorMatrix<Val> {
+    assert_eq!(
+        instance.len(),
+        i_blocks * RATE,
+        "instance must be i_blocks·RATE felts"
+    );
+    assert_eq!(
+        commitment.len(),
+        c_blocks * RATE,
+        "commitment must be c_blocks·RATE felts"
+    );
     let n_blocks = i_blocks + c_blocks;
     let padded = n_blocks.next_power_of_two();
     let mut felts = instance.to_vec();
@@ -191,7 +220,13 @@ impl FullTranscriptAir {
     fn periodic(&self) -> Vec<Vec<Val>> {
         let h = self.height();
         let nb = self.counts.len();
-        let count_of = |b: usize| -> Val { if b < nb { Val::from_u64(self.counts[b] as u64) } else { Val::ZERO } };
+        let count_of = |b: usize| -> Val {
+            if b < nb {
+                Val::from_u64(self.counts[b] as u64)
+            } else {
+                Val::ZERO
+            }
+        };
         let mut cols = periodic_table(); // 11 round cols
         let mut block_last = vec![Val::ZERO; BLOCK];
         block_last[BLOCK - 1] = Val::ONE;
@@ -203,7 +238,11 @@ impl FullTranscriptAir {
             let b = r / BLOCK;
             count[r] = count_of(b);
             count_next[r] = count_of(b + 1);
-            is_sq_next[r] = if (b + 1 >= nb) || self.counts[b + 1] == 0 { Val::ONE } else { Val::ZERO };
+            is_sq_next[r] = if (b + 1 >= nb) || self.counts[b + 1] == 0 {
+                Val::ONE
+            } else {
+                Val::ZERO
+            };
         }
         cols.push(count);
         cols.push(count_next);
@@ -242,7 +281,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullTranscriptAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
 
         // Poseidon2 round constraints (periodic_table zeroes the selectors at the block-boundary row).
@@ -252,10 +295,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullTranscriptAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -276,12 +325,19 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FullTranscriptAir {
         // only on squeeze blocks (absorb blocks' rate is free = the next absorbed felts).
         {
             let bl = p[FT_P_BLOCK_LAST].clone();
-            builder.when_transition().assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()));
+            builder.when_transition().assert_zero(
+                bl.clone()
+                    * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()),
+            );
             for i in (CAP_LANE + 1)..W {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
             for i in 0..RATE {
-                builder.when_transition().assert_zero(bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()));
+                builder.when_transition().assert_zero(
+                    bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()),
+                );
             }
         }
         // ext challenge bindings: at each bind block's output row, (rate[3], rate[2]) = the public challenge.
@@ -327,7 +383,12 @@ impl BaseAir<Goldilocks> for DeepPointAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for DeepPointAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
@@ -421,13 +482,21 @@ impl BaseAir<Goldilocks> for MroAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MroAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let zero = AB::Expr::ZERO;
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let g = |o: usize| (cur[o].clone(), cur[o + 1].clone());
         let mut fr = builder.when_first_row();
@@ -453,7 +522,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MroAir {
             let chk = emul(inv.clone(), z_m_x);
             fr.assert_zero(chk.0 - one.clone());
             fr.assert_zero(chk.1);
-            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let d = (
+                cur[self.pz(k)].clone() - cur[self.px(k)].clone(),
+                cur[self.pz(k) + 1].clone(),
+            );
             let t = emul(emul(g(self.apow(k)), d), inv);
             ro = (ro.0 + t.0, ro.1 + t.1);
         }
@@ -462,10 +534,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MroAir {
     }
 }
 
-pub(crate) fn mro_build_trace(terms: &[(Challenge, Challenge, Val)], x: Val, alpha: Challenge, ro: Challenge) -> RowMajorMatrix<Val> {
+pub(crate) fn mro_build_trace(
+    terms: &[(Challenge, Challenge, Val)],
+    x: Val,
+    alpha: Challenge,
+    ro: Challenge,
+) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
     let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
-    let air = MroAir { n_terms: terms.len() };
+    let air = MroAir {
+        n_terms: terms.len(),
+    };
     let mut r = vec![Val::ZERO; air.w()];
     r[air.x()] = x;
     let ac = c(alpha);
@@ -535,7 +614,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryFoldAir {
         let half = AB::Expr::from(Goldilocks::ONE.halve());
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
 
         // first row: running eval == public ro
@@ -548,8 +630,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryFoldAir {
         let bit = cur[QF_BIT].clone();
         let i2s = cur[QF_I2S].clone();
         let spt = cur[QF_SPT].clone();
-        builder.when_transition().assert_zero(bit.clone() * (one.clone() - bit.clone())); // boolean
-        builder.when_transition().assert_zero(i2s.clone() * (two.clone() * spt) - one.clone()); // inv(2s)
+        builder
+            .when_transition()
+            .assert_zero(bit.clone() * (one.clone() - bit.clone())); // boolean
+        builder
+            .when_transition()
+            .assert_zero(i2s.clone() * (two.clone() * spt) - one.clone()); // inv(2s)
         let sign = one - two * bit; // 1 − 2·bit ∈ {+1, −1}
         let e = (cur[QF_E].clone(), cur[QF_E + 1].clone());
         let s = (cur[QF_S].clone(), cur[QF_S + 1].clone());
@@ -559,8 +645,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryFoldAir {
         let prod = emul(diff, b);
         let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
         let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
-        builder.when_transition().assert_zero(nxt[QF_E].clone() - fold0);
-        builder.when_transition().assert_zero(nxt[QF_E + 1].clone() - fold1);
+        builder
+            .when_transition()
+            .assert_zero(nxt[QF_E].clone() - fold0);
+        builder
+            .when_transition()
+            .assert_zero(nxt[QF_E + 1].clone() - fold1);
 
         // last row: running eval == public folded_eval
         {
@@ -571,7 +661,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryFoldAir {
     }
 }
 
-pub(crate) fn qf_build_trace(ro: Challenge, rounds: &[(Challenge, Challenge, bool, Val)], _folded_eval: Challenge) -> RowMajorMatrix<Val> {
+pub(crate) fn qf_build_trace(
+    ro: Challenge,
+    rounds: &[(Challenge, Challenge, bool, Val)],
+    _folded_eval: Challenge,
+) -> RowMajorMatrix<Val> {
     use crate::recursion::fri_fold::native_fold;
     use p3_field::BasedVectorSpace;
     let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
@@ -657,13 +751,21 @@ impl BaseAir<Goldilocks> for QueryInputTileAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryInputTileAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
         let mut fr = builder.when_first_row();
@@ -680,7 +782,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryInputTileAir {
             fr.assert_zero(cur[QI_ACC + i].clone() - prev * factor);
             prev = cur[QI_ACC + i].clone();
         }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QI_ACC + DP_LOG_HEIGHT - 1].clone();
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR)
+            * cur[QI_ACC + DP_LOG_HEIGHT - 1].clone();
 
         // --- reduced opening using THAT x: ro = Σ_k apow_k·(p_z_k − p_x_k)·inv_k, inv_k·(z_k − x) == 1 ---
         let alpha = gg(QI_ALPHA);
@@ -699,7 +802,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryInputTileAir {
             let chk = emul(inv.clone(), z_m_x);
             fr.assert_zero(chk.0 - one.clone());
             fr.assert_zero(chk.1);
-            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let d = (
+                cur[self.pz(k)].clone() - cur[self.px(k)].clone(),
+                cur[self.pz(k) + 1].clone(),
+            );
             let t = emul(emul(gg(self.apow(k)), d), inv);
             ro = (ro.0 + t.0, ro.1 + t.1);
         }
@@ -708,10 +814,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryInputTileAir {
     }
 }
 
-pub(crate) fn qi_build_trace(index: usize, terms: &[(Challenge, Challenge, Val)], alpha: Challenge, ro: Challenge) -> RowMajorMatrix<Val> {
+pub(crate) fn qi_build_trace(
+    index: usize,
+    terms: &[(Challenge, Challenge, Val)],
+    alpha: Challenge,
+    ro: Challenge,
+) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
     let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
-    let air = QueryInputTileAir { n_terms: terms.len() };
+    let air = QueryInputTileAir {
+        n_terms: terms.len(),
+    };
     let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
     let mut r = vec![Val::ZERO; air.w()];
     // DEEP: bits + acc chain → x
@@ -719,7 +832,11 @@ pub(crate) fn qi_build_trace(index: usize, terms: &[(Challenge, Challenge, Val)]
     for i in 0..DP_LOG_HEIGHT {
         let bit = (index >> i) & 1;
         r[QI_BITS + i] = Val::from_u64(bit as u64);
-        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        acc *= if bit == 1 {
+            g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i)
+        } else {
+            Val::ONE
+        };
         r[QI_ACC + i] = acc;
     }
     let x = <Goldilocks as Field>::GENERATOR * acc;
@@ -809,7 +926,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryTileAir {
         let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
 
@@ -827,7 +947,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryTileAir {
                 fr.assert_zero(cur[QT_ACC + i].clone() - prev * factor);
                 prev = cur[QT_ACC + i].clone();
             }
-            let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+            let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR)
+                * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
             let alpha = gg(QT_ALPHA);
             fr.assert_zero(cur[self.apow(0)].clone() - one.clone());
             fr.assert_zero(cur[self.apow(0) + 1].clone());
@@ -844,7 +965,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryTileAir {
                 let chk = emul(inv.clone(), z_m_x);
                 fr.assert_zero(chk.0 - one.clone());
                 fr.assert_zero(chk.1);
-                let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+                let d = (
+                    cur[self.pz(k)].clone() - cur[self.px(k)].clone(),
+                    cur[self.pz(k) + 1].clone(),
+                );
                 let t = emul(emul(gg(self.apow(k)), d), inv);
                 ro = (ro.0 + t.0, ro.1 + t.1);
             }
@@ -856,8 +980,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryTileAir {
         let bit = cur[QT_BIT].clone();
         let i2s = cur[QT_I2S].clone();
         let spt = cur[QT_SPT].clone();
-        builder.when_transition().assert_zero(bit.clone() * (one.clone() - bit.clone()));
-        builder.when_transition().assert_zero(i2s.clone() * (two.clone() * spt) - one.clone());
+        builder
+            .when_transition()
+            .assert_zero(bit.clone() * (one.clone() - bit.clone()));
+        builder
+            .when_transition()
+            .assert_zero(i2s.clone() * (two.clone() * spt) - one.clone());
         let sign = one - two * bit;
         let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
         let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
@@ -867,8 +995,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for QueryTileAir {
         let prod = emul(diff, b);
         let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
         let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
-        builder.when_transition().assert_zero(nxt[QT_E].clone() - fold0);
-        builder.when_transition().assert_zero(nxt[QT_E + 1].clone() - fold1);
+        builder
+            .when_transition()
+            .assert_zero(nxt[QT_E].clone() - fold0);
+        builder
+            .when_transition()
+            .assert_zero(nxt[QT_E + 1].clone() - fold1);
 
         // --- last row: folded_eval == final_poly[0] (the per-query accept) ---
         {
@@ -890,7 +1022,9 @@ pub(crate) fn qt_build_trace(
     use crate::recursion::fri_fold::native_fold;
     use p3_field::BasedVectorSpace;
     let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
-    let air = QueryTileAir { n_terms: terms.len() };
+    let air = QueryTileAir {
+        n_terms: terms.len(),
+    };
     let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
     let n = rounds.len();
     let height = (n + 1).next_power_of_two().max(2);
@@ -928,7 +1062,11 @@ pub(crate) fn qt_build_trace(
     for i in 0..DP_LOG_HEIGHT {
         let bit = (index >> i) & 1;
         t[QT_DBITS + i] = Val::from_u64(bit as u64);
-        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        acc *= if bit == 1 {
+            g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i)
+        } else {
+            Val::ONE
+        };
         t[QT_ACC + i] = acc;
     }
     let x = <Goldilocks as Field>::GENERATOR * acc;
@@ -1027,7 +1165,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
@@ -1035,7 +1177,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
         let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
         let tf = p[TQ_P_TF].clone();
@@ -1053,7 +1198,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
             builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
             prev = cur[QT_ACC + i].clone();
         }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR)
+            * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
         let alpha = gg(QT_ALPHA);
         builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
         builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
@@ -1070,7 +1216,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
             let chk = emul(inv.clone(), z_m_x);
             builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
             builder.assert_zero(tf.clone() * chk.1);
-            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let d = (
+                cur[self.pz(k)].clone() - cur[self.px(k)].clone(),
+                cur[self.pz(k) + 1].clone(),
+            );
             let t = emul(emul(gg(self.apow(k)), d), inv);
             ro = (ro.0 + t.0, ro.1 + t.1);
         }
@@ -1082,8 +1231,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
         let bit = cur[QT_BIT].clone();
         let i2s = cur[QT_I2S].clone();
         let spt = cur[QT_SPT].clone();
-        builder.when_transition().assert_zero(not_last.clone() * (bit.clone() * (one.clone() - bit.clone())));
-        builder.when_transition().assert_zero(not_last.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        builder
+            .when_transition()
+            .assert_zero(not_last.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder
+            .when_transition()
+            .assert_zero(not_last.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
         let sign = one - two * bit;
         let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
         let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
@@ -1093,8 +1246,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
         let prod = emul(diff, b);
         let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
         let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
-        builder.when_transition().assert_zero(not_last.clone() * (nxt[QT_E].clone() - fold0));
-        builder.when_transition().assert_zero(not_last * (nxt[QT_E + 1].clone() - fold1));
+        builder
+            .when_transition()
+            .assert_zero(not_last.clone() * (nxt[QT_E].clone() - fold0));
+        builder
+            .when_transition()
+            .assert_zero(not_last * (nxt[QT_E + 1].clone() - fold1));
 
         // --- per-tile last row (gated by TL): folded_eval == final_poly[0] (the per-query accept) ---
         builder.assert_zero(tl.clone() * (cur[QT_E].clone() - pis[0].clone()));
@@ -1105,12 +1262,21 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TiledQueryAir {
 #[allow(clippy::type_complexity)]
 pub(crate) fn tq_build_trace(
     n_terms: usize,
-    per_query: &[(usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>)],
+    per_query: &[(
+        usize,
+        Vec<(Challenge, Challenge, Val)>,
+        Challenge,
+        Challenge,
+        Vec<(Challenge, Challenge, bool, Val)>,
+    )],
 ) -> RowMajorMatrix<Val> {
     use crate::recursion::fri_fold::native_fold;
     use p3_field::BasedVectorSpace;
     let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
-    let air = TiledQueryAir { n_queries: per_query.len(), n_terms };
+    let air = TiledQueryAir {
+        n_queries: per_query.len(),
+        n_terms,
+    };
     let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
     let h = air.height();
     let width = air.w();
@@ -1149,7 +1315,11 @@ pub(crate) fn tq_build_trace(
         for i in 0..DP_LOG_HEIGHT {
             let bit = (index >> i) & 1;
             t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
-            acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+            acc *= if bit == 1 {
+                g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i)
+            } else {
+                Val::ONE
+            };
             t[base0 + QT_ACC + i] = acc;
         }
         let x = <Goldilocks as Field>::GENERATOR * acc;
@@ -1186,7 +1356,7 @@ pub(crate) fn tq_build_trace(
 // =================================================================================================
 
 pub(crate) const SK_TB: usize = 4; // transcript Poseidon blocks (skeleton size)
-// periodic: 11 round cols + P_BLOCK_LAST (idx 11, present for alignment) + S_POSEIDON + P_OUT.
+                                   // periodic: 11 round cols + P_BLOCK_LAST (idx 11, present for alignment) + S_POSEIDON + P_OUT.
 const SK_S_POSEIDON: usize = 12; // 1 on the transcript region's rows
 const SK_P_OUT: usize = 13; // one-hot at the transcript's last block output row
 const SK_N_PERIODIC: usize = 14;
@@ -1235,7 +1405,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithSkeletonAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let s_pos = p[SK_S_POSEIDON].clone();
 
@@ -1248,10 +1422,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithSkeletonAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -1340,7 +1520,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CarryBindAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let s_pos = p[SK_S_POSEIDON].clone();
 
@@ -1351,10 +1535,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CarryBindAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -1372,8 +1562,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CarryBindAir {
 
         // The carrier: GLOBAL-PERSISTENT (held every transition), pinned to the squeezed value
         // (rate[3],rate[2]) at the transcript output row, read in the consumer (last) row → public.
-        builder.when_transition().assert_zero(nxt[CA_CARRY].clone() - cur[CA_CARRY].clone());
-        builder.when_transition().assert_zero(nxt[CA_CARRY + 1].clone() - cur[CA_CARRY + 1].clone());
+        builder
+            .when_transition()
+            .assert_zero(nxt[CA_CARRY].clone() - cur[CA_CARRY].clone());
+        builder
+            .when_transition()
+            .assert_zero(nxt[CA_CARRY + 1].clone() - cur[CA_CARRY + 1].clone());
         let out = p[SK_P_OUT].clone();
         builder.assert_zero(out.clone() * (cur[CA_CARRY].clone() - cur[3].clone()));
         builder.assert_zero(out * (cur[CA_CARRY + 1].clone() - cur[2].clone()));
@@ -1503,7 +1697,13 @@ impl Phase4AAir {
     fn periodic(&self) -> Vec<Vec<Val>> {
         let h = self.height();
         let nb_used = self.counts.len();
-        let count_of = |b: usize| -> Val { if b < nb_used { Val::from_u64(self.counts[b] as u64) } else { Val::ZERO } };
+        let count_of = |b: usize| -> Val {
+            if b < nb_used {
+                Val::from_u64(self.counts[b] as u64)
+            } else {
+                Val::ZERO
+            }
+        };
         let mut cols = periodic_table(); // 11 round (period BLOCK)
         let mut block_last = vec![Val::ZERO; BLOCK];
         block_last[BLOCK - 1] = Val::ONE;
@@ -1515,7 +1715,11 @@ impl Phase4AAir {
             let b = r / BLOCK;
             count[r] = count_of(b);
             count_next[r] = count_of(b + 1);
-            is_sq_next[r] = if (b + 1 >= nb_used) || self.counts[b + 1] == 0 { Val::ONE } else { Val::ZERO };
+            is_sq_next[r] = if (b + 1 >= nb_used) || self.counts[b + 1] == 0 {
+                Val::ONE
+            } else {
+                Val::ZERO
+            };
         }
         cols.push(count);
         cols.push(count_next);
@@ -1587,7 +1791,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
@@ -1603,10 +1811,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -1623,12 +1837,23 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
         }
         {
             let bl = p[FT_P_BLOCK_LAST].clone();
-            builder.when_transition().assert_zero(stt.clone() * bl.clone() * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()));
+            builder.when_transition().assert_zero(
+                stt.clone()
+                    * bl.clone()
+                    * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()),
+            );
             for i in (CAP_LANE + 1)..W {
-                builder.when_transition().assert_zero(stt.clone() * bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(stt.clone() * bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
             for i in 0..RATE {
-                builder.when_transition().assert_zero(stt.clone() * bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()));
+                builder.when_transition().assert_zero(
+                    stt.clone()
+                        * bl.clone()
+                        * p[FT_IS_SQ_NEXT].clone()
+                        * (nxt[i].clone() - cur[i].clone()),
+                );
             }
         }
         for j in 0..self.nb() {
@@ -1645,8 +1870,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
 
         // ---------- α_fri carrier (global-persistent): held everywhere, pinned at α_fri's bind row ----------
         let carry = self.carry();
-        builder.when_transition().assert_zero(nxt[carry].clone() - cur[carry].clone());
-        builder.when_transition().assert_zero(nxt[carry + 1].clone() - cur[carry + 1].clone());
+        builder
+            .when_transition()
+            .assert_zero(nxt[carry].clone() - cur[carry].clone());
+        builder
+            .when_transition()
+            .assert_zero(nxt[carry + 1].clone() - cur[carry + 1].clone());
         let alpha_bind = p[FT_BIND_START + 2].clone(); // binds[2] = α_fri
         builder.assert_zero(alpha_bind.clone() * (cur[carry].clone() - cur[3].clone()));
         builder.assert_zero(alpha_bind * (cur[carry + 1].clone() - cur[2].clone()));
@@ -1656,7 +1885,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
         let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
 
@@ -1672,7 +1904,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
             builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
             prev = cur[QT_ACC + i].clone();
         }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR)
+            * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
         // bind the tile's α to the DERIVED, carried α_fri (the cross-region binding).
         builder.assert_zero(tf.clone() * (cur[QT_ALPHA].clone() - cur[carry].clone()));
         builder.assert_zero(tf.clone() * (cur[QT_ALPHA + 1].clone() - cur[carry + 1].clone()));
@@ -1692,7 +1925,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
             let chk = emul(inv.clone(), z_m_x);
             builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
             builder.assert_zero(tf.clone() * chk.1);
-            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let d = (
+                cur[self.pz(k)].clone() - cur[self.px(k)].clone(),
+                cur[self.pz(k) + 1].clone(),
+            );
             let t = emul(emul(gg(self.apow(k)), d), inv);
             ro = (ro.0 + t.0, ro.1 + t.1);
         }
@@ -1727,18 +1963,27 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
             recon = recon + cur[self.sb_b(i)].clone() * pow2(i);
         }
         builder.assert_zero(tf.clone() * (cur[self.sb_x()].clone() - recon));
-        builder.assert_zero(tf.clone() * (cur[self.sb_q(0)].clone() - cur[self.sb_b(32)].clone() * cur[self.sb_b(33)].clone()));
+        builder.assert_zero(
+            tf.clone()
+                * (cur[self.sb_q(0)].clone()
+                    - cur[self.sb_b(32)].clone() * cur[self.sb_b(33)].clone()),
+        );
         for k in 2..=31 {
-            builder.assert_zero(tf.clone() * (cur[self.sb_q(k - 1)].clone() - cur[self.sb_q(k - 2)].clone() * cur[self.sb_b(32 + k)].clone()));
+            builder.assert_zero(
+                tf.clone()
+                    * (cur[self.sb_q(k - 1)].clone()
+                        - cur[self.sb_q(k - 2)].clone() * cur[self.sb_b(32 + k)].clone()),
+            );
         }
         let mut lo = AB::Expr::ZERO;
         for i in 0..32 {
             lo = lo + cur[self.sb_b(i)].clone() * pow2(i);
         }
         builder.assert_zero(tf.clone() * (cur[self.sb_q(30)].clone() * lo)); // canonical: value < p
-        // the DEEP bits are the canonical low bits.
+                                                                             // the DEEP bits are the canonical low bits.
         for i in 0..DP_LOG_HEIGHT {
-            builder.assert_zero(tf.clone() * (cur[QT_DBITS + i].clone() - cur[self.sb_b(i)].clone()));
+            builder
+                .assert_zero(tf.clone() * (cur[QT_DBITS + i].clone() - cur[self.sb_b(i)].clone()));
         }
         // idx_rem at TF = the query index (low DP_LOG_HEIGHT bits); the shift register feeds QT_BIT.
         let mut qidx = AB::Expr::ZERO;
@@ -1751,17 +1996,24 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
         for r in 0..self.n_rounds() {
             round_mask = round_mask + p[self.p_round(r)].clone();
         }
-        builder
-            .when_transition()
-            .assert_zero(round_mask * (cur[self.idx_rem()].clone() - two.clone() * nxt[self.idx_rem()].clone() - cur[QT_BIT].clone()));
+        builder.when_transition().assert_zero(
+            round_mask
+                * (cur[self.idx_rem()].clone()
+                    - two.clone() * nxt[self.idx_rem()].clone()
+                    - cur[QT_BIT].clone()),
+        );
 
         // tile fold (transition gated by S_QUERY·(1-TL)).
         let fold_gate = sq.clone() * (one.clone() - tl.clone());
         let bit = cur[QT_BIT].clone();
         let i2s = cur[QT_I2S].clone();
         let spt = cur[QT_SPT].clone();
-        builder.when_transition().assert_zero(fold_gate.clone() * (bit.clone() * (one.clone() - bit.clone())));
-        builder.when_transition().assert_zero(fold_gate.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        builder
+            .when_transition()
+            .assert_zero(fold_gate.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder
+            .when_transition()
+            .assert_zero(fold_gate.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
         let sign = one.clone() - two * bit;
         let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
         let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
@@ -1771,8 +2023,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
         let prod = emul(diff, bb);
         let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
         let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
-        builder.when_transition().assert_zero(fold_gate.clone() * (nxt[QT_E].clone() - fold0));
-        builder.when_transition().assert_zero(fold_gate * (nxt[QT_E + 1].clone() - fold1));
+        builder
+            .when_transition()
+            .assert_zero(fold_gate.clone() * (nxt[QT_E].clone() - fold0));
+        builder
+            .when_transition()
+            .assert_zero(fold_gate * (nxt[QT_E + 1].clone() - fold1));
 
         // tile accept (TL): folded_eval == final_poly[0] (shared public).
         let fp0 = pis[2 * self.nb() + self.ni()].clone();
@@ -1786,7 +2042,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for Phase4AAir {
 pub(crate) fn phase4a_build_trace(
     air: &Phase4AAir,
     block_inputs: &[[Val; W]],
-    per_query: &[(usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>)],
+    per_query: &[(
+        usize,
+        Vec<(Challenge, Challenge, Val)>,
+        Challenge,
+        Challenge,
+        Vec<(Challenge, Challenge, bool, Val)>,
+    )],
     alpha_fri: [Val; 2],
     index_felts: &[Val],
 ) -> RowMajorMatrix<Val> {
@@ -1870,7 +2132,12 @@ impl BaseAir<Goldilocks> for IndexBindAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for IndexBindAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
@@ -1889,7 +2156,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for IndexBindAir {
         fr.assert_zero(cur[IB_X].clone() - recon);
         fr.assert_zero(cur[IB_Q].clone() - cur[IB_B + 32].clone() * cur[IB_B + 33].clone());
         for k in 2..=31 {
-            fr.assert_zero(cur[IB_Q + k - 1].clone() - cur[IB_Q + k - 2].clone() * cur[IB_B + 32 + k].clone());
+            fr.assert_zero(
+                cur[IB_Q + k - 1].clone() - cur[IB_Q + k - 2].clone() * cur[IB_B + 32 + k].clone(),
+            );
         }
         let mut lo = AB::Expr::ZERO;
         for i in 0..32 {
@@ -1905,7 +2174,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for IndexBindAir {
             fr.assert_zero(cur[IB_ACC + i].clone() - prev * factor);
             prev = cur[IB_ACC + i].clone();
         }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[IB_ACC + DP_LOG_HEIGHT - 1].clone();
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR)
+            * cur[IB_ACC + DP_LOG_HEIGHT - 1].clone();
         fr.assert_zero(pis[0].clone() - cur[IB_X].clone());
         fr.assert_zero(pis[1].clone() - x);
     }
@@ -1928,7 +2198,11 @@ pub(crate) fn ib_build_trace(index_felt: Val) -> (RowMajorMatrix<Val>, Val) {
     let mut acc = Val::ONE;
     for i in 0..DP_LOG_HEIGHT {
         let bit = (v >> i) & 1;
-        acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+        acc *= if bit == 1 {
+            g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i)
+        } else {
+            Val::ONE
+        };
         r[IB_ACC + i] = acc;
     }
     let x = <Goldilocks as Field>::GENERATOR * acc;
@@ -1977,7 +2251,12 @@ impl BaseAir<Goldilocks> for FoldPointAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldPointAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
@@ -2005,7 +2284,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldPointAir {
                 } else {
                     one.clone()
                 };
-                fr.assert_zero(cur[self.acc(r, m)].clone() - cur[self.acc(r, m - 1)].clone() * factor);
+                fr.assert_zero(
+                    cur[self.acc(r, m)].clone() - cur[self.acc(r, m - 1)].clone() * factor,
+                );
             }
             fr.assert_zero(cur[self.s(r)].clone() - cur[self.acc(r, n - 1)].clone());
             fr.assert_zero(cur[self.s(r)].clone() - pis[1 + r].clone()); // == native s_r
@@ -2028,7 +2309,11 @@ pub(crate) fn fp_build_trace(n_rounds: usize, index: usize) -> RowMajorMatrix<Va
         let mut acc = Val::ONE;
         r0[air.acc(r, 0)] = acc;
         for m in 1..n {
-            let factor = if m >= r + 1 && (index >> m) & 1 == 1 { g.exp_power_of_2(n - 1 - m + r) } else { Val::ONE };
+            let factor = if m >= r + 1 && (index >> m) & 1 == 1 {
+                g.exp_power_of_2(n - 1 - m + r)
+            } else {
+                Val::ONE
+            };
             acc *= factor;
             r0[air.acc(r, m)] = acc;
         }
@@ -2063,7 +2348,12 @@ impl BaseAir<Goldilocks> for CapMuxAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CapMuxAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let n = 1 << CM_CAP_HEIGHT;
@@ -2078,7 +2368,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CapMuxAir {
                 let mut sel = one.clone();
                 for j in 0..CM_CAP_HEIGHT {
                     let b = cur[j].clone();
-                    sel = sel * if (e >> j) & 1 == 1 { b } else { one.clone() - b };
+                    sel = sel
+                        * if (e >> j) & 1 == 1 {
+                            b
+                        } else {
+                            one.clone() - b
+                        };
                 }
                 mux = mux + sel * pis[e * 4 + l].clone();
             }
@@ -2159,7 +2454,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for InputMerkleTileAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
 
@@ -2170,10 +2469,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for InputMerkleTileAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -2200,8 +2505,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for InputMerkleTileAir {
             let bl = p[IMT_P_BLOCK_LAST].clone();
             let nb = nxt[IMT_BIT].clone();
             for k in 0..4 {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[IMT_SIB + k].clone())));
-                builder.when_transition().assert_zero(bl.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[IMT_SIB + k].clone() + nb.clone() * cur[k].clone())));
+                builder.when_transition().assert_zero(
+                    bl.clone()
+                        * (nxt[k].clone()
+                            - ((one.clone() - nb.clone()) * cur[k].clone()
+                                + nb.clone() * nxt[IMT_SIB + k].clone())),
+                );
+                builder.when_transition().assert_zero(
+                    bl.clone()
+                        * (nxt[4 + k].clone()
+                            - ((one.clone() - nb.clone()) * nxt[IMT_SIB + k].clone()
+                                + nb.clone() * cur[k].clone())),
+                );
             }
         }
 
@@ -2281,7 +2596,7 @@ pub(crate) const ST_W: usize = ST_CARRY + 1;
 const ST_NBLOCKS_PAD: usize = 8;
 const ST_LEAF_BLOCK: usize = 1;
 const ST_TERMINAL_BLOCK: usize = 5; // leaf (1) + 4 merges (2..5)
-// periodic indices
+                                    // periodic indices
 const ST_P_BLOCK_LAST: usize = 11;
 const ST_P_SPOS: usize = 12; // 1 on the Merkle blocks (1..7)
 const ST_P_TF: usize = 13; // arith head (block 0 row 0)
@@ -2319,7 +2634,7 @@ impl SuperTileAir {
     fn periodic(&self) -> Vec<Vec<Val>> {
         let h = self.height();
         let mut cols = periodic_table(); // 11 round (period BLOCK, repeats across the whole trace)
-        // each of these is full-height with a 1 at the given within-super-tile offset of EVERY super-tile.
+                                         // each of these is full-height with a 1 at the given within-super-tile offset of EVERY super-tile.
         let tiled = |offset: usize| -> Vec<Val> {
             let mut c = vec![Val::ZERO; h];
             for q in 0..self.n_queries {
@@ -2371,7 +2686,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let two = AB::Expr::TWO;
@@ -2379,7 +2698,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
         let tf = p[ST_P_TF].clone();
@@ -2398,7 +2720,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
             builder.assert_zero(tf.clone() * (cur[QT_ACC + i].clone() - prev * factor));
             prev = cur[QT_ACC + i].clone();
         }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR)
+            * cur[QT_ACC + DP_LOG_HEIGHT - 1].clone();
         let alpha = gg(QT_ALPHA);
         builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
         builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
@@ -2415,7 +2738,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
             let chk = emul(inv.clone(), z_m_x);
             builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
             builder.assert_zero(tf.clone() * chk.1);
-            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let d = (
+                cur[self.pz(k)].clone() - cur[self.px(k)].clone(),
+                cur[self.pz(k) + 1].clone(),
+            );
             let t = emul(emul(gg(self.apow(k)), d), inv);
             ro = (ro.0 + t.0, ro.1 + t.1);
         }
@@ -2429,8 +2755,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         let bit = cur[QT_BIT].clone();
         let i2s = cur[QT_I2S].clone();
         let spt = cur[QT_SPT].clone();
-        builder.when_transition().assert_zero(round_mask.clone() * (bit.clone() * (one.clone() - bit.clone())));
-        builder.when_transition().assert_zero(round_mask.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        builder
+            .when_transition()
+            .assert_zero(round_mask.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder
+            .when_transition()
+            .assert_zero(round_mask.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
         let sign = one.clone() - two.clone() * bit;
         let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
         let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
@@ -2440,8 +2770,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         let prod = emul(diff, bb);
         let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
         let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
-        builder.when_transition().assert_zero(round_mask.clone() * (nxt[QT_E].clone() - fold0));
-        builder.when_transition().assert_zero(round_mask * (nxt[QT_E + 1].clone() - fold1));
+        builder
+            .when_transition()
+            .assert_zero(round_mask.clone() * (nxt[QT_E].clone() - fold0));
+        builder
+            .when_transition()
+            .assert_zero(round_mask * (nxt[QT_E + 1].clone() - fold1));
         // accept (block 0 row 7): folded_eval == final_poly[0]
         builder.assert_zero(tl.clone() * (cur[QT_E].clone() - pis[0].clone()));
         builder.assert_zero(tl * (cur[QT_E + 1].clone() - pis[1].clone()));
@@ -2449,7 +2783,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         // ---------------- opened-value carrier: tile-persistent (held within a super-tile, free at its
         // boundary so each query carries its own value); == QT_px(term 0) at the arith head; leaf preimage.
         let not_st_last = one.clone() - p[ST_P_ST_LAST].clone();
-        builder.when_transition().assert_zero(not_st_last * (nxt[ST_CARRY].clone() - cur[ST_CARRY].clone()));
+        builder
+            .when_transition()
+            .assert_zero(not_st_last * (nxt[ST_CARRY].clone() - cur[ST_CARRY].clone()));
         builder.assert_zero(tf.clone() * (cur[ST_CARRY].clone() - cur[self.px(0)].clone()));
 
         // ---------------- input-Merkle (blocks 1..5): leaf-hash + binary merges → terminal == cap entry ----
@@ -2459,10 +2795,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -2477,15 +2819,28 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
             builder.assert_zero(leaf.clone() * cur[i].clone());
         }
         // merge bit boolean (on Merkle blocks), and the bit-ordered block link (block i output → block i+1).
-        builder.assert_zero(spos.clone() * (cur[ST_BIT].clone() * (one.clone() - cur[ST_BIT].clone())));
+        builder.assert_zero(
+            spos.clone() * (cur[ST_BIT].clone() * (one.clone() - cur[ST_BIT].clone())),
+        );
         {
             // Merkle block-last only (not block 0→1, since S_POSEIDON=0 on block 0), AND not the super-tile
             // boundary (1 - P_ST_LAST), so super-tile q's last block doesn't merge into q+1's arith block.
-            let link = spos.clone() * p[ST_P_BLOCK_LAST].clone() * (one.clone() - p[ST_P_ST_LAST].clone());
+            let link =
+                spos.clone() * p[ST_P_BLOCK_LAST].clone() * (one.clone() - p[ST_P_ST_LAST].clone());
             let nb = nxt[ST_BIT].clone();
             for k in 0..4 {
-                builder.when_transition().assert_zero(link.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[ST_SIB + k].clone())));
-                builder.when_transition().assert_zero(link.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[ST_SIB + k].clone() + nb.clone() * cur[k].clone())));
+                builder.when_transition().assert_zero(
+                    link.clone()
+                        * (nxt[k].clone()
+                            - ((one.clone() - nb.clone()) * cur[k].clone()
+                                + nb.clone() * nxt[ST_SIB + k].clone())),
+                );
+                builder.when_transition().assert_zero(
+                    link.clone()
+                        * (nxt[4 + k].clone()
+                            - ((one.clone() - nb.clone()) * nxt[ST_SIB + k].clone()
+                                + nb.clone() * cur[k].clone())),
+                );
             }
         }
         // terminal (block 5 row 31): output digest == the committed cap entry.
@@ -2499,7 +2854,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SuperTileAir {
 #[allow(clippy::type_complexity)]
 pub(crate) fn st_build_trace(
     per_query: &[(
-        (usize, Vec<(Challenge, Challenge, Val)>, Challenge, Challenge, Vec<(Challenge, Challenge, bool, Val)>),
+        (
+            usize,
+            Vec<(Challenge, Challenge, Val)>,
+            Challenge,
+            Challenge,
+            Vec<(Challenge, Challenge, bool, Val)>,
+        ),
         Val,
         Vec<([Val; 4], bool)>,
     )],
@@ -2507,7 +2868,9 @@ pub(crate) fn st_build_trace(
     use crate::recursion::fri_fold::native_fold;
     use p3_field::BasedVectorSpace;
     let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
-    let air = SuperTileAir { n_queries: per_query.len() };
+    let air = SuperTileAir {
+        n_queries: per_query.len(),
+    };
     let g = Goldilocks::two_adic_generator(DP_LOG_HEIGHT);
     let h = air.height();
     let mut t = vec![Val::ZERO; h * ST_W];
@@ -2540,7 +2903,11 @@ pub(crate) fn st_build_trace(
         for i in 0..DP_LOG_HEIGHT {
             let bit = (index >> i) & 1;
             t[base0 + QT_DBITS + i] = Val::from_u64(bit as u64);
-            acc *= if bit == 1 { g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i) } else { Val::ONE };
+            acc *= if bit == 1 {
+                g.exp_power_of_2(DP_LOG_HEIGHT - 1 - i)
+            } else {
+                Val::ONE
+            };
             t[base0 + QT_ACC + i] = acc;
         }
         let x = <Goldilocks as Field>::GENERATOR * acc;
@@ -2668,7 +3035,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CommitMerkleTileAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
 
@@ -2678,10 +3049,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CommitMerkleTileAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -2707,8 +3084,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CommitMerkleTileAir {
             let bl = p[CMT_P_BLOCK_LAST].clone();
             let nb = nxt[CMT_BIT].clone();
             for k in 0..4 {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[k].clone() - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[CMT_SIB + k].clone())));
-                builder.when_transition().assert_zero(bl.clone() * (nxt[4 + k].clone() - ((one.clone() - nb.clone()) * nxt[CMT_SIB + k].clone() + nb.clone() * cur[k].clone())));
+                builder.when_transition().assert_zero(
+                    bl.clone()
+                        * (nxt[k].clone()
+                            - ((one.clone() - nb.clone()) * cur[k].clone()
+                                + nb.clone() * nxt[CMT_SIB + k].clone())),
+                );
+                builder.when_transition().assert_zero(
+                    bl.clone()
+                        * (nxt[4 + k].clone()
+                            - ((one.clone() - nb.clone()) * nxt[CMT_SIB + k].clone()
+                                + nb.clone() * cur[k].clone())),
+                );
             }
         }
         // terminal: the last active block's output == the committed cap entry.
@@ -2719,7 +3106,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for CommitMerkleTileAir {
     }
 }
 
-pub(crate) fn cm2_build_trace(group: [Val; 4], path: &[([Val; 4], bool)]) -> (RowMajorMatrix<Val>, [Val; 4]) {
+pub(crate) fn cm2_build_trace(
+    group: [Val; 4],
+    path: &[([Val; 4], bool)],
+) -> (RowMajorMatrix<Val>, [Val; 4]) {
     let air = CommitMerkleTileAir;
     let h = air.height();
     let mut t = vec![Val::ZERO; h * CMT_W];

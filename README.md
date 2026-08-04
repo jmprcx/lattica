@@ -1,90 +1,71 @@
-# Lattica — quantum-safe shielded payments (design spec + PoC)
+# Lattica
 
-A clean-slate, Zcash-style shielded payment protocol built entirely on **post-quantum
-primitives** — no elliptic-curve / discrete-log dependency anywhere. It pairs a full
-**protocol specification** ([`SPEC.md`](./SPEC.md)) with a runnable **proof of concept**: a
-**Plonky3 zero-knowledge join-split circuit** (Rust) driven by a **Zig** protocol + node layer
-that demonstrates a complete shielded transaction lifecycle.
+Lattica is a clean-slate, post-quantum shielded-payment protocol and working proof of concept. It combines a Zig wallet and node state machine with Plonky3 zero-knowledge STARK circuits written in Rust. The protocol avoids elliptic curves and discrete-log assumptions throughout its production proof path.
 
-> **Auditing this?** Start at **[`docs/AUDITORS.md`](docs/AUDITORS.md)** — the audit scope, security
-> properties, build/reproduce commands, and known limitations.
+The repository contains an audited CPU proof/verifier baseline, a complete shielded transaction demonstration, production batch circuits, and feature-gated research into GPU proving, out-of-core proving, and recursive aggregation. It is not a complete cryptocurrency node and is not cleared for value-bearing deployment.
 
-Why: Zcash's shielded pools rely on the elliptic-curve discrete log, which Shor's algorithm
-breaks. Lattica replaces every such primitive with a hash- or lattice-based one:
+## Start here
 
-| Concern | Zcash (broken by Shor) | Lattica (quantum-safe) |
-|---|---|---|
-| Zero-knowledge proof | Halo 2 (Pasta curves) | **Plonky3 FRI-STARK** (transparent, hash-soundness), Poseidon2-Goldilocks, hiding FRI = ZK |
-| Note encryption | ECDH (Jubjub) | ML-KEM-768 (FIPS 203) + ChaCha20-Poly1305 |
-| Tx authorization | RedPallas binding sig | the **join-split proof** (knowledge of the spend key) bound to a canonical **`tx_binding`** digest |
-| Commitments / balance | Pedersen (homomorphic) | Poseidon2 hash commitment; per-tx balance + range proven **in-circuit** |
+- [Protocol specification](SPEC.md) defines the transaction model and cryptographic construction.
+- [Documentation map](docs/README.md) separates current guidance, normative references, research, and historical audit records.
+- [Audit handoff](docs/AUDITORS.md) defines the reviewed surface, assumptions, reproduction commands, and exclusions.
+- [Current status](docs/audit-readiness-status.md) records the production baseline and active development boundary.
+- [Remediation status](docs/remediation-status.md) maps audit findings to their resolutions.
 
-Post-quantum + symmetric primitives come from Zig's `std.crypto` (ML-KEM-768, ML-DSA-44 in the key
-hierarchy, SHA3, ChaCha20-Poly1305); the in-circuit hash is Poseidon2-Goldilocks, identical on-chain
-(`src/poseidon2.zig`) and in the circuit. No cryptography is hand-rolled — the proof system is Plonky3.
+## What it provides
 
-## Layout
+Lattica replaces the elliptic-curve components normally found in shielded payment systems:
 
-```
-build.zig               Zig build: the wallet exe, the `test` step, `check-production` (M-09/M-10 probe)
-lattica-prover-p3/      Rust: the production Plonky3 join-split circuit + verify/prove C ABI
-  src/joinsplit_air.rs    the single production AIR (N-in/M-out join-split statement)
-  src/poseidon2_air.rs    the Poseidon2-Goldilocks permutation AIR
-  src/lib.rs              the C ABI (lattica_joinsplit_verify / _prove) + canonical (de)serialization
-src/
-  primitives.zig        ML-KEM, ML-DSA, SHA3/PRF/KDF, AEAD, the Poseidon2 note commitment helper
-  field.zig             Goldilocks field (p = 2^64-2^32+1)
-  poseidon2.zig         Poseidon2-Goldilocks — the on-chain hash, KAT-equal to the circuit
-  tree.zig              incremental Merkle commitment tree (anchors)
-  tx.zig                notes, key hierarchy, diversified addresses, incoming viewing key, ML-KEM encryption
-  ffi.zig               fail-closed verify/prove boundary to the Rust prover (pluggable backend)
-  codec.zig             canonical, overflow-safe byte (de)serialization
-  protocol.zig          public supply model (SupplyState, live) + reference tx codec
-  node.zig              chain state + shielded join-split validation (verify → anchor → nullifier → apply)
-  wallet.zig            keygen, scanning, transfer builder, end-to-end demo (CLI)
-  integration_node.zig  the live node driving the REAL Rust prover/verifier in-process
-  production_probe.zig  compile probe: builds the consensus surface with test-only APIs gated out
-  tests.zig            test aggregator for `zig build test`
-SPEC.md                 the protocol specification
-docs/AUDITORS.md        external audit handoff (start here)
-```
+| Function | Lattica construction |
+|---|---|
+| Zero-knowledge authorization | Transparent Plonky3 FRI-STARK with a hiding PCS |
+| Circuit and protocol hash | Poseidon2 over the Goldilocks field |
+| Note encryption | ML-KEM-768 and ChaCha20-Poly1305 |
+| Key hierarchy | ML-DSA-44 plus hash-derived spending and viewing material |
+| Transaction authorization | Join-split proof of spend-key knowledge, bound to a canonical `tx_binding` digest |
+| Value conservation | In-circuit balance equations and range checks |
 
-## Run it
+The production circuits cover individual join-splits, shielded HTLCs, and batch forms of both. The Zig node checks anchors, nullifiers, supply transitions, transaction bindings, and proof validity before atomically applying state.
 
-Requires **Zig 0.16** and **Rust 1.96** (+ a C compiler for the cross-language link).
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `src/` | Zig protocol, wallet, codecs, state machine, cryptography, and Rust FFI |
+| `lattica-prover-p3/` | Production Plonky3 circuits, prover/verifier, C ABI, and research backends |
+| `docs/` | Specifications, audit material, operational guidance, and research notes |
+| `scripts/` | Cross-language integration and support scripts |
+| `framework-spike/`, `plonky2-spike/`, `plonky3-spike/` | Historical framework experiments |
+| `lattica-prover/` | Reference-only Winterfell differential oracle |
+
+## Build and verify
+
+Requirements: Zig 0.16, Rust 1.96, and a C toolchain.
 
 ```sh
-# Build the Rust prover/verifier, then run the circuit + ABI tests.
-cd lattica-prover-p3 && cargo test --release && cd ..
+cd lattica-prover-p3
+cargo test --release
+cd ..
 
-# The Zig protocol suite (incl. Poseidon2 KATs that pin on-chain == circuit) + the production probe.
 zig build test
-
-# The REAL cross-language path: Zig node → real Rust prove → real Rust verify → tamper/double-spend reject.
 scripts/run-real-integration.sh
-
-# End-to-end shielded transfer, narrated (uses a mock backend for the demo).
 zig build run -- demo
 ```
 
-The `demo` mints a shielded note to Alice, has her pay Bob via a **hidden-value join-split proof**
-bound to the transaction (the `tx_binding` digest replaces a binding signature), verifies it at the
-node, lets Bob trial-decrypt his note, and shows a replay rejected as a double-spend.
+The integration script exercises the real Zig-to-Rust boundary: proof generation, verification, state application, transaction-root agreement, tamper rejection, and double-spend rejection.
 
-## Status
+## Status and security boundary
 
-Proof of concept, **not cleared for value-bearing production** (see `docs/AUDITORS.md` §5 and
-`docs/remediation-status.md`). What is implemented and tested end to end:
+The default CPU implementation at `v3-batch-audit` is the frozen ten-symbol audit target and includes the join-split, HTLC, batch join-split, and batch HTLC paths. The current development tree adds two join-split proof-tree container symbols, bringing its default ABI to twelve; that post-tag seam is not covered by the frozen audit. The documented soundness budget for the underlying production proof family is approximately 103 bits proven and 127 bits conjectured.
 
-- The production **Plonky3 join-split** circuit — ownership (128-bit spend key), Merkle membership
-  under a published anchor, nullifier correctness with position binding, value balance
-  `Σin + mint = Σout + fee` with in-circuit range checks, domain separation, and a `tx_binding` public
-  input — proving and verifying in **zero-knowledge** (hiding FRI PCS), ~103-bit proven / ~127-bit
-  conjectured soundness (`docs/soundness-budget.md`).
-- The live Zig node validates transactions solely through the proof (fail-closed, panic-isolated across
-  the C ABI), with a public supply accumulator, atomic state application, and diversified addresses + a
-  delegatable incoming viewing key.
+GPU acceleration, streaming/out-of-core proving, and recursion are opt-in research features. They do not alter the underlying production verifier or leaf-proof format. Recursion remains excluded from the default static library; the development proof-tree container is a non-recursive aggregation seam and must not be mistaken for audited recursive aggregation.
 
-Out of scope (host chain `rubble-node-zig`): block consensus / PoW / mempool / networking / emission
-schedule and block-level state commitments. See [`docs/AUDITORS.md`](docs/AUDITORS.md) for the full
-scope, threat model, and the deliberate sign-off items.
+The following remain outside this repository's production claim:
+
+- block consensus, networking, mempool policy, reorg handling, and emissions;
+- host-chain release integration and startup attestation;
+- operational wallet and prover key management;
+- production recursive aggregation;
+- final independent sign-off on the documented cryptographic assumptions.
+
+Read [the audit handoff](docs/AUDITORS.md) before treating any component as security-sensitive.

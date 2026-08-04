@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Audit gate: the DEFAULT (production) staticlib exposes EXACTLY the frozen `lattica_*` node-seam externs and
+# ABI gate: the DEFAULT staticlib exposes EXACTLY the current `lattica_*` node-seam externs and
 # ZERO recursion symbols — turning "recursion is feature-gated out of production" into checkable evidence.
 # The recursion module (src/recursion) is behind `--features recursion`; a default build must not include it.
 set -euo pipefail
@@ -10,7 +10,7 @@ cargo build --release --lib >/dev/null 2>&1
 LIB="$(ls target/release/liblattica_prover_p3.a 2>/dev/null || true)"
 [ -n "$LIB" ] && [ -f "$LIB" ] || { echo "FAIL: staticlib not found under target/release/"; exit 1; }
 
-# The frozen node seam. Any add/remove is a deliberate wire change — update this list in the SAME commit.
+# The current development node seam. Any add/remove is a deliberate wire change — update this list in the SAME commit.
 EXPECTED="$(cat <<'EOF'
 lattica_batch_prove
 lattica_batch_verify
@@ -19,6 +19,8 @@ lattica_htlc_batch_verify
 lattica_htlc_prove
 lattica_htlc_prove_demo
 lattica_htlc_verify
+lattica_joinsplit_tree_prove
+lattica_joinsplit_tree_verify
 lattica_joinsplit_prove
 lattica_joinsplit_prove_demo
 lattica_joinsplit_verify
@@ -31,11 +33,11 @@ EXPECTED="$(echo "$EXPECTED" | sort -u)"
 GOT="$(nm -g --defined-only "$LIB" 2>/dev/null | grep -oE 'lattica_(batch|htlc|joinsplit)[a-z_]*' | sort -u)"
 
 if [ "$GOT" != "$EXPECTED" ]; then
-  echo "FAIL: lattica_* extern set drifted from the frozen node seam:"
+  echo "FAIL: lattica_* extern set drifted from the current node seam:"
   diff <(echo "$EXPECTED") <(echo "$GOT") || true
   exit 1
 fi
-echo "OK: exactly $(echo "$GOT" | grep -c .) lattica_* externs (the frozen node seam)."
+echo "OK: exactly $(echo "$GOT" | grep -c .) lattica_* externs (the current development node seam)."
 
 # ZERO recursion symbols (the module is feature-gated out of the default build). Rust mangling embeds the
 # module path, so gated-out recursion code contributes no `..recursion..`/`..monolith..` symbols.

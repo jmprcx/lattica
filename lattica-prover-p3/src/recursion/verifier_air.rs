@@ -32,7 +32,9 @@ use p3_uni_stark::{prove, verify, Proof, StarkConfig};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W};
+use crate::poseidon2_air::{
+    ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W,
+};
 
 type Val = Goldilocks;
 type Challenge = BinomialExtensionField<Val, 2>;
@@ -93,7 +95,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TranscriptAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let rate = AB::Expr::from(Goldilocks::from_u64(RATE as u64));
 
@@ -104,10 +110,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TranscriptAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -128,11 +140,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for TranscriptAir {
         // ---- capacity carries across blocks (+RATE), rate lanes free (the next absorbed felts) ----
         {
             let bl = p[P_BLOCK_LAST].clone();
-            builder
-                .when_transition()
-                .assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())));
+            builder.when_transition().assert_zero(
+                bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())),
+            );
             for i in (CAP_LANE + 1)..W {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
         }
 
@@ -179,8 +193,16 @@ fn build_trace(instance: &[Val], commitments: &[Val]) -> RowMajorMatrix<Val> {
 type Perm = Poseidon2Goldilocks<8>;
 type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
+type ValMmcs = MerkleTreeHidingMmcs<
+    <Val as Field>::Packing,
+    <Val as Field>::Packing,
+    MyHash,
+    MyCompress,
+    ChaCha20Rng,
+    2,
+    4,
+    4,
+>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
 type Dft = Radix2DitParallel<Val>;
@@ -189,7 +211,12 @@ type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
 
 fn make_config() -> MyConfig {
     let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
+    let val_mmcs = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm.clone()),
+        6,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let fri = FriParameters {
         log_blowup: 4,
@@ -200,14 +227,30 @@ fn make_config() -> MyConfig {
         query_proof_of_work_bits: 16,
         mmcs: challenge_mmcs,
     };
-    let pcs = MyPcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
+    let pcs = MyPcs::new(
+        Dft::default(),
+        val_mmcs,
+        fri,
+        4,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
     MyConfig::new(pcs, Challenger::new(perm))
 }
 
 /// Prove that absorbing (instance ‖ commitments) squeezes the public (α, ζ).
-pub fn prove_transcript(instance: &[Val], commitments: &[Val], alpha: [Val; 2], zeta: [Val; 2]) -> Vec<u8> {
+pub fn prove_transcript(
+    instance: &[Val],
+    commitments: &[Val],
+    alpha: [Val; 2],
+    zeta: [Val; 2],
+) -> Vec<u8> {
     let pis = vec![alpha[0], alpha[1], zeta[0], zeta[1]];
-    let proof = prove(&make_config(), &TranscriptAir, build_trace(instance, commitments), &pis);
+    let proof = prove(
+        &make_config(),
+        &TranscriptAir,
+        build_trace(instance, commitments),
+        &pis,
+    );
     postcard::to_allocvec(&proof).expect("serialize")
 }
 
@@ -248,7 +291,12 @@ impl BaseAir<Goldilocks> for SampleBitsAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SampleBitsAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
@@ -269,7 +317,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for SampleBitsAir {
         // product chain over the high 32 bits: q_1 = b_32·b_33, q_k = q_{k-1}·b_{32+k}; q_31 = Π high bits
         fr.assert_zero(cur[SB_Q].clone() - cur[SB_B + 32].clone() * cur[SB_B + 33].clone());
         for k in 2..=31 {
-            fr.assert_zero(cur[SB_Q + k - 1].clone() - cur[SB_Q + k - 2].clone() * cur[SB_B + 32 + k].clone());
+            fr.assert_zero(
+                cur[SB_Q + k - 1].clone() - cur[SB_Q + k - 2].clone() * cur[SB_B + 32 + k].clone(),
+            );
         }
         // canonical: q_31 · lo == 0  (lo = Σ_{i<32} b_i·2^i) ⇒ value < p
         let mut lo = AB::Expr::ZERO;
@@ -315,7 +365,13 @@ pub fn native_sample_bits(x: Val) -> u64 {
 }
 
 pub fn prove_sample_bits(x: Val, index: u64) -> Vec<u8> {
-    postcard::to_allocvec(&prove(&make_config(), &SampleBitsAir, sb_build_trace(x), &vec![Val::from_u64(index)])).expect("serialize")
+    postcard::to_allocvec(&prove(
+        &make_config(),
+        &SampleBitsAir,
+        sb_build_trace(x),
+        &vec![Val::from_u64(index)],
+    ))
+    .expect("serialize")
 }
 
 pub fn verify_sample_bits(proof_bytes: &[u8], index: u64) -> bool {
@@ -323,7 +379,13 @@ pub fn verify_sample_bits(proof_bytes: &[u8], index: u64) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    verify(&make_config(), &SampleBitsAir, &proof, &vec![Val::from_u64(index)]).is_ok()
+    verify(
+        &make_config(),
+        &SampleBitsAir,
+        &proof,
+        &vec![Val::from_u64(index)],
+    )
+    .is_ok()
 }
 
 // =================================================================================================
@@ -357,7 +419,12 @@ impl BaseAir<Goldilocks> for ReducedOpeningAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ReducedOpeningAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let zero = AB::Expr::ZERO;
@@ -375,7 +442,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ReducedOpeningAir {
         let inv_denom = (cur[RO_INV_DENOM].clone(), cur[RO_INV_DENOM + 1].clone());
 
         // inv_denom · (X − ζ) == 1  [X − ζ = (X − ζ_0, −ζ_1)]
-        let x_m_zeta = (cur[RO_X].clone() - zeta.0.clone(), zero.clone() - zeta.1.clone());
+        let x_m_zeta = (
+            cur[RO_X].clone() - zeta.0.clone(),
+            zero.clone() - zeta.1.clone(),
+        );
         let chk = emul(inv_denom.clone(), x_m_zeta);
         fr.assert_zero(chk.0 - one.clone());
         fr.assert_zero(chk.1);
@@ -383,7 +453,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ReducedOpeningAir {
         // num = Σ_i α^i·(p_i − y_i)  via Horner (i high → low)
         let mut acc = (zero.clone(), zero.clone());
         for i in (0..RO_NCOLS).rev() {
-            let d = (cur[RO_P + i].clone() - cur[RO_Y + 2 * i].clone(), zero.clone() - cur[RO_Y + 2 * i + 1].clone());
+            let d = (
+                cur[RO_P + i].clone() - cur[RO_Y + 2 * i].clone(),
+                zero.clone() - cur[RO_Y + 2 * i + 1].clone(),
+            );
             let t = emul(acc, alpha.clone());
             acc = (t.0 + d.0, t.1 + d.1);
         }
@@ -394,7 +467,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ReducedOpeningAir {
     }
 }
 
-fn ro_build_trace(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alpha: Challenge, x: Val, zeta: Challenge, reduced: Challenge) -> RowMajorMatrix<Val> {
+fn ro_build_trace(
+    p: [Val; RO_NCOLS],
+    y: [Challenge; RO_NCOLS],
+    alpha: Challenge,
+    x: Val,
+    zeta: Challenge,
+    reduced: Challenge,
+) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
     let c = |v: Challenge| -> [Val; 2] { v.as_basis_coefficients_slice().try_into().unwrap() };
     let inv_denom = (Challenge::from(x) - zeta).inverse();
@@ -421,7 +501,13 @@ fn ro_build_trace(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alpha: Challenge
 }
 
 /// Native reduced opening: `(X − ζ)⁻¹ · Σ_i α^i·(p_i − y_i)`.
-pub fn native_reduced_opening(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alpha: Challenge, x: Val, zeta: Challenge) -> Challenge {
+pub fn native_reduced_opening(
+    p: [Val; RO_NCOLS],
+    y: [Challenge; RO_NCOLS],
+    alpha: Challenge,
+    x: Val,
+    zeta: Challenge,
+) -> Challenge {
     let mut num = Challenge::ZERO;
     for i in (0..RO_NCOLS).rev() {
         num = num * alpha + (Challenge::from(p[i]) - y[i]);
@@ -429,10 +515,23 @@ pub fn native_reduced_opening(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alph
     (Challenge::from(x) - zeta).inverse() * num
 }
 
-pub fn prove_reduced_opening(p: [Val; RO_NCOLS], y: [Challenge; RO_NCOLS], alpha: Challenge, x: Val, zeta: Challenge, reduced: Challenge) -> Vec<u8> {
+pub fn prove_reduced_opening(
+    p: [Val; RO_NCOLS],
+    y: [Challenge; RO_NCOLS],
+    alpha: Challenge,
+    x: Val,
+    zeta: Challenge,
+    reduced: Challenge,
+) -> Vec<u8> {
     use p3_field::BasedVectorSpace;
     let pis = reduced.as_basis_coefficients_slice().to_vec();
-    postcard::to_allocvec(&prove(&make_config(), &ReducedOpeningAir, ro_build_trace(p, y, alpha, x, zeta, reduced), &pis)).expect("serialize")
+    postcard::to_allocvec(&prove(
+        &make_config(),
+        &ReducedOpeningAir,
+        ro_build_trace(p, y, alpha, x, zeta, reduced),
+        &pis,
+    ))
+    .expect("serialize")
 }
 
 pub fn verify_reduced_opening(proof_bytes: &[u8], reduced: Challenge) -> bool {
@@ -490,7 +589,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for LeafHashAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
 
         // Poseidon2 rounds (reused).
@@ -500,10 +603,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for LeafHashAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -523,7 +632,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for LeafHashAir {
         {
             let bl = p[LH_P_BLOCK_LAST].clone();
             for i in RATE..W {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
         }
         // ... the final block's rate lanes are the leaf digest.
@@ -556,7 +667,13 @@ fn lh_build_trace(row: &[Val]) -> RowMajorMatrix<Val> {
 
 /// Prove that `MyHash(row) == digest` (the leaf hash), with the digest as public output.
 pub fn prove_leaf_hash(row: &[Val], digest: [Val; 4]) -> Vec<u8> {
-    postcard::to_allocvec(&prove(&make_config(), &LeafHashAir, lh_build_trace(row), &digest.to_vec())).expect("serialize")
+    postcard::to_allocvec(&prove(
+        &make_config(),
+        &LeafHashAir,
+        lh_build_trace(row),
+        &digest.to_vec(),
+    ))
+    .expect("serialize")
 }
 
 pub fn verify_leaf_hash(proof_bytes: &[u8], digest: [Val; 4]) -> bool {
@@ -620,7 +737,12 @@ impl BaseAir<Goldilocks> for DomainSelectorsAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for DomainSelectorsAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let g_inv = AB::Expr::from(ds_g_inv());
@@ -641,7 +763,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for DomainSelectorsAir {
             fr.assert_zero(cur[2 * i + 1].clone() - sq.1);
         }
         let u = g(DS_ZETA);
-        let z_h = (cur[2 * DS_LOG_SIZE].clone() - one.clone(), cur[2 * DS_LOG_SIZE + 1].clone());
+        let z_h = (
+            cur[2 * DS_LOG_SIZE].clone() - one.clone(),
+            cur[2 * DS_LOG_SIZE + 1].clone(),
+        );
         let u_m1 = (u.0.clone() - one.clone(), u.1.clone());
         let u_mg = (u.0.clone() - g_inv, u.1.clone());
 
@@ -683,7 +808,11 @@ fn ds_build_trace(zeta: Challenge) -> RowMajorMatrix<Val> {
         r[2 * (i + 1)] = sc[0];
         r[2 * (i + 1) + 1] = sc[1];
     }
-    for (off, v) in [(DS_INV_UM1, inv_um1), (DS_INV_UMG, inv_umg), (DS_INV_ZH, inv_zh)] {
+    for (off, v) in [
+        (DS_INV_UM1, inv_um1),
+        (DS_INV_UMG, inv_umg),
+        (DS_INV_ZH, inv_zh),
+    ] {
         let vc = c(v);
         r[off] = vc[0];
         r[off + 1] = vc[1];
@@ -698,13 +827,25 @@ fn ds_build_trace(zeta: Challenge) -> RowMajorMatrix<Val> {
 /// Prove the in-circuit domain selectors at ζ; the 4 selectors are the public output.
 pub fn prove_domain_selectors(zeta: Challenge, selectors: [Challenge; 4]) -> Vec<u8> {
     use p3_field::BasedVectorSpace;
-    let pis: Vec<Val> = selectors.iter().flat_map(|s| s.as_basis_coefficients_slice().to_vec()).collect();
-    postcard::to_allocvec(&prove(&make_config(), &DomainSelectorsAir, ds_build_trace(zeta), &pis)).expect("serialize")
+    let pis: Vec<Val> = selectors
+        .iter()
+        .flat_map(|s| s.as_basis_coefficients_slice().to_vec())
+        .collect();
+    postcard::to_allocvec(&prove(
+        &make_config(),
+        &DomainSelectorsAir,
+        ds_build_trace(zeta),
+        &pis,
+    ))
+    .expect("serialize")
 }
 
 pub fn verify_domain_selectors(proof_bytes: &[u8], selectors: [Challenge; 4]) -> bool {
     use p3_field::BasedVectorSpace;
-    let pis: Vec<Val> = selectors.iter().flat_map(|s| s.as_basis_coefficients_slice().to_vec()).collect();
+    let pis: Vec<Val> = selectors
+        .iter()
+        .flat_map(|s| s.as_basis_coefficients_slice().to_vec())
+        .collect();
     let proof: Proof<MyConfig> = match postcard::from_bytes(proof_bytes) {
         Ok(p) => p,
         Err(_) => return false,
@@ -749,7 +890,11 @@ fn ft_periodic() -> Vec<Vec<Val>> {
 }
 
 /// Native reference: α, ζ, then β_0..β_{R-1}, via the validated ModelChallenger.
-pub fn native_fri_challenges(instance: &[Val], zeta_commits: &[Val], round_commits: &[[Val; RATE]]) -> Vec<[Val; 2]> {
+pub fn native_fri_challenges(
+    instance: &[Val],
+    zeta_commits: &[Val],
+    round_commits: &[[Val; RATE]],
+) -> Vec<[Val; 2]> {
     let mut ch = crate::recursion::transcript::ModelChallenger::new();
     ch.observe_slice(instance);
     let mut out = vec![ch.sample_ext()]; // α
@@ -784,7 +929,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriTranscriptAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let rate = AB::Expr::from(Goldilocks::from_u64(RATE as u64));
 
@@ -795,10 +944,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriTranscriptAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -817,11 +972,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriTranscriptAir {
         }
         {
             let bl = p[FT_P_BLOCK_LAST].clone();
-            builder
-                .when_transition()
-                .assert_zero(bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())));
+            builder.when_transition().assert_zero(
+                bl.clone() * (nxt[CAP_LANE].clone() - (cur[CAP_LANE].clone() + rate.clone())),
+            );
             for i in (CAP_LANE + 1)..W {
-                builder.when_transition().assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
         }
 
@@ -864,7 +1021,13 @@ fn ft_build_trace(felts: &[Val]) -> RowMajorMatrix<Val> {
 /// (α, ζ, β_0..β_{R-1}), each a 2-coefficient F_p² value.
 pub fn prove_fri_transcript(felts: &[Val], challenges: &[[Val; 2]]) -> Vec<u8> {
     let pis: Vec<Val> = challenges.iter().flat_map(|c| [c[0], c[1]]).collect();
-    postcard::to_allocvec(&prove(&make_config(), &FriTranscriptAir, ft_build_trace(felts), &pis)).expect("serialize")
+    postcard::to_allocvec(&prove(
+        &make_config(),
+        &FriTranscriptAir,
+        ft_build_trace(felts),
+        &pis,
+    ))
+    .expect("serialize")
 }
 
 pub fn verify_fri_transcript(proof_bytes: &[u8], challenges: &[[Val; 2]]) -> bool {
@@ -912,7 +1075,12 @@ impl BaseAir<Goldilocks> for ConstraintCheckAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let w = AB::Expr::from(Goldilocks::from_u64(W_EXT));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
@@ -925,10 +1093,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckAir {
 
         let mut fr = builder.when_first_row();
         // c0 = is_first ⊗ (local − pub)   [pub is base, lifted to (pub, 0)]
-        let local_m_pub = (cur[CC_LOCAL].clone() - cur[CC_PUB].clone(), cur[CC_LOCAL + 1].clone());
+        let local_m_pub = (
+            cur[CC_LOCAL].clone() - cur[CC_PUB].clone(),
+            cur[CC_LOCAL + 1].clone(),
+        );
         let c0 = emul(g(CC_ISFIRST), local_m_pub);
         // c1 = is_transition ⊗ (next − local)
-        let next_m_local = (cur[CC_NEXT].clone() - cur[CC_LOCAL].clone(), cur[CC_NEXT + 1].clone() - cur[CC_LOCAL + 1].clone());
+        let next_m_local = (
+            cur[CC_NEXT].clone() - cur[CC_LOCAL].clone(),
+            cur[CC_NEXT + 1].clone() - cur[CC_LOCAL + 1].clone(),
+        );
         let c1 = emul(g(CC_ISTRANS), next_m_local);
         // folded = c0·α + c1   (Horner, matching the VerifierConstraintFolder accumulation order)
         let c0a = emul(c0, g(CC_ALPHA));
@@ -992,8 +1166,11 @@ pub fn prove_constraint_check(
 ) -> Vec<u8> {
     use p3_field::BasedVectorSpace;
     let pis: Vec<Val> = quotient.as_basis_coefficients_slice().to_vec();
-    let trace = cc_build_trace(local, next, alpha, is_first, is_trans, inv_van, quotient, pub_val);
-    postcard::to_allocvec(&prove(&make_config(), &ConstraintCheckAir, trace, &pis)).expect("serialize")
+    let trace = cc_build_trace(
+        local, next, alpha, is_first, is_trans, inv_van, quotient, pub_val,
+    );
+    postcard::to_allocvec(&prove(&make_config(), &ConstraintCheckAir, trace, &pis))
+        .expect("serialize")
 }
 
 pub fn verify_constraint_check(proof_bytes: &[u8], quotient: Challenge) -> bool {
@@ -1040,7 +1217,12 @@ impl BaseAir<Goldilocks> for ConstraintCheckWithSelectorsAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckWithSelectorsAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
         let w = AB::Expr::from(Goldilocks::from_u64(W_EXT));
@@ -1061,7 +1243,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckWithSelectorsAir
             fr.assert_zero(cur[2 * i + 1].clone() - sq.1);
         }
         let u = g(CCS_ZETA);
-        let z_h = (cur[2 * DS_LOG_SIZE].clone() - one.clone(), cur[2 * DS_LOG_SIZE + 1].clone());
+        let z_h = (
+            cur[2 * DS_LOG_SIZE].clone() - one.clone(),
+            cur[2 * DS_LOG_SIZE + 1].clone(),
+        );
         let u_m1 = (u.0.clone() - one.clone(), u.1.clone());
         let u_mg = (u.0.clone() - g_inv, u.1.clone());
         let p1 = emul(g(CCS_INV_UM1), u_m1);
@@ -1078,9 +1263,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckWithSelectorsAir
         let inv_van = g(CCS_INV_ZH);
 
         // --- component 2: fold the constraints with the derived selectors ---
-        let local_m_pub = (cur[CCS_LOCAL].clone() - cur[CCS_PUB].clone(), cur[CCS_LOCAL + 1].clone());
+        let local_m_pub = (
+            cur[CCS_LOCAL].clone() - cur[CCS_PUB].clone(),
+            cur[CCS_LOCAL + 1].clone(),
+        );
         let c0 = emul(is_first, local_m_pub);
-        let next_m_local = (cur[CCS_NEXT].clone() - cur[CCS_LOCAL].clone(), cur[CCS_NEXT + 1].clone() - cur[CCS_LOCAL + 1].clone());
+        let next_m_local = (
+            cur[CCS_NEXT].clone() - cur[CCS_LOCAL].clone(),
+            cur[CCS_NEXT + 1].clone() - cur[CCS_LOCAL + 1].clone(),
+        );
         let c1 = emul(is_trans, next_m_local);
         let c0a = emul(c0, g(CCS_ALPHA));
         let folded = (c0a.0 + c1.0, c0a.1 + c1.1);
@@ -1094,7 +1285,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for ConstraintCheckWithSelectorsAir
 
 /// Native reference for the composed fragment: the quotient implied by deriving the selectors at ζ and
 /// folding the (ConstAir-shaped) constraints with α. Uses the same selector formula as component 4.
-pub fn ccs_native_quotient(zeta: Challenge, alpha: Challenge, local: Challenge, next: Challenge, pub_val: Val) -> Challenge {
+pub fn ccs_native_quotient(
+    zeta: Challenge,
+    alpha: Challenge,
+    local: Challenge,
+    next: Challenge,
+    pub_val: Val,
+) -> Challenge {
     let (chain, inv_um1, _inv_umg, inv_zh) = ds_native(zeta);
     let z_h = *chain.last().unwrap() - Challenge::ONE;
     let is_first = z_h * inv_um1;
@@ -1104,7 +1301,14 @@ pub fn ccs_native_quotient(zeta: Challenge, alpha: Challenge, local: Challenge, 
     (c0 * alpha + c1) * inv_zh
 }
 
-fn ccs_build_trace(zeta: Challenge, alpha: Challenge, local: Challenge, next: Challenge, pub_val: Val, quotient: Challenge) -> RowMajorMatrix<Val> {
+fn ccs_build_trace(
+    zeta: Challenge,
+    alpha: Challenge,
+    local: Challenge,
+    next: Challenge,
+    pub_val: Val,
+    quotient: Challenge,
+) -> RowMajorMatrix<Val> {
     use p3_field::BasedVectorSpace;
     let c = |x: Challenge| -> [Val; 2] { x.as_basis_coefficients_slice().try_into().unwrap() };
     let (chain, inv_um1, inv_umg, inv_zh) = ds_native(zeta);
@@ -1117,7 +1321,15 @@ fn ccs_build_trace(zeta: Challenge, alpha: Challenge, local: Challenge, next: Ch
         r[2 * (i + 1)] = sc[0];
         r[2 * (i + 1) + 1] = sc[1];
     }
-    for (off, v) in [(CCS_INV_UM1, inv_um1), (CCS_INV_UMG, inv_umg), (CCS_INV_ZH, inv_zh), (CCS_LOCAL, local), (CCS_NEXT, next), (CCS_ALPHA, alpha), (CCS_QUOT, quotient)] {
+    for (off, v) in [
+        (CCS_INV_UM1, inv_um1),
+        (CCS_INV_UMG, inv_umg),
+        (CCS_INV_ZH, inv_zh),
+        (CCS_LOCAL, local),
+        (CCS_NEXT, next),
+        (CCS_ALPHA, alpha),
+        (CCS_QUOT, quotient),
+    ] {
         let vc = c(v);
         r[off] = vc[0];
         r[off + 1] = vc[1];
@@ -1130,10 +1342,23 @@ fn ccs_build_trace(zeta: Challenge, alpha: Challenge, local: Challenge, next: Ch
     RowMajorMatrix::new(vals, CCS_WIDTH)
 }
 
-pub fn prove_ccs(zeta: Challenge, alpha: Challenge, local: Challenge, next: Challenge, pub_val: Val, quotient: Challenge) -> Vec<u8> {
+pub fn prove_ccs(
+    zeta: Challenge,
+    alpha: Challenge,
+    local: Challenge,
+    next: Challenge,
+    pub_val: Val,
+    quotient: Challenge,
+) -> Vec<u8> {
     use p3_field::BasedVectorSpace;
     let pis = quotient.as_basis_coefficients_slice().to_vec();
-    postcard::to_allocvec(&prove(&make_config(), &ConstraintCheckWithSelectorsAir, ccs_build_trace(zeta, alpha, local, next, pub_val, quotient), &pis)).expect("serialize")
+    postcard::to_allocvec(&prove(
+        &make_config(),
+        &ConstraintCheckWithSelectorsAir,
+        ccs_build_trace(zeta, alpha, local, next, pub_val, quotient),
+        &pis,
+    ))
+    .expect("serialize")
 }
 
 pub fn verify_ccs(proof_bytes: &[u8], quotient: Challenge) -> bool {
@@ -1143,7 +1368,13 @@ pub fn verify_ccs(proof_bytes: &[u8], quotient: Challenge) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    verify(&make_config(), &ConstraintCheckWithSelectorsAir, &proof, &pis).is_ok()
+    verify(
+        &make_config(),
+        &ConstraintCheckWithSelectorsAir,
+        &proof,
+        &pis,
+    )
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -1161,8 +1392,13 @@ mod tests {
         use p3_field::BasedVectorSpace;
         use p3_uni_stark::StarkGenericConfig;
         let config = make_config();
-        let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(config.pcs(), 1 << DS_LOG_SIZE);
-        let ch = |a: u64, b: u64| Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }));
+        let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            config.pcs(),
+            1 << DS_LOG_SIZE,
+        );
+        let ch = |a: u64, b: u64| {
+            Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }))
+        };
         let zeta = ch(7_777, 5_555);
         let sels = domain.selectors_at_point(zeta);
         let (alpha, local, next, pub_val) = (ch(31, 37), ch(11, 13), ch(17, 19), Val::from_u64(23));
@@ -1172,10 +1408,16 @@ mod tests {
         let c1 = sels.is_transition * (next - local);
         let quotient = (c0 * alpha + c1) * sels.inv_vanishing;
         // the in-circuit selectors (component 4 formula) must agree with the real selectors_at_point.
-        assert_eq!(ccs_native_quotient(zeta, alpha, local, next, pub_val), quotient);
+        assert_eq!(
+            ccs_native_quotient(zeta, alpha, local, next, pub_val),
+            quotient
+        );
 
         let proof = prove_ccs(zeta, alpha, local, next, pub_val, quotient);
-        assert!(verify_ccs(&proof, quotient), "composed selectors+constraint must match native");
+        assert!(
+            verify_ccs(&proof, quotient),
+            "composed selectors+constraint must match native"
+        );
         assert!(!verify_ccs(&proof, quotient + Challenge::ONE));
     }
 
@@ -1186,7 +1428,10 @@ mod tests {
         let commitments = felts(100, 8);
         let (alpha, zeta) = native_alpha_zeta(&instance, &commitments);
         let proof = prove_transcript(&instance, &commitments, alpha, zeta);
-        assert!(verify_transcript(&proof, alpha, zeta), "in-circuit α/ζ must match the native challenger");
+        assert!(
+            verify_transcript(&proof, alpha, zeta),
+            "in-circuit α/ζ must match the native challenger"
+        );
         // wrong α ⇒ reject
         let mut bad = alpha;
         bad[0] += Val::ONE;
@@ -1212,7 +1457,10 @@ mod tests {
         ] {
             let index = native_sample_bits(x);
             let proof = prove_sample_bits(x, index);
-            assert!(verify_sample_bits(&proof, index), "in-circuit index must match native sample_bits");
+            assert!(
+                verify_sample_bits(&proof, index),
+                "in-circuit index must match native sample_bits"
+            );
             assert!(!verify_sample_bits(&proof, index ^ 1));
         }
     }
@@ -1221,15 +1469,25 @@ mod tests {
     #[ignore = "slow: in-circuit reduced opening (DEEP) vs native"]
     fn reduced_opening_matches_native() {
         use p3_field::BasedVectorSpace;
-        let ch = |a: u64, b: u64| Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }));
-        let p = [Val::from_u64(3), Val::from_u64(5), Val::from_u64(7), Val::from_u64(11)];
+        let ch = |a: u64, b: u64| {
+            Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }))
+        };
+        let p = [
+            Val::from_u64(3),
+            Val::from_u64(5),
+            Val::from_u64(7),
+            Val::from_u64(11),
+        ];
         let y = [ch(2, 1), ch(4, 3), ch(6, 5), ch(8, 7)];
         let alpha = ch(13, 17);
         let x = Val::from_u64(19);
         let zeta = ch(23, 29);
         let reduced = native_reduced_opening(p, y, alpha, x, zeta);
         let proof = prove_reduced_opening(p, y, alpha, x, zeta, reduced);
-        assert!(verify_reduced_opening(&proof, reduced), "in-circuit reduced opening must match native");
+        assert!(
+            verify_reduced_opening(&proof, reduced),
+            "in-circuit reduced opening must match native"
+        );
         assert!(!verify_reduced_opening(&proof, reduced + ch(1, 0)));
     }
 
@@ -1238,9 +1496,13 @@ mod tests {
     fn leaf_hash_matches_native() {
         use p3_symmetric::CryptographicHasher;
         let row = felts(7, LH_LEN);
-        let digest: [Val; 4] = MyHash::new(default_goldilocks_poseidon2_8()).hash_iter(row.iter().copied());
+        let digest: [Val; 4] =
+            MyHash::new(default_goldilocks_poseidon2_8()).hash_iter(row.iter().copied());
         let proof = prove_leaf_hash(&row, digest);
-        assert!(verify_leaf_hash(&proof, digest), "in-circuit leaf hash must match native MyHash");
+        assert!(
+            verify_leaf_hash(&proof, digest),
+            "in-circuit leaf hash must match native MyHash"
+        );
         let mut bad = digest;
         bad[0] += Val::ONE;
         assert!(!verify_leaf_hash(&proof, bad));
@@ -1253,13 +1515,26 @@ mod tests {
         use p3_field::BasedVectorSpace;
         use p3_uni_stark::StarkGenericConfig;
         let config = make_config();
-        let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(config.pcs(), 1 << DS_LOG_SIZE);
-        let zeta = Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { 9_999 } else { 12_345 }));
+        let domain = <MyPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            config.pcs(),
+            1 << DS_LOG_SIZE,
+        );
+        let zeta = Challenge::from_basis_coefficients_fn(|i| {
+            Val::from_u64(if i == 0 { 9_999 } else { 12_345 })
+        });
         let sels = domain.selectors_at_point(zeta);
-        let selectors = [sels.is_first_row, sels.is_last_row, sels.is_transition, sels.inv_vanishing];
+        let selectors = [
+            sels.is_first_row,
+            sels.is_last_row,
+            sels.is_transition,
+            sels.inv_vanishing,
+        ];
 
         let proof = prove_domain_selectors(zeta, selectors);
-        assert!(verify_domain_selectors(&proof, selectors), "in-circuit selectors must match native selectors_at_point");
+        assert!(
+            verify_domain_selectors(&proof, selectors),
+            "in-circuit selectors must match native selectors_at_point"
+        );
         // a wrong selector ⇒ reject
         let mut bad = selectors;
         bad[0] += Challenge::ONE;
@@ -1272,13 +1547,17 @@ mod tests {
         let felts = felts(1, FT_BLOCKS * RATE); // 32 felts
         let instance = &felts[0..8];
         let zeta_commits = &felts[8..16];
-        let round_commits: Vec<[Val; RATE]> =
-            (0..FRI_ROUNDS).map(|r| felts[16 + 4 * r..20 + 4 * r].try_into().unwrap()).collect();
+        let round_commits: Vec<[Val; RATE]> = (0..FRI_ROUNDS)
+            .map(|r| felts[16 + 4 * r..20 + 4 * r].try_into().unwrap())
+            .collect();
         let challenges = native_fri_challenges(instance, zeta_commits, &round_commits);
         assert_eq!(challenges.len(), 2 + FRI_ROUNDS); // α, ζ, β_0..β_3
 
         let proof = prove_fri_transcript(&felts, &challenges);
-        assert!(verify_fri_transcript(&proof, &challenges), "in-circuit α/ζ/β_r must match the native challenger");
+        assert!(
+            verify_fri_transcript(&proof, &challenges),
+            "in-circuit α/ζ/β_r must match the native challenger"
+        );
 
         // a tampered absorb ⇒ different challenges ⇒ unsatisfiable against the original public set.
         let mut tfelts = felts.clone();
@@ -1298,8 +1577,11 @@ mod tests {
         use p3_field::BasedVectorSpace;
         use p3_uni_stark::{verify_constraints, StarkGenericConfig};
 
-        let ext = |x: Val| Challenge::from_basis_coefficients_fn(|i| if i == 0 { x } else { Val::ZERO });
-        let ch = |a: u64, b: u64| Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }));
+        let ext =
+            |x: Val| Challenge::from_basis_coefficients_fn(|i| if i == 0 { x } else { Val::ZERO });
+        let ch = |a: u64, b: u64| {
+            Challenge::from_basis_coefficients_fn(|i| Val::from_u64(if i == 0 { a } else { b }))
+        };
 
         let config = make_config();
         let pcs = config.pcs();
@@ -1322,17 +1604,49 @@ mod tests {
         type PErr = <MyPcs as Pcs<Challenge, Challenger>>::Error;
         // native verify_constraints accepts this quotient…
         assert!(verify_constraints::<MyConfig, ConstAir, PErr>(
-            &ConstAir, &[local], &[next], None, None, &[], &[pub_val], domain, zeta, alpha, quotient
+            &ConstAir,
+            &[local],
+            &[next],
+            None,
+            None,
+            &[],
+            &[pub_val],
+            domain,
+            zeta,
+            alpha,
+            quotient
         )
         .is_ok());
         // …and the in-circuit check agrees (real prover).
-        let proof = prove_constraint_check(local, next, alpha, sels.is_first_row, sels.is_transition, sels.inv_vanishing, quotient, pub_val);
-        assert!(verify_constraint_check(&proof, quotient), "in-circuit constraint check must accept the correct quotient");
+        let proof = prove_constraint_check(
+            local,
+            next,
+            alpha,
+            sels.is_first_row,
+            sels.is_transition,
+            sels.inv_vanishing,
+            quotient,
+            pub_val,
+        );
+        assert!(
+            verify_constraint_check(&proof, quotient),
+            "in-circuit constraint check must accept the correct quotient"
+        );
 
         // a wrong quotient ⇒ both native and in-circuit reject.
         let bad = quotient + ext(Val::ONE);
         assert!(verify_constraints::<MyConfig, ConstAir, PErr>(
-            &ConstAir, &[local], &[next], None, None, &[], &[pub_val], domain, zeta, alpha, bad
+            &ConstAir,
+            &[local],
+            &[next],
+            None,
+            None,
+            &[],
+            &[pub_val],
+            domain,
+            zeta,
+            alpha,
+            bad
         )
         .is_err());
         assert!(!verify_constraint_check(&proof, bad));

@@ -1,5 +1,7 @@
 # HTLC circuit — constraint-accounting self-audit
 
+> **Document role:** Security analysis of the production shielded-HTLC AIR.
+
 A column-by-column and constraint-by-constraint review of `lattica-prover-p3::htlc_air`, the v3
 shielded-HTLC spend circuit, arguing that **every HTLC-specific column is constrained** and **no new
 binding is vacuous**. `htlc_air` is a superset of the audited `joinsplit_air`: it keeps the entire

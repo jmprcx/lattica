@@ -83,6 +83,24 @@ pub extern fn lattica_batch_prove(
     root_cap: usize,
     root_len: *usize,
 ) callconv(.c) i32;
+pub extern fn lattica_joinsplit_tree_verify(
+    proof: [*]const u8,
+    proof_len: usize,
+    root: [*]const u8,
+    root_len: usize,
+    n_tx: usize,
+) callconv(.c) i32;
+pub extern fn lattica_joinsplit_tree_prove(
+    witness_ptr: [*]const u8,
+    witness_len: usize,
+    n_tx: usize,
+    proof_out: [*]u8,
+    proof_cap: usize,
+    proof_len: *usize,
+    root_out: [*]u8,
+    root_cap: usize,
+    root_len: *usize,
+) callconv(.c) i32;
 pub extern fn lattica_htlc_batch_verify(
     proof: [*]const u8,
     proof_len: usize,

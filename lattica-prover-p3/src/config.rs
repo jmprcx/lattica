@@ -18,8 +18,6 @@
 
 use p3_air::symbolic::SymbolicAirBuilder;
 use p3_air::{Air, DebugConstraintBuilder};
-use p3_matrix::dense::RowMajorMatrix;
-use p3_uni_stark::{prove, verify, Proof, ProverConstraintFolder, VerifierConstraintFolder};
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
@@ -27,8 +25,10 @@ use p3_field::extension::BinomialExtensionField;
 use p3_field::Field;
 use p3_fri::{FriParameters, HidingFriPcs};
 use p3_goldilocks::{default_goldilocks_poseidon2_8, Goldilocks, Poseidon2Goldilocks};
+use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+use p3_uni_stark::{prove, verify, Proof, ProverConstraintFolder, VerifierConstraintFolder};
 use p3_uni_stark::{AirLayout, ProvenSecurity, StarkConfig, StarkSecurityParams};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -37,8 +37,16 @@ pub type Val = Goldilocks;
 pub type Perm = Poseidon2Goldilocks<8>;
 pub type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 pub type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-pub type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
+pub type ValMmcs = MerkleTreeHidingMmcs<
+    <Val as Field>::Packing,
+    <Val as Field>::Packing,
+    MyHash,
+    MyCompress,
+    ChaCha20Rng,
+    2,
+    4,
+    4,
+>;
 pub type Challenge = BinomialExtensionField<Val, 2>;
 pub type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 pub type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
@@ -71,6 +79,24 @@ pub fn production_fri(mmcs: ChallengeMmcs) -> FriParameters<ChallengeMmcs> {
     }
 }
 
+/// Production-parameter recursion profile for the current binary-fold monolith.
+///
+/// This keeps q96/lb4/query-PoW/cap6/random-codeword parameters, but emits
+/// binary FRI commit rounds (`max_log_arity = 1`) so the current recursive AIR
+/// can fold them. It is not the node proof profile used by `make_config`.
+#[cfg(feature = "recursion")]
+pub fn recursion_binary_fri(mmcs: ChallengeMmcs) -> FriParameters<ChallengeMmcs> {
+    FriParameters {
+        log_blowup: LOG_BLOWUP,
+        log_final_poly_len: 0,
+        max_log_arity: 1,
+        num_queries: NUM_QUERIES,
+        commit_proof_of_work_bits: 0,
+        query_proof_of_work_bits: QUERY_POW_BITS,
+        mmcs,
+    }
+}
+
 /// The production proving/verifying config.
 ///
 /// The hiding-PCS / Merkle-salt RNG must be a CSPRNG seeded from fresh OS entropy **per proof** —
@@ -78,11 +104,46 @@ pub fn production_fri(mmcs: ChallengeMmcs) -> FriParameters<ChallengeMmcs> {
 /// not actually hidden. ChaCha20Rng is ChaCha-based; `from_rng(&mut rand::rng())` reseeds each call.
 pub fn make_config() -> MyConfig {
     let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs =
-        ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
+    let val_mmcs = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm.clone()),
+        CAP_HEIGHT,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let fri = production_fri(challenge_mmcs);
-    let pcs = MyPcs::new(Dft::default(), val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::from_rng(&mut rand::rng()));
+    let pcs = MyPcs::new(
+        Dft::default(),
+        val_mmcs,
+        fri,
+        NUM_RANDOM_CODEWORDS,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
+    MyConfig::new(pcs, Challenger::new(perm))
+}
+
+/// Production-parameter binary-FRI proving/verifying config for recursive aggregation research.
+///
+/// Same proof type and security literals as `make_config`, except `max_log_arity = 1`.
+/// Proof bytes produced here must be verified with the same config profile.
+#[cfg(feature = "recursion")]
+pub fn make_recursion_binary_config() -> MyConfig {
+    let perm = default_goldilocks_poseidon2_8();
+    let val_mmcs = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm.clone()),
+        CAP_HEIGHT,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    let fri = recursion_binary_fri(challenge_mmcs);
+    let pcs = MyPcs::new(
+        Dft::default(),
+        val_mmcs,
+        fri,
+        NUM_RANDOM_CODEWORDS,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
     MyConfig::new(pcs, Challenger::new(perm))
 }
 
@@ -97,11 +158,22 @@ where
     A: Air<SymbolicAirBuilder<Val, Challenge>>,
 {
     let perm = default_goldilocks_poseidon2_8();
-    let vm = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm), CAP_HEIGHT, ChaCha20Rng::seed_from_u64(1));
+    let vm = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm),
+        CAP_HEIGHT,
+        ChaCha20Rng::seed_from_u64(1),
+    );
     let fri = production_fri(ChallengeMmcs::new(vm));
     let layout = AirLayout::from_air::<Val>(air);
-    let params = StarkSecurityParams::from_air::<Val, Challenge, A, ChallengeMmcs>(&fri, air, layout, 127, 128, 2);
-    ProvenSecurity::compute(&params, 1usize << (trace_height.trailing_zeros() as usize + 1)).security_bits()
+    let params = StarkSecurityParams::from_air::<Val, Challenge, A, ChallengeMmcs>(
+        &fri, air, layout, 127, 128, 2,
+    );
+    ProvenSecurity::compute(
+        &params,
+        1usize << (trace_height.trailing_zeros() as usize + 1),
+    )
+    .security_bits()
 }
 
 /// Prove `air` over `trace` with public inputs `pis` under the production config, returning the
@@ -133,7 +205,13 @@ where
 /// circuit's size — e.g. a batch of K ≫ `MAX_BATCH_TILES`, *below* the ≥100-bit proven-soundness floor —
 /// would verify. Making the height cap intrinsic here means the ≥100-bit floor is a property of the
 /// verify seam, not a caller obligation (v3-batch internal audit F1).
-pub fn verify_proof_bytes<A>(air: &A, n_expected_pis: usize, max_trace_height: usize, proof_bytes: &[u8], pis: &[Val]) -> bool
+pub fn verify_proof_bytes<A>(
+    air: &A,
+    n_expected_pis: usize,
+    max_trace_height: usize,
+    proof_bytes: &[u8],
+    pis: &[Val],
+) -> bool
 where
     A: Air<SymbolicAirBuilder<Val>> + for<'a> Air<VerifierConstraintFolder<'a, MyConfig>>,
 {
@@ -174,11 +252,21 @@ pub mod gpu {
     /// The production config with GPU LDE. See `super::make_config` — only the `Dft` differs.
     pub fn make_config() -> MyConfigGpu {
         let perm = default_goldilocks_poseidon2_8();
-        let val_mmcs =
-            ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let val_mmcs = ValMmcs::new(
+            MyHash::new(perm.clone()),
+            MyCompress::new(perm.clone()),
+            CAP_HEIGHT,
+            ChaCha20Rng::from_rng(&mut rand::rng()),
+        );
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
         let fri = production_fri(challenge_mmcs);
-        let pcs = MyPcsGpu::new(GpuDft, val_mmcs, fri, NUM_RANDOM_CODEWORDS, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let pcs = MyPcsGpu::new(
+            GpuDft,
+            val_mmcs,
+            fri,
+            NUM_RANDOM_CODEWORDS,
+            ChaCha20Rng::from_rng(&mut rand::rng()),
+        );
         MyConfigGpu::new(pcs, Challenger::new(perm))
     }
 
@@ -216,7 +304,12 @@ pub mod gpu {
     /// and fresh per-proof ChaCha20 randomness.
     pub fn make_config_hiding() -> MyConfigGpuHiding {
         let perm = default_goldilocks_poseidon2_8();
-        let val_mmcs = GpuHidingMerkleMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), CAP_HEIGHT, ChaCha20Rng::from_rng(&mut rand::rng()));
+        let val_mmcs = GpuHidingMerkleMmcs::new(
+            MyHash::new(perm.clone()),
+            MyCompress::new(perm.clone()),
+            CAP_HEIGHT,
+            ChaCha20Rng::from_rng(&mut rand::rng()),
+        );
         let challenge_mmcs = ChallengeMmcsGpuHiding::new(val_mmcs.clone());
         let fri = gpu_fri_params(challenge_mmcs);
         let pcs = GpuHidingPcs::new(
@@ -256,7 +349,8 @@ pub mod gpu {
     use p3_fri::TwoAdicFriPcs;
     use p3_merkle_tree::MerkleTreeMmcs;
 
-    pub type BenchValMmcsCpu = MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
+    pub type BenchValMmcsCpu =
+        MerkleTreeMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, 2, 4>;
     pub type BenchChMmcsCpu = ExtensionMmcs<Val, Challenge, BenchValMmcsCpu>;
     pub type BenchPcsCpu = TwoAdicFriPcs<Val, Dft, BenchValMmcsCpu, BenchChMmcsCpu>;
     pub type BenchConfigCpu = StarkConfig<BenchPcsCpu, Challenge, Challenger>;
@@ -283,7 +377,11 @@ pub mod gpu {
     pub fn make_bench_config_cpu() -> BenchConfigCpu {
         let perm = default_goldilocks_poseidon2_8();
         let vm = BenchValMmcsCpu::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 0);
-        let pcs = BenchPcsCpu::new(Dft::default(), vm.clone(), gpu_fri_params(BenchChMmcsCpu::new(vm)));
+        let pcs = BenchPcsCpu::new(
+            Dft::default(),
+            vm.clone(),
+            gpu_fri_params(BenchChMmcsCpu::new(vm)),
+        );
         BenchConfigCpu::new(pcs, Challenger::new(perm))
     }
 
@@ -299,20 +397,28 @@ pub mod gpu {
 /// Dev/demo config family — deterministic salts, reduced parameters. NOT for production proofs.
 pub mod demo {
     use super::{Challenge, Dft, MyCompress, MyHash, Val};
+    use p3_challenger::DuplexChallenger;
+    use p3_commit::ExtensionMmcs;
+    use p3_field::Field;
     use p3_fri::{FriParameters, HidingFriPcs};
     use p3_goldilocks::default_goldilocks_poseidon2_8;
     use p3_merkle_tree::MerkleTreeHidingMmcs;
-    use p3_commit::ExtensionMmcs;
-    use p3_challenger::DuplexChallenger;
-    use p3_field::Field;
     use p3_uni_stark::StarkConfig;
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 
     pub const LOG_BLOWUP: usize = 3; // supports the degree-7 S-box
     pub type Perm = super::Perm;
-    pub type ValMmcs =
-        MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, SmallRng, 2, 4, 4>;
+    pub type ValMmcs = MerkleTreeHidingMmcs<
+        <Val as Field>::Packing,
+        <Val as Field>::Packing,
+        MyHash,
+        MyCompress,
+        SmallRng,
+        2,
+        4,
+        4,
+    >;
     pub type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
     pub type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
     pub type MyPcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, SmallRng>;
@@ -334,7 +440,13 @@ pub mod demo {
             query_proof_of_work_bits: 1,
             mmcs: challenge_mmcs,
         };
-        let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params, 4, SmallRng::seed_from_u64(seed));
+        let pcs = MyPcs::new(
+            Dft::default(),
+            val_mmcs,
+            fri_params,
+            4,
+            SmallRng::seed_from_u64(seed),
+        );
         MyConfig::new(pcs, Challenger::new(perm))
     }
 }

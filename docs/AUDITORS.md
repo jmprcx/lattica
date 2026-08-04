@@ -1,5 +1,7 @@
 # Lattica — external audit handoff (start here)
 
+> **Document role:** Current audit entry point for the frozen production CPU surface. For navigation and historical records, see [`README.md`](README.md).
+
 Lattica is a **quantum-safe, Zcash-style shielded transaction layer** (it replaces Zcash
 Sapling/Orchard): a Plonky3 zero-knowledge circuit + a Zig protocol layer, on a shielded-only value
 model. This is the entry point for the external security audit. Read this first, then the deep-dive
@@ -74,10 +76,12 @@ here) for the cross-language link.
 ```sh
 # 1. Circuit + ABI tests (incl. adversarial corrupted-trace soundness tests, the htlc_air redeem/
 #    refund + negative tests, and the htlc prove/verify C-ABI round-trips).
-#    v3-audit tag: 82 passed, 3 ignored. Current tip (636741f): 101 passed, 17 ignored.
+#    Frozen v3-audit evidence: 82 passed, 3 ignored. Frozen v3-batch-audit evidence is recorded
+#    in v3-batch-audit-handoff.md; exact counts may increase on later development revisions.
 cd lattica-prover-p3 && cargo test --release
 
-# 1b. Slower ignored audit tests (exhaustive/fuzz-style HTLC checks). v3-audit: 3 passed; current tip: 17 passed.
+# 1b. Slower ignored audit tests (exhaustive/fuzz-style checks). Run separately and require all selected
+#     gates to pass; compare tag-specific counts with the corresponding frozen handoff.
 cd lattica-prover-p3 && cargo test --release -- --ignored
 
 # 2. The Zig protocol suite — incl. the Poseidon2 KATs that pin on-chain == circuit byte-for-byte.

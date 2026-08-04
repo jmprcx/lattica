@@ -113,7 +113,9 @@ pub(crate) fn eval_tile_persistence<AB: AirBuilder<F = Goldilocks>>(
     staged: &[usize],
 ) {
     for &c in staged {
-        builder.when_transition().assert_zero(tile_persist.clone() * (nxt[c].clone() - cur[c].clone()));
+        builder
+            .when_transition()
+            .assert_zero(tile_persist.clone() * (nxt[c].clone() - cur[c].clone()));
     }
 }
 
@@ -145,7 +147,9 @@ pub(crate) fn eval_txroot_fold<AB: AirBuilder<F = Goldilocks>>(
         let sel = p_fold[bi].clone();
         for (k, lane) in chunk.iter().enumerate() {
             match lane {
-                Some(col) => builder.assert_zero(sel.clone() * (cur[DIGEST + k].clone() - cur[*col].clone())),
+                Some(col) => {
+                    builder.assert_zero(sel.clone() * (cur[DIGEST + k].clone() - cur[*col].clone()))
+                }
                 None => builder.assert_zero(sel.clone() * cur[DIGEST + k].clone()),
             }
         }
@@ -159,12 +163,16 @@ pub(crate) fn eval_txroot_fold<AB: AirBuilder<F = Goldilocks>>(
     // 3. s_k chain link: block bi output lanes 0..DIGEST → block bi+1 input lanes 0..DIGEST.
     let sl = p_fold[n].clone();
     for k in 0..DIGEST {
-        builder.when_transition().assert_zero(sl.clone() * (nxt[k].clone() - cur[k].clone()));
+        builder
+            .when_transition()
+            .assert_zero(sl.clone() * (nxt[k].clone() - cur[k].clone()));
     }
     // 4. last s_k block output (= s_k) → root block input lanes DIGEST..2·DIGEST.
     let s2r = p_fold[n + 1].clone();
     for k in 0..DIGEST {
-        builder.when_transition().assert_zero(s2r.clone() * (nxt[DIGEST + k].clone() - cur[k].clone()));
+        builder
+            .when_transition()
+            .assert_zero(s2r.clone() * (nxt[DIGEST + k].clone() - cur[k].clone()));
     }
     // 5. root block input lanes 0..DIGEST == the running ROOT column (root_{k-1}).
     let ri = p_fold[n + 2].clone();
@@ -173,18 +181,24 @@ pub(crate) fn eval_txroot_fold<AB: AirBuilder<F = Goldilocks>>(
     }
     // 6. IV: ROOT = 0 at the global first row.
     for k in 0..DIGEST {
-        builder.when_first_row().assert_zero(cur[root_col + k].clone());
+        builder
+            .when_first_row()
+            .assert_zero(cur[root_col + k].clone());
     }
     // 7. ROOT is constant except across the per-tile update (root block output row → next row).
     let ru = p_fold[n + 3].clone();
     for k in 0..DIGEST {
+        builder.when_transition().assert_zero(
+            (one.clone() - ru.clone()) * (nxt[root_col + k].clone() - cur[root_col + k].clone()),
+        );
         builder
             .when_transition()
-            .assert_zero((one.clone() - ru.clone()) * (nxt[root_col + k].clone() - cur[root_col + k].clone()));
-        builder.when_transition().assert_zero(ru.clone() * (nxt[root_col + k].clone() - cur[k].clone()));
+            .assert_zero(ru.clone() * (nxt[root_col + k].clone() - cur[k].clone()));
     }
     // 8. the root block is the LAST block, so the global last row's cur[0..DIGEST] IS the block tx-root.
     for k in 0..DIGEST {
-        builder.when_last_row().assert_zero(cur[k].clone() - pis[k].clone());
+        builder
+            .when_last_row()
+            .assert_zero(cur[k].clone() - pis[k].clone());
     }
 }

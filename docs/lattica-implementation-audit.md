@@ -1,5 +1,7 @@
 # Lattica Implementation Audit
 
+> **Audit record:** Findings and remediation evidence for the reviewed revisions. Consult [`remediation-status.md`](remediation-status.md) for the current disposition.
+
 **Date:** 2026-06-28
 **Entry point:** `docs/AUDITORS.md`
 **Scope covered:** Plonky3 join-split AIR, Rust C ABI, Zig FFI seam, protocol hashing, transaction construction, node state machine, note/key/encryption code, canonical codecs, tests, and operational/security areas needed by a production full node.

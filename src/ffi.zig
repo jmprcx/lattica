@@ -68,6 +68,15 @@ pub const VerifyFn = *const fn (
     pi_len: usize,
 ) callconv(.c) i32;
 
+/// C ABI shape for a join-split tree verifier: proof container + expected tx-root + real tx count.
+pub const TreeVerifyFn = *const fn (
+    proof_ptr: [*]const u8,
+    proof_len: usize,
+    root_ptr: [*]const u8,
+    root_len: usize,
+    n_tx: usize,
+) callconv(.c) i32;
+
 /// Comptime generator for one pluggable backend slot: the `?Fn` global plus the set/clear/has and
 /// the fail-closed, size-bounded call wrappers every seam repeats. `seam` makes each instantiation
 /// a distinct type — its own `backend` global — even when two seams share the same `Fn` shape (Zig
@@ -246,6 +255,9 @@ pub fn clearJoinSplitProveBackend() void {
 
 /// Maximum join-split proof size the wallet buffers for (the real proof is ~0.5 MB).
 pub const MAX_PROOF_LEN: usize = 1 << 21;
+/// Maximum join-split tree proof container size. The current Rust tree seam carries all leaf proofs;
+/// a future recursive wrap can reduce this without changing the verifier call shape.
+pub const MAX_TREE_PROOF_LEN: usize = 1 << 29;
 
 /// Prove a join-split from a serialized witness via the installed prover backend (the Rust
 /// `lattica_joinsplit_prove` in production). Returns the proof bytes (allocator-owned).
@@ -319,6 +331,30 @@ pub fn clearBatchProveBackend() void {
 pub fn proveBatch(allocator: std.mem.Allocator, witness: []const u8, n_tx: usize) !struct { proof: []u8, root: Hash32 } {
     const r = try batch_prove_slot.proveBatch(allocator, witness, n_tx);
     return .{ .proof = r.proof, .root = r.root };
+}
+
+// --- join-split tree seam (proof container over validated join-split leaves) --------------------
+
+const joinsplit_tree_slot = struct {
+    var backend: ?TreeVerifyFn = null;
+};
+
+pub fn setJoinSplitTreeBackend(f: TreeVerifyFn) void {
+    joinsplit_tree_slot.backend = f;
+}
+pub fn clearJoinSplitTreeBackend() void {
+    joinsplit_tree_slot.backend = null;
+}
+pub fn hasJoinSplitTreeBackend() bool {
+    return joinsplit_tree_slot.backend != null;
+}
+
+/// Verify a join-split tree proof container against the node-recomputed block tx-root and count.
+/// Fail-closed (no backend ⇒ reject), and size-bounded before calling Rust.
+pub fn verifyJoinSplitTree(proof: []const u8, root: Hash32, n_tx: usize) bool {
+    if (proof.len > MAX_TREE_PROOF_LEN) return false;
+    const f = joinsplit_tree_slot.backend orelse return false;
+    return f(proof.ptr, proof.len, &root, root.len, n_tx) == 0;
 }
 
 // --- v3 HTLC batch seam (backend = Rust lattica_htlc_batch_*; same shapes as the join-split batch) ---

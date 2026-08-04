@@ -1,5 +1,7 @@
 # Lattica spend circuit — external audit scope, threat model & readiness (Plonky3 stack)
 
+> **Document role:** Current technical scope and threat model for the Plonky3 production surface. Read with [`AUDITORS.md`](AUDITORS.md).
+
 Auditor handoff for the **production** proving stack (`lattica-prover-p3/`). It defines what is in
 scope, the trust/threat model, the frozen parameters, known limitations, and the pre-audit readiness
 checklist. Companion docs: `docs/soundness-budget.md` (C-04), `docs/plonky3-port-plan.md` (how the

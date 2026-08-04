@@ -1,5 +1,7 @@
 # v3 batch-delta — internal adversarial audit round (W5)
 
+> **Frozen audit record:** Internal review evidence for the batch delta at its named revision.
+
 Internal pre-audit of the **production delta since the `v3-audit` tag** — the batch-aggregation circuits
 (`batch_joinsplit_air`, `batch_htlc_air`, `batch_common`), the shared refactor (`eval_spend`/config/ABI
 dedup), and the batch C-ABI + node seam. Run before the external Codex audit to front-load fixes; it does

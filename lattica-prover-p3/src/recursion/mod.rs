@@ -19,6 +19,7 @@
 //! `batch_*_air`); it only *reuses* their `pub`/`pub(crate)` primitives. See
 //! `docs/recursion-verifier-audit.md` for the in-circuit verifier spec + constraint budget.
 
+pub mod aggregation;
 pub mod fri_fold;
 pub mod fri_merkle;
 pub mod monolith; // the monolithic in-circuit verifier AIR (accept-iff-p3::verify; hiding incl.)

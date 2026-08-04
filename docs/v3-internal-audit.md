@@ -1,5 +1,7 @@
 # v3 shielded-HTLC — internal pre-audit report
 
+> **Frozen audit record:** Initial internal review of the v3 shielded-HTLC surface.
+
 A full internal security audit of the v3 lattica surface (`htlc_air` + `ShieldedHtlcTx` + the seam),
 conducted **before** the external Codex audit to find and fix issues early. Method: four independent
 adversarial reviewers (one per dimension), each blind to having built the code, plus a constraint-level

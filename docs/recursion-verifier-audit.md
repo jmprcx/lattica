@@ -1,5 +1,7 @@
 # Recursive STARK verifier — in-circuit constraint audit + spec
 
+> **Research audit:** Constraint analysis for the feature-gated recursive verifier, outside the frozen production audit.
+
 **Status (2026-07-03): BUILT + VALIDATED (R1–R5).** The in-circuit verifier ("the monolith", `MonolithAir` in
 `lattica-prover-p3/src/recursion/monolith`) is ONE AIR, proven by the audited `p3_uni_stark::prove`/`verify`,
 that **accepts iff `p3::verify(inner_proof)` accepts** — validated on a REAL production `JoinSplitAir` proof,

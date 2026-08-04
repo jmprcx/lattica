@@ -1,5 +1,7 @@
 # Lattica — v3 batch-delta audit handoff (supplements AUDITORS.md)
 
+> **Frozen record:** Evidence and scope for the completed `v3-batch-audit` artifact. Statements describing W10 as pending record the pre-tag handoff stage; W10 is now complete.
+
 **Read `docs/AUDITORS.md` first** — it is the external handoff for the v1 join-split + v3 shielded-HTLC
 surface, audited + remediated at the `v3-audit` tag (2026-06-28). This doc adds the **production delta
 since that tag**: batch aggregation (now production), the whole-crate refactor, and exchange mode. It
@@ -82,7 +84,7 @@ constraint-set change). Toolchain / `.sframe` caveat: as in AUDITORS.md §3 (rea
 
 ## 6. Status
 
-W1–W9 of the batch-delta audit-readiness track are complete (feature-gate + ABI gate; batch fuzz; batch
-constraint audit; doc-truth pass; internal adversarial round + remediation; evidence pass; this handoff;
-consistency sweep). The only remaining step is **W10 — the maintainer tags `v3-batch-audit`** at the RC
-commit to freeze the artifact (a human action, never autonomous). See `docs/audit-readiness-status.md`.
+W1–W10 of the batch-delta audit-readiness track are complete: feature gating and the ABI gate, batch
+fuzzing, constraint audit, documentation review, internal adversarial review and remediation, evidence
+capture, external handoff, consistency sweep, and the maintainer-created `v3-batch-audit` tag. See
+`audit-readiness-status.md` for the current boundary between that frozen artifact and later development.

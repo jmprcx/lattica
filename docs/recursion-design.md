@@ -1,5 +1,7 @@
 # Recursion — trustless per-user proving + proof aggregation (design & feasibility)
 
+> **Research design:** Motivation and architecture for recursive aggregation; not a production commitment.
+
 **Status: design doc for deferred future work.** This is *not* implemented. The batch-aggregation
 circuit (`batch_joinsplit_air` / `batch_htlc_air`, "one proof per block") is the implemented, validated
 interim that already handles realistic block sizes; recursion is the scale-out beyond it. This document

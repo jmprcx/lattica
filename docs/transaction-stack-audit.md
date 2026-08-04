@@ -1,5 +1,7 @@
 # Lattica Transaction Stack Production Audit
 
+> **Historical audit:** Findings from the earlier transaction stack. Current dispositions are consolidated in [`remediation-status.md`](remediation-status.md).
+
 > **⚠ Historical / reference-only — not the v1 audit artifact.** This is the earlier (2026-06-26)
 > pre-Plonky3 audit; its findings are tracked as closed/superseded in `remediation-status.md`. The
 > current implementation audit is `lattica-implementation-audit.md`. Start at [`AUDITORS.md`](AUDITORS.md).

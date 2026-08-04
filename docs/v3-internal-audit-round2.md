@@ -1,5 +1,7 @@
 # v3 internal pre-audit — round 2 (expanded coverage & depth)
 
+> **Frozen audit record:** Second internal review round for the identified v3 revision.
+
 A second, deeper internal pass before the external Codex audit, expanding into the layers round 1
 treated as trusted. Method: **eight** independent adversarial reviewers (one per dimension) plus a
 **refutation skeptic** that tried to disprove the most serious findings before any code changed. Where

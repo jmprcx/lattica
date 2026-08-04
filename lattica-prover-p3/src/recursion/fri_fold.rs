@@ -209,7 +209,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldChainAir {
         // per round (transition): inv2x correct, next.E = fold(cur), next.X = cur.X² (squaring map)
         let x = cur[C_X].clone();
         let i2x = cur[C_I2X].clone();
-        builder.when_transition().assert_zero(i2x.clone() * (two.clone() * x.clone()) - AB::Expr::ONE);
+        builder
+            .when_transition()
+            .assert_zero(i2x.clone() * (two.clone() * x.clone()) - AB::Expr::ONE);
 
         let e = (cur[C_E].clone(), cur[C_E + 1].clone());
         let s = (cur[C_S].clone(), cur[C_S + 1].clone());
@@ -219,9 +221,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldChainAir {
         let prod = emul(diff, b);
         let folded0 = sum.0 * half.clone() + prod.0 * i2x.clone();
         let folded1 = sum.1 * half.clone() + prod.1 * i2x.clone();
-        builder.when_transition().assert_zero(nxt[C_E].clone() - folded0);
-        builder.when_transition().assert_zero(nxt[C_E + 1].clone() - folded1);
-        builder.when_transition().assert_zero(nxt[C_X].clone() - x.clone() * x.clone());
+        builder
+            .when_transition()
+            .assert_zero(nxt[C_E].clone() - folded0);
+        builder
+            .when_transition()
+            .assert_zero(nxt[C_E + 1].clone() - folded1);
+        builder
+            .when_transition()
+            .assert_zero(nxt[C_X].clone() - x.clone() * x.clone());
 
         // last row: running eval == public final (the final_poly value)
         {
@@ -234,7 +242,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FoldChainAir {
 
 /// Native commit-phase fold chain: returns the per-round running evals (`evals[0]` = initial,
 /// `evals[rounds]` = final) and the squaring point sequence.
-pub fn native_fold_chain(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0: Val) -> Vec<Challenge> {
+pub fn native_fold_chain(
+    e0: Challenge,
+    sibs: &[Challenge],
+    betas: &[Challenge],
+    x0: Val,
+) -> Vec<Challenge> {
     assert_eq!(sibs.len(), betas.len());
     let mut e = e0;
     let mut x = x0;
@@ -248,7 +261,12 @@ pub fn native_fold_chain(e0: Challenge, sibs: &[Challenge], betas: &[Challenge],
 }
 
 #[cfg(test)]
-fn build_chain_trace(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0: Val) -> RowMajorMatrix<Val> {
+fn build_chain_trace(
+    e0: Challenge,
+    sibs: &[Challenge],
+    betas: &[Challenge],
+    x0: Val,
+) -> RowMajorMatrix<Val> {
     let rounds = sibs.len();
     let height = (rounds + 1).next_power_of_two().max(2);
     let evals = native_fold_chain(e0, sibs, betas, x0);
@@ -256,7 +274,11 @@ fn build_chain_trace(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0:
     let mut vals = vec![Val::ZERO; height * CHAIN_WIDTH];
     for r in 0..height {
         let base = r * CHAIN_WIDTH;
-        let e = if r < evals.len() { evals[r] } else { *evals.last().unwrap() };
+        let e = if r < evals.len() {
+            evals[r]
+        } else {
+            *evals.last().unwrap()
+        };
         let ec = coeffs(e);
         vals[base + C_E] = ec[0];
         vals[base + C_E + 1] = ec[1];
@@ -283,10 +305,21 @@ fn build_chain_trace(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0:
 
 /// Prove the commit-phase fold chain takes `e0` to `final_eval` under the given siblings/betas/point.
 #[cfg(test)]
-pub fn prove_fold_chain(e0: Challenge, sibs: &[Challenge], betas: &[Challenge], x0: Val, final_eval: Challenge) -> Vec<u8> {
+pub fn prove_fold_chain(
+    e0: Challenge,
+    sibs: &[Challenge],
+    betas: &[Challenge],
+    x0: Val,
+    final_eval: Challenge,
+) -> Vec<u8> {
     let mut pis = coeffs(e0).to_vec();
     pis.extend_from_slice(&coeffs(final_eval));
-    let proof = prove(&make_config(), &FoldChainAir, build_chain_trace(e0, sibs, betas, x0), &pis);
+    let proof = prove(
+        &make_config(),
+        &FoldChainAir,
+        build_chain_trace(e0, sibs, betas, x0),
+        &pis,
+    );
     postcard::to_allocvec(&proof).expect("serialize")
 }
 
@@ -307,8 +340,19 @@ use crate::config::{make_config, MyConfig};
 
 /// Prove the in-circuit fold of (e0,e1,beta,s) equals `claimed`.
 #[cfg(test)]
-pub fn prove_fold(e0: Challenge, e1: Challenge, beta: Challenge, s: Val, claimed: Challenge) -> Vec<u8> {
-    let proof = prove(&make_config(), &FriFoldAir, build_trace(e0, e1, beta, s), &coeffs(claimed).to_vec());
+pub fn prove_fold(
+    e0: Challenge,
+    e1: Challenge,
+    beta: Challenge,
+    s: Val,
+    claimed: Challenge,
+) -> Vec<u8> {
+    let proof = prove(
+        &make_config(),
+        &FriFoldAir,
+        build_trace(e0, e1, beta, s),
+        &coeffs(claimed).to_vec(),
+    );
     postcard::to_allocvec(&proof).expect("serialize")
 }
 
@@ -318,7 +362,13 @@ pub fn verify_fold(proof_bytes: &[u8], claimed: Challenge) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    verify(&make_config(), &FriFoldAir, &proof, &coeffs(claimed).to_vec()).is_ok()
+    verify(
+        &make_config(),
+        &FriFoldAir,
+        &proof,
+        &coeffs(claimed).to_vec(),
+    )
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -362,13 +412,11 @@ mod tests {
             let g = Goldilocks::two_adic_generator(log_height + 1);
             let s = g.exp_u64(reverse_bits(index, log_height) as u64);
             let mine = native_fold(e0, e1, beta, s);
-            let p3: Challenge = <TwoAdicFriFolding<(), ()> as FriFoldingStrategy<Goldilocks, Challenge>>::fold_row(
-                &folding,
-                index,
-                log_height,
-                1,
-                beta,
-                [e0, e1].into_iter(),
+            let p3: Challenge = <TwoAdicFriFolding<(), ()> as FriFoldingStrategy<
+                Goldilocks,
+                Challenge,
+            >>::fold_row(
+                &folding, index, log_height, 1, beta, [e0, e1].into_iter()
             );
             assert_eq!(mine, p3, "index={index} log_height={log_height}");
         }

@@ -29,7 +29,9 @@ use p3_uni_stark::{prove, verify, Proof, StarkConfig};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use crate::poseidon2_air::{ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W};
+use crate::poseidon2_air::{
+    ext_linear, int_linear, native_permute, native_steps, periodic_table, pow7, BLOCK, W,
+};
 
 type Val = Goldilocks;
 const DIGEST: usize = 4;
@@ -83,7 +85,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriMerkleAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let one = AB::Expr::ONE;
 
@@ -96,10 +102,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriMerkleAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let c = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -121,12 +133,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriMerkleAir {
                 // input[k]   = (1-b)·leaf[k] + b·sib[k]
                 fr.assert_zero(
                     cur[k].clone()
-                        - ((one.clone() - b.clone()) * leaf[k].clone() + b.clone() * cur[SIB + k].clone()),
+                        - ((one.clone() - b.clone()) * leaf[k].clone()
+                            + b.clone() * cur[SIB + k].clone()),
                 );
                 // input[4+k] = (1-b)·sib[k]  + b·leaf[k]
                 fr.assert_zero(
                     cur[DIGEST + k].clone()
-                        - ((one.clone() - b.clone()) * cur[SIB + k].clone() + b.clone() * leaf[k].clone()),
+                        - ((one.clone() - b.clone()) * cur[SIB + k].clone()
+                            + b.clone() * leaf[k].clone()),
                 );
             }
         }
@@ -141,13 +155,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriMerkleAir {
                 builder.when_transition().assert_zero(
                     bl.clone()
                         * (nxt[k].clone()
-                            - ((one.clone() - nb.clone()) * cur[k].clone() + nb.clone() * nxt[SIB + k].clone())),
+                            - ((one.clone() - nb.clone()) * cur[k].clone()
+                                + nb.clone() * nxt[SIB + k].clone())),
                 );
                 // nxt.input[4+k] = (1-nb)·nxt.sib[k] + nb·node[k]
                 builder.when_transition().assert_zero(
                     bl.clone()
                         * (nxt[DIGEST + k].clone()
-                            - ((one.clone() - nb.clone()) * nxt[SIB + k].clone() + nb.clone() * cur[k].clone())),
+                            - ((one.clone() - nb.clone()) * nxt[SIB + k].clone()
+                                + nb.clone() * cur[k].clone())),
                 );
             }
         }
@@ -166,8 +182,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for FriMerkleAir {
 type Perm = Poseidon2Goldilocks<8>;
 type MyHash = PaddingFreeSponge<Perm, 8, 4, 4>;
 type MyCompress = TruncatedPermutation<Perm, 2, 4, 8>;
-type ValMmcs =
-    MerkleTreeHidingMmcs<<Val as Field>::Packing, <Val as Field>::Packing, MyHash, MyCompress, ChaCha20Rng, 2, 4, 4>;
+type ValMmcs = MerkleTreeHidingMmcs<
+    <Val as Field>::Packing,
+    <Val as Field>::Packing,
+    MyHash,
+    MyCompress,
+    ChaCha20Rng,
+    2,
+    4,
+    4,
+>;
 type Challenge = BinomialExtensionField<Val, 2>;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Challenger = DuplexChallenger<Val, Perm, 8, 4>;
@@ -177,7 +201,12 @@ type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
 
 fn make_config() -> MyConfig {
     let perm = default_goldilocks_poseidon2_8();
-    let val_mmcs = ValMmcs::new(MyHash::new(perm.clone()), MyCompress::new(perm.clone()), 6, ChaCha20Rng::from_rng(&mut rand::rng()));
+    let val_mmcs = ValMmcs::new(
+        MyHash::new(perm.clone()),
+        MyCompress::new(perm.clone()),
+        6,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let fri = FriParameters {
         log_blowup: 4,
@@ -188,7 +217,13 @@ fn make_config() -> MyConfig {
         query_proof_of_work_bits: 16,
         mmcs: challenge_mmcs,
     };
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri, 4, ChaCha20Rng::from_rng(&mut rand::rng()));
+    let pcs = Pcs::new(
+        Dft::default(),
+        val_mmcs,
+        fri,
+        4,
+        ChaCha20Rng::from_rng(&mut rand::rng()),
+    );
     MyConfig::new(pcs, Challenger::new(perm))
 }
 
@@ -206,7 +241,10 @@ pub fn build_tree(leaves: &[[Val; DIGEST]]) -> Vec<Vec<[Val; DIGEST]>> {
 }
 
 /// An authentication path for leaf `idx`: (leaf, [(sibling, node_is_right_child)], root).
-pub fn opening(levels: &[Vec<[Val; DIGEST]>], idx: usize) -> ([Val; DIGEST], Vec<([Val; DIGEST], bool)>, [Val; DIGEST]) {
+pub fn opening(
+    levels: &[Vec<[Val; DIGEST]>],
+    idx: usize,
+) -> ([Val; DIGEST], Vec<([Val; DIGEST], bool)>, [Val; DIGEST]) {
     let leaf = levels[0][idx];
     let mut path = Vec::with_capacity(levels.len() - 1);
     let mut i = idx;
@@ -246,7 +284,11 @@ pub fn build_trace(leaf: [Val; DIGEST], path: &[([Val; DIGEST], bool)]) -> RowMa
 }
 
 /// Prove that the opening (leaf, path) authenticates to `root`; returns the serialized proof.
-pub fn prove_opening(leaf: [Val; DIGEST], path: &[([Val; DIGEST], bool)], root: [Val; DIGEST]) -> Vec<u8> {
+pub fn prove_opening(
+    leaf: [Val; DIGEST],
+    path: &[([Val; DIGEST], bool)],
+    root: [Val; DIGEST],
+) -> Vec<u8> {
     let mut pis = leaf.to_vec();
     pis.extend_from_slice(&root);
     let proof = prove(&make_config(), &FriMerkleAir, build_trace(leaf, path), &pis);
@@ -280,7 +322,10 @@ mod tests {
         let mut s = [Val::ZERO; W];
         s[..DIGEST].copy_from_slice(&l);
         s[DIGEST..].copy_from_slice(&r);
-        assert_eq!(merge(l, r), <[Val; DIGEST]>::try_from(&native_permute(s)[..DIGEST]).unwrap());
+        assert_eq!(
+            merge(l, r),
+            <[Val; DIGEST]>::try_from(&native_permute(s)[..DIGEST]).unwrap()
+        );
     }
 
     #[test]
@@ -332,12 +377,20 @@ mod tests {
         let proof: Proof<MyConfig> = postcard::from_bytes(&bytes).unwrap();
         let fri = &proof.opening_proof.1;
         assert_eq!(fri.query_proofs.len(), 96, "one query proof per FRI query");
-        assert_eq!(fri.final_poly.len(), 1, "log_final_poly_len = 0 ⇒ constant final poly");
+        assert_eq!(
+            fri.final_poly.len(),
+            1,
+            "log_final_poly_len = 0 ⇒ constant final poly"
+        );
         assert!(!fri.commit_phase_commits.is_empty());
         let rounds = fri.commit_phase_commits.len();
         for q in &fri.query_proofs {
             // each query opens once per commit-phase round
-            assert_eq!(q.commit_phase_openings.len(), rounds, "openings per query == commit rounds");
+            assert_eq!(
+                q.commit_phase_openings.len(),
+                rounds,
+                "openings per query == commit rounds"
+            );
         }
         println!(
             "B3-wire proof structure: {} queries, {} commit rounds, final_poly len {}",

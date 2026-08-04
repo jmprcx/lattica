@@ -1,5 +1,7 @@
 # Join-split circuit — constraint-accounting self-audit
 
+> **Document role:** Security analysis of the production join-split AIR.
+
 A column-by-column and constraint-by-constraint review of `lattica-prover-p3::joinsplit_air`, arguing
 that **every witness column is constrained** and **no binding is vacuous** (the failure mode an
 external audit hunts for). This is a self-audit to feed the Phase-3 review, not a substitute for it.

@@ -64,7 +64,15 @@ where
         hp ^= 0x1f;
         hp = hp.wrapping_mul(FNV_PRIME);
     }
-    (air.width(), air.num_periodic_columns(), air.num_public_values(), n, maxd, h, hp)
+    (
+        air.width(),
+        air.num_periodic_columns(),
+        air.num_public_values(),
+        n,
+        maxd,
+        h,
+        hp,
+    )
 }
 
 /// The recursion monolith at its two canonical shapes (synthetic geometry — `get_symbolic_constraints`
@@ -81,7 +89,8 @@ fn monolith_air(is_zk: usize) -> crate::recursion::monolith::MonolithAir {
         inner_counter: false,
         column_window: false,
         k_instances: 1,
-        fold: false, fold_txstmt: false,
+        fold: false,
+        fold_txstmt: false,
         constraints: vec![],
         w_inner_f: 1,
         n_pub_f: 1,
@@ -95,11 +104,23 @@ fn monolith_air(is_zk: usize) -> crate::recursion::monolith::MonolithAir {
 fn pinned_constraint_fingerprints() {
     #[allow(unused_mut)]
     let mut got: Vec<(&str, Fingerprint)> = vec![
-        ("JoinSplitAir", fingerprint(&crate::joinsplit_air::JoinSplitAir)),
+        (
+            "JoinSplitAir",
+            fingerprint(&crate::joinsplit_air::JoinSplitAir),
+        ),
         ("HtlcAir", fingerprint(&crate::htlc_air::HtlcAir)),
-        ("JoinSplitBatchAir", fingerprint(&crate::batch_joinsplit_air::JoinSplitBatchAir)),
-        ("HtlcBatchAir", fingerprint(&crate::batch_htlc_air::HtlcBatchAir)),
-        ("Poseidon2RowsAir", fingerprint(&crate::poseidon2_air::Poseidon2RowsAir)),
+        (
+            "JoinSplitBatchAir",
+            fingerprint(&crate::batch_joinsplit_air::JoinSplitBatchAir),
+        ),
+        (
+            "HtlcBatchAir",
+            fingerprint(&crate::batch_htlc_air::HtlcBatchAir),
+        ),
+        (
+            "Poseidon2RowsAir",
+            fingerprint(&crate::poseidon2_air::Poseidon2RowsAir),
+        ),
     ];
     // The recursion monolith pins compile only under `--features recursion` (the module is gated out of the
     // default/production build); the 5 production-AIR pins above are always checked.
@@ -117,11 +138,26 @@ fn pinned_constraint_fingerprints() {
         // through the refactor; the periodic-content fnv (last) was added by the post-refactor review
         // (the symbolic constraints cannot see periodic VALUES) and harvested at 324c45b — the periodic
         // producers were byte-compared against eda58ee at that point. Re-pin policy: module doc.
-        ("JoinSplitAir", (19, 33, 26, 81, 8, 10377435458428738100, 2370469867362978521)),
-        ("HtlcAir", (36, 43, 31, 145, 8, 399889076546091351, 6527013588378775531)),
-        ("JoinSplitBatchAir", (49, 45, 4, 167, 8, 9176787058577691560, 6216047000859822608)),
-        ("HtlcBatchAir", (71, 57, 4, 244, 9, 14186304468083107211, 7128159627846454138)),
-        ("Poseidon2RowsAir", (8, 11, 8, 16, 8, 4555829733017345773, 3694726246285696047)),
+        (
+            "JoinSplitAir",
+            (19, 33, 26, 81, 8, 10377435458428738100, 2370469867362978521),
+        ),
+        (
+            "HtlcAir",
+            (36, 43, 31, 145, 8, 399889076546091351, 6527013588378775531),
+        ),
+        (
+            "JoinSplitBatchAir",
+            (49, 45, 4, 167, 8, 9176787058577691560, 6216047000859822608),
+        ),
+        (
+            "HtlcBatchAir",
+            (71, 57, 4, 244, 9, 14186304468083107211, 7128159627846454138),
+        ),
+        (
+            "Poseidon2RowsAir",
+            (8, 11, 8, 16, 8, 4555829733017345773, 3694726246285696047),
+        ),
     ];
     // MonolithAir[is_zk=0] re-pinned 2026-07-03 (was maxdeg 13, fnv 2831239969576965911): the merge-link
     // `not_term` migrated from the product Π(1−one_hot) to the row-wise-identical disjoint-one-hot SUM form —
@@ -130,12 +166,41 @@ fn pinned_constraint_fingerprints() {
     // same trace, degree-1 link. is_zk=1 UNCHANGED. RESEARCH — feature-gated with the recursion module.
     #[cfg(feature = "recursion")]
     {
-        pinned.push(("MonolithAir[is_zk=0,db=6]", (193, 56, 53, 380, 9, 8931234269209497483, 4845014777825624174)));
-        pinned.push(("MonolithAir[is_zk=1,hiding]", (619, 81, 2271, 875, 9, 5788871046264575537, 9300941697942390572)));
+        pinned.push((
+            "MonolithAir[is_zk=0,db=6]",
+            (
+                193,
+                56,
+                53,
+                380,
+                9,
+                8931234269209497483,
+                4845014777825624174,
+            ),
+        ));
+        pinned.push((
+            "MonolithAir[is_zk=1,hiding]",
+            (
+                619,
+                81,
+                2271,
+                875,
+                9,
+                5788871046264575537,
+                9300941697942390572,
+            ),
+        ));
     }
     for (name, fp) in &pinned {
-        let (_, actual) = got.iter().find(|(n, _)| n == name).expect("pinned AIR present");
+        let (_, actual) = got
+            .iter()
+            .find(|(n, _)| n == name)
+            .expect("pinned AIR present");
         assert_eq!(actual, fp, "{name}: constraint fingerprint drifted");
     }
-    assert_eq!(pinned.len(), got.len(), "every computed fingerprint must be pinned (harvest run: pins empty)");
+    assert_eq!(
+        pinned.len(),
+        got.len(),
+        "every computed fingerprint must be pinned (harvest run: pins empty)"
+    );
 }

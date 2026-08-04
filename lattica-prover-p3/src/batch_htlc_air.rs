@@ -17,12 +17,12 @@ use p3_uni_stark::prove;
 
 use crate::batch_common::padded_tiles;
 use crate::domains::DOM_TXROOT;
-use crate::poseidon2_air::BLOCK;
 use crate::htlc_air::{
-    build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST, HEIGHT,
-    M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_HASHLOCK, PI_HEIGHT, PI_MINT, PI_NF, PI_OUTCM,
-    PI_TXBIND, WIDTH,
+    build_trace, eval_spend, merge, periodic, public_values, Input, Output, Witness, DEPTH, DIGEST,
+    HEIGHT, M_OUT, N_IN, N_PERIODIC, N_PUBLIC, PI_ANCHOR, PI_FEE, PI_HASHLOCK, PI_HEIGHT, PI_MINT,
+    PI_NF, PI_OUTCM, PI_TXBIND, WIDTH,
 };
+use crate::poseidon2_air::BLOCK;
 
 type Val = Goldilocks;
 
@@ -81,7 +81,14 @@ pub fn dummy_witness() -> Witness {
         hashlock: z4,
         timeout: 0,
     };
-    let out = Output { recipient: z4, asset: Val::ZERO, note_type: Val::ZERO, value: 0, rho: [Val::ZERO; 2], rcm: [Val::ZERO; 2] };
+    let out = Output {
+        recipient: z4,
+        asset: Val::ZERO,
+        note_type: Val::ZERO,
+        value: 0,
+        rho: [Val::ZERO; 2],
+        rcm: [Val::ZERO; 2],
+    };
     Witness {
         inputs: core::array::from_fn(|_| inp.clone()),
         outputs: [out; M_OUT],
@@ -184,7 +191,13 @@ fn batch_periodic() -> Vec<Vec<Val>> {
     let mut cols = periodic();
     // Same shared selectors as batch_joinsplit (geometry as data); the HTLC delta is only that
     // FOLD_SK_BLOCKS is larger (9 vs 7) — order MUST match the P_* indices above.
-    crate::batch_common::append_batch_selectors(&mut cols, TILE_HEIGHT, FOLD_SK_BLOCKS, FOLD_BASE, ROOT_BLOCK);
+    crate::batch_common::append_batch_selectors(
+        &mut cols,
+        TILE_HEIGHT,
+        FOLD_SK_BLOCKS,
+        FOLD_BASE,
+        ROOT_BLOCK,
+    );
     cols
 }
 
@@ -207,9 +220,23 @@ impl BaseAir<Goldilocks> for HtlcBatchAir {
 
 impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcBatchAir {
     fn eval(&self, builder: &mut AB) {
-        let cur: Vec<AB::Expr> = builder.main().current_slice().iter().map(|&x| x.into()).collect();
-        let nxt: Vec<AB::Expr> = builder.main().next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let cur: Vec<AB::Expr> = builder
+            .main()
+            .current_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
+        let nxt: Vec<AB::Expr> = builder
+            .main()
+            .next_slice()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         let one = AB::Expr::ONE;
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
         let tile_last = p[P_TILE_LAST].clone();
@@ -265,7 +292,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for HtlcBatchAir {
 
         // 4. the in-circuit tx-root fold — the SAME shared emitter as batch_joinsplit_air; the HTLC delta
         //    is only the two extra chunks (Height, hashlock) in fold_chunks() and the larger FOLD_SK_BLOCKS.
-        crate::batch_common::eval_txroot_fold(builder, &cur, &nxt, &pis, &p[P_FOLD_IN..], &fold_chunks(), ROOT);
+        crate::batch_common::eval_txroot_fold(
+            builder,
+            &cur,
+            &nxt,
+            &pis,
+            &p[P_FOLD_IN..],
+            &fold_chunks(),
+            ROOT,
+        );
     }
 }
 
@@ -287,17 +322,29 @@ pub fn build_batch_trace(ws: &[Witness]) -> RowMajorMatrix<Val> {
         }
         for r in 0..TILE_HEIGHT {
             let b = (toff + r) * BATCH_WIDTH;
-            t[b + S_ANCHOR..b + S_ANCHOR + DIGEST].copy_from_slice(&pv[PI_ANCHOR..PI_ANCHOR + DIGEST]);
-            t[b + S_NF..b + S_NF + N_IN * DIGEST].copy_from_slice(&pv[PI_NF..PI_NF + N_IN * DIGEST]);
-            t[b + S_OUTCM..b + S_OUTCM + M_OUT * DIGEST].copy_from_slice(&pv[PI_OUTCM..PI_OUTCM + M_OUT * DIGEST]);
+            t[b + S_ANCHOR..b + S_ANCHOR + DIGEST]
+                .copy_from_slice(&pv[PI_ANCHOR..PI_ANCHOR + DIGEST]);
+            t[b + S_NF..b + S_NF + N_IN * DIGEST]
+                .copy_from_slice(&pv[PI_NF..PI_NF + N_IN * DIGEST]);
+            t[b + S_OUTCM..b + S_OUTCM + M_OUT * DIGEST]
+                .copy_from_slice(&pv[PI_OUTCM..PI_OUTCM + M_OUT * DIGEST]);
             t[b + S_FEE] = pv[PI_FEE];
             t[b + S_MINT] = pv[PI_MINT];
-            t[b + S_TXBIND..b + S_TXBIND + DIGEST].copy_from_slice(&pv[PI_TXBIND..PI_TXBIND + DIGEST]);
+            t[b + S_TXBIND..b + S_TXBIND + DIGEST]
+                .copy_from_slice(&pv[PI_TXBIND..PI_TXBIND + DIGEST]);
             t[b + S_HEIGHT] = pv[PI_HEIGHT];
-            t[b + S_HASHLOCK..b + S_HASHLOCK + DIGEST].copy_from_slice(&pv[PI_HASHLOCK..PI_HASHLOCK + DIGEST]);
+            t[b + S_HASHLOCK..b + S_HASHLOCK + DIGEST]
+                .copy_from_slice(&pv[PI_HASHLOCK..PI_HASHLOCK + DIGEST]);
         }
-        let new_root =
-            crate::batch_common::write_fold_blocks(&mut t, toff, BATCH_WIDTH, &statement_chunks(&pv), root, FOLD_BASE, ROOT_BLOCK);
+        let new_root = crate::batch_common::write_fold_blocks(
+            &mut t,
+            toff,
+            BATCH_WIDTH,
+            &statement_chunks(&pv),
+            root,
+            FOLD_BASE,
+            ROOT_BLOCK,
+        );
         let rout = root_out_row();
         for r in 0..TILE_HEIGHT {
             let b = (toff + r) * BATCH_WIDTH;
@@ -326,7 +373,13 @@ pub fn proven_security_bits(n: usize) -> usize {
 
 /// Verify an HTLC batch proof against the block tx-root.
 pub fn verify_batch_bytes(proof_bytes: &[u8], root: &[Val]) -> bool {
-    crate::config::verify_proof_bytes(&HtlcBatchAir, DIGEST, crate::batch_common::MAX_BATCH_TILES * TILE_HEIGHT, proof_bytes, root)
+    crate::config::verify_proof_bytes(
+        &HtlcBatchAir,
+        DIGEST,
+        crate::batch_common::MAX_BATCH_TILES * TILE_HEIGHT,
+        proof_bytes,
+        root,
+    )
 }
 
 #[cfg(test)]
@@ -351,8 +404,24 @@ mod tests {
         let d = felts(&dummy_sk());
         println!("htlc_seq_digest = {s:?}");
         println!("htlc_dummy_sk = {d:?}");
-        assert_eq!(s, [12024734340241841742, 6068874100855730733, 14239999004995857547, 2452102150457936639]);
-        assert_eq!(d, [10539992321146962576, 13450880049652540131, 10286920310671709176, 6485382129692956089]);
+        assert_eq!(
+            s,
+            [
+                12024734340241841742,
+                6068874100855730733,
+                14239999004995857547,
+                2452102150457936639
+            ]
+        );
+        assert_eq!(
+            d,
+            [
+                10539992321146962576,
+                13450880049652540131,
+                10286920310671709176,
+                6485382129692956089
+            ]
+        );
     }
 
     #[test]
@@ -380,7 +449,10 @@ mod tests {
         let mut b = dummy_witness();
         a.current_height = 50;
         b.current_height = 51;
-        assert_ne!(tx_statement_digest(&public_values(&a)), tx_statement_digest(&public_values(&b)));
+        assert_ne!(
+            tx_statement_digest(&public_values(&a)),
+            tx_statement_digest(&public_values(&b))
+        );
     }
 
     #[test]
@@ -395,7 +467,11 @@ mod tests {
         let root = batch_root(&ws);
         let h = trace.values.len() / BATCH_WIDTH;
         for k in 0..DIGEST {
-            assert_eq!(trace.values[(h - 1) * BATCH_WIDTH + k], root[k], "htlc fold limb {k} != oracle root");
+            assert_eq!(
+                trace.values[(h - 1) * BATCH_WIDTH + k],
+                root[k],
+                "htlc fold limb {k} != oracle root"
+            );
         }
     }
 
@@ -406,7 +482,10 @@ mod tests {
     fn htlc_batch_n1_verifies_under_txroot() {
         let w = variant(1);
         let root = batch_root(std::slice::from_ref(&w));
-        assert!(verify_batch_bytes(&prove_batch_to_bytes(std::slice::from_ref(&w)), &root));
+        assert!(verify_batch_bytes(
+            &prove_batch_to_bytes(std::slice::from_ref(&w)),
+            &root
+        ));
     }
 
     #[test]

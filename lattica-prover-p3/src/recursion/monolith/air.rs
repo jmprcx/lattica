@@ -114,7 +114,12 @@ impl MonolithAir {
     // input-Merkle leaf felt width (the opened row hashed to the leaf). is_zk=0 = the inner trace row (w_inner);
     // is_zk=1 = the COMMITTED row (w_inner ‖ codewords) ‖ salt — the salted hiding leaf (hiding_commit_layout).
     pub(crate) fn input_leaf_felts(&self) -> usize {
-        self.w_inner() + if self.is_zk == 1 { HIDING_NUM_CW + HIDING_SALT } else { 0 }
+        self.w_inner()
+            + if self.is_zk == 1 {
+                HIDING_NUM_CW + HIDING_SALT
+            } else {
+                0
+            }
     }
     pub(crate) fn leaf_blocks(&self) -> usize {
         self.input_leaf_felts().div_ceil(RATE)
@@ -215,7 +220,12 @@ impl MonolithAir {
     // bound to their ζ-definitions, so the constraint tree is evaluated with selector VALUES (no per-constraint
     // inverse-clearing). Placed after the column window; is_trans = ζ−g^{-1} is computed inline (no column).
     pub(crate) fn sel_base(&self) -> usize {
-        self.pw_base() + if self.column_window { self.pis_count() + 2 * self.cm_rounds() } else { 0 }
+        self.pw_base()
+            + if self.column_window {
+                self.pis_count() + 2 * self.cm_rounds()
+            } else {
+                0
+            }
     }
     pub(crate) fn sel(&self, i: usize) -> usize {
         self.sel_base() + i // 0,1 = is_first; 2,3 = is_last; 4,5 = inv_van
@@ -230,7 +240,11 @@ impl MonolithAir {
     // quotient at zeta over nqc chunks. is_zk=0 reduces to the legacy [trace(W) | next(W) | quot(2*nqc)] layout,
     // so every offset below is byte-for-byte at is_zk=0. ----
     pub(crate) fn cw(&self) -> usize {
-        if self.is_zk == 1 { HIDING_NUM_CW } else { 0 }
+        if self.is_zk == 1 {
+            HIDING_NUM_CW
+        } else {
+            0
+        }
     }
     // committed trace-row width (px-bound reduced-opening terms per opening point): W, or W+CW hiding.
     pub(crate) fn trm_committed_w(&self) -> usize {
@@ -238,7 +252,11 @@ impl MonolithAir {
     }
     // first trace-zeta term index (past the prepended random round when is_zk=1).
     pub(crate) fn trm_trace_base(&self) -> usize {
-        if self.is_zk == 1 { HIDING_RAND_PUB + HIDING_NUM_CW } else { 0 }
+        if self.is_zk == 1 {
+            HIDING_RAND_PUB + HIDING_NUM_CW
+        } else {
+            0
+        }
     }
     pub(crate) fn trm_next_base(&self) -> usize {
         self.trm_trace_base() + self.trm_committed_w()
@@ -381,7 +399,9 @@ impl MonolithAir {
     // column-window: the inner-proof "pis" as a witness column window (held constant across the instance) so
     // the monolith can be tiled. Placed after all other columns.
     pub(crate) fn pw_base(&self) -> usize {
-        self.carriers_base() + 4 * self.cm_rounds() + if self.full_cap() { self.n_cap_c() } else { 0 }
+        self.carriers_base()
+            + 4 * self.cm_rounds()
+            + if self.full_cap() { self.n_cap_c() } else { 0 }
     }
     pub(crate) fn pw(&self, i: usize) -> usize {
         self.pw_base() + i
@@ -403,7 +423,9 @@ impl MonolithAir {
     }
     pub(crate) fn commit_caps_len(&self) -> usize {
         if self.full_cap() {
-            (0..self.cm_rounds()).map(|r| self.commit_cap_size(r) * 4).sum::<usize>()
+            (0..self.cm_rounds())
+                .map(|r| self.commit_cap_size(r) * 4)
+                .sum::<usize>()
         } else {
             self.cm_rounds() * 4
         }
@@ -427,7 +449,12 @@ impl MonolithAir {
         }
     }
     pub(crate) fn pis_count(&self) -> usize {
-        self.random_cap_base() + if self.is_zk == 1 { self.cap_stride() } else { 0 }
+        self.random_cap_base()
+            + if self.is_zk == 1 {
+                self.cap_stride()
+            } else {
+                0
+            }
     }
     // pis cap layout — the FULL cap (2^cap_height entries) for a non-constant inner (so the cap-mux can select
     // cap[index>>shift] by the index bits), a single shared entry (stride 4) for ConstAir. For ConstAir these
@@ -468,7 +495,12 @@ impl MonolithAir {
     pub(crate) fn fused_w(&self) -> usize {
         // sel_base = pw_base (+ column-window window); + 3 witnessed Lagrange selectors (6 felts, symbolic);
         // + the witnessed constraint-fold accumulators (column-window only — see fold_acc / FOLD_CHUNK).
-        self.sel_base() + if self.symbolic() { 6 + 2 * self.n_fold_acc() } else { 0 }
+        self.sel_base()
+            + if self.symbolic() {
+                6 + 2 * self.n_fold_acc()
+            } else {
+                0
+            }
     }
     // The α-Horner fold of the inner AIR's C_inner constraints (`folded = folded·α_stark + c_k`) is checked
     // against quotient(ζ) in ONE expression. In COLUMN-WINDOW mode α_stark is a degree-1 witness column (the
@@ -481,7 +513,10 @@ impl MonolithAir {
     pub(crate) const FOLD_CHUNK: usize = 7;
     pub(crate) fn n_fold_acc(&self) -> usize {
         if self.symbolic() && self.column_window {
-            self.constraints.len().div_ceil(Self::FOLD_CHUNK).saturating_sub(1) // chunk boundaries = n_chunks − 1
+            self.constraints
+                .len()
+                .div_ceil(Self::FOLD_CHUNK)
+                .saturating_sub(1) // chunk boundaries = n_chunks − 1
         } else {
             0
         }
@@ -694,7 +729,12 @@ impl MonolithAir {
     // sklast/rootin/rootupd shift past the per-block first-rows in tx_statement mode; unchanged (base+2..4) in
     // 1-value mode.
     fn fold_tail_base(&self) -> usize {
-        self.fold_base() + if self.fold_txstmt { 2 + self.n_sk_blocks() } else { 2 }
+        self.fold_base()
+            + if self.fold_txstmt {
+                2 + self.n_sk_blocks()
+            } else {
+                2
+            }
     }
     pub(crate) fn p_fold_sklast(&self) -> usize {
         self.fold_tail_base()
@@ -716,7 +756,8 @@ impl MonolithAir {
             2 // p_random_leaf (head) + p_random_term (terminal)
                 + (self.random_leaf_blocks() - 1) // subsequent-block absorb heads
                 + usize::from(self.random_leaf_blocks() > 1) // capacity-carry boundary
-                + usize::from(self.random_leaf_blocks() > 1 && self.random_leaf_felts() % RATE != 0) // short-final
+                + usize::from(self.random_leaf_blocks() > 1 && self.random_leaf_felts() % RATE != 0)
+        // short-final
         } else {
             0
         }
@@ -787,7 +828,13 @@ impl MonolithAir {
         let h = self.inst_h();
         let tr = self.tr();
         let nb_used = self.counts.len();
-        let count_of = |b: usize| -> Val { if b < nb_used { Val::from_u64(self.counts[b] as u64) } else { Val::ZERO } };
+        let count_of = |b: usize| -> Val {
+            if b < nb_used {
+                Val::from_u64(self.counts[b] as u64)
+            } else {
+                Val::ZERO
+            }
+        };
         let mut cols = periodic_table(); // 11 round
         let mut block_last = vec![Val::ZERO; h];
         for blk in 0..(h / BLOCK) {
@@ -801,7 +848,11 @@ impl MonolithAir {
             let b = r / BLOCK;
             count[r] = count_of(b);
             count_next[r] = count_of(b + 1);
-            is_sq_next[r] = if (b + 1 >= nb_used) || self.counts[b + 1] == 0 { Val::ONE } else { Val::ZERO };
+            is_sq_next[r] = if (b + 1 >= nb_used) || self.counts[b + 1] == 0 {
+                Val::ONE
+            } else {
+                Val::ZERO
+            };
         }
         cols.push(count);
         cols.push(count_next);
@@ -901,12 +952,15 @@ impl MonolithAir {
             let mut qboundary = vec![Val::ZERO; h];
             for q in 0..self.n_queries {
                 for b in 1..self.quot_leaf_blocks() {
-                    qboundary[st_off(q, (self.m_quot_leaf() + b) * BLOCK - 1)] = Val::ONE; // block (m_quot_leaf+b−1) last row
+                    qboundary[st_off(q, (self.m_quot_leaf() + b) * BLOCK - 1)] = Val::ONE;
+                    // block (m_quot_leaf+b−1) last row
                 }
             }
             cols.push(qboundary); // q_boundary
             if self.quot_leaf_felts() % RATE != 0 {
-                cols.push(tiled((self.m_quot_leaf() + self.quot_leaf_blocks() - 1) * BLOCK - 1)); // q_last_carry
+                cols.push(tiled(
+                    (self.m_quot_leaf() + self.quot_leaf_blocks() - 1) * BLOCK - 1,
+                )); // q_last_carry
             }
         }
         if self.fold && !self.fold_txstmt {
@@ -977,7 +1031,9 @@ impl MonolithAir {
                 }
                 cols.push(rboundary); // p_random_boundary
                 if self.random_leaf_felts() % RATE != 0 {
-                    cols.push(tiled((M_INPUT_LEAF + self.random_leaf_blocks() - 1) * BLOCK - 1)); // p_random_last_carry
+                    cols.push(tiled(
+                        (M_INPUT_LEAF + self.random_leaf_blocks() - 1) * BLOCK - 1,
+                    )); // p_random_last_carry
                 }
             }
         }
@@ -1024,11 +1080,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         let main = builder.main();
         let cur: Vec<AB::Expr> = main.current_slice().iter().map(|&x| x.into()).collect();
         let nxt: Vec<AB::Expr> = main.next_slice().iter().map(|&x| x.into()).collect();
-        let p: Vec<AB::Expr> = builder.periodic_values().iter().map(|&x| x.into()).collect();
+        let p: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|&x| x.into())
+            .collect();
         // COLUMN-WINDOW: read the inner-proof "pis" from the witness column window (held constant across the
         // instance) instead of public inputs, so the monolith can be tiled. The internal binds pin the window.
         let pis: Vec<AB::Expr> = if self.column_window {
-            (0..self.pis_count()).map(|i| cur[self.pw(i)].clone()).collect()
+            (0..self.pis_count())
+                .map(|i| cur[self.pw(i)].clone())
+                .collect()
         } else {
             builder.public_values().iter().map(|&x| x.into()).collect()
         };
@@ -1039,7 +1101,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         let w = AB::Expr::from(Goldilocks::from_u64(MRO_W_EXT));
         let pow2 = |i: usize| AB::Expr::from(Goldilocks::from_u64(1u64 << i));
         let emul = |a: (AB::Expr, AB::Expr), b: (AB::Expr, AB::Expr)| -> (AB::Expr, AB::Expr) {
-            (a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(), a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone())
+            (
+                a.0.clone() * b.0.clone() + w.clone() * a.1.clone() * b.1.clone(),
+                a.0.clone() * b.1.clone() + a.1.clone() * b.0.clone(),
+            )
         };
         let gg = |o: usize| (cur[o].clone(), cur[o + 1].clone());
         let s_trans = p[self.s_trans()].clone();
@@ -1060,10 +1125,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         let rc: Vec<AB::Expr> = (0..W).map(|i| p[3 + i].clone()).collect();
         let mut init_s: [AB::Expr; W] = core::array::from_fn(|i| cur[i].clone());
         ext_linear(&mut init_s);
-        let mut full_s: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
+        let mut full_s: [AB::Expr; W] =
+            core::array::from_fn(|i| pow7(cur[i].clone() + rc[i].clone()));
         ext_linear(&mut full_s);
-        let mut part_s: [AB::Expr; W] =
-            core::array::from_fn(|i| if i == 0 { pow7(cur[0].clone() + rc[0].clone()) } else { cur[i].clone() });
+        let mut part_s: [AB::Expr; W] = core::array::from_fn(|i| {
+            if i == 0 {
+                pow7(cur[0].clone() + rc[0].clone())
+            } else {
+                cur[i].clone()
+            }
+        });
         int_linear(&mut part_s);
         for i in 0..W {
             let step = is_init.clone() * (nxt[i].clone() - init_s[i].clone())
@@ -1083,12 +1154,23 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         }
         {
             let bl = p[FT_P_BLOCK_LAST].clone();
-            builder.when_transition().assert_zero(stt.clone() * bl.clone() * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()));
+            builder.when_transition().assert_zero(
+                stt.clone()
+                    * bl.clone()
+                    * (nxt[CAP_LANE].clone() - cur[CAP_LANE].clone() - p[FT_COUNT_NEXT].clone()),
+            );
             for i in (CAP_LANE + 1)..W {
-                builder.when_transition().assert_zero(stt.clone() * bl.clone() * (nxt[i].clone() - cur[i].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(stt.clone() * bl.clone() * (nxt[i].clone() - cur[i].clone()));
             }
             for i in 0..RATE {
-                builder.when_transition().assert_zero(stt.clone() * bl.clone() * p[FT_IS_SQ_NEXT].clone() * (nxt[i].clone() - cur[i].clone()));
+                builder.when_transition().assert_zero(
+                    stt.clone()
+                        * bl.clone()
+                        * p[FT_IS_SQ_NEXT].clone()
+                        * (nxt[i].clone() - cur[i].clone()),
+                );
             }
         }
         for j in 0..self.nb() {
@@ -1106,8 +1188,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // at α_fri's bind row ----------
         let carry = self.carry();
         let not_inst_last = one.clone() - p[self.p_inst_last()].clone();
-        builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[carry].clone() - cur[carry].clone()));
-        builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[carry + 1].clone() - cur[carry + 1].clone()));
+        builder
+            .when_transition()
+            .assert_zero(not_inst_last.clone() * (nxt[carry].clone() - cur[carry].clone()));
+        builder
+            .when_transition()
+            .assert_zero(not_inst_last.clone() * (nxt[carry + 1].clone() - cur[carry + 1].clone()));
         let alpha_bind = p[FT_BIND_START + 2].clone();
         builder.assert_zero(alpha_bind.clone() * (cur[carry].clone() - cur[3].clone()));
         builder.assert_zero(alpha_bind * (cur[carry + 1].clone() - cur[2].clone()));
@@ -1117,10 +1203,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         if self.column_window {
             // per-instance-persistent (reset across instance boundaries so each inner has its own window).
             for i in 0..self.pis_count() {
-                builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[self.pw(i)].clone() - cur[self.pw(i)].clone()));
+                builder.when_transition().assert_zero(
+                    not_inst_last.clone() * (nxt[self.pw(i)].clone() - cur[self.pw(i)].clone()),
+                );
             }
             for j in 0..(2 * self.cm_rounds()) {
-                builder.when_transition().assert_zero(not_inst_last.clone() * (nxt[self.sch(j)].clone() - cur[self.sch(j)].clone()));
+                builder.when_transition().assert_zero(
+                    not_inst_last.clone() * (nxt[self.sch(j)].clone() - cur[self.sch(j)].clone()),
+                );
             }
         }
 
@@ -1136,10 +1226,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             builder.assert_zero(tf.clone() * (cur[self.qt_acc() + i].clone() - prev * factor));
             prev = cur[self.qt_acc() + i].clone();
         }
-        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR) * cur[self.qt_acc() + self.lg() - 1].clone();
+        let x = AB::Expr::from(<Goldilocks as Field>::GENERATOR)
+            * cur[self.qt_acc() + self.lg() - 1].clone();
         // self.qt_alpha() bound to the carried α_fri
         builder.assert_zero(tf.clone() * (cur[self.qt_alpha()].clone() - cur[carry].clone()));
-        builder.assert_zero(tf.clone() * (cur[self.qt_alpha() + 1].clone() - cur[carry + 1].clone()));
+        builder
+            .assert_zero(tf.clone() * (cur[self.qt_alpha() + 1].clone() - cur[carry + 1].clone()));
         let alpha = gg(self.qt_alpha());
         builder.assert_zero(tf.clone() * (cur[self.apow(0)].clone() - one.clone()));
         builder.assert_zero(tf.clone() * cur[self.apow(0) + 1].clone());
@@ -1156,7 +1248,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let chk = emul(inv.clone(), z_m_x);
             builder.assert_zero(tf.clone() * (chk.0 - one.clone()));
             builder.assert_zero(tf.clone() * chk.1);
-            let d = (cur[self.pz(k)].clone() - cur[self.px(k)].clone(), cur[self.pz(k) + 1].clone());
+            let d = (
+                cur[self.pz(k)].clone() - cur[self.px(k)].clone(),
+                cur[self.pz(k) + 1].clone(),
+            );
             let t = emul(emul(gg(self.apow(k)), d), inv);
             ro = (ro.0 + t.0, ro.1 + t.1);
         }
@@ -1184,9 +1279,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             recon = recon + cur[self.sb_b(i)].clone() * pow2(i);
         }
         builder.assert_zero(tf.clone() * (cur[self.sb_x()].clone() - recon));
-        builder.assert_zero(tf.clone() * (cur[self.sb_q(0)].clone() - cur[self.sb_b(32)].clone() * cur[self.sb_b(33)].clone()));
+        builder.assert_zero(
+            tf.clone()
+                * (cur[self.sb_q(0)].clone()
+                    - cur[self.sb_b(32)].clone() * cur[self.sb_b(33)].clone()),
+        );
         for k in 2..=31 {
-            builder.assert_zero(tf.clone() * (cur[self.sb_q(k - 1)].clone() - cur[self.sb_q(k - 2)].clone() * cur[self.sb_b(32 + k)].clone()));
+            builder.assert_zero(
+                tf.clone()
+                    * (cur[self.sb_q(k - 1)].clone()
+                        - cur[self.sb_q(k - 2)].clone() * cur[self.sb_b(32 + k)].clone()),
+            );
         }
         let mut lo = AB::Expr::ZERO;
         for i in 0..32 {
@@ -1194,7 +1297,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         }
         builder.assert_zero(tf.clone() * (cur[self.sb_q(30)].clone() * lo));
         for i in 0..self.lg() {
-            builder.assert_zero(tf.clone() * (cur[QT_DBITS + i].clone() - cur[self.sb_b(i)].clone()));
+            builder
+                .assert_zero(tf.clone() * (cur[QT_DBITS + i].clone() - cur[self.sb_b(i)].clone()));
         }
         let mut qidx = AB::Expr::ZERO;
         for i in 0..self.lg() {
@@ -1205,15 +1309,22 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         for r in 0..(self.nb() - 3) {
             round_mask = round_mask + p[self.p_round(r)].clone();
         }
-        builder
-            .when_transition()
-            .assert_zero(round_mask.clone() * (cur[self.idx_rem()].clone() - two.clone() * nxt[self.idx_rem()].clone() - cur[QT_BIT].clone()));
+        builder.when_transition().assert_zero(
+            round_mask.clone()
+                * (cur[self.idx_rem()].clone()
+                    - two.clone() * nxt[self.idx_rem()].clone()
+                    - cur[QT_BIT].clone()),
+        );
         // bit-aware fold (transitions on the round rows)
         let bit = cur[QT_BIT].clone();
         let i2s = cur[QT_I2S].clone();
         let spt = cur[QT_SPT].clone();
-        builder.when_transition().assert_zero(round_mask.clone() * (bit.clone() * (one.clone() - bit.clone())));
-        builder.when_transition().assert_zero(round_mask.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
+        builder
+            .when_transition()
+            .assert_zero(round_mask.clone() * (bit.clone() * (one.clone() - bit.clone())));
+        builder
+            .when_transition()
+            .assert_zero(round_mask.clone() * (i2s.clone() * (two.clone() * spt) - one.clone()));
         let sign = one.clone() - two.clone() * bit;
         let e = (cur[QT_E].clone(), cur[QT_E + 1].clone());
         let s = (cur[QT_S].clone(), cur[QT_S + 1].clone());
@@ -1223,8 +1334,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         let prod = emul(diff, bb);
         let fold0 = sum.0 * half.clone() + sign.clone() * prod.0 * i2s.clone();
         let fold1 = sum.1 * half.clone() + sign * prod.1 * i2s;
-        builder.when_transition().assert_zero(round_mask.clone() * (nxt[QT_E].clone() - fold0));
-        builder.when_transition().assert_zero(round_mask * (nxt[QT_E + 1].clone() - fold1));
+        builder
+            .when_transition()
+            .assert_zero(round_mask.clone() * (nxt[QT_E].clone() - fold0));
+        builder
+            .when_transition()
+            .assert_zero(round_mask * (nxt[QT_E + 1].clone() - fold1));
         // accept (M_TL): folded_eval == final_poly[0]
         builder.assert_zero(tl.clone() * (cur[QT_E].clone() - fp0));
         builder.assert_zero(tl * (cur[QT_E + 1].clone() - fp1));
@@ -1247,7 +1362,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let z_h = if self.column_window {
                 let mut prev = zeta.clone();
                 for i in 0..cdb {
-                    let si = (cur[self.sch(2 * i)].clone(), cur[self.sch(2 * i) + 1].clone());
+                    let si = (
+                        cur[self.sch(2 * i)].clone(),
+                        cur[self.sch(2 * i) + 1].clone(),
+                    );
                     let sq = emul(prev.clone(), prev.clone());
                     builder.assert_zero(tf.clone() * (si.0.clone() - sq.0));
                     builder.assert_zero(tf.clone() * (si.1.clone() - sq.1));
@@ -1283,8 +1401,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 let biv = emul(inv_van.clone(), z_h.clone());
                 builder.assert_zero(tf.clone() * (biv.0 - one.clone()));
                 builder.assert_zero(tf.clone() * biv.1);
-                let local: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_trace(c)))).collect();
-                let next: Vec<(AB::Expr, AB::Expr)> = (0..w_in).map(|c| gg(self.pz(self.trm_next(c)))).collect();
+                let local: Vec<(AB::Expr, AB::Expr)> =
+                    (0..w_in).map(|c| gg(self.pz(self.trm_trace(c)))).collect();
+                let next: Vec<(AB::Expr, AB::Expr)> =
+                    (0..w_in).map(|c| gg(self.pz(self.trm_next(c)))).collect();
                 // recompose quotient(ζ) from the nqc chunk-openings: Σ_i zps_i·(pz(2W+2i)+pz(2W+2i+1)·X). nqc=1 ⇒
                 // the single chunk c0+c1·X (implicit weight 1, byte-for-byte); nqc>1 ⇒ verifier-computed weights
                 // zps_i (the qwt pis region) — exactly p3's recompose_quotient_from_chunks (validated by the oracle).
@@ -1293,20 +1413,35 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                     for i in 0..self.nqc() {
                         let d0 = gg(self.pz(self.trm_quot(i, 0)));
                         let d1 = gg(self.pz(self.trm_quot(i, 1)));
-                        let chunk = (d0.0.clone() + w.clone() * d1.1.clone(), d0.1.clone() + d1.0.clone());
+                        let chunk = (
+                            d0.0.clone() + w.clone() * d1.1.clone(),
+                            d0.1.clone() + d1.0.clone(),
+                        );
                         let weighted = if self.nqc() == 1 {
                             chunk
                         } else {
-                            let zps = (pis[self.qwt_base() + 2 * i].clone(), pis[self.qwt_base() + 2 * i + 1].clone());
+                            let zps = (
+                                pis[self.qwt_base() + 2 * i].clone(),
+                                pis[self.qwt_base() + 2 * i + 1].clone(),
+                            );
                             emul(zps, chunk)
                         };
                         acc = (acc.0 + weighted.0, acc.1 + weighted.1);
                     }
                     acc
                 };
-                let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub()).map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO)).collect();
+                let pubs: Vec<(AB::Expr, AB::Expr)> = (0..self.n_pub())
+                    .map(|i| (pis[self.pub_pi() + i].clone(), AB::Expr::ZERO))
+                    .collect();
                 // periodic column values at ζ (verifier-computed publics in the periodic pis region).
-                let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic()).map(|i| (pis[self.periodic_base() + 2 * i].clone(), pis[self.periodic_base() + 2 * i + 1].clone())).collect();
+                let periodic: Vec<(AB::Expr, AB::Expr)> = (0..self.n_periodic())
+                    .map(|i| {
+                        (
+                            pis[self.periodic_base() + 2 * i].clone(),
+                            pis[self.periodic_base() + 2 * i + 1].clone(),
+                        )
+                    })
+                    .collect();
                 // α-Horner fold of the inner constraints, CHUNKED in column-window mode (α_stark degree-1):
                 // witness the running fold every FOLD_CHUNK constraints and continue from that degree-1 column,
                 // so this stays ≈ base+FOLD_CHUNK instead of base+C_inner. pis-mode (α degree-0) folds inline.
@@ -1315,7 +1450,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 let mut acc_i = 0usize;
                 let n_c = self.constraints.len();
                 for (k, c) in self.constraints.iter().enumerate() {
-                    let ci = eval_symbolic_circuit::<AB>(c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w);
+                    let ci = eval_symbolic_circuit::<AB>(
+                        c, &local, &next, &pubs, &periodic, &is_first, &is_last, &is_trans, &w,
+                    );
                     let fa = emul(folded.clone(), alpha_stark.clone());
                     folded = (fa.0 + ci.0, fa.1 + ci.1);
                     if chunked && (k + 1) % Self::FOLD_CHUNK == 0 && k + 1 < n_c {
@@ -1346,11 +1483,17 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                     for i in 0..self.nqc() {
                         let d0 = gg(self.pz(self.trm_quot(i, 0)));
                         let d1 = gg(self.pz(self.trm_quot(i, 1)));
-                        let chunk = (d0.0.clone() + w.clone() * d1.1.clone(), d0.1.clone() + d1.0.clone());
+                        let chunk = (
+                            d0.0.clone() + w.clone() * d1.1.clone(),
+                            d0.1.clone() + d1.0.clone(),
+                        );
                         let weighted = if self.nqc() == 1 {
                             chunk
                         } else {
-                            let zps = (pis[self.qwt_base() + 2 * i].clone(), pis[self.qwt_base() + 2 * i + 1].clone());
+                            let zps = (
+                                pis[self.qwt_base() + 2 * i].clone(),
+                                pis[self.qwt_base() + 2 * i + 1].clone(),
+                            );
                             emul(zps, chunk)
                         };
                         acc = (acc.0 + weighted.0, acc.1 + weighted.1);
@@ -1358,7 +1501,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                     acc
                 };
                 let lm = (local.0.clone() - pub_val, local.1.clone());
-                let trans_const = if self.inner_counter { one.clone() } else { AB::Expr::ZERO };
+                let trans_const = if self.inner_counter {
+                    one.clone()
+                } else {
+                    AB::Expr::ZERO
+                };
                 let nl = (next.0 - local.0 - trans_const, next.1 - local.1);
                 let t1 = emul(p1, lm);
                 let t2 = emul(p2, nl);
@@ -1374,7 +1521,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for k in 0..self.n_terms {
                 let at_next = k >= self.trm_next_base() && k < self.trm_quot_base();
                 let (zx, zy) = if at_next {
-                    (zeta.0.clone() * g_trace.clone(), zeta.1.clone() * g_trace.clone())
+                    (
+                        zeta.0.clone() * g_trace.clone(),
+                        zeta.1.clone() * g_trace.clone(),
+                    )
                 } else {
                     (zeta.0.clone(), zeta.1.clone())
                 };
@@ -1392,10 +1542,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         // (is_zk=1) are the free leaf salt: held but not px-bound (authenticated by folding to the committed cap).
         for c in 0..self.input_leaf_felts() {
             let ovc = self.ov_c(c);
-            builder.when_transition().assert_zero(hold.clone() * (nxt[ovc].clone() - cur[ovc].clone()));
+            builder
+                .when_transition()
+                .assert_zero(hold.clone() * (nxt[ovc].clone() - cur[ovc].clone()));
             if c < self.trm_committed_w() {
-                builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_trace(c))].clone())); // @ ζ
-                builder.assert_zero(tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_next(c))].clone())); // @ ζ_next
+                builder.assert_zero(
+                    tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_trace(c))].clone()),
+                ); // @ ζ
+                builder.assert_zero(
+                    tf.clone() * (cur[ovc].clone() - cur[self.px(self.trm_next(c))].clone()),
+                ); // @ ζ_next
             }
         }
         // HIDING random-round carrier (random_leaf_felts felts, is_zk=1): the random-polynomial committed row
@@ -1403,7 +1559,9 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         if self.is_zk == 1 {
             for c in 0..self.random_leaf_felts() {
                 let ovr = self.ov_random(c);
-                builder.when_transition().assert_zero(hold.clone() * (nxt[ovr].clone() - cur[ovr].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(hold.clone() * (nxt[ovr].clone() - cur[ovr].clone()));
                 if c < self.random_committed_w() {
                     builder.assert_zero(tf.clone() * (cur[ovr].clone() - cur[self.px(c)].clone()));
                 }
@@ -1416,10 +1574,14 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let stride = self.quot_chunk_stride();
             for c in 0..self.quot_leaf_felts() {
                 let qcj = self.qc(c);
-                builder.when_transition().assert_zero(hold.clone() * (nxt[qcj].clone() - cur[qcj].clone()));
+                builder
+                    .when_transition()
+                    .assert_zero(hold.clone() * (nxt[qcj].clone() - cur[qcj].clone()));
                 let (i, j) = (c / stride, c % stride);
                 if j < self.trm_chunk_w() {
-                    builder.assert_zero(tf.clone() * (cur[qcj].clone() - cur[self.px(self.trm_quot(i, j))].clone()));
+                    builder.assert_zero(
+                        tf.clone() * (cur[qcj].clone() - cur[self.px(self.trm_quot(i, j))].clone()),
+                    );
                 }
             }
         }
@@ -1431,12 +1593,26 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let nbit = one.clone() - bit.clone();
             let (e0, e1) = (cur[QT_E].clone(), cur[QT_E + 1].clone());
             let (sib0, sib1) = (cur[QT_S].clone(), cur[QT_S + 1].clone());
-            builder.assert_zero(pr.clone() * (cur[self.cg(r, 0)].clone() - (nbit.clone() * e0.clone() + bit.clone() * sib0.clone())));
-            builder.assert_zero(pr.clone() * (cur[self.cg(r, 1)].clone() - (nbit.clone() * e1.clone() + bit.clone() * sib1.clone())));
-            builder.assert_zero(pr.clone() * (cur[self.cg(r, 2)].clone() - (nbit.clone() * sib0 + bit.clone() * e0)));
-            builder.assert_zero(pr.clone() * (cur[self.cg(r, 3)].clone() - (nbit * sib1 + bit * e1)));
+            builder.assert_zero(
+                pr.clone()
+                    * (cur[self.cg(r, 0)].clone()
+                        - (nbit.clone() * e0.clone() + bit.clone() * sib0.clone())),
+            );
+            builder.assert_zero(
+                pr.clone()
+                    * (cur[self.cg(r, 1)].clone()
+                        - (nbit.clone() * e1.clone() + bit.clone() * sib1.clone())),
+            );
+            builder.assert_zero(
+                pr.clone()
+                    * (cur[self.cg(r, 2)].clone() - (nbit.clone() * sib0 + bit.clone() * e0)),
+            );
+            builder
+                .assert_zero(pr.clone() * (cur[self.cg(r, 3)].clone() - (nbit * sib1 + bit * e1)));
             for k in 0..4 {
-                builder.when_transition().assert_zero(hold.clone() * (nxt[self.cg(r, k)].clone() - cur[self.cg(r, k)].clone()));
+                builder.when_transition().assert_zero(
+                    hold.clone() * (nxt[self.cg(r, k)].clone() - cur[self.cg(r, k)].clone()),
+                );
             }
         }
 
@@ -1459,19 +1635,27 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let ia = p[self.ia_in(b)].clone();
             let clen = core::cmp::min(RATE, self.input_leaf_felts() - b * RATE);
             for k in 0..clen {
-                builder.assert_zero(ia.clone() * (cur[k].clone() - cur[self.ov_c(b * RATE + k)].clone()));
+                builder.assert_zero(
+                    ia.clone() * (cur[k].clone() - cur[self.ov_c(b * RATE + k)].clone()),
+                );
             }
         }
         if self.leaf_blocks() > 1 {
             let bnd = p[self.in_boundary()].clone();
             for k in RATE..W {
-                builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+                builder
+                    .when_transition()
+                    .assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone()));
+                // capacity carry
             }
             if self.input_leaf_felts() % RATE != 0 {
                 let lc = p[self.in_last_carry()].clone();
                 let rem = self.input_leaf_felts() - (self.leaf_blocks() - 1) * RATE;
                 for k in rem..RATE {
-                    builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
+                    builder
+                        .when_transition()
+                        .assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone()));
+                    // short-final rate carry
                 }
             }
         }
@@ -1491,19 +1675,27 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let iq = p[self.iq_(b)].clone();
             let clen = core::cmp::min(RATE, self.quot_leaf_felts() - b * RATE);
             for k in 0..clen {
-                builder.assert_zero(iq.clone() * (cur[k].clone() - cur[self.qc(b * RATE + k)].clone()));
+                builder.assert_zero(
+                    iq.clone() * (cur[k].clone() - cur[self.qc(b * RATE + k)].clone()),
+                );
             }
         }
         if self.quot_leaf_blocks() > 1 {
             let bnd = p[self.q_boundary()].clone();
             for k in RATE..W {
-                builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+                builder
+                    .when_transition()
+                    .assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone()));
+                // capacity carry
             }
             if self.quot_leaf_felts() % RATE != 0 {
                 let lc = p[self.q_last_carry()].clone();
                 let rem = self.quot_leaf_felts() - (self.quot_leaf_blocks() - 1) * RATE;
                 for k in rem..RATE {
-                    builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
+                    builder
+                        .when_transition()
+                        .assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone()));
+                    // short-final rate carry
                 }
             }
         }
@@ -1515,7 +1707,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             let rleaf = p[self.p_random_leaf()].clone();
             let rlc0 = core::cmp::min(self.random_leaf_felts(), RATE);
             for c in 0..rlc0 {
-                builder.assert_zero(rleaf.clone() * (cur[c].clone() - cur[self.ov_random(c)].clone()));
+                builder
+                    .assert_zero(rleaf.clone() * (cur[c].clone() - cur[self.ov_random(c)].clone()));
             }
             for i in rlc0..W {
                 builder.assert_zero(rleaf.clone() * cur[i].clone());
@@ -1524,19 +1717,27 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 let ia = p[self.p_random_absorb(b)].clone();
                 let clen = core::cmp::min(RATE, self.random_leaf_felts() - b * RATE);
                 for k in 0..clen {
-                    builder.assert_zero(ia.clone() * (cur[k].clone() - cur[self.ov_random(b * RATE + k)].clone()));
+                    builder.assert_zero(
+                        ia.clone() * (cur[k].clone() - cur[self.ov_random(b * RATE + k)].clone()),
+                    );
                 }
             }
             if self.random_leaf_blocks() > 1 {
                 let bnd = p[self.p_random_boundary()].clone();
                 for k in RATE..W {
-                    builder.when_transition().assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+                    builder
+                        .when_transition()
+                        .assert_zero(bnd.clone() * (nxt[k].clone() - cur[k].clone()));
+                    // capacity carry
                 }
                 if self.random_leaf_felts() % RATE != 0 {
                     let lc = p[self.p_random_last_carry()].clone();
                     let rem = self.random_leaf_felts() - (self.random_leaf_blocks() - 1) * RATE;
                     for k in rem..RATE {
-                        builder.when_transition().assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone())); // short-final rate carry
+                        builder
+                            .when_transition()
+                            .assert_zero(lc.clone() * (nxt[k].clone() - cur[k].clone()));
+                        // short-final rate carry
                     }
                 }
             }
@@ -1544,7 +1745,10 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             // super-tile in cap_c group (8 + 4·cm_rounds) and seeded at the arith head by the cap-mux below.
             let rterm = p[self.p_random_term()].clone();
             for k in 0..4 {
-                builder.assert_zero(rterm.clone() * (cur[k].clone() - cur[self.cap_c(8 + 4 * self.cm_rounds() + k)].clone()));
+                builder.assert_zero(
+                    rterm.clone()
+                        * (cur[k].clone() - cur[self.cap_c(8 + 4 * self.cm_rounds() + k)].clone()),
+                );
             }
         }
         // commit-phase leaves (blocks CM_LEAF[r]): absorb the bit-ordered fold group carried in cg(r,·).
@@ -1563,10 +1767,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         if self.is_zk == 1 && self.cm_leaf_blocks() > 1 {
             let cb = p[self.c_bnd()].clone();
             for k in RATE..W {
-                builder.when_transition().assert_zero(cb.clone() * (nxt[k].clone() - cur[k].clone())); // capacity carry
+                builder
+                    .when_transition()
+                    .assert_zero(cb.clone() * (nxt[k].clone() - cur[k].clone()));
+                // capacity carry
             }
         }
-        builder.assert_zero(s_merkle.clone() * (cur[self.m_bit()].clone() * (one.clone() - cur[self.m_bit()].clone())));
+        builder.assert_zero(
+            s_merkle.clone()
+                * (cur[self.m_bit()].clone() * (one.clone() - cur[self.m_bit()].clone())),
+        );
         {
             // bit-ordered merge link across Merkle block boundaries, EXCEPT after any terminal (input/quotient/
             // random/commit) — the block after a terminal is a fresh leaf-hash seeded from its carrier, not a
@@ -1605,12 +1815,25 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 }
                 one.clone() - term_sum
             };
-            let link = s_merkle.clone() * p[FT_P_BLOCK_LAST].clone() * (one.clone() - p[self.p_st_last()].clone()) * not_term;
+            let link = s_merkle.clone()
+                * p[FT_P_BLOCK_LAST].clone()
+                * (one.clone() - p[self.p_st_last()].clone())
+                * not_term;
             let nb_ = nxt[self.m_bit()].clone();
             let sib = self.m_sib();
             for k in 0..4 {
-                builder.when_transition().assert_zero(link.clone() * (nxt[k].clone() - ((one.clone() - nb_.clone()) * cur[k].clone() + nb_.clone() * nxt[sib + k].clone())));
-                builder.when_transition().assert_zero(link.clone() * (nxt[4 + k].clone() - ((one.clone() - nb_.clone()) * nxt[sib + k].clone() + nb_.clone() * cur[k].clone())));
+                builder.when_transition().assert_zero(
+                    link.clone()
+                        * (nxt[k].clone()
+                            - ((one.clone() - nb_.clone()) * cur[k].clone()
+                                + nb_.clone() * nxt[sib + k].clone())),
+                );
+                builder.when_transition().assert_zero(
+                    link.clone()
+                        * (nxt[4 + k].clone()
+                            - ((one.clone() - nb_.clone()) * nxt[sib + k].clone()
+                                + nb_.clone() * cur[k].clone())),
+                );
             }
         }
         // input terminal (block 5) == trace cap entry; quotient terminal (block 10) == quotient cap entry.
@@ -1622,12 +1845,16 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             // per-query cap pis via the p_query one-hots, held to the terminals).
             for k in 0..4 {
                 builder.assert_zero(term.clone() * (cur[k].clone() - cur[self.cap_c(k)].clone())); // input
-                builder.assert_zero(qterm.clone() * (cur[k].clone() - cur[self.cap_c(4 + k)].clone())); // quotient
+                builder
+                    .assert_zero(qterm.clone() * (cur[k].clone() - cur[self.cap_c(4 + k)].clone()));
+                // quotient
             }
             for r in 0..self.cm_rounds() {
                 let ct = p[self.c_term(r)].clone();
                 for k in 0..4 {
-                    builder.assert_zero(ct.clone() * (cur[k].clone() - cur[self.cap_c(8 + 4 * r + k)].clone()));
+                    builder.assert_zero(
+                        ct.clone() * (cur[k].clone() - cur[self.cap_c(8 + 4 * r + k)].clone()),
+                    );
                 }
             }
             // hold the cap carriers across the super-tile; SEED them at the arith head (M_TF) via the CAP-MUX:
@@ -1636,18 +1863,33 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             // SampleBits bits sb_b). This BINDS each terminal to the index-selected committed cap entry.
             let hold = p[self.s_query()].clone() * (one.clone() - p[self.p_st_last()].clone());
             for g in 0..self.n_cap_c() {
-                builder.when_transition().assert_zero(hold.clone() * (nxt[self.cap_c(g)].clone() - cur[self.cap_c(g)].clone()));
+                builder.when_transition().assert_zero(
+                    hold.clone() * (nxt[self.cap_c(g)].clone() - cur[self.cap_c(g)].clone()),
+                );
             }
             // (cg_offset, shift, bits, cap_base) per opening: trace, quotient, then self.cm_rounds() commit rounds.
             // trace/quotient are at the max height, so the cap-selecting shift is input_depth (log_global−cap), runtime.
-            let mut openings = vec![(0usize, self.input_depth(), self.cap_height, self.cap_base()), (4, self.input_depth(), self.cap_height, self.qcap_base())];
+            let mut openings = vec![
+                (0usize, self.input_depth(), self.cap_height, self.cap_base()),
+                (4, self.input_depth(), self.cap_height, self.qcap_base()),
+            ];
             for r in 0..self.cm_rounds() {
-                openings.push((8 + 4 * r, self.commit_shift(r), self.commit_bits(r), self.commit_cap_base(r)));
+                openings.push((
+                    8 + 4 * r,
+                    self.commit_shift(r),
+                    self.commit_bits(r),
+                    self.commit_cap_base(r),
+                ));
             }
             // HIDING random round (is_zk=1): a full cap at max height (shift = input_depth), cap_c group
             // (8 + 4·cm_rounds), selecting cap[index>>input_depth] from the random commitment's cap pis region.
             if self.is_zk == 1 {
-                openings.push((8 + 4 * self.cm_rounds(), self.input_depth(), self.cap_height, self.random_cap_base()));
+                openings.push((
+                    8 + 4 * self.cm_rounds(),
+                    self.input_depth(),
+                    self.cap_height,
+                    self.random_cap_base(),
+                ));
             }
             for (cg_off, shift, bits, cbase) in openings {
                 for k in 0..4 {
@@ -1656,7 +1898,12 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                         let mut sel = AB::Expr::ONE;
                         for j in 0..bits {
                             let b = cur[self.sb_b(shift + j)].clone();
-                            sel = sel * if (e >> j) & 1 == 1 { b } else { one.clone() - b };
+                            sel = sel
+                                * if (e >> j) & 1 == 1 {
+                                    b
+                                } else {
+                                    one.clone() - b
+                                };
                         }
                         acc = acc + sel * pis[cbase + e * 4 + k].clone();
                     }
@@ -1674,7 +1921,8 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
             for r in 0..self.cm_rounds() {
                 let ct = p[self.c_term(r)].clone();
                 for k in 0..4 {
-                    builder.assert_zero(ct.clone() * (cur[k].clone() - pis[ccap + 4 * r + k].clone()));
+                    builder
+                        .assert_zero(ct.clone() * (cur[k].clone() - pis[ccap + 4 * r + k].clone()));
                 }
             }
         }
@@ -1689,16 +1937,22 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
         if self.fold {
             let txroot: Vec<AB::Expr> = builder.public_values().iter().map(|&x| x.into()).collect();
             let dom = AB::Expr::from(Goldilocks::from_u64(crate::domains::DOM_TXROOT)); // DOM_AGG = DOM_TXROOT
-            // fold Poseidon step (reuses the period-BLOCK round schedule is_init/is_full/is_partial/rc), gated to
-            // ALL fold blocks by P_FOLD_ACTIVE. The round schedule zeroes at each block's last row (the output
-            // row), so the block-boundary transitions are step-free and the seed/link/inject one-hots take over.
+                                                                                        // fold Poseidon step (reuses the period-BLOCK round schedule is_init/is_full/is_partial/rc), gated to
+                                                                                        // ALL fold blocks by P_FOLD_ACTIVE. The round schedule zeroes at each block's last row (the output
+                                                                                        // row), so the block-boundary transitions are step-free and the seed/link/inject one-hots take over.
             let fa = p[self.p_fold_active()].clone();
             let mut f_init: [AB::Expr; W] = core::array::from_fn(|i| cur[self.af_p(i)].clone());
             ext_linear(&mut f_init);
-            let mut f_full: [AB::Expr; W] = core::array::from_fn(|i| pow7(cur[self.af_p(i)].clone() + rc[i].clone()));
+            let mut f_full: [AB::Expr; W] =
+                core::array::from_fn(|i| pow7(cur[self.af_p(i)].clone() + rc[i].clone()));
             ext_linear(&mut f_full);
-            let mut f_part: [AB::Expr; W] =
-                core::array::from_fn(|i| if i == 0 { pow7(cur[self.af_p(0)].clone() + rc[0].clone()) } else { cur[self.af_p(i)].clone() });
+            let mut f_part: [AB::Expr; W] = core::array::from_fn(|i| {
+                if i == 0 {
+                    pow7(cur[self.af_p(0)].clone() + rc[0].clone())
+                } else {
+                    cur[self.af_p(i)].clone()
+                }
+            });
             int_linear(&mut f_part);
             for i in 0..W {
                 let step = is_init.clone() * (nxt[self.af_p(i)].clone() - f_init[i].clone())
@@ -1710,14 +1964,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 // SK block seed: [DOM, 0,0,0, pvs0, 0,0,0].
                 let psk = p[self.p_fold_sk()].clone();
                 builder.assert_zero(psk.clone() * (cur[self.af_p(0)].clone() - dom.clone()));
-                builder.assert_zero(psk.clone() * (cur[self.af_p(4)].clone() - cur[self.pw(self.pub_pi())].clone()));
+                builder.assert_zero(
+                    psk.clone() * (cur[self.af_p(4)].clone() - cur[self.pw(self.pub_pi())].clone()),
+                );
                 for i in [1usize, 2, 3, 5, 6, 7] {
                     builder.assert_zero(psk.clone() * cur[self.af_p(i)].clone());
                 }
                 // SK block last row: s_k (output lanes 0..4) → ROOT block rate-high (next row lanes 4..8).
                 let pskl = p[self.p_fold_sklast()].clone();
                 for k in 0..4 {
-                    builder.when_transition().assert_zero(pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()));
+                    builder.when_transition().assert_zero(
+                        pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()),
+                    );
                 }
             } else {
                 // tx_statement s_k chain: each s_k block b injects chunk_b into rate-high (lanes 4..8) at its
@@ -1744,27 +2002,42 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MonolithAir {
                 // s_k-chain internal link: block b output (last row lanes 0..4) → block b+1 rate-low (next row).
                 let plink = p[self.p_fold_sklink()].clone();
                 for k in 0..4 {
-                    builder.when_transition().assert_zero(plink.clone() * (nxt[self.af_p(k)].clone() - cur[self.af_p(k)].clone()));
+                    builder.when_transition().assert_zero(
+                        plink.clone() * (nxt[self.af_p(k)].clone() - cur[self.af_p(k)].clone()),
+                    );
                 }
                 // last s_k block output (= s_k) → ROOT block rate-high (lanes 4..8).
                 let pskl = p[self.p_fold_sklast()].clone();
                 for k in 0..4 {
-                    builder.when_transition().assert_zero(pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()));
+                    builder.when_transition().assert_zero(
+                        pskl.clone() * (nxt[self.af_p(4 + k)].clone() - cur[self.af_p(k)].clone()),
+                    );
                 }
             }
             // ROOT block first row: rate-low == the running root column (both modes).
             let prin = p[self.p_fold_rootin()].clone();
             for k in 0..4 {
-                builder.assert_zero(prin.clone() * (cur[self.af_p(k)].clone() - cur[self.af_root(k)].clone()));
+                builder.assert_zero(
+                    prin.clone() * (cur[self.af_p(k)].clone() - cur[self.af_root(k)].clone()),
+                );
             }
             // running root: IV=0 at global row 0; held except at each instance's ROOT update; the ROOT block
             // output at the global last row == the block tx-root (the single public input).
             let prup = p[self.p_fold_rootupd()].clone();
             for k in 0..4 {
-                builder.when_first_row().assert_zero(cur[self.af_root(k)].clone());
-                builder.when_transition().assert_zero((one.clone() - prup.clone()) * (nxt[self.af_root(k)].clone() - cur[self.af_root(k)].clone()));
-                builder.when_transition().assert_zero(prup.clone() * (nxt[self.af_root(k)].clone() - cur[self.af_p(k)].clone()));
-                builder.when_last_row().assert_zero(cur[self.af_p(k)].clone() - txroot[k].clone());
+                builder
+                    .when_first_row()
+                    .assert_zero(cur[self.af_root(k)].clone());
+                builder.when_transition().assert_zero(
+                    (one.clone() - prup.clone())
+                        * (nxt[self.af_root(k)].clone() - cur[self.af_root(k)].clone()),
+                );
+                builder.when_transition().assert_zero(
+                    prup.clone() * (nxt[self.af_root(k)].clone() - cur[self.af_p(k)].clone()),
+                );
+                builder
+                    .when_last_row()
+                    .assert_zero(cur[self.af_p(k)].clone() - txroot[k].clone());
             }
         }
     }

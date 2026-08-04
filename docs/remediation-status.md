@@ -1,5 +1,7 @@
 # Remediation status
 
+> **Document role:** Current index of closed findings and residual host-chain obligations.
+
 Current state of audit-finding remediation. **Entry point for reviewers: `docs/AUDITORS.md`.**
 
 ## Current live path (M6 cutover — COMPLETE)

@@ -1,5 +1,7 @@
 # Lattica protocol v1 — completeness decisions
 
+> **Decision record:** Protocol choices that complement the normative [`../SPEC.md`](../SPEC.md).
+
 Resolves the protocol-completeness items the audit-scope flagged (`docs/audit-scope-p3.md` §5/§6).
 These are deliberate v1 scoping decisions with rationale + the limitations an auditor should weigh.
 They fix the note/circuit shape that the M6 live cutover migrates to.

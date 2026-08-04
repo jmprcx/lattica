@@ -1,5 +1,7 @@
 # Lattica — Production-Readiness Assessment
 
+> **Historical assessment:** Retained for provenance. Use [`audit-readiness-status.md`](audit-readiness-status.md) for the current conclusion and scope boundary.
+
 > **⚠ SUPERSEDED — historical, do NOT read as current.** This assesses the **pre-Plonky3** stack (the
 > Winterfell → Zig FRI-STARK PoC: ~50-bit, 64-bit field, a placeholder `x³+C`-style relation, "not yet
 > zero-knowledge"). The current production stack is the **Plonky3 `lattica-prover-p3` crate — ~103-bit

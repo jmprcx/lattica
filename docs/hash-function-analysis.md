@@ -1,5 +1,7 @@
 # Arithmetization-hash analysis — Poseidon2 vs Monolith vs Tip5
 
+> **Decision record:** Comparative analysis supporting the continued use of Poseidon2; it does not replace an independent parameter review.
+
 > **Pre-v1 forward-looking analysis — not part of the current audit artifact.** Evaluates whether to
 > replace the in-circuit / on-chain hash before v1 freezes it. Start at [`AUDITORS.md`](AUDITORS.md).
 

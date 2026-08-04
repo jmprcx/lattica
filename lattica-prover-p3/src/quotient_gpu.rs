@@ -15,7 +15,8 @@
 //! `prove_with_preprocessed`. Kept in this one clearly-labeled file for that reason.
 
 use p3_air::symbolic::{
-    get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf, SymbolicAirBuilder, SymbolicExpression,
+    get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf, SymbolicAirBuilder,
+    SymbolicExpression,
 };
 use p3_air::{Air, DebugConstraintBuilder};
 use p3_challenger::{CanObserve, FieldChallenger};
@@ -88,8 +89,14 @@ where
             BaseLeaf::Constant(c) => Op::Const(*c),
         }
     }
-    fn go<F: Field>(e: &SymbolicExpression<F>, ops: &mut Vec<Op<F>>, memo: &mut HashMap<usize, usize>) -> usize {
-        let child = |c: &Arc<SymbolicExpression<F>>, ops: &mut Vec<Op<F>>, memo: &mut HashMap<usize, usize>| {
+    fn go<F: Field>(
+        e: &SymbolicExpression<F>,
+        ops: &mut Vec<Op<F>>,
+        memo: &mut HashMap<usize, usize>,
+    ) -> usize {
+        let child = |c: &Arc<SymbolicExpression<F>>,
+                     ops: &mut Vec<Op<F>>,
+                     memo: &mut HashMap<usize, usize>| {
             let key = Arc::as_ptr(c) as usize;
             if let Some(&i) = memo.get(&key) {
                 return i;
@@ -120,7 +127,10 @@ where
     let constraints = get_symbolic_constraints::<F, A>(air, layout);
     let mut ops = Vec::new();
     let mut memo = HashMap::new();
-    let roots = constraints.iter().map(|c| go(c, &mut ops, &mut memo)).collect();
+    let roots = constraints
+        .iter()
+        .map(|c| go(c, &mut ops, &mut memo))
+        .collect();
     QuotientProgram { ops, roots }
 }
 
@@ -181,7 +191,8 @@ where
     let next_step = quotient_size / trace_domain.size();
 
     let periodic_cols = air.periodic_columns();
-    let periodic_table = pcs.build_periodic_lde_table(&periodic_cols, trace_domain, quotient_domain);
+    let periodic_table =
+        pcs.build_periodic_lde_table(&periodic_cols, trace_domain, quotient_domain);
     let n_periodic = periodic_table.width();
 
     let prog = flatten_air::<Val<SC>, A>(air, layout);
@@ -194,11 +205,28 @@ where
 
     (0..quotient_size)
         .map(|i| {
-            let local: Vec<Val<SC>> = trace_on_quotient_domain.row(i).unwrap().into_iter().collect();
-            let next: Vec<Val<SC>> =
-                trace_on_quotient_domain.row((i + next_step) % quotient_size).unwrap().into_iter().collect();
-            let periodic: Vec<Val<SC>> = (0..n_periodic).map(|c| *periodic_table.get(i, c)).collect();
-            let cons = eval_row(&prog, &local, &next, &periodic, public_values, sels.is_first_row[i], sels.is_last_row[i], sels.is_transition[i]);
+            let local: Vec<Val<SC>> = trace_on_quotient_domain
+                .row(i)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let next: Vec<Val<SC>> = trace_on_quotient_domain
+                .row((i + next_step) % quotient_size)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let periodic: Vec<Val<SC>> =
+                (0..n_periodic).map(|c| *periodic_table.get(i, c)).collect();
+            let cons = eval_row(
+                &prog,
+                &local,
+                &next,
+                &periodic,
+                public_values,
+                sels.is_first_row[i],
+                sels.is_last_row[i],
+                sels.is_transition[i],
+            );
             let acc: SC::Challenge = cons.iter().zip(&alpha_powers).map(|(&c, &a)| a * c).sum();
             // quotient(x) = constraints(x) / Z_H(x) = acc · inv_vanishing (Challenge · base).
             acc * sels.inv_vanishing[i]
@@ -233,7 +261,8 @@ where
     let sels = trace_domain.selectors_on_coset(quotient_domain);
     let next_step = qsize / trace_domain.size();
     let periodic_cols = air.periodic_columns();
-    let periodic_table = pcs.build_periodic_lde_table(&periodic_cols, trace_domain, quotient_domain);
+    let periodic_table =
+        pcs.build_periodic_lde_table(&periodic_cols, trace_domain, quotient_domain);
     let n_periodic = periodic_table.width();
     let width = trace_on_quotient_domain.width();
 
@@ -301,8 +330,24 @@ where
     }
 
     let out = crate::gpu::gpu_run_quotient(
-        &op_code, &op_a, &op_b, &consts, &roots, &trace_flat, width, qsize, next_step, &periodic_flat,
-        n_periodic, &public, &isf, &isl, &ist, &ivn, &alpha0, &alpha1,
+        &op_code,
+        &op_a,
+        &op_b,
+        &consts,
+        &roots,
+        &trace_flat,
+        width,
+        qsize,
+        next_step,
+        &periodic_flat,
+        n_periodic,
+        &public,
+        &isf,
+        &isl,
+        &ist,
+        &ivn,
+        &alpha0,
+        &alpha1,
     );
 
     // Reassemble F_p² quotient values from the (c0, c1) pairs.
@@ -341,7 +386,11 @@ where
     let log_ext_degree = log_degree + config.is_zk();
 
     // Our production circuits define no preprocessed columns (fork is specialized to that case).
-    assert_eq!(air.preprocessed_width(), 0, "prove_gpu: preprocessed columns unsupported");
+    assert_eq!(
+        air.preprocessed_width(),
+        0,
+        "prove_gpu: preprocessed columns unsupported"
+    );
     let preprocessed_width = 0usize;
 
     let layout = AirLayout {
@@ -352,7 +401,8 @@ where
         ..Default::default()
     };
 
-    let log_num_quotient_chunks = get_log_num_quotient_chunks::<Val<SC>, A>(air, layout, config.is_zk());
+    let log_num_quotient_chunks =
+        get_log_num_quotient_chunks::<Val<SC>, A>(air, layout, config.is_zk());
     let num_quotient_chunks = 1 << (log_num_quotient_chunks + config.is_zk());
 
     let pcs = config.pcs();
@@ -378,13 +428,37 @@ where
     // === THE ONLY SWAP vs p3 === the quotient evaluator (all three share p3's `quotient_values` signature).
     let quotient_values = match mode {
         QuotientMode::P3 => quotient_values(
-            pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
+            pcs,
+            air,
+            public_values,
+            layout,
+            trace_domain,
+            quotient_domain,
+            &trace_on_quotient_domain,
+            None,
+            alpha,
         ),
         QuotientMode::Cpu => cpu_quotient_values(
-            pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
+            pcs,
+            air,
+            public_values,
+            layout,
+            trace_domain,
+            quotient_domain,
+            &trace_on_quotient_domain,
+            None,
+            alpha,
         ),
         QuotientMode::Gpu => gpu_quotient_values(
-            pcs, air, public_values, layout, trace_domain, quotient_domain, &trace_on_quotient_domain, None, alpha,
+            pcs,
+            air,
+            public_values,
+            layout,
+            trace_domain,
+            quotient_domain,
+            &trace_on_quotient_domain,
+            None,
+            alpha,
         ),
     };
 
@@ -412,13 +486,19 @@ where
     }
 
     let zeta: SC::Challenge = challenger.sample_algebra_element();
-    let zeta_next = trace_domain.next_point(zeta).expect("domain should support next_point");
+    let zeta_next = trace_domain
+        .next_point(zeta)
+        .expect("domain should support next_point");
 
     let is_random = opt_r_data.is_some();
     let main_next = !air.main_next_row_columns().is_empty();
     let (opened_values, opening_proof) = {
         let round0 = opt_r_data.as_ref().map(|r_data| (r_data, vec![vec![zeta]]));
-        let round1_points = if main_next { vec![zeta, zeta_next] } else { vec![zeta] };
+        let round1_points = if main_next {
+            vec![zeta, zeta_next]
+        } else {
+            vec![zeta]
+        };
         let round1 = (&trace_data, vec![round1_points]);
         let round2 = (&quotient_data, vec![vec![zeta]; num_quotient_chunks]);
         let rounds = round0.into_iter().chain([round1, round2]).collect();
@@ -428,9 +508,20 @@ where
     let trace_idx = SC::Pcs::TRACE_IDX;
     let quotient_idx = SC::Pcs::QUOTIENT_IDX;
     let trace_local = opened_values[trace_idx][0][0].clone();
-    let trace_next = if main_next { Some(opened_values[trace_idx][0][1].clone()) } else { None };
-    let quotient_chunks = opened_values[quotient_idx].iter().map(|v| v[0].clone()).collect();
-    let random = if is_random { Some(opened_values[0][0][0].clone()) } else { None };
+    let trace_next = if main_next {
+        Some(opened_values[trace_idx][0][1].clone())
+    } else {
+        None
+    };
+    let quotient_chunks = opened_values[quotient_idx]
+        .iter()
+        .map(|v| v[0].clone())
+        .collect();
+    let random = if is_random {
+        Some(opened_values[0][0][0].clone())
+    } else {
+        None
+    };
 
     let opened_values = OpenedValues {
         trace_local,
@@ -440,7 +531,12 @@ where
         quotient_chunks,
         random,
     };
-    Proof { commitments, opened_values, opening_proof, degree_bits: log_ext_degree }
+    Proof {
+        commitments,
+        opened_values,
+        opening_proof,
+        degree_bits: log_ext_degree,
+    }
 }
 
 #[cfg(test)]
@@ -458,7 +554,13 @@ mod tests {
         let pis = joinsplit_air::public_values(&w);
         let cfg = crate::config::gpu::make_bench_config_cpu();
         let p_ref = prove(&cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis);
-        let p_fork = prove_gpu(&cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis, QuotientMode::P3);
+        let p_fork = prove_gpu(
+            &cfg,
+            &JoinSplitAir,
+            joinsplit_air::build_trace(&w),
+            &pis,
+            QuotientMode::P3,
+        );
         assert_eq!(
             postcard::to_allocvec(&p_ref).unwrap(),
             postcard::to_allocvec(&p_fork).unwrap(),
@@ -477,13 +579,31 @@ mod tests {
         let cfg = crate::config::gpu::make_bench_config_cpu();
         let w = joinsplit_air::demo_witness();
         let pis = joinsplit_air::public_values(&w);
-        let pj = prove_gpu(&cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis, QuotientMode::Cpu);
-        assert!(verify(&cfg, &JoinSplitAir, &pj, &pis).is_ok(), "cpu-quotient join-split proof must verify");
+        let pj = prove_gpu(
+            &cfg,
+            &JoinSplitAir,
+            joinsplit_air::build_trace(&w),
+            &pis,
+            QuotientMode::Cpu,
+        );
+        assert!(
+            verify(&cfg, &JoinSplitAir, &pj, &pis).is_ok(),
+            "cpu-quotient join-split proof must verify"
+        );
         use crate::htlc_air::{self, HtlcAir};
         let hw = htlc_air::demo_htlc_witness();
         let hpis = htlc_air::public_values(&hw);
-        let ph = prove_gpu(&cfg, &HtlcAir, htlc_air::build_trace(&hw), &hpis, QuotientMode::Cpu);
-        assert!(verify(&cfg, &HtlcAir, &ph, &hpis).is_ok(), "cpu-quotient HTLC proof must verify");
+        let ph = prove_gpu(
+            &cfg,
+            &HtlcAir,
+            htlc_air::build_trace(&hw),
+            &hpis,
+            QuotientMode::Cpu,
+        );
+        assert!(
+            verify(&cfg, &HtlcAir, &ph, &hpis).is_ok(),
+            "cpu-quotient HTLC proof must verify"
+        );
     }
 
     /// Q3 gate: the GPU quotient kernel produces VALID proofs. Uses the CPU (bench) config for LDE+Merkle
@@ -494,13 +614,31 @@ mod tests {
         let cfg = crate::config::gpu::make_bench_config_cpu();
         let w = joinsplit_air::demo_witness();
         let pis = joinsplit_air::public_values(&w);
-        let pj = prove_gpu(&cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis, QuotientMode::Gpu);
-        assert!(verify(&cfg, &JoinSplitAir, &pj, &pis).is_ok(), "gpu-quotient join-split proof must verify");
+        let pj = prove_gpu(
+            &cfg,
+            &JoinSplitAir,
+            joinsplit_air::build_trace(&w),
+            &pis,
+            QuotientMode::Gpu,
+        );
+        assert!(
+            verify(&cfg, &JoinSplitAir, &pj, &pis).is_ok(),
+            "gpu-quotient join-split proof must verify"
+        );
         use crate::htlc_air::{self, HtlcAir};
         let hw = htlc_air::demo_htlc_witness();
         let hpis = htlc_air::public_values(&hw);
-        let ph = prove_gpu(&cfg, &HtlcAir, htlc_air::build_trace(&hw), &hpis, QuotientMode::Gpu);
-        assert!(verify(&cfg, &HtlcAir, &ph, &hpis).is_ok(), "gpu-quotient HTLC proof must verify");
+        let ph = prove_gpu(
+            &cfg,
+            &HtlcAir,
+            htlc_air::build_trace(&hw),
+            &hpis,
+            QuotientMode::Gpu,
+        );
+        assert!(
+            verify(&cfg, &HtlcAir, &ph, &hpis).is_ok(),
+            "gpu-quotient HTLC proof must verify"
+        );
     }
 
     /// The FULL GPU path is production-compatible: `prove_gpu(Gpu)` under the hiding config (GPU LDE +
@@ -512,7 +650,13 @@ mod tests {
         let cfg = crate::config::gpu::make_config_hiding();
         let w = joinsplit_air::demo_witness();
         let pis = joinsplit_air::public_values(&w);
-        let proof = prove_gpu(&cfg, &JoinSplitAir, joinsplit_air::build_trace(&w), &pis, QuotientMode::Gpu);
+        let proof = prove_gpu(
+            &cfg,
+            &JoinSplitAir,
+            joinsplit_air::build_trace(&w),
+            &pis,
+            QuotientMode::Gpu,
+        );
         let bytes = postcard::to_allocvec(&proof).unwrap();
         assert!(
             joinsplit_air::verify_bytes(&bytes, &pis),

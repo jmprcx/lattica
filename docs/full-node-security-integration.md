@@ -1,5 +1,7 @@
 # Lattica Full Node Security Integration Plan
 
+> **Integration contract:** Required host-chain controls that are outside this repository's audited circuit and state-machine boundary.
+
 **Status:** production integration guidance  
 **Basepoints:** `docs/audit-scope.md`, `docs/transaction-stack-audit.md`, `docs/remediation-status.md`, `SPEC.md`  
 **Audience:** full-node, consensus, wallet, prover, and audit-tool implementers

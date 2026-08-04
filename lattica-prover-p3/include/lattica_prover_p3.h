@@ -60,6 +60,11 @@ int32_t lattica_batch_verify(const uint8_t *proof_ptr, size_t proof_len,
 int32_t lattica_batch_prove(const uint8_t *witness_ptr, size_t witness_len, size_t n_tx,
                             uint8_t *proof_out, size_t proof_cap, size_t *proof_len,
                             uint8_t *root_out, size_t root_cap, size_t *root_len);
+int32_t lattica_joinsplit_tree_verify(const uint8_t *proof_ptr, size_t proof_len,
+                                      const uint8_t *root_ptr, size_t root_len, size_t n_tx);
+int32_t lattica_joinsplit_tree_prove(const uint8_t *witness_ptr, size_t witness_len, size_t n_tx,
+                                     uint8_t *proof_out, size_t proof_cap, size_t *proof_len,
+                                     uint8_t *root_out, size_t root_cap, size_t *root_len);
 int32_t lattica_htlc_batch_verify(const uint8_t *proof_ptr, size_t proof_len,
                                   const uint8_t *root_ptr, size_t root_len);
 int32_t lattica_htlc_batch_prove(const uint8_t *witness_ptr, size_t witness_len, size_t n_tx,

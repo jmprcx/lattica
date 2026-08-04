@@ -1,5 +1,7 @@
 # Block Production & Miner Incentives — heartbeat consensus (host-chain design)
 
+> **Design note:** This describes host-chain policy outside Lattica's audited proof-system boundary.
+
 **Status: design decision, recorded — not implemented in lattica.** Block production (cadence, PoW,
 emission, fee distribution, miner payouts, finality, reorg) is **host-chain (`rubble-node-zig`)**
 territory; this document records the agreed design and the primitives Lattica provides for it, and flags

@@ -1,5 +1,7 @@
 # GPU-accelerated proving (opt-in)
 
+> **Research status:** Feature-gated, prove-only, and outside the production audit. The CPU verifier and proof format remain authoritative.
+
 `lattica-prover-p3` can offload the heavy proving steps — the low-degree extension (LDE), the Merkle
 tree build, and the hiding PCS's quotient-randomization pipeline — to a GPU via OpenCL, for a
 **measured ~4.6× speedup over an AVX2-optimized CPU** on the production (hiding) config, with the GPU
